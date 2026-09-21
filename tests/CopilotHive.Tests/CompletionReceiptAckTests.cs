@@ -1455,6 +1455,19 @@ public sealed class CompletionReceiptAckTests
     /// is observable; a genuinely held completion MUST get it, or inactivity-based reclamation could
     /// evict a worker that is actively reporting.
     /// </para>
+    /// <para>
+    /// THE NOTIFICATION COUNTS ARE SETTLED FOR THEIR OCCURRENCES BEFORE THEY ARE RESET OR ASSERTED.
+    /// This vector was observed failing with "expected TransportNotifications=1, actual 2", and the
+    /// SOURCE-CONSISTENT cause is production's DETACHED <c>Task.Run</c> scheduling of
+    /// <c>completionNotifier.NotifyAsync</c>: an acknowledgement at the writer and a returned stream
+    /// handler are both compatible with the callback not having run. That historical interleaving was
+    /// NOT independently reproduced — what this fixture now does is wait on each ordinary completion's
+    /// OWN occurrence milestone, so the counter is settled for that occurrence. The window itself is
+    /// staged deterministically by
+    /// <see cref="OrdinaryCompletion_ResetsOnlyAfterItsHeldNotificationIsReleased"/>, and the resulting
+    /// same-task count is pinned by
+    /// <see cref="OrdinaryCompletion_AfterAReset_CountsOnlyTheLaterOccurrencesNotification"/>.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Duplicate_PreExistingHeldTask_NeverReadsAndIsHandledOrdinarily()
@@ -1523,6 +1536,372 @@ public sealed class CompletionReceiptAckTests
             Assert.True(
                 activityAtAcceptance > staleActivity,
                 "a genuinely held completion must keep its normal activity refresh");
+        });
+    }
+
+    /// <summary>
+    /// THE NAMED REGRESSION'S OWN SHAPE, DETERMINISTIC: after a reset that follows one ordinary
+    /// completion, a LATER ordinary completion REUSING THE SAME TASK ID observes EXACTLY ONE
+    /// notification — its own — and the earlier occurrence's detached callback is not counted with it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THE NAMED REGRESSION WAS OBSERVED FAILING. <see cref=
+    /// "Duplicate_PreExistingHeldTask_NeverReadsAndIsHandledOrdinarily"/> reported "expected
+    /// TransportNotifications=1, actual 2", and the SOURCE-CONSISTENT cause is that
+    /// <c>HiveOrchestratorService</c> schedules <c>completionNotifier.NotifyAsync</c> inside a DETACHED
+    /// <c>Task.Run</c>: an acknowledgement at the writer and a returned stream handler are both
+    /// perfectly compatible with that callback not having run yet, so
+    /// <see cref="AckHarness.ResetObservations"/> could zero the counter before the previous
+    /// completion's callback incremented it, and the later occurrence was then counted with the stale
+    /// one. HONESTLY STATED: that historical interleaving was NOT independently reproduced here, and
+    /// this vector does not claim it was — the deterministic staging of the WINDOW is
+    /// <see cref="OrdinaryCompletion_ResetsOnlyAfterItsHeldNotificationIsReleased"/>; what this vector
+    /// pins is the resulting count, which the fixture's per-occurrence wait now makes exact rather than
+    /// racy.
+    /// </para>
+    /// <para>
+    /// IT IS THE SAME-ID REUSE THAT WOULD MAKE A STALE CALLBACK INDISTINGUISHABLE. Both completions
+    /// name the SAME opaque task id on the SAME live stream, which is precisely why the observation
+    /// cannot be keyed on the task id and precisely why a pending callback from the first occurrence
+    /// would be counted together with the second's.
+    /// </para>
+    /// <para>
+    /// WAIT SENSITIVITY IS POSITIVE, NOT TIMED. The first completion's own milestone wait is asserted
+    /// to have really happened (<see cref="AckHarness.AssertMilestoneWaitPerformed"/>) AND to have been
+    /// RESUMED PAST (<see cref="AckHarness.AssertMilestoneWaitPassed"/>), so a helper whose milestone
+    /// await had been REMOVED fails the first assertion directly — independently of any test-side gate
+    /// timing. Detachment is not discriminated HERE (an unheld callback completes either way): the
+    /// detached shape is killed by
+    /// <see cref="OrdinaryCompletion_ResetsOnlyAfterItsHeldNotificationIsReleased"/>, which holds the
+    /// callback and obtains the two await-site receipts — the schedule-independent discriminator —
+    /// before releasing it. The post-wait boundary checks here remain CORROBORATING evidence only.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task OrdinaryCompletion_AfterAReset_CountsOnlyTheLaterOccurrencesNotification()
+    {
+        const string taskId = "task-notification-reset-reuse";
+
+        var h = AckHarness.Create();
+        await AckHarness.RunAsync(h, async () =>
+        {
+            // ── (1) THE FIRST ORDINARY COMPLETION, SETTLED BY ITS OWN WAIT ────────────────────
+            await h.CompleteOrdinaryAsync(taskId);
+
+            // THE WAIT REALLY HAPPENED AND WAS RESUMED PAST, named by the EXACT milestone this
+            // occurrence registered: a helper with the milestone await removed records no wait for it
+            // and fails here.
+            var firstMilestone = h.LastRegisteredMilestone!;
+            h.AssertMilestoneWaitPerformed(firstMilestone);
+            h.AssertMilestoneWaitPassed(firstMilestone);
+
+            // THE HELPER HAS SETTLED, so apply the universal corroborating check here too: any
+            // post-wait boundary this sibling vector observed must have seen its own milestone
+            // complete. The await-site receipt pair remains the schedule-independent discriminator;
+            // this check preserves the required post-settlement coverage without substituting for it.
+            h.AssertEveryPassedWaitObservedItsMilestoneComplete();
+
+            Assert.Equal(1, h.TransportNotifications);
+
+            // ── (2) THE RESET THE CAUSE NAMES ──────────────────────────────────────────────────
+            h.ResetObservations();
+            Assert.Equal(0, h.TransportNotifications);
+
+            // ── (3) THE LATER ORDINARY COMPLETION, REUSING THE SAME TASK ID ───────────────────
+            h.ReactivateLatestTask(taskId);
+            var activityAtAcceptance = await h.CompleteHeldTaskOrdinarilyAsync(taskId);
+            Assert.True(activityAtAcceptance > DateTime.MinValue);
+
+            // ── (4) EXACTLY ONE: the later occurrence's own contribution, and NOTHING STALE ────
+            // This is the assertion the historical failing run reported as "actual 2": a stale
+            // callback for the SAME task id counted alongside the later occurrence's own.
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Queue.GetActiveTask(taskId));
+        });
+    }
+
+    /// <summary>
+    /// THE DETERMINISTIC REGRESSION: with the FIRST occurrence's real notification callback HELD
+    /// before its transport-counter increment, the helper cannot authorize the observation reset — or
+    /// the next assertion — until that callback is released, and only then is the reset performed and
+    /// the SAME-TASK second completion run, whose OWN fresh milestone yields an exact post-reset count.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT THIS PINS, AND WHAT IT DOES NOT. <c>HiveOrchestratorService</c> schedules
+    /// <c>completionNotifier.NotifyAsync</c> inside a DETACHED <c>Task.Run</c>, so neither an
+    /// acknowledgement at the writer nor a returned stream handler proves the callback has run. This
+    /// vector stages that window under the fixture's OWN control and asserts the property that closes
+    /// it. It does NOT claim to have reproduced the historical failing interleaving — the gap is
+    /// described as SOURCE-CONSISTENT, demonstrated by this deterministic staging.
+    /// </para>
+    /// <para>
+    /// THE HOLD IS THE FIXTURE'S OBSERVATION SEAM, NOT A PRODUCTION HOOK. It parks the callback before
+    /// the fixture counts it; production still schedules, invokes and emits the notification exactly as
+    /// it did, so nothing here fabricates one.
+    /// </para>
+    /// <para>
+    /// WHAT THE INDEPENDENT-PROGRESS EVIDENCE ACTUALLY IS, STATED EXACTLY. While the callback is held,
+    /// the production ACCEPTANCE line for this task has been logged and the acknowledgement has been
+    /// FORWARDED AT THE WRITER — so the completion handler returned and the pump drained — and the
+    /// helper's OWN post-handler barrier token has NOT been emitted. That is the whole claim: it is not
+    /// a claim that every stream activity finished (the helper's barrier deliberately comes later), and
+    /// it is not a claim that production's detached <c>Task.Run</c> became joined.
+    /// </para>
+    /// <para>
+    /// THE ORDERING IS PROVEN BY THE VECTOR'S OWN SEQUENCE, not by a claim about the past: this vector
+    /// obtains BOTH await-site receipts (see below) while the callback is still parked, then runs the
+    /// reset, and only afterwards releases the callback — so the reset provably executed while a
+    /// callback for this same fixture was still uncounted.
+    /// </para>
+    /// <para>
+    /// WAIT-REMOVAL AND WAIT-DETACHMENT SENSITIVITY. The pre-wait record and the one-shot checkpoint are
+    /// produced SYNCHRONOUSLY inside <see cref="AckHarness.AwaitTransportNotificationAsync"/>, before its
+    /// own await, so they alone cannot tell a real <c>await</c> from a detached
+    /// <c>_ = AwaitTransportNotificationAsync(...)</c>. The CALLER-side POST-WAIT boundary observed
+    /// through <see cref="AckHarness.AssertMilestoneWaitStillPending"/> cannot tell them apart on its own
+    /// either: it is an ABSENCE reading, and a detached caller may simply not have been scheduled past
+    /// its next statement yet, so it is CORROBORATING EVIDENCE ONLY and is never the discriminator. The
+    /// schedule-independent discriminator is the pair of await-site receipts described next.
+    /// <see cref="AckHarness.AssertMilestoneWaitPassed"/> likewise corroborates that the helper resumed
+    /// past the wait once the callback was released. <c>IsCompleted == false</c> is deliberately NOT
+    /// relied on alone either, because the helper's later stream barrier could explain it.
+    /// </para>
+    /// <para>
+    /// WHY THE PROOF IS SCHEDULE-INDEPENDENT. The discriminator is an AWAIT-SITE RECEIPT, and the test
+    /// waits for its PRESENCE rather than sampling for an absence. The notification wait is reached
+    /// through awaitables whose <c>GetAwaiter()</c> writes a receipt
+    /// (<see cref="AckHarness.CallerAwaitReceipt"/> and
+    /// <see cref="AckHarness.MilestoneSuspensionReceipt"/>); the C# <c>await</c> machinery invokes
+    /// <c>GetAwaiter()</c> SYNCHRONOUSLY at the await site, before any suspension. A mutant that
+    /// DISCARDS the call — <c>_ = AwaitTransportNotificationAsync(...)</c>, or an inner
+    /// <c>_ = &lt;milestone suspension&gt;</c> — never obtains that awaiter, so it can never write the
+    /// receipt, and no later resume can retroactively create one. The fact is therefore written exactly
+    /// once, permanently, and is settled BEFORE this vector releases the hold, so there is no
+    /// preemption window in which a detached caller could look like a real one.
+    /// </para>
+    /// <para>
+    /// WHAT THE OTHER SIGNALS ARE, HONESTLY. The caller-side post-wait stamp
+    /// (<see cref="AckHarness.PassedMilestoneWait"/>) is taken in the caller's NEXT statement after the
+    /// call returns, so a detached caller could be preempted before writing it; it is retained as a
+    /// CORROBORATING signal only and is explicitly NOT the discriminator.
+    /// <see cref="AckHarness.AssertEveryPassedWaitObservedItsMilestoneComplete"/> is applied before the
+    /// release AND again after the helper has settled, so a late false stamp cannot escape — a
+    /// complement to the receipts, not a substitute for them.
+    /// </para>
+    /// <para>
+    /// AN EARLIER REVISION tried to control scheduling instead, starting the helper on a dedicated
+    /// single-threaded <c>SynchronizationContext</c> and probing it for quiescence. That mechanism was
+    /// removed: it depended on the helper's continuations actually being posted back to that context,
+    /// which is not guaranteed across an <c>await</c> chain that includes production code, and it
+    /// produced a 30s "boundary never reached" stall under load.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task OrdinaryCompletion_ResetsOnlyAfterItsHeldNotificationIsReleased()
+    {
+        const string taskId = "task-notification-gap";
+
+        var h = AckHarness.Create();
+        await AckHarness.RunAsync(h, async () =>
+        {
+            var hold = h.HoldNextTransportNotification();
+            var waitBoundary = h.ArmMilestoneWaitCheckpoint();
+
+            // STARTED, NOT AWAITED: this occurrence's callback is parked inside the hold while the
+            // completion's real acceptance, release and ACK work proceed. Nothing about WHERE this
+            // helper's continuations run matters to the proof below — the decisive fact is written by
+            // the await machinery itself, inside GetAwaiter(), at the await site.
+            var firstCompletion = h.CompleteOrdinaryAsync(taskId);
+
+            try
+            {
+                // ── THE WINDOW, STAGED: the callback has ARRIVED at the shared notifier and is ─────
+                // ── parked BEFORE its increment; the helper is parked at ITS OWN milestone wait. ──
+                await hold.AwaitEnteredAsync();
+                await h.AwaitWaitBoundaryAsync(waitBoundary);
+
+                var heldMilestone = h.LastRegisteredMilestone!;
+
+                // ── THE DISCRIMINATOR FIRST, DELIBERATELY ──────────────────────────────────────
+                // The receipts below are the schedule-independent facts, so they are evaluated BEFORE
+                // any corroborating check. Evaluating a schedule-dependent signal first would let a
+                // mutant be reported through that weaker check and would hide whether the immutable
+                // one actually discriminates.
+                //
+                // ── THE DISCRIMINATOR: AWAIT-SITE RECEIPTS, WAITED FOR POSITIVELY ───────────────
+                // These receipts are written inside the awaitables' GetAwaiter(), which the `await`
+                // machinery invokes SYNCHRONOUSLY at the await site before any suspension. A mutant
+                // that DISCARDS either call never obtains that awaiter, so it can NEVER write the
+                // receipt — the fact is immutable from that moment on and no later resume can create
+                // it. Waiting for PRESENCE (not sampling for absence) therefore has no preemption
+                // window: a genuine await always satisfies these, and both detached shapes always
+                // expire here with their named messages, whatever the thread scheduling.
+                //
+                // BOTH RECEIPTS ARE REQUIRED, AND THEY CATCH DIFFERENT MUTANTS: the caller-side one
+                // catches `_ = AwaitTransportNotificationAsync(...)`, and the milestone-suspension one
+                // catches an INNER `_ = MilestoneSuspension(milestone)` that leaves the caller-side
+                // receipt intact.
+                //
+                // EACH CHANNEL WAS VERIFIED SEPARATELY, against a source-verified mutation and a
+                // freshly rebuilt binary: the outer discard fails HERE on the 'caller-await' receipt,
+                // and the inner discard fails HERE on the 'milestone-suspension' receipt — both after
+                // the bounded wait, raised by AwaitReceiptAsync, NOT by the corroborating checks
+                // below. Anything that fails at a corroborating check instead means the intended
+                // mutation was not the one actually built.
+                //
+                // THIS HAPPENS BEFORE THE HOLD IS RELEASED, so the detach fact is settled while the
+                // callback is still parked.
+                await h.AwaitReceiptAsync(heldMilestone, AckHarness.CallerAwaitReceipt);
+                await h.AwaitReceiptAsync(heldMilestone, AckHarness.MilestoneSuspensionReceipt);
+                Assert.Equal(1, h.ReceiptCount(heldMilestone, AckHarness.CallerAwaitReceipt));
+                Assert.Equal(1, h.ReceiptCount(heldMilestone, AckHarness.MilestoneSuspensionReceipt));
+
+                // ── CORROBORATING SIGNALS ONLY, EVALUATED AFTER THE DISCRIMINATOR ──────────────
+                // NEITHER of these is the discriminator. The still-pending witness is an ABSENCE
+                // reading ("not observed YET"), which a detached caller that has not been scheduled
+                // past its record also satisfies; the caller-side stamp is taken in the caller's next
+                // statement after the call returns, so a detached caller could be preempted before
+                // writing it. They are retained because, when they DO fire, they are real evidence.
+                h.AssertMilestoneWaitStillPending(heldMilestone);
+                h.AssertEveryPassedWaitObservedItsMilestoneComplete();
+
+                // ── INDEPENDENT PROGRESS, FROM OBSERVATIONS THAT ARE NOT THE HELPER'S OWN BARRIER ──
+                // The production ACCEPTANCE line proves the completion handler ran to its provenance
+                // point, and the acknowledgement FORWARDED AT THE WRITER proves the pump drained the
+                // pinned instance's channel. Both are real production effects of this delivery, and
+                // neither is the helper's own barrier.
+                Assert.Equal(
+                    1, h.DiagnosticCount(ProductionLogFragments.CompletionAccepted, taskId));
+                Assert.Equal(1, h.AcknowledgedCount(taskId));
+
+                // …AND THE HELPER HAS NOT REACHED ITS OWN POST-HANDLER BARRIER, so the incompletion
+                // below cannot be explained by that later stream barrier instead of by the held
+                // notification.
+                Assert.True(
+                    h.BarrierTokensEmitted == 0,
+                    "THE HELPER ALREADY EMITTED ITS OWN POST-HANDLER BARRIER: it ran past the " +
+                    "notification wait, so its incompletion could be explained by the barrier rather " +
+                    "than by the held callback — the state a REMOVED or DETACHED notification await " +
+                    $"produces (barrier tokens seen: {h.BarrierTokensEmitted}).");
+
+                // …and the helper really has not returned. Kept as a corroborating check only — the
+                // discriminating facts are the ones above.
+                Assert.False(
+                    firstCompletion.IsCompleted,
+                    "the ordinary-completion helper returned while THIS occurrence's notification " +
+                    "callback was still parked, so a caller resetting or asserting the notification " +
+                    "counters at that point would race production's detached Task.Run.");
+
+                // ── THE RESET, PERFORMED WHILE THE CALLBACK IS STILL PARKED ──────────────────────
+                // This is the precise interleaving the cause names: the counters are zeroed BEFORE
+                // this occurrence's callback has been counted.
+                h.ResetObservations();
+                Assert.Equal(0, h.TransportNotifications);
+
+                // RE-ASSERTED AFTER THE RESET. Both are corroborating signals; the settled facts are
+                // the two await-site receipts already obtained above.
+                h.AssertMilestoneWaitStillPending(heldMilestone);
+                h.AssertEveryPassedWaitObservedItsMilestoneComplete();
+                Assert.True(
+                    h.BarrierTokensEmitted == 0,
+                    "the helper reached its own post-handler barrier between the still-pending " +
+                    "witness and the reset, so it was not held at its notification wait.");
+
+                // ── RELEASE THE GATE, OBSERVE, AND ONLY THEN CONTINUE ────────────────────────────
+                // THE RETAINED HELPER IS AWAITED UNDER THE SAME BoundedWait as every other wait here:
+                // it was started, not awaited, so a bare await would be an unbounded wait on a task
+                // whose continuation depends on a test-owned gate.
+                hold.Release();
+                await AckHarness.AwaitRetainedHelperAsync(
+                    firstCompletion, "the held ordinary completion");
+
+                // THE HELPER RESUMED PAST ITS OWN NOTIFICATION WAIT, which is only reachable once the
+                // awaited task completed — the positive complement of the still-pending witness above.
+                h.AssertMilestoneWaitPassed(heldMilestone);
+
+                // ── THE UNIVERSAL CHECK, APPLIED *AFTER* THE HELPER HAS SETTLED ─────────────────
+                // The pre-release application above cannot see a record written later; this one can,
+                // so a LATE false-stamped record cannot escape. It complements — and does not replace
+                // — the await-site receipts, which are what make the detach fact immutable.
+                h.AssertEveryPassedWaitObservedItsMilestoneComplete();
+
+                // AND THE RECEIPTS ARE STILL EXACTLY ONE EACH after settlement: the awaitables are
+                // obtained once per occurrence, so nothing double-writes them.
+                Assert.Equal(1, h.ReceiptCount(heldMilestone, AckHarness.CallerAwaitReceipt));
+                Assert.Equal(1, h.ReceiptCount(heldMilestone, AckHarness.MilestoneSuspensionReceipt));
+
+                // THE WITHHELD CALLBACK WAS COUNTED AS EXACTLY ONE, and the helper did not return until
+                // it was: the reset zeroed the counter without losing, duplicating or misattributing
+                // this occurrence's arrival.
+                Assert.Equal(1, h.TransportNotifications);
+
+                // ── THE SAME-TASK SECOND ORDINARY COMPLETION, WITH A FRESH MILESTONE ─────────────
+                h.ReactivateLatestTask(taskId);
+                h.ResetObservations();
+                var laterBoundary = h.ArmMilestoneWaitCheckpoint();
+                var activityAtAcceptance = await h.CompleteHeldTaskOrdinarilyAsync(taskId);
+                await h.AwaitWaitBoundaryAsync(laterBoundary);
+                Assert.True(activityAtAcceptance > DateTime.MinValue);
+
+                // ── EXACTLY ONE AFTER THE RESET: the later occurrence's OWN notification ─────────
+                // The first occurrence's callback was already counted and reset BEFORE this second
+                // completion was even dispatched, so a count of one here cannot include it.
+                Assert.Equal(1, h.TransportNotifications);
+
+                // …and the queue really advanced for the later task, so the completion was accepted.
+                Assert.Null(h.Queue.GetActiveTask(taskId));
+
+                // THE LATER OCCURRENCE'S OWN WAIT ALSO REALLY HAPPENED *AND WAS PASSED*, named by ITS
+                // milestone — so the second helper awaited its notification too, rather than detaching.
+                var laterMilestone = h.LastRegisteredMilestone!;
+                h.AssertMilestoneWaitPerformed(laterMilestone);
+                h.AssertMilestoneWaitPassed(laterMilestone);
+
+                // …AND ITS OWN AWAIT-SITE RECEIPTS EXIST TOO, so the second helper genuinely awaited
+                // rather than detaching.
+                await h.AwaitReceiptAsync(laterMilestone, AckHarness.CallerAwaitReceipt);
+                await h.AwaitReceiptAsync(laterMilestone, AckHarness.MilestoneSuspensionReceipt);
+
+                // THE UNIVERSAL CHECK ONCE MORE, after this second occurrence settled as well.
+                h.AssertEveryPassedWaitObservedItsMilestoneComplete();
+
+                // …and the later completion was genuinely ACCEPTED (recorded and released), so the
+                // exact-one count above is about a real ordinary completion and not a refusal.
+                Assert.Equal(1, h.Recorder.RecordCalls);
+                Assert.False(h.Worker.IsBusy);
+            }
+            finally
+            {
+                // ── TEARDOWN THAT CANNOT REPLACE THE PRIMARY ASSERTION ──────────────────────────
+                // THE GATE IS RELEASED FIRST AND UNCONDITIONALLY, so no parked callback continuation
+                // survives ANY failing assertion above: the callback proceeds, counts itself and
+                // signals its milestone.
+                hold.Release();
+
+                // THEN THE HELPER TASK THIS VECTOR STARTED IS SETTLED BEFORE THE SHARED TEARDOWN, so
+                // it cannot still be running (and touching the shared stores) once
+                // AckHarness.StopAsync disposes them. THE SETTLE IS BOUNDED by the same BoundedWait as
+                // every other wait here — a bare await would be an unbounded wait on the cleanup path,
+                // which is precisely where a stall is hardest to diagnose. Its own outcome is
+                // deliberately NOT rethrown: a cleanup-path failure must never replace the vector's
+                // primary assertion, which RunAsync rethrows first. On the success path this await is
+                // already complete.
+                try
+                {
+                    await AckHarness.AwaitRetainedHelperAsync(
+                        firstCompletion, "the held ordinary completion (teardown settle)");
+                }
+                catch (Exception)
+                {
+                    // Swallowed ON PURPOSE — see above. The bounded wait guarantees this returns:
+                    // either the helper settled, or the bound expired with its own named message that
+                    // is deliberately discarded here so the primary assertion stays authoritative.
+                }
+
+            }
         });
     }
 
@@ -2898,6 +3277,17 @@ public sealed class CompletionReceiptAckTests
     /// awaited inline, so the barrier's own Progress message can only be processed after the handler
     /// RETURNED. No sleeps, no competing channel reader, and every started producer is joined.
     /// </para>
+    /// <para>
+    /// THE ORDINARY COMPLETION'S DOWNSTREAM NOTIFICATION IS OBSERVED SEPARATELY, AND IT HAS TO BE.
+    /// <c>HiveOrchestratorService</c> schedules <c>completionNotifier.NotifyAsync</c> inside a DETACHED
+    /// <c>Task.Run</c>, so NEITHER the forwarded acknowledgement NOR the post-handler barrier proves
+    /// that this fixture's notification callback has run: both are consistent with it still being
+    /// pending. The per-occurrence milestone — registered before the completion is pushed or invoked
+    /// and awaited before the helper returns — is what settles the observation for THAT occurrence, so
+    /// a caller's following reset or zero/one assertion cannot race it. It is a claim about this
+    /// fixture's own counter ONLY: it does not mean production's detached <c>Task.Run</c> became joined,
+    /// and it does not mean arbitrary downstream pipeline effects finished.
+    /// </para>
     /// </remarks>
     private sealed class AckHarness
     {
@@ -2925,6 +3315,53 @@ public sealed class CompletionReceiptAckTests
         private int _transportNotifications;
         private int _tasksEnqueued;
         private int _barrierSequence;
+
+        /// <summary>
+        /// THE TOKEN PREFIX <see cref="BarrierAsync"/> stamps on its Progress messages, so a vector can
+        /// count how many of THIS helper-barrier's own lines production has logged.
+        /// </summary>
+        /// <remarks>
+        /// IT IS DELIBERATELY DISTINCT from every other probe prefix in this harness (the pump probes
+        /// and the additional-stream barrier), so counting it cannot be satisfied by a different kind of
+        /// probe.
+        /// </remarks>
+        private const string BarrierTokenPrefix = "ack-barrier-";
+
+        /// <summary>
+        /// THE PER-OCCURRENCE NOTIFICATION MILESTONES: one pending signal per ordinary completion
+        /// whose completion notification this fixture has undertaken to observe, consumed IN
+        /// REGISTRATION ORDER by the callbacks that actually arrive.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS A SEQUENCE, NOT A COUNTER AND NOT A TASK-ID-KEYED MAP, and both of those distinctions
+        /// are load-bearing here. This fixture deliberately REUSES task ids, and independent streams
+        /// share the ONE notifier, so a match keyed on the task id alone would readily signal a LATER
+        /// occurrence for an EARLIER one; and a single shared, already-completed task would signal
+        /// immediately, proving nothing at all about the occurrence under test. A fresh signal per
+        /// registration, consumed strictly in order, keeps each milestone attributable to exactly the
+        /// occurrence that registered it.
+        /// </para>
+        /// <para>
+        /// IT IS STRUCTURALLY SEPARATE FROM THE ASSERTION COUNTERS. This list and its gate are never
+        /// touched by <see cref="ResetObservations"/> or <see cref="ResetDashboardNotifications"/>, so
+        /// zeroing the resettable counters cannot erase, satisfy or misattribute a pending milestone.
+        /// </para>
+        /// </remarks>
+        private readonly List<TaskCompletionSource> _pendingNotificationMilestones = [];
+
+        /// <summary>
+        /// Guards the milestone sequence on the callback side. It deliberately does NOT guard the
+        /// assertion counters, which stay independently <see cref="Interlocked"/> and resettable.
+        /// </summary>
+        private readonly object _notificationGate = new();
+
+        /// <summary>
+        /// The one-shot hold armed by <see cref="HoldNextTransportNotification"/>, or <c>null</c>. It
+        /// is taken and cleared by the callback it was armed for, so it can never delay a later
+        /// occurrence.
+        /// </summary>
+        private NotificationHold? _notificationHold;
 
         private AckHarness() { }
 
@@ -2966,11 +3403,21 @@ public sealed class CompletionReceiptAckTests
         /// duplicate delivery's own effects in isolation.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// THE WRITER'S LEDGER IS DELIBERATELY NOT CLEARED: it is CUMULATIVE evidence, so
         /// <see cref="AcknowledgedCount"/> keeps reporting the ordinary completion's own
         /// acknowledgement alongside any re-acknowledgement. Counting from zero would make "exactly one
         /// acknowledgement for this task" impossible to distinguish from "one acknowledgement was added
         /// for a different task".
+        /// </para>
+        /// <para>
+        /// IT DOES NOT — AND MUST NOT — RESET THE NOTIFICATION MILESTONES. Those are the per-occurrence
+        /// handoff that makes an ordinary completion's transport callback observable, and they live
+        /// outside the counters precisely so that zeroing the one cannot erase, satisfy or misattribute
+        /// the other. A caller that resets here must already have awaited its own occurrence's milestone
+        /// — see <see cref="CompleteOrdinaryAsync"/> and its siblings — because production's notification
+        /// is scheduled on a DETACHED <c>Task.Run</c> and is NOT ordered against this reset.
+        /// </para>
         /// </remarks>
         public void ResetObservations()
         {
@@ -3058,14 +3505,921 @@ public sealed class CompletionReceiptAckTests
 
             dashboard.OnStateChanged += () => Interlocked.Increment(ref harness._dashboardNotifications);
             queue.OnEnqueue = _ => Interlocked.Increment(ref harness._tasksEnqueued);
-            completionNotifier.OnTaskCompleted += _ =>
+
+            // ── THE ORDINARY COMPLETION'S TRANSPORT CALLBACK, IN THE FIXTURE'S OWN ORDER ────────────
+            // THE COUNTER IS INCREMENTED FIRST, THEN the milestone registered for THIS occurrence is
+            // signalled — never the other way round, so a waiter released by the signal cannot observe
+            // a counter that the occurrence it waited for has not yet incremented.
+            //
+            // WHY THE MILESTONE EXISTS AT ALL. `HiveOrchestratorService` schedules
+            // `completionNotifier.NotifyAsync` inside a DETACHED `Task.Run`, so neither an
+            // acknowledgement at the writer nor a returned stream handler proves that this callback
+            // has run yet. Waiting on the milestone is what makes THIS occurrence's contribution to
+            // the counter settle — it is a fact about the fixture's own notification counter, NOT a
+            // claim that production's detached `Task.Run` became joined, and NOT a claim that arbitrary
+            // downstream pipeline effects finished.
+            completionNotifier.OnTaskCompleted += async _ =>
             {
-                Interlocked.Increment(ref harness._transportNotifications);
-                return Task.CompletedTask;
+                await harness.AwaitNotificationHoldAsync();
+                harness.OnTransportNotification();
             };
 
             return harness;
         }
+
+        /// <summary>
+        /// THE ONE-SHOT HOLD the regression vector arms so that the NEXT transport callback's arrival
+        /// is CONTROLLED by the test rather than by the thread pool.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// WHY A HOLD IS NEEDED FOR AN HONEST REGRESSION. Production schedules
+        /// <c>completionNotifier.NotifyAsync</c> on a DETACHED <c>Task.Run</c>, so the interval in
+        /// which this fixture's counter has not yet been incremented is a genuine race. A vector that
+        /// merely hoped to observe that interval would be flaky rather than deterministic; holding the
+        /// callback makes the interval an explicit, controlled state.
+        /// </para>
+        /// <para>
+        /// IT IS THE FIXTURE'S OWN OBSERVATION SEAM AND NOTHING MORE: it delays WHEN this fixture
+        /// counts a notification, never whether production emits one, and the callback still increments
+        /// the counter and signals its milestone in that order once released.
+        /// </para>
+        /// </remarks>
+        public sealed class NotificationHold
+        {
+            private readonly TaskCompletionSource _entered =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            private readonly TaskCompletionSource _release =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            /// <summary>
+            /// THE TEST'S OWN CANCELLATION TOKEN, captured when the hold is ARMED — i.e. on the test's
+            /// thread — rather than read inside the callback.
+            /// </summary>
+            /// <remarks>
+            /// THE CALLBACK RUNS ON PRODUCTION'S DETACHED <c>Task.Run</c>, so reading the ambient test
+            /// context from there would depend on how that continuation was scheduled. Capturing the
+            /// token at arming time makes the callback's bounded wait observe the SAME token every
+            /// other bounded wait in this fixture uses, with no ambient lookup on a production thread.
+            /// </remarks>
+            private readonly CancellationToken _testToken;
+
+            /// <summary>Initialises the gate with the arming test's cancellation token.</summary>
+            /// <param name="testToken">The arming test's cancellation token.</param>
+            public NotificationHold(CancellationToken testToken) => _testToken = testToken;
+
+            /// <summary>Lets the held callback proceed.</summary>
+            public void Release() => _release.TrySetResult();
+
+            /// <summary>
+            /// Waits for the held callback to arrive, under the fixture's bounded wait, so a callback
+            /// that never arrives is a NAMED failure rather than a stall.
+            /// </summary>
+            /// <returns>A task that completes once the callback is inside the hold.</returns>
+            public async Task AwaitEnteredAsync()
+            {
+                try
+                {
+                    await _entered.Task.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                }
+                catch (TimeoutException ex)
+                {
+                    throw new TimeoutException(
+                        "THE HELD TRANSPORT CALLBACK NEVER ARRIVED: no ordinary completion's " +
+                        "notification reached the shared notifier's callback within " +
+                        $"{BoundedWait.TotalSeconds:F0}s, so the held interval could not be staged.",
+                        ex);
+                }
+            }
+
+            /// <summary>Marks the callback as held, then blocks the callback on the BOUNDED release.</summary>
+            /// <remarks>
+            /// <para>
+            /// THE RELEASE WAIT IS BOUNDED BY THE SAME <see cref="BoundedWait"/> every other wait in
+            /// this fixture uses — no second timing constant, no sleep. The vector releases this gate in
+            /// a <c>finally</c>, but a gate that is never released (a teardown or control-flow failure
+            /// before the release) must still surface as a NAMED failure rather than parking the
+            /// callback forever.
+            /// </para>
+            /// <para>
+            /// THE TIMEOUT SURFACES THROUGH THE CALLBACK, NOT THROUGH THE TEST THREAD, because that is
+            /// where this wait lives; production's own handler guard logs it. The vector's separate
+            /// bounded milestone wait then fails with its own named message, so the run ends as a
+            /// reported failure instead of a stall.
+            /// </para>
+            /// </remarks>
+            /// <returns>A task the callback must await before it counts itself.</returns>
+            public async Task HeldAsync()
+            {
+                _entered.TrySetResult();
+
+                try
+                {
+                    await _release.Task.WaitAsync(BoundedWait, _testToken);
+                }
+                catch (TimeoutException ex)
+                {
+                    throw new TimeoutException(
+                        "THE TEST-OWNED NOTIFICATION-HOLD GATE WAS NEVER RELEASED: the transport " +
+                        "callback stayed parked in this fixture's hold for " +
+                        $"{BoundedWait.TotalSeconds:F0}s without the vector calling Release(), so the " +
+                        "occurrence's notification was never counted.",
+                        ex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Awaits a RETAINED helper task a vector started earlier, under the same
+        /// <see cref="BoundedWait"/> every other wait in this fixture uses, so a helper that never
+        /// settles is a NAMED failure rather than a stall.
+        /// </summary>
+        /// <remarks>
+        /// IT EXISTS FOR THE STARTED-BUT-NOT-YET-AWAITED SHAPE. A vector that starts an ordinary
+        /// completion and observes it mid-flight holds a task whose continuation depends on a
+        /// test-owned gate; awaiting that task bare would reintroduce exactly the unbounded wait this
+        /// fixture forbids.
+        /// </remarks>
+        /// <param name="retained">The retained helper task.</param>
+        /// <param name="description">What the task is, for the named failure.</param>
+        /// <returns>A task that completes once the retained helper settled.</returns>
+        public static async Task AwaitRetainedHelperAsync(Task retained, string description)
+        {
+            try
+            {
+                await retained.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException(
+                    $"THE RETAINED HELPER TASK NEVER SETTLED: {description} did not complete within " +
+                    $"{BoundedWait.TotalSeconds:F0}s after its test-owned gate was released.",
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// ARMS the hold for the NEXT transport callback and returns its handle, so the regression can
+        /// observe — deterministically — the interval in which an ordinary completion's notification
+        /// has not been counted yet.
+        /// </summary>
+        /// <remarks>
+        /// THE ARMING TEST'S CANCELLATION TOKEN IS CAPTURED HERE, on the test's own thread, and handed
+        /// to the gate: the callback that later waits on it runs on production's detached
+        /// <c>Task.Run</c>, where the ambient test context is not a reliable place to read it from.
+        /// </remarks>
+        /// <returns>The handle the vector holds, observes and releases.</returns>
+        public NotificationHold HoldNextTransportNotification()
+        {
+            var hold = new NotificationHold(TestContext.Current.CancellationToken);
+            lock (_notificationGate)
+                _notificationHold = hold;
+
+            return hold;
+        }
+
+        /// <summary>
+        /// Awaits the hold armed for THIS callback, if any — consumed as it is taken, so it can never
+        /// delay a later occurrence.
+        /// </summary>
+        /// <returns>A task that completes once the callback may proceed.</returns>
+        private async Task AwaitNotificationHoldAsync()
+        {
+            NotificationHold? hold;
+            lock (_notificationGate)
+            {
+                hold = _notificationHold;
+                _notificationHold = null;
+            }
+
+            if (hold is not null)
+                await hold.HeldAsync();
+        }
+
+        /// <summary>Counts the REAL transport notification THIS occurrence produced, then signals the
+        /// milestone registered for it.</summary>
+        /// <remarks>
+        /// THE TWO STEPS ARE ORDERED, NOT ATOMIC: the counter is a resettable observation that
+        /// <see cref="ResetObservations"/> is allowed to zero at any time, while the milestone is the
+        /// per-occurrence handoff that no reset touches. Keeping them separate is what lets a caller
+        /// zero the counters and still be certain that exactly one FURTHER callback — the one it is
+        /// about to wait for — has yet to arrive.
+        /// </remarks>
+        private void OnTransportNotification()
+        {
+            Interlocked.Increment(ref _transportNotifications);
+
+            TaskCompletionSource? milestone = null;
+            lock (_notificationGate)
+            {
+                if (_pendingNotificationMilestones.Count > 0)
+                {
+                    milestone = _pendingNotificationMilestones[0];
+                    _pendingNotificationMilestones.RemoveAt(0);
+                }
+            }
+
+            milestone?.TrySetResult();
+        }
+
+        /// <summary>
+        /// REGISTERS the milestone for the NEXT ordinary completion's notification callback and
+        /// returns the task that completes once THAT occurrence's callback has run.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT MUST BE CALLED BEFORE the completion is pushed or invoked, and the caller must await the
+        /// returned task before returning — that pairing is what closes the gap this fixture used to
+        /// have. A milestone registered for an occurrence that never notifies would simply expire, so
+        /// the REFUSED/READ-ONLY paths — which correctly produce no notification — must never register
+        /// one.
+        /// </para>
+        /// <para>
+        /// IT IS NEVER A COUNT AND NEVER KEYED ON THE TASK ID. It is matched to an occurrence by
+        /// REGISTRATION ORDER alone: this fixture reuses task ids and independent streams share the one
+        /// notifier, so an id-keyed or "any notification at all" match would be satisfied by a
+        /// different occurrence's callback.
+        /// </para>
+        /// </remarks>
+        /// <returns>A task that completes once this occurrence's callback has run.</returns>
+        private Task ExpectTransportNotification()
+        {
+            var milestone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_notificationGate)
+            {
+                _pendingNotificationMilestones.Add(milestone);
+                LastRegisteredMilestone = milestone.Task;
+            }
+
+            return milestone.Task;
+        }
+
+        /// <summary>
+        /// THE MILESTONE MOST RECENTLY REGISTERED by <see cref="ExpectTransportNotification"/>, so a
+        /// vector can name the EXACT occurrence whose wait it is asserting about without that value
+        /// being threaded through every helper signature.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS HARNESS-INSTANCE STATE, NEVER STATIC, and it is overwritten on every registration, so
+        /// it always names the occurrence most recently set up on THIS harness. A vector reads it only
+        /// after it has observed the wait boundary (or the registration itself), which is strictly after
+        /// that registration.
+        /// </para>
+        /// <para>
+        /// IT IS READ-ONLY TO VECTORS: nothing outside this harness can substitute a different task, so
+        /// a passing <see cref="AssertMilestoneWaitPerformed"/> cannot be satisfied by a milestone the
+        /// vector supplied.
+        /// </para>
+        /// </remarks>
+        public Task? LastRegisteredMilestone { get; private set; }
+
+        /// <summary>
+        /// THE MILESTONE WAIT ONE HELPER PERFORMED: the milestone task it awaited, and whether that
+        /// milestone was ALREADY satisfied at the moment the helper arrived at the wait.
+        /// </summary>
+        /// <param name="Milestone">The per-occurrence milestone task the helper awaited.</param>
+        /// <param name="AlreadyCompletedWhenReached">
+        /// Whether the milestone had already completed when the helper arrived at the wait. A wait
+        /// reached while its milestone is still PENDING is the one that closes the notification gap;
+        /// this flag makes that distinction assertable rather than assumed.
+        /// </param>
+        public sealed record MilestoneWait(Task Milestone, bool AlreadyCompletedWhenReached);
+
+        /// <summary>
+        /// THE MILESTONE WAITS THIS HARNESS'S HELPERS HAVE ACTUALLY PERFORMED, in completion order,
+        /// each paired with the milestone task it awaited.
+        /// </summary>
+        /// <remarks>
+        /// THIS IS THE WAIT'S OWN RECORD. A helper whose milestone await has been REMOVED contributes no
+        /// entry, so a vector can assert POSITIVELY, and without depending on test-side gate timing,
+        /// that the wait it relies on really happened — naming the exact milestone it registered.
+        /// </remarks>
+        private readonly List<MilestoneWait> _milestoneWaits = [];
+
+        /// <summary>Guards <see cref="_milestoneWaits"/>.</summary>
+        private readonly object _milestoneWaitsGate = new();
+
+        /// <summary>
+        /// A one-shot checkpoint armed by a regression vector and fired by
+        /// <see cref="AwaitTransportNotificationAsync"/> at the exact moment a helper ARRIVES at its
+        /// milestone wait. Consumed as it fires, so it can never satisfy a later arming.
+        /// </summary>
+        private TaskCompletionSource? _milestoneWaitCheckpoint;
+
+        /// <summary>Guards <see cref="_milestoneWaitCheckpoint"/>.</summary>
+        private readonly object _milestoneCheckpointGate = new();
+
+        /// <summary>
+        /// THE POSITIVE PROOF THAT A HELPER REALLY PERFORMED ITS MILESTONE WAIT: the wait for exactly
+        /// <paramref name="milestone"/> exists in this harness's own record.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THIS IS WHAT A HELPER-WAIT REMOVAL CANNOT SATISFY, AND IT DOES NOT DEPEND ON TIMING A
+        /// TEST-SIDE GATE CAN MASK. Dropping the await from a helper means no entry is recorded for
+        /// that helper's milestone, so this fails with a message that names the removal — rather than
+        /// relying on a counter value that a mutant's early return usually satisfies anyway, or on a
+        /// bounded wait that a callback gate could release before it is ever reached.
+        /// </para>
+        /// <para>
+        /// IT IS KEYED ON THE EXACT MILESTONE TASK, never on a count and never on the task id: this
+        /// fixture reuses task ids and shares one notifier across streams, so only the identity of the
+        /// very milestone the helper registered can attribute the wait to THAT occurrence.
+        /// </para>
+        /// <para>
+        /// IT DELIBERATELY CLAIMS NOTHING ABOUT ORDERING FROM OUTSIDE. A wait PROVEN to have been
+        /// reached does not by itself entitle a vector to say the reset "could not have run yet" — a
+        /// test-side gate may release the callback before the reset.
+        /// <see cref="OrdinaryCompletion_ResetsOnlyAfterItsHeldNotificationIsReleased"/> proves that
+        /// ordering the only honest way: it HOLDS the callback and sequences the reset itself.
+        /// </para>
+        /// </remarks>
+        /// <param name="milestone">The milestone returned by the helper's registration.</param>
+        /// <param name="mustHaveBeenPending">
+        /// When <c>true</c>, the recorded wait must ALSO have been reached while its milestone was
+        /// still pending — i.e. the helper was genuinely PARKED at the wait rather than merely observing
+        /// a milestone its callback had already satisfied.
+        /// </param>
+        public void AssertMilestoneWaitPerformed(Task milestone, bool mustHaveBeenPending = false)
+        {
+            Assert.NotNull(milestone);
+
+            MilestoneWait[] waits;
+            lock (_milestoneWaitsGate)
+                waits = [.. _milestoneWaits];
+
+            var recorded = waits.Where(wait => ReferenceEquals(wait.Milestone, milestone)).ToArray();
+
+            Assert.True(
+                recorded.Length > 0,
+                "THE ORDINARY-COMPLETION HELPER NEVER REACHED ITS MILESTONE WAIT: no wait was " +
+                "recorded for the milestone this occurrence registered, which is exactly the state a " +
+                "helper with the notification-milestone await REMOVED leaves behind — it returns " +
+                "without ever observing the callback that closes the gap.");
+
+            if (mustHaveBeenPending)
+            {
+                Assert.True(
+                    recorded.Any(wait => !wait.AlreadyCompletedWhenReached),
+                    "THE RECORDED WAIT FOUND THE MILESTONE ALREADY SATISFIED: the helper reached its " +
+                    "wait only after this occurrence's callback had been counted, so the wait was not " +
+                    "the thing holding the helper back — the held-callback state under test was never " +
+                    "actually staged.");
+            }
+        }
+
+        /// <summary>
+        /// RECORDS that a helper has ARRIVED at its milestone wait, at the instant it does so and
+        /// before awaiting, so the entry captures whether this was a genuine wait or merely a
+        /// re-observation of an already-satisfied milestone.
+        /// </summary>
+        /// <param name="milestone">The milestone task the helper is about to await.</param>
+        private void RecordMilestoneWaitReached(Task milestone)
+        {
+            lock (_milestoneWaitsGate)
+                _milestoneWaits.Add(new MilestoneWait(milestone, milestone.IsCompleted));
+        }
+
+        /// <summary>
+        /// THE POST-WAIT BOUNDARY: the milestones whose waits a helper has PASSED, recorded by the
+        /// helper itself at the statement immediately AFTER its awaited notification call.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS CORROBORATING EVIDENCE ONLY, NOT THE DISCRIMINATOR.
+        /// <see cref="AwaitTransportNotificationAsync"/> records its arrival and fires its checkpoint
+        /// SYNCHRONOUSLY, before its own <c>await</c> — so both of those are produced identically
+        /// whether the caller wrote <c>await AwaitTransportNotificationAsync(x)</c> or
+        /// <c>_ = AwaitTransportNotificationAsync(x)</c>. This record is made by the CALLER in its next
+        /// statement, which is strictly weaker than it looks: a detached caller may be PREEMPTED before
+        /// reaching that statement, and may then write the record — with a <c>true</c> flag — only after
+        /// the hold has been released. So neither the record's presence, its absence, nor its flag can
+        /// settle detachment on its own.
+        /// </para>
+        /// <para>
+        /// THE SCHEDULE-INDEPENDENT DISCRIMINATOR IS ELSEWHERE: the two await-site receipts
+        /// (<see cref="CallerAwaitReceipt"/> and <see cref="MilestoneSuspensionReceipt"/>) written
+        /// inside the awaitables' <c>GetAwaiter()</c>, which a discarded call never invokes. The vector
+        /// obtains both POSITIVELY through the bounded, named <see cref="AwaitReceiptAsync"/> — with
+        /// exactly-once <see cref="ReceiptCount"/> assertions — BEFORE it releases the hold. The entries
+        /// here corroborate that conclusion; they never establish it.
+        /// </para>
+        /// </remarks>
+        private readonly List<PassedMilestoneWait> _passedMilestoneWaits = [];
+
+        /// <summary>
+        /// A CALLER'S POST-WAIT BOUNDARY, SELF-TIMESTAMPED: the milestone the caller had awaited, and
+        /// whether that milestone had ALREADY COMPLETED at the instant the caller recorded the
+        /// boundary.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THE FLAG IS CORROBORATING EVIDENCE, NOT THE DISCRIMINATOR. A caller that genuinely
+        /// <c>await</c>ed cannot reach this record until the awaited task completed, so when it does
+        /// record it observes <c>true</c>. A DETACHED caller
+        /// (<c>_ = AwaitTransportNotificationAsync(...)</c>, or a detached inner
+        /// <c>_ = milestone.WaitAsync(...)</c>) returns immediately — but it is NOT guaranteed to
+        /// record <c>false</c>: it may be PREEMPTED before this statement and then, after the hold is
+        /// released and the milestone completes, record <c>true</c> like a genuine await. A
+        /// <c>false</c> flag is therefore real evidence of detachment when it appears, while its
+        /// absence proves nothing at all.
+        /// </para>
+        /// <para>
+        /// WHAT IS SCHEDULE-INDEPENDENT IS THE AWAIT-SITE RECEIPT PAIR, not this flag. A receipt is
+        /// written inside an awaitable's <c>GetAwaiter()</c>, which only a genuine <c>await</c>
+        /// invokes, so a discarded call can never produce one however its threads are scheduled. See
+        /// <see cref="AwaitReceiptAsync"/>, <see cref="CallerAwaitReceipt"/> and
+        /// <see cref="MilestoneSuspensionReceipt"/>.
+        /// </para>
+        /// </remarks>
+        /// <param name="Milestone">The milestone the caller awaited.</param>
+        /// <param name="MilestoneCompletedWhenPassed">
+        /// Whether that milestone had already completed when the caller recorded this boundary.
+        /// </param>
+        public sealed record PassedMilestoneWait(Task Milestone, bool MilestoneCompletedWhenPassed);
+
+        /// <summary>
+        /// RECORDS that the helper itself has RESUMED past its awaited notification call for
+        /// <paramref name="milestone"/> — i.e. the awaited task genuinely completed before the helper's
+        /// next statement ran.
+        /// </summary>
+        /// <remarks>
+        /// IT MUST BE THE STATEMENT IMMEDIATELY AFTER the awaited call, with nothing awaited in
+        /// between, or the record stops describing that specific boundary.
+        /// </remarks>
+        /// <param name="milestone">The milestone whose wait the helper has just passed.</param>
+        private void RecordMilestoneWaitPassed(Task milestone)
+        {
+            // A CORROBORATING FACT, CAPTURED BY THE CALLER AT THE INSTANT IT RESUMES. A genuine
+            // `await` cannot reach this statement before the awaited task completed, so it records
+            // `true`. A detached call returns immediately, but may be PREEMPTED before this statement
+            // and then record `true` after the hold is released — so a `false` here is real evidence of
+            // detachment, while its absence or a `true` proves nothing. The schedule-independent
+            // discriminator is the await-site receipt pair (see AwaitReceiptAsync).
+            var completedWhenPassed = milestone.IsCompleted;
+
+            lock (_milestoneWaitsGate)
+                _passedMilestoneWaits.Add(new PassedMilestoneWait(milestone, completedWhenPassed));
+        }
+
+        /// <summary>
+        /// THE ORDERING WITNESS FOR A HELD OCCURRENCE: the helper REACHED its notification wait for
+        /// <paramref name="milestone"/>, has NOT passed it, and the milestone is still pending.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS CORROBORATING EVIDENCE ONLY, AND ITS LIMIT IS EXPLICIT. It is an ABSENCE reading, so it
+        /// fires only when a detached caller HAPPENS to have already recorded its post-wait boundary;
+        /// a detached caller that has not been scheduled that far yet satisfies it exactly like a
+        /// genuine await. It therefore never settles detachment on its own — the schedule-independent
+        /// discriminator is the await-site receipt pair obtained through
+        /// <see cref="AwaitReceiptAsync"/> BEFORE the hold is released.
+        /// </para>
+        /// <para>
+        /// THE PENDING MILESTONE IS THE PREMISE, asserted rather than assumed: if the callback had
+        /// already been counted there would be nothing for the helper to be held by, and the claim
+        /// would be vacuous.
+        /// </para>
+        /// </remarks>
+        /// <param name="milestone">The milestone registered for the held occurrence.</param>
+        public void AssertMilestoneWaitStillPending(Task milestone)
+        {
+            AssertMilestoneWaitPerformed(milestone, mustHaveBeenPending: true);
+
+            Assert.False(
+                milestone.IsCompleted,
+                "THE HELD OCCURRENCE'S MILESTONE IS ALREADY SATISFIED: its callback has been counted, " +
+                "so there is nothing left for the helper to be held by and the ordering claim that " +
+                "follows would be vacuous.");
+
+            PassedMilestoneWait[] passed;
+            lock (_milestoneWaitsGate)
+                passed = [.. _passedMilestoneWaits];
+
+            Assert.False(
+                passed.Any(candidate => ReferenceEquals(candidate.Milestone, milestone)),
+                "THE HELPER RESUMED PAST ITS NOTIFICATION WAIT WHILE THE MILESTONE WAS STILL " +
+                "PENDING: it recorded the POST-WAIT boundary for this occurrence even though the " +
+                "callback has not been counted, which is exactly what a DETACHED " +
+                "`_ = AwaitTransportNotificationAsync(...)` does. This is CORROBORATING evidence, not " +
+                "the discriminator: the pre-wait record and the checkpoint are produced identically by " +
+                "that mutant, and a detached caller preempted before its next statement would not " +
+                "trigger this check at all. The schedule-independent discriminator is the await-site " +
+                "receipt pair obtained before the hold was released.");
+        }
+
+        /// <summary>
+        /// THE COMPLEMENT: the helper RESUMED past its notification wait for
+        /// <paramref name="milestone"/>, so the awaited task really did complete before the helper's
+        /// next statement — and the helper OBSERVED it complete at that instant.
+        /// </summary>
+        /// <remarks>
+        /// IT IS CORROBORATING EVIDENCE, NOT THE DISCRIMINATOR. A genuine <c>await</c> cannot reach the
+        /// recording statement before the awaited task completed, so its record carries
+        /// <c>MilestoneCompletedWhenPassed == true</c>. A DETACHED caller returns immediately and
+        /// records <c>false</c> IF it records while the milestone is still pending — but it may be
+        /// PREEMPTED before that statement and then record <c>true</c> once the hold has been released,
+        /// so this check cannot be relied on to expose detachment by itself. The schedule-independent
+        /// discriminator is the await-site receipt pair (<see cref="AwaitReceiptAsync"/>).
+        /// </remarks>
+        /// <param name="milestone">The milestone whose wait the helper must have passed.</param>
+        public void AssertMilestoneWaitPassed(Task milestone)
+        {
+            PassedMilestoneWait[] passed;
+            lock (_milestoneWaitsGate)
+                passed = [.. _passedMilestoneWaits];
+
+            var recorded = passed
+                .Where(candidate => ReferenceEquals(candidate.Milestone, milestone))
+                .ToArray();
+
+            Assert.True(
+                recorded.Length > 0,
+                "THE ORDINARY-COMPLETION HELPER NEVER RESUMED PAST ITS NOTIFICATION WAIT: no post-wait " +
+                "boundary was recorded for this occurrence's milestone, so the helper cannot have " +
+                "awaited it to completion.");
+
+            Assert.True(
+                recorded.All(candidate => candidate.MilestoneCompletedWhenPassed),
+                "THE HELPER CROSSED ITS POST-WAIT BOUNDARY WHILE ITS OWN MILESTONE WAS STILL PENDING: " +
+                "the boundary was recorded, but the caller observed the awaited task INCOMPLETE at " +
+                "that exact instant, which a genuine `await` can never do. That makes this CORROBORATING " +
+                "evidence of the DETACHED shape — `_ = AwaitTransportNotificationAsync(...)`, or a " +
+                "detached inner `_ = milestone.WaitAsync(...)`. It is not the discriminator: a detached " +
+                "caller preempted before this statement could later record `true` instead, which is why " +
+                "the await-site receipts are obtained before the hold is released.");
+        }
+
+        /// <summary>
+        /// THE UNIVERSAL CORROBORATING CHECK: EVERY post-wait boundary this harness has recorded so far
+        /// observed its own milestone already complete.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// WHAT IT ADDS, AND WHAT IT DOES NOT. The absence-based witness can only say "no boundary
+        /// observed YET", which a not-yet-scheduled detached caller also satisfies. This one inspects
+        /// the flag the caller stamped when it resumed, so a detached caller that recorded while its
+        /// milestone was still pending leaves permanent evidence that this rejects — including when it
+        /// records LATE, which is why the vector applies this again after the helper has settled. It is
+        /// still NOT the discriminator: a detached caller preempted before its recording statement can
+        /// resume after the hold is released and stamp <c>true</c>, leaving nothing here to reject.
+        /// </para>
+        /// <para>
+        /// THE DISCRIMINATOR IS THE AWAIT-SITE RECEIPT PAIR, obtained positively before the hold is
+        /// released (<see cref="AwaitReceiptAsync"/>, <see cref="CallerAwaitReceipt"/>,
+        /// <see cref="MilestoneSuspensionReceipt"/>). This check complements it and never substitutes
+        /// for it.
+        /// </para>
+        /// <para>
+        /// IT IS A UNIVERSAL CLAIM OVER THE RECORD, deliberately: a mutant that detaches ANY of the
+        /// five ordinary helpers' notification awaits and records while its milestone is still pending
+        /// writes a <c>false</c> stamp that this rejects.
+        /// </para>
+        /// </remarks>
+        public void AssertEveryPassedWaitObservedItsMilestoneComplete()
+        {
+            PassedMilestoneWait[] passed;
+            lock (_milestoneWaitsGate)
+                passed = [.. _passedMilestoneWaits];
+
+            var detached = passed.Where(candidate => !candidate.MilestoneCompletedWhenPassed).ToArray();
+
+            Assert.True(
+                detached.Length == 0,
+                "A POST-WAIT BOUNDARY WAS CROSSED WHILE ITS MILESTONE WAS STILL PENDING: " +
+                $"{detached.Length} of {passed.Length} recorded boundaries observed their own awaited " +
+                "task INCOMPLETE at the instant the caller recorded them, which a genuine `await` " +
+                "cannot do. That is CORROBORATING evidence of the DETACHED-await shape; the " +
+                "schedule-independent discriminator remains the await-site receipt pair obtained " +
+                "before the hold was released.");
+        }
+
+        /// <summary>
+        /// HOW MANY POST-HANDLER BARRIER TOKENS this harness's own <see cref="BarrierAsync"/> has had
+        /// logged so far — the observation that lets a vector rule OUT the stream barrier as the reason
+        /// a helper has not returned.
+        /// </summary>
+        public int BarrierTokensEmitted =>
+            ServiceLogger.Messages.Count(m => m.Contains(BarrierTokenPrefix, StringComparison.Ordinal));
+
+        /// <summary>
+        /// ARMS the one-shot wait-boundary checkpoint and returns the task that completes the moment a
+        /// helper ARRIVES at its milestone wait.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THIS IS THE WAIT'S OWN WITNESS. It marks the arriving instant, which is the boundary a
+        /// helper whose milestone await has been REMOVED never reaches — so a vector can ALSO order
+        /// itself against the wait, and a helper parked at its own wait is provably distinguishable
+        /// from one that returned.
+        /// </para>
+        /// <para>
+        /// IT IS A MINIMAL, HARNESS-LOCAL, TEST-ONLY OBSERVATION SEAM: it delays nothing, fabricates no
+        /// callback and touches no production path; it only marks the instant the fixture's own helper
+        /// arrives at its own milestone wait. Arm it before EXACTLY ONE milestone wait is expected.
+        /// </para>
+        /// </remarks>
+        /// <returns>A task that completes once a helper arrives at its milestone wait.</returns>
+        public Task ArmMilestoneWaitCheckpoint()
+        {
+            var checkpoint = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_milestoneCheckpointGate)
+                _milestoneWaitCheckpoint = checkpoint;
+
+            return checkpoint.Task;
+        }
+
+        /// <summary>
+        /// Awaits the wait-boundary checkpoint returned by <see cref="ArmMilestoneWaitCheckpoint"/>
+        /// under the harness's bounded wait, so a helper that never arrives at its milestone wait is a
+        /// NAMED failure rather than a bare timeout.
+        /// </summary>
+        /// <param name="checkpoint">The task returned by <see cref="ArmMilestoneWaitCheckpoint"/>.</param>
+        /// <returns>A task that completes once a helper arrived at its milestone wait.</returns>
+        public async Task AwaitWaitBoundaryAsync(Task checkpoint)
+        {
+            try
+            {
+                await checkpoint.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException(
+                    "THE MILESTONE-WAIT BOUNDARY WAS NEVER REACHED: the ordinary-completion helper " +
+                    "returned without ever arriving at its own notification-milestone wait within " +
+                    $"{BoundedWait.TotalSeconds:F0}s, which is exactly what a helper with the wait " +
+                    "REMOVED does.",
+                    ex);
+            }
+        }
+
+        // ── THE AWAIT-SITE RECEIPTS: facts written by the AWAIT MACHINERY, not by a later statement ──
+
+        /// <summary>The receipt kind written when a CALLER genuinely awaits the notification wait.</summary>
+        public const string CallerAwaitReceipt = "caller-await";
+
+        /// <summary>The receipt kind written when the milestone suspension itself is genuinely awaited.</summary>
+        public const string MilestoneSuspensionReceipt = "milestone-suspension";
+
+        private readonly List<(Task Milestone, string Kind)> _awaitReceipts = [];
+
+        private readonly List<(Task Milestone, string Kind, TaskCompletionSource Signal)> _receiptWaiters = [];
+
+        /// <summary>Guards the receipt ledger and its waiters.</summary>
+        private readonly object _receiptGate = new();
+
+        /// <summary>
+        /// WRITES an await-site receipt for <paramref name="milestone"/>. Called ONLY from an
+        /// awaitable's <c>GetAwaiter()</c>, i.e. synchronously AT the await site and BEFORE any
+        /// suspension — so a discarded (<c>_ = ...</c>) call, which never obtains an awaiter, can never
+        /// write it.
+        /// </summary>
+        /// <param name="milestone">The occurrence's milestone the receipt is about.</param>
+        /// <param name="kind">Which await site wrote it.</param>
+        private void RecordAwaitReceipt(Task milestone, string kind)
+        {
+            List<TaskCompletionSource> matched = [];
+
+            lock (_receiptGate)
+            {
+                _awaitReceipts.Add((milestone, kind));
+
+                for (var i = _receiptWaiters.Count - 1; i >= 0; i--)
+                {
+                    if (!ReferenceEquals(_receiptWaiters[i].Milestone, milestone)
+                        || !string.Equals(_receiptWaiters[i].Kind, kind, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    matched.Add(_receiptWaiters[i].Signal);
+                    _receiptWaiters.RemoveAt(i);
+                }
+            }
+
+            foreach (var signal in matched)
+                signal.TrySetResult();
+        }
+
+        /// <summary>How many receipts of <paramref name="kind"/> exist for <paramref name="milestone"/>.</summary>
+        /// <param name="milestone">The occurrence's milestone.</param>
+        /// <param name="kind">The receipt kind.</param>
+        /// <returns>The count.</returns>
+        public int ReceiptCount(Task milestone, string kind)
+        {
+            lock (_receiptGate)
+            {
+                return _awaitReceipts.Count(
+                    receipt => ReferenceEquals(receipt.Milestone, milestone)
+                               && string.Equals(receipt.Kind, kind, StringComparison.Ordinal));
+            }
+        }
+
+        /// <summary>
+        /// WAITS — bounded and POSITIVELY — for the await-site receipt of <paramref name="kind"/> to
+        /// appear for <paramref name="milestone"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THIS IS THE DISCRIMINATOR, AND IT IS A PRESENCE CHECK, NEVER AN ABSENCE ONE. The receipt is
+        /// written inside the awaitable's <c>GetAwaiter()</c>, which the C# <c>await</c> machinery
+        /// invokes synchronously at the await site before any suspension. A mutant that DISCARDS the
+        /// call never obtains an awaiter, so it can never write the receipt — no matter how its threads
+        /// are scheduled, and no matter when this test looks. The wait therefore expires with a NAMED
+        /// failure for the mutant and completes for the genuine await, with no preemption window in
+        /// which a detached caller could look identical to a real one.
+        /// </para>
+        /// <para>
+        /// IT IS BOUNDED BY THE UNCHANGED <see cref="BoundedWait"/> and the test's cancellation token,
+        /// like every other wait in this fixture.
+        /// </para>
+        /// </remarks>
+        /// <param name="milestone">The occurrence's milestone.</param>
+        /// <param name="kind">The receipt kind to wait for.</param>
+        /// <returns>A task completing once that receipt exists.</returns>
+        public async Task AwaitReceiptAsync(Task milestone, string kind)
+        {
+            Task signal;
+            lock (_receiptGate)
+            {
+                if (_awaitReceipts.Any(
+                        receipt => ReferenceEquals(receipt.Milestone, milestone)
+                                   && string.Equals(receipt.Kind, kind, StringComparison.Ordinal)))
+                {
+                    return;
+                }
+
+                var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _receiptWaiters.Add((milestone, kind, waiter));
+                signal = waiter.Task;
+            }
+
+            try
+            {
+                await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException(
+                    $"THE '{kind}' AWAIT-SITE RECEIPT WAS NEVER WRITTEN for this occurrence within " +
+                    $"{BoundedWait.TotalSeconds:F0}s. That receipt is written inside the awaitable's " +
+                    "GetAwaiter(), which only a genuine `await` invokes — so its absence means the " +
+                    "call was DISCARDED rather than awaited: " +
+                    (string.Equals(kind, CallerAwaitReceipt, StringComparison.Ordinal)
+                        ? "`_ = AwaitTransportNotificationAsync(...)` never obtains the caller-side awaiter."
+                        : "`_ = <milestone suspension>` inside the awaited method never obtains its awaiter."),
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// THE CALLER-SIDE AWAITABLE returned by <see cref="AwaitTransportNotificationAsync"/>: awaiting
+        /// it WRITES the caller-await receipt, discarding it writes nothing.
+        /// </summary>
+        /// <remarks>
+        /// THE RETURN TYPE IS THE MECHANISM. Because this is an awaitable rather than a bare
+        /// <see cref="Task"/>, the only way to consume it correctly is to <c>await</c> it — and that is
+        /// exactly the act the receipt records. <c>_ = AwaitTransportNotificationAsync(...)</c> compiles
+        /// and runs, but it never calls <see cref="GetAwaiter"/>, so the receipt is never written and
+        /// the fact is IMMUTABLE from that moment on: no later resume can retroactively create it.
+        /// </remarks>
+        public readonly struct NotificationWaitAwaitable
+        {
+            private readonly AckHarness _harness;
+            private readonly Task _milestone;
+            private readonly Task _core;
+
+            /// <summary>Wraps the running core wait for the caller to await.</summary>
+            /// <param name="harness">The harness whose ledger the receipt is written to.</param>
+            /// <param name="milestone">The occurrence's milestone.</param>
+            /// <param name="core">The already-started core wait.</param>
+            public NotificationWaitAwaitable(AckHarness harness, Task milestone, Task core)
+            {
+                _harness = harness;
+                _milestone = milestone;
+                _core = core;
+            }
+
+            /// <summary>
+            /// Invoked by the <c>await</c> machinery, synchronously at the await site and before any
+            /// suspension: writes the caller-await receipt, then defers to the core wait.
+            /// </summary>
+            /// <returns>The core wait's awaiter.</returns>
+            public System.Runtime.CompilerServices.TaskAwaiter GetAwaiter()
+            {
+                _harness.RecordAwaitReceipt(_milestone, CallerAwaitReceipt);
+                return _core.GetAwaiter();
+            }
+        }
+
+        /// <summary>
+        /// THE INNER AWAITABLE for the milestone suspension itself: awaiting it WRITES the
+        /// milestone-suspension receipt, discarding it writes nothing.
+        /// </summary>
+        /// <remarks>
+        /// IT EXISTS SO THE INNER-DETACHED SHAPE IS ALSO KILLED. A mutant that writes
+        /// <c>_ = &lt;milestone suspension&gt;</c> inside the awaited method leaves the caller-side
+        /// receipt intact — so the caller-side one alone cannot see it. This receipt can only be written
+        /// by genuinely awaiting the suspension, so the inner mutant can never produce it.
+        /// </remarks>
+        public readonly struct MilestoneSuspensionAwaitable
+        {
+            private readonly AckHarness _harness;
+            private readonly Task _milestone;
+            private readonly Task _bounded;
+
+            /// <summary>Wraps the bounded milestone wait.</summary>
+            /// <param name="harness">The harness whose ledger the receipt is written to.</param>
+            /// <param name="milestone">The occurrence's milestone.</param>
+            /// <param name="bounded">The bounded wait on that milestone.</param>
+            public MilestoneSuspensionAwaitable(AckHarness harness, Task milestone, Task bounded)
+            {
+                _harness = harness;
+                _milestone = milestone;
+                _bounded = bounded;
+            }
+
+            /// <summary>
+            /// Invoked by the <c>await</c> machinery, synchronously at the await site and before any
+            /// suspension: writes the milestone-suspension receipt, then defers to the bounded wait.
+            /// </summary>
+            /// <returns>The bounded wait's awaiter.</returns>
+            public System.Runtime.CompilerServices.TaskAwaiter GetAwaiter()
+            {
+                _harness.RecordAwaitReceipt(_milestone, MilestoneSuspensionReceipt);
+                return _bounded.GetAwaiter();
+            }
+        }
+
+        /// <summary>
+        /// Awaits a milestone from <see cref="ExpectTransportNotification"/> under the fixture's
+        /// bounded wait, so a callback that never arrives is a NAMED failure rather than a bare
+        /// timeout. RECORDS the arrival (<see cref="AssertMilestoneWaitPerformed"/>) and fires the armed
+        /// wait-boundary checkpoint FIRST — both describe the helper's ARRIVAL at this wait, not the
+        /// milestone's completion.
+        /// </summary>
+        /// <remarks>
+        /// IT RETURNS AN AWAITABLE, NOT A <see cref="Task"/>, ON PURPOSE. The caller-await receipt is
+        /// written inside <see cref="NotificationWaitAwaitable.GetAwaiter"/>, which only a genuine
+        /// <c>await</c> invokes — so <c>_ = AwaitTransportNotificationAsync(...)</c> can never produce
+        /// it, whatever the scheduling. The core work still starts eagerly here, exactly as before, so
+        /// the arrival record and the checkpoint keep their existing timing.
+        /// </remarks>
+        /// <param name="milestone">The registered milestone for the occurrence this helper ran.</param>
+        /// <returns>An awaitable that completes once the occurrence's callback has run.</returns>
+        private NotificationWaitAwaitable AwaitTransportNotificationAsync(Task milestone) =>
+            new(this, milestone, AwaitTransportNotificationCoreAsync(milestone));
+
+        /// <summary>
+        /// The core of the notification wait: records the arrival, fires the armed checkpoint, then
+        /// genuinely awaits the milestone suspension through its own receipt-writing awaitable.
+        /// </summary>
+        /// <param name="milestone">The registered milestone for the occurrence this helper ran.</param>
+        /// <returns>A task that completes once the occurrence's callback has run.</returns>
+        private async Task AwaitTransportNotificationCoreAsync(Task milestone)
+        {
+            // RECORDED BEFORE THE CHECKPOINT FIRES, so a vector released by the checkpoint can read the
+            // record for THIS milestone without racing this helper's own continuation: the record
+            // strictly precedes the firing, and both strictly precede the await below.
+            RecordMilestoneWaitReached(milestone);
+
+            TaskCompletionSource? checkpoint;
+            lock (_milestoneCheckpointGate)
+            {
+                checkpoint = _milestoneWaitCheckpoint;
+                _milestoneWaitCheckpoint = null;
+            }
+
+            checkpoint?.TrySetResult();
+
+            try
+            {
+                // AWAITED THROUGH THE RECEIPT-WRITING AWAITABLE, so an INNER detachment
+                // (`_ = <milestone suspension>`) fails to write the milestone-suspension receipt and is
+                // caught even though the caller-side receipt is untouched by that mutant.
+                await MilestoneSuspension(milestone);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException(
+                    "THE COMPLETION-NOTIFICATION MILESTONE WAS NEVER REACHED: this occurrence's " +
+                    "ordinary completion did not reach the shared notifier's callback within " +
+                    $"{BoundedWait.TotalSeconds:F0}s, so no observation of its notification is " +
+                    "available for the assertions that follow.",
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// THE BOUNDED MILESTONE SUSPENSION, wrapped so that genuinely awaiting it writes the
+        /// milestone-suspension receipt.
+        /// </summary>
+        /// <param name="milestone">The occurrence's milestone.</param>
+        /// <returns>The receipt-writing awaitable over the bounded wait.</returns>
+        private MilestoneSuspensionAwaitable MilestoneSuspension(Task milestone) =>
+            new(this, milestone, milestone.WaitAsync(BoundedWait, TestContext.Current.CancellationToken));
 
         /// <summary>
         /// THE SHARED LIFECYCLE: the body, then the STRICT teardown on every path, so no producer is
@@ -3221,8 +4575,15 @@ public sealed class CompletionReceiptAckTests
         /// Runs ONE ordinary enabled completion: it is accepted, released, recorded and acknowledged,
         /// and it populates the single latest-eligible slot.
         /// </summary>
+        /// <remarks>
+        /// THE COMPLETION'S OWN NOTIFICATION CALLBACK IS AWAITED BEFORE THIS RETURNS. An
+        /// acknowledgement at the writer proves the handler's enqueue, not that production's DETACHED
+        /// <c>Task.Run</c> notification has reached the notifier — so a caller that zeroed or asserted
+        /// the notification counters straight afterwards could otherwise race it.
+        /// </remarks>
         /// <param name="taskId">The completing task's identifier.</param>
-        /// <returns>A task that completes once the handler has RETURNED.</returns>
+        /// <returns>A task that completes once the handler has RETURNED and this occurrence's
+        /// completion notification has been observed.</returns>
         public async Task CompleteOrdinaryAsync(string taskId)
         {
             AssignTask(taskId, "assigned-model");
@@ -3230,6 +4591,10 @@ public sealed class CompletionReceiptAckTests
             var accepted = ServiceLogger.WaitFor(ProductionLogFragments.CompletionAccepted);
             var acknowledged = Writer.WaitForMessage(
                 m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck);
+
+            // REGISTERED BEFORE THE PUSH, so this occurrence's callback cannot arrive before its
+            // milestone exists — and so the milestone names THIS occurrence and no earlier one.
+            var notification = ExpectTransportNotification();
 
             Reader.Push(new WorkerMessage
             {
@@ -3239,6 +4604,25 @@ public sealed class CompletionReceiptAckTests
 
             await accepted.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
             await acknowledged.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THIS OCCURRENCE'S NOTIFICATION CALLBACK HAS RUN, so the fixture's transport counter is
+            // settled for it. A caller's following zero/one assertion is therefore about the NEXT
+            // delivery rather than a race with this one's detached callback.
+            await AwaitTransportNotificationAsync(notification);
+
+            // THE POST-WAIT BOUNDARY: this records only that the CALLER reached the statement
+            // immediately after the notification-wait call, with nothing awaited in between. It is
+            // CORROBORATING EVIDENCE ONLY and settles nothing about detachment by itself — a detached
+            // `_ = ...` caller can be preempted after the discarded call returns and may record only
+            // after `hold.Release()` has completed the milestone, i.e. with a `true` flag, exactly
+            // like a genuine await.
+            //
+            // THE SCHEDULE-INDEPENDENT DETACH PROOF IS THE AWAIT-SITE RECEIPT PAIR
+            // (CallerAwaitReceipt / MilestoneSuspensionReceipt), written inside the awaitables'
+            // GetAwaiter() and obtained POSITIVELY before the hold is released through the bounded,
+            // named AwaitReceiptAsync with exactly-once ReceiptCount assertions.
+            RecordMilestoneWaitPassed(notification);
+
             await BarrierAsync();
         }
 
@@ -3247,13 +4631,20 @@ public sealed class CompletionReceiptAckTests
         /// NO acknowledgement is awaited — a disabled registration publishes none, so waiting for one
         /// would hang forever. That absence is asserted by the caller.
         /// </summary>
+        /// <remarks>
+        /// THE ORDINARY NOTIFICATION IS NOT NEGOTIATED: an accepted completion notifies the shared
+        /// notifier whether or not the registration carries the acknowledgement, so this occurrence's
+        /// callback is awaited here too.
+        /// </remarks>
         /// <param name="taskId">The completing task's identifier.</param>
-        /// <returns>A task that completes once the handler has RETURNED.</returns>
+        /// <returns>A task that completes once the handler has RETURNED and this occurrence's
+        /// completion notification has been observed.</returns>
         public async Task CompleteOrdinaryWithoutAckAsync(string taskId)
         {
             AssignTask(taskId, "assigned-model");
 
             var accepted = ServiceLogger.WaitFor(ProductionLogFragments.CompletionAccepted);
+            var notification = ExpectTransportNotification();
 
             Reader.Push(new WorkerMessage
             {
@@ -3262,6 +4653,20 @@ public sealed class CompletionReceiptAckTests
             });
 
             await accepted.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await AwaitTransportNotificationAsync(notification);
+
+            // THE POST-WAIT BOUNDARY: this records only that the CALLER reached the statement
+            // immediately after the notification-wait call, with nothing awaited in between. It is
+            // CORROBORATING EVIDENCE ONLY and settles nothing about detachment by itself — a detached
+            // `_ = ...` caller can be preempted after the discarded call returns and may record only
+            // after `hold.Release()` has completed the milestone, i.e. with a `true` flag, exactly
+            // like a genuine await.
+            //
+            // THE SCHEDULE-INDEPENDENT DETACH PROOF IS THE AWAIT-SITE RECEIPT PAIR
+            // (CallerAwaitReceipt / MilestoneSuspensionReceipt), written inside the awaitables'
+            // GetAwaiter() and obtained POSITIVELY before the hold is released through the bounded,
+            // named AwaitReceiptAsync with exactly-once ReceiptCount assertions.
+            RecordMilestoneWaitPassed(notification);
             await BarrierAsync();
 
             // THE RELEASE REALLY HAPPENED — so this is an accepted completion, not a refusal.
@@ -3275,11 +4680,20 @@ public sealed class CompletionReceiptAckTests
         /// forwarded the ordinary acknowledgement, so a following count starts from a settled ledger.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// THE PUMP IS PINNED FIRST. The production pump only binds the worker's channel once the
         /// stream has pinned the instance on its first inbound message, so a direct invocation with no
         /// prior stream message would have its acknowledgement queued and never forwarded. Pinning with
         /// a Progress message first is what makes the following wait for the forwarded acknowledgement
         /// meaningful.
+        /// </para>
+        /// <para>
+        /// THE COMPLETION'S NOTIFICATION MILESTONE IS REGISTERED BEFORE THE DIRECT INVOCATION. This is
+        /// a synchronous handler call, but the notification it schedules is a DETACHED
+        /// <c>Task.Run</c>, so the call RETURNING says nothing about that callback: the milestone is
+        /// what makes this occurrence's contribution to the transport counter settle before the caller
+        /// resets or asserts it.
+        /// </para>
         /// </remarks>
         /// <param name="taskId">The completing task's identifier.</param>
         /// <param name="ackState">
@@ -3288,7 +4702,8 @@ public sealed class CompletionReceiptAckTests
         /// handler call is not that invocation — so the caller owns this one and must pass the SAME
         /// instance to the duplicate that follows.
         /// </param>
-        /// <returns>A task that completes once the handler finished and the ack was forwarded.</returns>
+        /// <returns>A task that completes once the handler finished, the ack was forwarded and the
+        /// occurrence's completion notification was observed.</returns>
         public async Task CompleteOrdinaryDirectAsync(
             string taskId, WorkStreamCompletionAckState ackState)
         {
@@ -3304,6 +4719,10 @@ public sealed class CompletionReceiptAckTests
             var forwarded = Writer.WaitForMessage(
                 m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck);
 
+            // REGISTERED BEFORE THE INVOCATION, so the detached notification this call schedules
+            // cannot outrun its own milestone.
+            var notification = ExpectTransportNotification();
+
             try
             {
                 method!.Invoke(
@@ -3318,6 +4737,20 @@ public sealed class CompletionReceiptAckTests
             // THE ORDINARY PATH REALLY COMPLETED: released, recorded and acknowledged, with the
             // CALLER'S OWN holder naming this task and the acknowledgement already at the writer.
             await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await AwaitTransportNotificationAsync(notification);
+
+            // THE POST-WAIT BOUNDARY: this records only that the CALLER reached the statement
+            // immediately after the notification-wait call, with nothing awaited in between. It is
+            // CORROBORATING EVIDENCE ONLY and settles nothing about detachment by itself — a detached
+            // `_ = ...` caller can be preempted after the discarded call returns and may record only
+            // after `hold.Release()` has completed the milestone, i.e. with a `true` flag, exactly
+            // like a genuine await.
+            //
+            // THE SCHEDULE-INDEPENDENT DETACH PROOF IS THE AWAIT-SITE RECEIPT PAIR
+            // (CallerAwaitReceipt / MilestoneSuspensionReceipt), written inside the awaitables'
+            // GetAwaiter() and obtained POSITIVELY before the hold is released through the bounded,
+            // named AwaitReceiptAsync with exactly-once ReceiptCount assertions.
+            RecordMilestoneWaitPassed(notification);
             Assert.False(Worker.IsBusy);
             Assert.NotNull(Stores.ReceiptStore.Load(taskId));
             Assert.Equal(taskId, ackState.LatestEligibleTaskId);
@@ -3484,13 +4917,20 @@ public sealed class CompletionReceiptAckTests
         /// wait would expire.
         /// </para>
         /// <para>
-        /// THE ACTIVITY VALUE IS CAPTURED BEFORE THE BARRIER, AND THAT IS ESSENTIAL. The post-handler
-        /// barrier sends a Progress message, and Progress legitimately calls <c>TouchActivity</c> — so a
-        /// timestamp read AFTER the barrier would always look refreshed and could never detect a
-        /// withheld refresh. The read here happens once the acceptance provenance line has been
-        /// observed, which the handler emits after its validation gates and therefore strictly after
-        /// the read loop already decided whether to refresh, so the captured value is exactly the
-        /// loop's own decision.
+        /// THE ACTIVITY VALUE IS CAPTURED BEFORE THIS OCCURRENCE'S NOTIFICATION MILESTONE IS AWAITED,
+        /// AND THAT ORDER IS ESSENTIAL. The post-handler barrier sends a Progress message, and Progress
+        /// legitimately calls <c>TouchActivity</c> — so a timestamp read after the barrier would always
+        /// look refreshed and could never detect a withheld refresh. The read happens once the
+        /// acceptance provenance line has been observed, which the handler emits after its validation
+        /// gates and therefore strictly after the read loop already decided whether to refresh, so the
+        /// captured value is exactly the loop's own decision — and it is captured BEFORE the barrier,
+        /// whose own Progress legitimately refreshes activity and must never be allowed to mask a
+        /// withheld refresh.
+        /// </para>
+        /// <para>
+        /// THE NOTIFICATION MILESTONE IS REGISTERED BEFORE THE PUSH and awaited before this returns, so
+        /// a caller that resets or asserts the notification counters straight afterwards cannot race
+        /// production's DETACHED <c>Task.Run</c> notification for this occurrence.
         /// </para>
         /// </remarks>
         /// <param name="taskId">The held task's identifier.</param>
@@ -3506,6 +4946,10 @@ public sealed class CompletionReceiptAckTests
             var acknowledged = Writer.WaitForMessage(
                 m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck);
 
+            // REGISTERED BEFORE THE PUSH, so this occurrence's detached notification is observed as
+            // THIS occurrence and no other.
+            var notification = ExpectTransportNotification();
+
             Reader.Push(new WorkerMessage
             {
                 WorkerId = Worker.Id,
@@ -3518,6 +4962,25 @@ public sealed class CompletionReceiptAckTests
             var activityAtAcceptance = Worker.LastActivityAt;
 
             await acknowledged.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THIS OCCURRENCE'S NOTIFICATION CALLBACK HAS RUN. This deliberately says nothing beyond
+            // the fixture's own counter settling: it is not a claim that production's detached
+            // <c>Task.Run</c> was joined, nor that any downstream pipeline effect finished.
+            await AwaitTransportNotificationAsync(notification);
+
+            // THE POST-WAIT BOUNDARY: this records only that the CALLER reached the statement
+            // immediately after the notification-wait call, with nothing awaited in between. It is
+            // CORROBORATING EVIDENCE ONLY and settles nothing about detachment by itself — a detached
+            // `_ = ...` caller can be preempted after the discarded call returns and may record only
+            // after `hold.Release()` has completed the milestone, i.e. with a `true` flag, exactly
+            // like a genuine await.
+            //
+            // THE SCHEDULE-INDEPENDENT DETACH PROOF IS THE AWAIT-SITE RECEIPT PAIR
+            // (CallerAwaitReceipt / MilestoneSuspensionReceipt), written inside the awaitables'
+            // GetAwaiter() and obtained POSITIVELY before the hold is released through the bounded,
+            // named AwaitReceiptAsync with exactly-once ReceiptCount assertions.
+            RecordMilestoneWaitPassed(notification);
+
             await BarrierAsync();
 
             return activityAtAcceptance;
@@ -4105,10 +5568,19 @@ public sealed class CompletionReceiptAckTests
         /// Runs ONE ordinary enabled completion ON AN ADDITIONAL LIVE STREAM, awaiting the
         /// acknowledgement AT THAT STREAM'S OWN WRITER and then that stream's post-handler barrier.
         /// </summary>
+        /// <remarks>
+        /// THE SHARED NOTIFIER'S OWN MILESTONE IS REGISTERED BEFORE THE PUSH AND AWAITED BEFORE THIS
+        /// RETURNS. Both streams share ONE notifier, and production schedules
+        /// <c>NotifyAsync</c> on a DETACHED <c>Task.Run</c>, so a completion observed only at this
+        /// stream's writer would leave the notifier's callback for THIS occurrence still in flight —
+        /// which is exactly what a caller that resets or asserts the notification counters afterwards
+        /// must not race.
+        /// </remarks>
         /// <param name="stream">The live stream the completion travels.</param>
         /// <param name="worker">The instance that stream is pinned to.</param>
         /// <param name="taskId">The completing task's identifier.</param>
-        /// <returns>A task that completes once the handler returned and the ack was forwarded.</returns>
+        /// <returns>A task that completes once the handler returned, the ack was forwarded and this
+        /// occurrence's completion notification was observed.</returns>
         public async Task CompleteOrdinaryOnAsync(
             SecondStream stream, ConnectedWorker worker, string taskId)
         {
@@ -4119,6 +5591,10 @@ public sealed class CompletionReceiptAckTests
                      && string.Equals(
                          m.CompletionReceiptAck.TaskId, taskId, StringComparison.Ordinal));
 
+            // REGISTERED BEFORE THE PUSH, on the SHARED notifier: it names this occurrence by
+            // registration order, never by task id (this fixture reuses ids across streams).
+            var notification = ExpectTransportNotification();
+
             stream.Reader.Push(new WorkerMessage
             {
                 WorkerId = worker.Id,
@@ -4126,6 +5602,24 @@ public sealed class CompletionReceiptAckTests
             });
 
             await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THIS OCCURRENCE'S NOTIFICATION CALLBACK HAS RUN before the stream barrier, so the
+            // counter is settled for it regardless of what the barrier's own Progress message does.
+            await AwaitTransportNotificationAsync(notification);
+
+            // THE POST-WAIT BOUNDARY: this records only that the CALLER reached the statement
+            // immediately after the notification-wait call, with nothing awaited in between. It is
+            // CORROBORATING EVIDENCE ONLY and settles nothing about detachment by itself — a detached
+            // `_ = ...` caller can be preempted after the discarded call returns and may record only
+            // after `hold.Release()` has completed the milestone, i.e. with a `true` flag, exactly
+            // like a genuine await.
+            //
+            // THE SCHEDULE-INDEPENDENT DETACH PROOF IS THE AWAIT-SITE RECEIPT PAIR
+            // (CallerAwaitReceipt / MilestoneSuspensionReceipt), written inside the awaitables'
+            // GetAwaiter() and obtained POSITIVELY before the hold is released through the bounded,
+            // named AwaitReceiptAsync with exactly-once ReceiptCount assertions.
+            RecordMilestoneWaitPassed(notification);
+
             await BarrierOnAsync(stream);
 
             Assert.False(worker.IsBusy);
@@ -4258,7 +5752,7 @@ public sealed class CompletionReceiptAckTests
         /// <returns>A task that completes once the loop demonstrably advanced.</returns>
         public async Task BarrierAsync()
         {
-            var token = $"ack-barrier-{Interlocked.Increment(ref _barrierSequence)}";
+            var token = $"{BarrierTokenPrefix}{Interlocked.Increment(ref _barrierSequence)}";
             var signal = ServiceLogger.WaitFor(token);
 
             Reader.Push(new WorkerMessage
