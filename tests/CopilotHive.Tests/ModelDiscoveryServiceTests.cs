@@ -1067,6 +1067,40 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal(Detail, failure.Exception!.Message);
     }
 
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_CancellationDuringHttp_ThrowsOperationCanceled()
+    {
+        // RESTORED (iteration-2): caller cancellation arriving DURING SendAsync must propagate
+        // — never be swallowed into an empty "discovery failed" list. The resolver answers
+        // normally first, so the cancellation fires inside the HTTP phase itself, exercising
+        // the send/catch block and NOT the endpoint-resolution seam (covered separately by
+        // the rule (a)-(c) tests above). Uses the same handler pattern as the pre-existing
+        // CancellationDuringHttp test this file always carried.
+        using var cts = new CancellationTokenSource();
+        var resolverInvocations = 0;
+        CopilotEndpointResolver countingResolver = (_, _) =>
+        {
+            resolverInvocations++;
+            return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        };
+        var factory = new Mock<IHttpClientFactory>();
+        factory.Setup(f => f.CreateClient(It.IsAny<string>()))
+               .Returns(() => new HttpClient(
+                   new CancellingHttpMessageHandler(() => cts.Cancel()), disposeHandler: false));
+        var svc = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, factory.Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>("stored-oauth-token"),
+            resolveCopilotEndpointAsync: countingResolver);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => svc.DiscoverCopilotModelsAsync(cts.Token));
+
+        // The exact cancellation the transport observed — the caller's token — is the one
+        // that surfaced; no successful /models result can be returned on this path.
+        Assert.Equal(cts.Token, exception.CancellationToken);
+        Assert.Equal(1, resolverInvocations);
+    }
+
     // ── Default-resolver fallback (structural, offline) ──────────────────────
 
     [Fact]
