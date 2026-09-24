@@ -5,6 +5,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Shared;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -654,9 +655,379 @@ public sealed class GoalDispatcherClearRetryStateTests
 }
 
 /// <summary>
-/// Minimal <see cref="IGoalSource"/> and <see cref="IGoalStore"/> used by cancellation tests.
-/// Tracks last status update for assertion.
+/// REGRESSION: the cancellation-vs-planning race. A goal cancelled while its planning call is in
+/// flight owns its own outcome — the stored "Cancelled by user" failure reason — so the planning
+/// result that arrives afterwards must be DISCARDED: the goal is never failed again and nothing is
+/// dispatched for it. Before the fix, the planning result unconditionally reached
+/// <c>FailNewGoalAsync</c> and overwrote the cancellation reason (and would have dispatched an
+/// approved plan for a cancelled goal).
 /// </summary>
+public sealed class GoalDispatchPlanningCancellationTests
+{
+    private static readonly TimeSpan Bounded = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// The pipeline's <see cref="GoalPhase.Failed"/> transition (the cancellation's own signal)
+    /// must make the planning result inert.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_GoalCancelledDuringPlanning_FailedPlanDoesNotOverwriteCancellation()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Failed("plan grammar violated"));
+
+        var dispatchTask = GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(fixture.Dispatcher, ct);
+
+        // Planning is GENUINELY in flight before the cancel is issued (a TaskCompletionSource gate,
+        // never a timing wait).
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        var cancelledPipeline = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.NotNull(cancelledPipeline);
+
+        var cancelled = await fixture.Dispatcher.CancelGoalAsync(fixture.Goal.Id, ct);
+        Assert.True(cancelled);
+
+        // The cancellation recorded the outcome while planning was still blocked.
+        var afterCancel = fixture.GoalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
+        Assert.Single(afterCancel);
+        Assert.Equal("Cancelled by user", afterCancel[0].Metadata?.FailureReason);
+        Assert.Null(fixture.PipelineManager.GetByGoalId(fixture.Goal.Id));
+
+        // Now let planning return — FAILED, exactly as the reported issue describes.
+        fixture.Brain.ReleasePlan.TrySetResult();
+        await dispatchTask.WaitAsync(Bounded, ct);
+
+        // The cancellation outcome survives: still exactly ONE Failed update, same reason.
+        var failures = fixture.GoalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
+        Assert.Single(failures);
+        Assert.Equal("Cancelled by user", failures[0].Metadata?.FailureReason);
+        Assert.Equal("Cancelled by user", fixture.Goal.FailureReason);
+        Assert.Equal(GoalStatus.Failed, fixture.Goal.Status);
+
+        // The cancelled pipeline was NOT dragged into the planning result.
+        Assert.Equal(GoalPhase.Failed, cancelledPipeline!.Phase);
+
+        // Nothing was dispatched for the cancelled goal.
+        Assert.Empty(fixture.Dispatched);
+
+        // The discard is reported at Information level.
+        Assert.Contains(fixture.Logger.Logs, l =>
+            l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
+    }
+
+    /// <summary>
+    /// The cancellation's OTHER signal — the pipeline is no longer registered in the manager —
+    /// must ALSO make the planning result inert, so an APPROVED plan arriving after the removal is
+    /// neither applied nor dispatched.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_PipelineRemovedDuringPlanning_ApprovedPlanIsNotAppliedOrDispatched()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Success(IterationPlan.Default()));
+
+        var dispatchTask = GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(fixture.Dispatcher, ct);
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        var pipeline = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.NotNull(pipeline);
+
+        // The removal signal alone — the pipeline keeps its Planning phase.
+        Assert.True(fixture.PipelineManager.RemovePipeline(fixture.Goal.Id));
+        Assert.Equal(GoalPhase.Planning, pipeline!.Phase);
+
+        fixture.Brain.ReleasePlan.TrySetResult();
+        await dispatchTask.WaitAsync(Bounded, ct);
+
+        // The approved plan was never applied and no worker was dispatched.
+        Assert.Equal(GoalPhase.Planning, pipeline.Phase);
+        Assert.Null(pipeline.Plan);
+        Assert.Empty(pipeline.PhaseLog);
+        Assert.Empty(fixture.Dispatched);
+
+        // The planning result was not attributed to the goal either.
+        Assert.DoesNotContain(fixture.GoalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+        Assert.Equal(GoalStatus.InProgress, fixture.Goal.Status);
+
+        Assert.Contains(fixture.Logger.Logs, l =>
+            l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
+    }
+
+    /// <summary>Test fixture for the cancel-while-planning interleaving.</summary>
+    private sealed record Fixture(        Goal Goal,
+        GoalDispatcher Dispatcher,
+        PlanRejectRecordingGoalStore GoalStore,
+        GoalPipelineManager PipelineManager,
+        GatedPlanBrain Brain,
+        List<WorkTask> Dispatched,
+        RetryStateCollectingLogger<GoalDispatcher> Logger);
+
+    private static Fixture CreateFixture(PlanResult planResult)
+    {
+        var goal = new Goal
+        {
+            Id = $"goal-cancel-during-plan-{Guid.NewGuid():N}",
+            Description = "Cancelled while planning",
+            Status = GoalStatus.Pending,
+            // A CONFIGURED repository keeps the dispatch path fully reachable, so the
+            // "nothing was dispatched" assertions below fail on the pre-fix code (which would
+            // complete the dispatch for a cancelled goal) instead of hitting an unrelated
+            // repository-configuration error.
+            RepositoryNames = ["test-repo"],
+        };
+
+        var goalStore = new PlanRejectRecordingGoalStore(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+
+        var pipelineManager = new GoalPipelineManager();
+        var brain = new GatedPlanBrain(planResult);
+
+        var taskQueue = new TaskQueue();
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => { lock (dispatched) { dispatched.Add(t); } };
+
+        var logger = new RetryStateCollectingLogger<GoalDispatcher>();
+
+        var config = TestHelpers.FullReadyConfig();
+        config.Repositories =
+        [
+            new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" }
+        ];
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        return new Fixture(goal, dispatcher, goalStore, pipelineManager, brain, dispatched, logger);
+    }
+}
+
+/// <summary>
+/// REGRESSION (resume path): <see cref="GoalDispatcher.ResumeGoalAsync"/> has the same race as the
+/// new-goal dispatch — a goal cancelled while the resumed iteration's planning call is in flight
+/// owns its own outcome, so the planning result that arrives afterwards must be discarded rather
+/// than passed to <c>FailResumedGoalAsync</c> (which would overwrite the "Cancelled by user" reason
+/// with a planning-failure reason).
+/// </summary>
+public sealed class GoalDispatcherResumePlanningCancellationTests
+{
+    private static readonly TimeSpan Bounded = TimeSpan.FromSeconds(20);
+
+    [Fact]
+    public async Task ResumeGoalAsync_GoalCancelledDuringPlanning_FailedPlanDoesNotOverwriteCancellation()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Failed("resume plan rejected"));
+
+        var resumeTask = fixture.Dispatcher.ResumeGoalAsync(fixture.Goal.Id, 5, ct);
+
+        // Planning is GENUINELY in flight before the cancel is issued.
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        // The resume already moved the goal to InProgress/Planning and registered the pipeline.
+        Assert.Equal(GoalStatus.InProgress, fixture.Goal.Status);
+        var pipeline = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.NotNull(pipeline);
+        Assert.Equal(GoalPhase.Planning, pipeline!.Phase);
+
+        // Cancel while the planning call is still blocked on its gate.
+        var cancelled = await fixture.Dispatcher.CancelGoalAsync(fixture.Goal.Id, ct);
+        Assert.True(cancelled);
+        Assert.Equal("Cancelled by user", fixture.Goal.FailureReason);
+
+        // Let planning return — FAILED, the very result that used to overwrite the cancellation.
+        fixture.Brain.ReleasePlan.TrySetResult();
+        var resumed = await resumeTask.WaitAsync(Bounded, ct);
+
+        Assert.True(resumed);
+
+        // The cancellation outcome survives: exactly ONE Failed update, still "Cancelled by user".
+        var failures = fixture.GoalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
+        Assert.Single(failures);
+        Assert.Equal("Cancelled by user", failures[0].Metadata?.FailureReason);
+        Assert.Equal("Cancelled by user", fixture.Goal.FailureReason);
+        Assert.Equal(GoalStatus.Failed, fixture.Goal.Status);
+
+        // The pipeline stayed Failed — FailResumedGoalAsync did not run a second terminal transition.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+
+        // Nothing was dispatched for the cancelled goal.
+        Assert.Empty(fixture.Dispatched);
+
+        Assert.Contains(fixture.Logger.Logs, l =>
+            l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
+    }
+
+    /// <summary>
+    /// The complement: with the goal still LIVE, the resume's planning failure keeps its current
+    /// behaviour — the goal IS failed with the planning reason (the fix must not swallow genuine
+    /// planning failures).
+    /// </summary>
+    [Fact]
+    public async Task ResumeGoalAsync_PlanningFailsOnLiveGoal_StillFailsGoalWithPlanningReason()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Failed("resume plan rejected"));
+
+        var resumeTask = fixture.Dispatcher.ResumeGoalAsync(fixture.Goal.Id, 5, ct);
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        fixture.Brain.ReleasePlan.TrySetResult();
+        var resumed = await resumeTask.WaitAsync(Bounded, ct);
+
+        Assert.True(resumed);
+
+        var failures = fixture.GoalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
+        Assert.Single(failures);
+        Assert.Equal("resume plan rejected", failures[0].Metadata?.FailureReason);
+        Assert.Equal("resume plan rejected", fixture.Goal.FailureReason);
+        Assert.Empty(fixture.Dispatched);
+    }
+
+    private sealed record Fixture(
+        Goal Goal,
+        GoalDispatcher Dispatcher,
+        PlanRejectRecordingGoalStore GoalStore,
+        GoalPipelineManager PipelineManager,
+        GatedPlanBrain Brain,
+        List<WorkTask> Dispatched,
+        RetryStateCollectingLogger<GoalDispatcher> Logger);
+
+    private static Fixture CreateFixture(PlanResult planResult)
+    {
+        var goal = new Goal
+        {
+            Id = $"goal-resume-cancel-during-plan-{Guid.NewGuid():N}",
+            Description = "Resumed while planning",
+            Status = GoalStatus.Failed,
+            FailureReason = "Exceeded max iterations",
+            RepositoryNames = ["test-repo"],
+        };
+
+        var goalStore = new PlanRejectRecordingGoalStore(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+        // Exhaust the iteration budget so the branchless exhaustion resume is eligible.
+        while (pipeline.IterationBudget.TryConsume()) { }
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        pipelineManager.PersistFull(pipeline);
+
+        var brain = new GatedPlanBrain(planResult);
+
+        var taskQueue = new TaskQueue();
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => { lock (dispatched) { dispatched.Add(t); } };
+
+        var logger = new RetryStateCollectingLogger<GoalDispatcher>();
+
+        var config = TestHelpers.FullReadyConfig();
+        config.Repositories =
+        [
+            new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" }
+        ];
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: brain,
+            config: config,
+            startupDelay: TimeSpan.Zero,
+            goalStore: goalStore);
+
+        return new Fixture(goal, dispatcher, goalStore, pipelineManager, brain, dispatched, logger);
+    }
+}
+
+/// <summary>
+/// Brain whose planning call signals that it is in flight and then blocks until the test releases
+/// it — the deterministic interleaving point for the cancel-while-planning regression. Every other
+/// member is inert. Internal (not file-local) because both cancellation-race fixtures below expose
+/// it.
+/// </summary>
+internal sealed class GatedPlanBrain : IDistributedBrain
+{
+    private readonly PlanResult _result;
+
+    internal GatedPlanBrain(PlanResult result) => _result = result;
+
+    /// <summary>Completed synchronously when the planning call is entered.</summary>
+    internal TaskCompletionSource PlanningStarted { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Releasing this lets the (already-started) planning call return its result.</summary>
+    internal TaskCompletionSource ReleasePlan { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task<PlanResult> PlanIterationAsync(
+        GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    {
+        PlanningStarted.TrySetResult();
+        return AwaitReleaseAsync();
+    }
+
+    private async Task<PlanResult> AwaitReleaseAsync()
+    {
+        await ReleasePlan.Task;
+        return _result;
+    }
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) => Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("Proceed."));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult("summary");
+
+    public BrainStats? GetStats() => null;
+}
+
 internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
 {
     private readonly Goal _goal;

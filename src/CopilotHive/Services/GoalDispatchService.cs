@@ -137,6 +137,35 @@ internal sealed class GoalDispatchService
     }
 
     /// <summary>
+    /// The cancellation predicate for a freshly-created goal whose planning call was in flight:
+    /// the pipeline was moved to <see cref="GoalPhase.Failed"/> (the cancellation transition), or
+    /// it is no longer the pipeline registered for the goal in the
+    /// <see cref="GoalPipelineManager"/> (the cancellation removal). Either signal means
+    /// <see cref="GoalDispatcher.CancelGoalAsync"/> already recorded the goal's outcome — the
+    /// stored "Cancelled by user" failure reason — and it must never be overwritten by a planning
+    /// result that arrives afterwards.
+    /// </summary>
+    /// <param name="goal">The goal planning was started for.</param>
+    /// <param name="pipeline">The pipeline created for that goal.</param>
+    /// <returns>
+    /// <c>true</c> when the goal was cancelled meanwhile — reported at Information level and the
+    /// planning outcome discarded (no <see cref="FailNewGoalAsync"/>, no dispatch); otherwise
+    /// <c>false</c>.
+    /// </returns>
+    private bool DiscardPlanningResultIfCancelled(Goal goal, GoalPipeline pipeline)
+    {
+        var registered = _pipelineManager.GetByGoalId(goal.Id);
+        var cancelled = pipeline.Phase == GoalPhase.Failed || !ReferenceEquals(registered, pipeline);
+        if (!cancelled)
+            return false;
+
+        _logger.LogInformation(
+            "Discarding the planning outcome for goal '{GoalId}': the goal was cancelled while planning was in flight (phase={Phase}, stillRegistered={StillRegistered}) — the stored failure reason is preserved and nothing is dispatched",
+            goal.Id, pipeline.Phase, registered is not null);
+        return true;
+    }
+
+    /// <summary>
     /// Selects the next pending goal (subject to the parallelism gate), creates its
     /// pipeline, plans the first iteration and dispatches the first phase.
     /// </summary>
@@ -261,7 +290,12 @@ internal sealed class GoalDispatchService
         catch (OperationCanceledException)
         {
             // Cancelled by the planning call itself (e.g. a Brain-side timeout) — fail the goal
-            // gracefully rather than leaving a half-started pipeline behind.
+            // gracefully rather than leaving a half-started pipeline behind. A goal cancelled
+            // while planning was in flight owns its own outcome: its stored failure reason is
+            // preserved and the goal is NOT failed again.
+            if (DiscardPlanningResultIfCancelled(goal, pipeline))
+                return;
+
             _logger.LogWarning("Planning was cancelled for goal '{GoalId}'", goal.Id);
             await FailNewGoalAsync(goal, pipeline, "Planning failed: planning was cancelled");
             return;
@@ -269,10 +303,21 @@ internal sealed class GoalDispatchService
         catch (Exception ex)
         {
             // A throw here leaves the pipeline half-started — fail the goal and clean up.
+            // A goal cancelled while planning was in flight owns its own outcome: its stored
+            // failure reason is preserved and the goal is NOT failed again.
+            if (DiscardPlanningResultIfCancelled(goal, pipeline))
+                return;
+
             _logger.LogError(ex, "Planning threw for goal '{GoalId}'", goal.Id);
             await FailNewGoalAsync(goal, pipeline, $"Planning failed: {ex.Message}");
             return;
         }
+
+        // Planning returned — possibly long after the goal was cancelled. The outcome is checked
+        // against the cancellation BEFORE it is attributed to the goal or dispatched, so a
+        // cancelled goal keeps its stored failure reason and no worker is ever dispatched for it.
+        if (DiscardPlanningResultIfCancelled(goal, pipeline))
+            return;
 
         if (planResult.IsFailed)
         {
