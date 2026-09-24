@@ -1,9 +1,13 @@
 using System.Net;
+using System.Security.Claims;
+using System.Text.Json;
 
 using AspNet.Security.OAuth.GitHub;
 
 using CopilotHive.Git;
 
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.OAuth.Claims;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -181,6 +185,55 @@ public sealed class AuthenticatedModeTests : IDisposable
         Assert.Contains("read:user", options.Scope);
         Assert.Contains("copilot", options.Scope);
         Assert.Contains("workflow", options.Scope);
+    }
+
+    // ── avatar claim-action mapping ───────────────────────────────────────────
+    // Program.cs must map GitHub's "avatar_url" JSON key onto "urn:github:avatar", because
+    // AspNet.Security.OAuth.GitHub maps only id/login/email/name/url on its own. Without the
+    // MapJsonKey action the claim is never emitted, so both the stored User.AvatarUrl and the
+    // nav-bar <img> stay empty.
+
+    private const string AvatarClaimType = "urn:github:avatar";
+    private const string AvatarJsonKey = "avatar_url";
+
+    [Fact]
+    public void GitHubOptions_ClaimActions_MapAvatarJsonKeyOntoAvatarClaim()
+    {
+        using var client = _factory.CreateClient();
+
+        var options = _factory.Services.GetRequiredService<IOptionsMonitor<GitHubAuthenticationOptions>>()
+            .Get("GitHub");
+
+        var avatarAction = Assert.Single(options.ClaimActions, action =>
+            action is JsonKeyClaimAction jsonKey
+            && jsonKey.ClaimType == AvatarClaimType
+            && jsonKey.JsonKey == AvatarJsonKey);
+
+        Assert.Equal(AvatarClaimType, avatarAction.ClaimType);
+        Assert.Equal(AvatarJsonKey, ((JsonKeyClaimAction)avatarAction).JsonKey);
+    }
+
+    [Fact]
+    public void GitHubOptions_ClaimActions_ProduceAvatarClaimFromGitHubUserJson()
+    {
+        using var client = _factory.CreateClient();
+
+        var options = _factory.Services.GetRequiredService<IOptionsMonitor<GitHubAuthenticationOptions>>()
+            .Get("GitHub");
+
+        var identity = new ClaimsIdentity(authenticationType: "Test.GitHub");
+        using var user = JsonDocument.Parse(
+            """{"id":1,"login":"octo","avatar_url":"https://avatars.githubusercontent.com/u/1"}""");
+
+        // This is exactly how the OAuth middleware projects the user-endpoint payload onto the
+        // ticket identity: every configured claim action's Run over the JSON element.
+        foreach (var action in options.ClaimActions)
+        {
+            action.Run(user.RootElement, identity, issuer: "GitHub");
+        }
+
+        var avatarClaim = Assert.Single(identity.FindAll(AvatarClaimType));
+        Assert.Equal("https://avatars.githubusercontent.com/u/1", avatarClaim.Value);
     }
 
     public void Dispose() => _factory.Dispose();

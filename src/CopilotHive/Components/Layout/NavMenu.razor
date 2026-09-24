@@ -1,5 +1,6 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Orchestration
+@using System.Text.Encodings.Web
 @implements IDisposable
 
 <NavLink href="/" Match="NavLinkMatch.All">🏠 <span class="nav-label">Dashboard</span></NavLink>
@@ -31,9 +32,18 @@
     <AuthorizeView>
         <Authorized>
             <div class="nav-user">
+                @{
+                    // AspNet.Security.OAuth.GitHub does not create "urn:github:avatar" on its own;
+                    // Program.cs maps GitHub's "avatar_url" JSON key onto it. When the claim is
+                    // stubbed or absent the value is empty, and rendering an <img> with an empty
+                    // src would show a broken image — so fall back to an initial instead.
+                    var avatarUrl = context.User.FindFirst("urn:github:avatar")?.Value;
+                    var username = context.User.Identity?.Name;
+                    var avatar = ComputeNavUserAvatar(avatarUrl, username);
+                }
                 <div class="nav-user-info">
-                    <img class="nav-user-avatar" src="@context.User.FindFirst("urn:github:avatar")?.Value" alt="avatar" />
-                    <span class="nav-user-name nav-label">@context.User.Identity?.Name</span>
+                    @((MarkupString)avatar.Markup)
+                    <span class="nav-user-name nav-label">@username</span>
                 </div>
                 <form class="nav-user-logout" action="/logout" method="post">
                     <AntiforgeryToken />
@@ -59,6 +69,59 @@
         _pendingClarifications = ClarificationQueue.PendingHumanCount;
         _knowledgeDocCount = State.GetKnowledgeDocumentCount();
         ClarificationQueue.OnChanged += HandleClarificationChanged;
+    }
+
+    // The single-character placeholder shown when no GitHub avatar URL is available: the first
+    // letter of the username (uppercased), or "?" when the username is missing/blank.
+    internal static string AvatarFallbackInitial(string? username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            return "?";
+        }
+
+        return char.ToUpperInvariant(username.Trim()[0]).ToString();
+    }
+
+    /// <summary>
+    /// The production-owned nav-bar avatar render decision. <see cref="HasAvatar"/> is true when
+    /// the <c>urn:github:avatar</c> claim supplied a usable URL (the <c>&lt;img&gt;</c> branch);
+    /// <see cref="Markup"/> is the exact avatar markup fragment the component emits.
+    /// </summary>
+    /// <param name="HasAvatar">Whether the avatar claim URL was used instead of the fallback.</param>
+    /// <param name="Markup">
+    /// The avatar fragment: either <c>&lt;img class="nav-user-avatar" src="..." alt="avatar" /&gt;</c>
+    /// or the neutral <c>&lt;span class="nav-user-avatar nav-user-avatar-fallback"&gt;</c> placeholder.
+    /// </param>
+    internal sealed record NavUserAvatarRender(bool HasAvatar, string Markup);
+
+    /// <summary>
+    /// Decides and builds the nav-bar avatar markup from the raw claim URL and username. A
+    /// missing/empty/whitespace claim never yields an <c>&lt;img&gt;</c> (an empty <c>src</c> would
+    /// render a broken image), only a neutral fallback element carrying
+    /// <see cref="AvatarFallbackInitial"/>; the component's markup renders this result, so tests
+    /// exercise the same production code without bUnit.
+    /// </summary>
+    /// <param name="avatarUrl">The <c>urn:github:avatar</c> claim value, or <c>null</c> when absent.</param>
+    /// <param name="username">The authenticated username, used only for the fallback initial.</param>
+    internal static NavUserAvatarRender ComputeNavUserAvatar(string? avatarUrl, string? username)
+    {
+        if (!string.IsNullOrWhiteSpace(avatarUrl))
+        {
+            return new NavUserAvatarRender(
+                HasAvatar: true,
+                Markup: string.Concat(
+                    "<img class=\"nav-user-avatar\" src=\"",
+                    HtmlEncoder.Default.Encode(avatarUrl),
+                    "\" alt=\"avatar\" />"));
+        }
+
+        return new NavUserAvatarRender(
+            HasAvatar: false,
+            Markup: string.Concat(
+                "<span class=\"nav-user-avatar nav-user-avatar-fallback\">",
+                HtmlEncoder.Default.Encode(AvatarFallbackInitial(username)),
+                "</span>"));
     }
 
     private void HandleClarificationChanged()

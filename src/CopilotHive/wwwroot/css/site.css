@@ -102,6 +102,22 @@ body {
     flex-shrink: 0;
 }
 
+/* Neutral placeholder shown when no GitHub avatar claim is available, so a missing
+   claim never renders an <img> with an empty src (broken image). Reuses the
+   .nav-user-avatar sizing and only adds the letter-centering look. */
+.nav-user-avatar-fallback {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1;
+    user-select: none;
+}
+
 .nav-user-name {
     color: var(--text);
     font-size: 0.85rem;

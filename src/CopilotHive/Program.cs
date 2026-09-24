@@ -11,6 +11,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -544,6 +545,13 @@ public sealed class Program
                         // are provisioned to workers.
                         options.Scope.Add("repo");
                         options.SaveTokens = true;
+
+                        // AspNet.Security.OAuth.GitHub 10.0.0 maps only id/login/email/name/url,
+                        // so without this claim action "urn:github:avatar" is never emitted and
+                        // both the stored User.AvatarUrl and the nav-bar <img> stay empty.
+                        // Mapping GitHub's "avatar_url" JSON key onto that claim type feeds the
+                        // existing OnCreatingTicket read below.
+                        options.ClaimActions.MapJsonKey("urn:github:avatar", "avatar_url");
 
                         if (Environment.GetEnvironmentVariable("ALLOW_INSECURE_OAUTH") == "true")
                         {
