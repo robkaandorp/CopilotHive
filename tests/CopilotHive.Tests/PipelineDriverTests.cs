@@ -1418,16 +1418,26 @@ public sealed class PipelineDriverImproveSkipTests
         Assert.Equal(0, syncCount[0]);
     }
 
-    // ── Test 11: a FAILED Improve result keeps its terminal failure behavior ──
+    // ── Test 11: a FAILED Improve result is non-blocking: the pipeline continues ──
 
+    /// <summary>
+    /// A FAILED Improve result (e.g. the Improver's config-repo pull/publication failed) must NOT
+    /// fail an otherwise approved goal. The failure evidence stays visible on the Improve entry —
+    /// <see cref="PhaseOutcome.Fail"/> with the VERBATIM diagnostic, never the (unconsulted)
+    /// metrics summary or a SKIP relabel — while the pipeline advances through the SAME
+    /// advancement path a completed non-skip Improve uses (here: on to Merging, which then fails
+    /// the goal under the pre-existing null-CoderBranch contract, NOT because of Improve).
+    /// </summary>
     [Fact]
-    public async Task DriveNextPhaseAsync_WhenImproveResultIsFailed_KeepsTerminalFailureBehavior()
+    public async Task DriveNextPhaseAsync_WhenImproveResultIsFailed_ContinuesToNextPhase()
     {
         var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver();
         const string diagnostic = "improver crashed before writing any guidance";
+        var conversationCountBefore = pipeline.Conversation.Count;
 
-        // A FAILED result with a SKIP verdict in its metrics must NEVER gain the skip treatment:
-        // the failed-worker early exit runs before verdict extraction.
+        // A FAILED result with a SKIP verdict in its metrics must NEVER gain the skip treatment
+        // either: the failed-worker early exit runs before verdict extraction, and on this path
+        // the metrics verdict/summary are never consulted at all.
         await driver.DriveNextPhaseAsync(pipeline, new TaskResult
         {
             TaskId = "task-improve-failed",
@@ -1436,13 +1446,116 @@ public sealed class PipelineDriverImproveSkipTests
             Metrics = new TaskMetrics { Verdict = "SKIP", Summary = "should not be consulted" },
         }, TestContext.Current.CancellationToken);
 
-        // Existing terminal behavior: raw diagnostic on the entry, Fail outcome, goal failed.
+        // Failure evidence preserved VERBATIM on the existing entry: Fail outcome, not Pass/Skip,
+        // not the metrics summary, and no verdict was extracted on this path.
         Assert.Equal(PhaseOutcome.Fail, entry.Result);
+        Assert.NotEqual(PhaseOutcome.Pass, entry.Result);
+        Assert.NotEqual(PhaseOutcome.Skip, entry.Result);
         Assert.Equal(diagnostic, entry.WorkerOutput);
         Assert.NotEqual("should not be consulted", entry.WorkerOutput);
-        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
-        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.NotNull(entry.CompletedAt);
+        Assert.Null(entry.Verdict);
+        // No synthesized duplicate entry and no conversation entry on the failed-Improve path.
+        Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Improve);
+        Assert.Equal(conversationCountBefore, pipeline.Conversation.Count);
+
+        // The post-Improve config-repo sync is NOT performed: a failed result is not evidence
+        // that guidance was published.
         Assert.Equal(0, syncCount[0]);
+
+        // The pipeline ADVANCED PAST Improve through the shared advancement path — the same one a
+        // completed non-skip Improve uses — and dispatched the next planned phase (Merging).
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        var mergingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Merging);
+        Assert.Equal(pipeline.Iteration, mergingEntry.Iteration);
+
+        // The goal was NOT failed by Improve. The single terminal status update comes from the
+        // pre-existing Merging contract (null CoderBranch), and NO update carries a
+        // "Worker failed: " reason — the Improve diagnostic never became the goal's failure.
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        Assert.Equal("No coder branch set", failedUpdate.Metadata?.FailureReason);
+        Assert.DoesNotContain(goalStore.StatusUpdates,
+            u => u.Metadata?.FailureReason?.StartsWith("Worker failed: ", StringComparison.Ordinal) == true);
+        Assert.DoesNotContain(diagnostic, pipeline.Goal.FailureReason ?? "");
+    }
+
+    // ── Test 11b: the SAME failure in a non-Improve phase still fails the goal ──
+
+    /// <summary>
+    /// Contrast vector for <see cref="DriveNextPhaseAsync_WhenImproveResultIsFailed_ContinuesToNextPhase"/>:
+    /// a failed worker result on a REQUIRED phase (Testing) keeps the existing terminal-failure
+    /// behavior — the goal fails immediately with the <c>"Worker failed: "</c> reason, the phase
+    /// entry keeps the verbatim diagnostic, and no advancement/dispatch happens.
+    /// </summary>
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenFailedResultIsNotImprove_StillFailsTheGoal()
+    {
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver(phase: GoalPhase.Testing);
+        var diagnostic = "fatal: " + new string('Z', 400);
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-testing-failed",
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "misleading summary" },
+        }, TestContext.Current.CancellationToken);
+
+        // The required phase's failure is terminal: verbatim diagnostic, Fail outcome, non-blocking
+        // treatment is Improve-only.
+        Assert.Equal(PhaseOutcome.Fail, entry.Result);
+        Assert.Equal(diagnostic, entry.WorkerOutput);
+        Assert.NotEqual("misleading summary", entry.WorkerOutput);
+        Assert.Equal(GoalStatus.Failed, pipeline.Goal.Status);
+
+        // The goal failure reason uses the existing "Worker failed: " + 300-char preview format.
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        Assert.Equal($"Worker failed: {diagnostic[..300]}...", failedUpdate.Metadata?.FailureReason);
+
+        // NO advancement and NO dispatch: the state machine stays on the failed phase and the
+        // PhaseLog gained no entry (in particular no Merging entry).
+        Assert.Equal(GoalPhase.Testing, pipeline.StateMachine.Phase);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Equal(phaseLogCountBefore, pipeline.PhaseLog.Count);
+        Assert.DoesNotContain(pipeline.PhaseLog, e => e.Name == GoalPhase.Merging);
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 11c: a FAILED Improve result with NO matching entry still continues ──
+
+    /// <summary>
+    /// The null-entry guard stays intact on the failed-Improve path: when no PhaseLog entry
+    /// matches the Improve phase, nothing is synthesized, the pipeline still continues through the
+    /// same advancement path (proving the continuation is independent of the entry bookkeeping),
+    /// and the goal is not failed by Improve.
+    /// </summary>
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproveResultIsFailedWithNoMatchingEntry_ContinuesWithoutSyntheticEntry()
+    {
+        var (driver, pipeline, _, syncCount, goalStore) = CreateImproveDriver();
+        pipeline.PhaseLog.Clear();
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-failed-noentry",
+            Status = TaskOutcome.Failed,
+            Output = "improver publication failed with no matching phase entry",
+        }, TestContext.Current.CancellationToken);
+
+        // No synthetic Improve entry, and the ONLY addition is the dispatched Merging entry.
+        Assert.Equal(phaseLogCountBefore + 1, pipeline.PhaseLog.Count);
+        Assert.DoesNotContain(pipeline.PhaseLog, e => e.Name == GoalPhase.Improve);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        Assert.Equal(0, syncCount[0]);
+
+        // The goal still left the Improve phase without a "Worker failed: " reason.
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        Assert.Equal("No coder branch set", failedUpdate.Metadata?.FailureReason);
     }
 
     // ── Test 12: a CANCELLED Improve result with a SKIP verdict is NOT a skip ──

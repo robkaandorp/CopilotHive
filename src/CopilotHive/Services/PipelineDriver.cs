@@ -196,7 +196,8 @@ internal sealed class PipelineDriver
         // a canned string. The raw failure diagnostic is authoritative on this path even when
         // result.Metrics.Summary contains different text: a crashed task's metrics/report
         // verdicts must never be consulted or treated as a successful result. MarkGoalFailedAsync
-        // remains the single owner of the terminal summary/status write.
+        // remains the single owner of the terminal summary/status write — EXCEPT on the optional
+        // Improve phase, whose failure is non-blocking (see the guarded branch below).
         if (result.Status == TaskOutcome.Failed)
         {
             var truncatedOutput = result.Output.Length > 300 ? result.Output[..300] + "..." : result.Output;
@@ -228,6 +229,41 @@ internal sealed class PipelineDriver
             // The role is derived NON-THROWINGLY: a worker failure recorded while the pipeline
             // sits on a non-worker phase must not throw before MarkGoalFailedAsync runs.
             await AppendPhaseNarrativesAsync(pipeline, result, DeriveNarrativeRole(pipeline.Phase), ct);
+
+            // Improve is the pipeline's OPTIONAL, non-blocking phase: a failed config-repo pull or
+            // publication by the Improver must never fail an otherwise approved goal before merge.
+            // So on this one phase the goal is NOT failed — the pipeline advances through the SAME
+            // advancement path a completed (non-skip) Improve uses, and returns HERE.
+            //
+            // Do NOT fall through into the normal completion path below the guard: that path
+            // re-marks the entry from the (unconsulted) metrics verdict/summary, which would
+            // relabel this failure and overwrite the verbatim diagnostic. The failure evidence
+            // therefore stays exactly as recorded above: Result = PhaseOutcome.Fail and the
+            // verbatim result.Output.
+            //
+            // The advancement is reached ONLY when the state machine's transition succeeds: an
+            // unexpected effect/state (e.g. the Improve phase had no plan) throws out of Transition
+            // BEFORE any advancement, which is the pre-existing failure class for such a state.
+            //
+            // _syncAgents is deliberately NOT called on this path: a failed result is not reliable
+            // evidence that guidance was published. If it was published before a later error, the
+            // dispatcher's periodic SyncAgentsFromConfigRepoAsync picks it up anyway.
+            if (pipeline.Phase == GoalPhase.Improve)
+            {
+                _logger.LogWarning(
+                    "Improver for goal {GoalId} failed — the optional Improve phase is non-blocking, " +
+                    "so the goal is not failed and the pipeline continues",
+                    pipeline.GoalId);
+
+                // Improve is non-blocking in the state machine: Succeeded and Failed both advance
+                // to the next phase, so a failed Improve takes the same advancement path as a
+                // completed non-skip Improve (Continue → next phase; NewIteration/Completed
+                // handled identically by the shared helper). The verdict is null: none is extracted
+                // on this path, and Improve + Succeeded cannot produce the only effect that reads it.
+                var improveTransition = pipeline.StateMachine.Transition(PhaseInput.Succeeded);
+                await ApplyTransitionAsync(pipeline, improveTransition, verdict: null, ct);
+                return;
+            }
 
             await _lifecycleService.MarkGoalFailedAsync(pipeline, $"Worker failed: {truncatedOutput}", ct);
             return;
@@ -497,6 +533,30 @@ internal sealed class PipelineDriver
         // State machine transition
         var transition = pipeline.StateMachine.Transition(phaseInput);
 
+        await ApplyTransitionAsync(pipeline, transition, verdict, ct);
+    }
+
+    /// <summary>
+    /// Applies a state-machine transition: advances to the next planned phase and dispatches it,
+    /// opens the re-plan window for a new iteration, or completes the goal.
+    /// <para>
+    /// Shared by the normal completion path and the non-blocking failed-Improve path so both use
+    /// EXACTLY the same advancement semantics — no second copy of the switch exists.
+    /// </para>
+    /// </summary>
+    /// <param name="pipeline">The pipeline to advance.</param>
+    /// <param name="transition">The transition whose <see cref="TransitionEffect"/> decides what happens.</param>
+    /// <param name="verdict">
+    /// The worker verdict that drove the transition; consumed ONLY by the
+    /// <see cref="TransitionEffect.NewIteration"/> path (retry classification and the iteration
+    /// summary text). It is <c>null</c> on the failed-Improve path, where no verdict is extracted
+    /// at all: <see cref="PhaseInput.Succeeded"/> on Improve can only yield
+    /// <see cref="TransitionEffect.Continue"/>, so the value is never consulted there.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    private async Task ApplyTransitionAsync(
+        GoalPipeline pipeline, TransitionResult transition, string? verdict, CancellationToken ct)
+    {
         switch (transition.Effect)
         {
             case TransitionEffect.Continue:
@@ -507,6 +567,15 @@ internal sealed class PipelineDriver
                 break;
 
             case TransitionEffect.NewIteration:
+                // Fail fast rather than substituting a placeholder verdict: the re-plan path reads
+                // the verdict to classify the retry and to label the iteration summary. The only
+                // caller allowed to pass null is the failed-Improve path, whose
+                // Improve + Succeeded transition can never yield NewIteration — so a null here is
+                // an invalid state, not a case to paper over.
+                if (verdict is null)
+                    throw new InvalidOperationException(
+                        $"A {TransitionEffect.NewIteration} transition for goal {pipeline.GoalId} " +
+                        $"requires the driving verdict, but none was supplied.");
                 await HandleNewIterationAsync(pipeline, verdict, ct);
                 break;
 
