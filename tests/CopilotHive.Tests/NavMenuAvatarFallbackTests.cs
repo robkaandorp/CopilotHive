@@ -1,6 +1,7 @@
 using System.Security.Claims;
 
 using CopilotHive.Components.Layout;
+using CopilotHive.Services;
 
 namespace CopilotHive.Tests;
 
@@ -11,10 +12,8 @@ namespace CopilotHive.Tests;
 /// </summary>
 public sealed class NavMenuAvatarFallbackTests
 {
-    private const string AvatarClaimType = "urn:github:avatar";
-
     private static NavMenu.NavUserAvatarRender RenderAvatar(ClaimsPrincipal user) =>
-        NavMenu.ComputeNavUserAvatar(user.FindFirst(AvatarClaimType)?.Value, user.Identity?.Name);
+        NavMenu.ComputeNavUserAvatar(user.FindFirst(GitHubClaimTypes.Avatar)?.Value, user.Identity?.Name);
 
     private static ClaimsPrincipal CreateUser(string? username, params (string Type, string Value)[] claims)
     {
@@ -42,7 +41,7 @@ public sealed class NavMenuAvatarFallbackTests
     {
         var result = RenderAvatar(CreateUser(
             "octo",
-            (AvatarClaimType, "https://avatars.githubusercontent.com/u/1")));
+            (GitHubClaimTypes.Avatar, "https://avatars.githubusercontent.com/u/1")));
 
         Assert.True(result.HasAvatar);
         Assert.Equal("<img class=\"nav-user-avatar\" src=\"https://avatars.githubusercontent.com/u/1\" alt=\"avatar\" />", result.Markup);
@@ -53,7 +52,7 @@ public sealed class NavMenuAvatarFallbackTests
     public void NavUserAvatar_WithAvatarClaim_EscapesUrlInEmittedImage()
     {
         // NavMenu casts this fragment to MarkupString, so an attribute delimiter must be encoded.
-        var result = RenderAvatar(CreateUser("octo", (AvatarClaimType, "https://example.test/u/1?size=48&format=png\"x")));
+        var result = RenderAvatar(CreateUser("octo", (GitHubClaimTypes.Avatar, "https://example.test/u/1?size=48&format=png\"x")));
 
         Assert.True(result.HasAvatar);
         Assert.Equal("<img class=\"nav-user-avatar\" src=\"https://example.test/u/1?size=48&amp;format=png&quot;x\" alt=\"avatar\" />", result.Markup);
@@ -75,7 +74,7 @@ public sealed class NavMenuAvatarFallbackTests
     [Fact]
     public void NavUserAvatar_WithEmptyAvatarClaim_RendersFallbackInitialAndNoImage()
     {
-        var result = RenderAvatar(CreateUser("octo", (AvatarClaimType, "")));
+        var result = RenderAvatar(CreateUser("octo", (GitHubClaimTypes.Avatar, "")));
 
         Assert.False(result.HasAvatar);
         Assert.Equal("<span class=\"nav-user-avatar nav-user-avatar-fallback\">O</span>", result.Markup);
@@ -86,7 +85,7 @@ public sealed class NavMenuAvatarFallbackTests
     [Fact]
     public void NavUserAvatar_WithWhitespaceAvatarClaim_RendersFallbackInitialAndNoImage()
     {
-        var result = RenderAvatar(CreateUser("octo", (AvatarClaimType, "   ")));
+        var result = RenderAvatar(CreateUser("octo", (GitHubClaimTypes.Avatar, "   ")));
 
         Assert.False(result.HasAvatar);
         Assert.Equal("<span class=\"nav-user-avatar nav-user-avatar-fallback\">O</span>", result.Markup);

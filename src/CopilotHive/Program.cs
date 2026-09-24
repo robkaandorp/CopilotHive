@@ -554,11 +554,11 @@ public sealed class Program
                         options.SaveTokens = true;
 
                         // AspNet.Security.OAuth.GitHub 10.0.0 maps only id/login/email/name/url,
-                        // so without this claim action "urn:github:avatar" is never emitted and
+                        // so without this claim action GitHubClaimTypes.Avatar is never emitted and
                         // both the stored User.AvatarUrl and the nav-bar <img> stay empty.
                         // Mapping GitHub's "avatar_url" JSON key onto that claim type feeds the
                         // existing OnCreatingTicket read below.
-                        options.ClaimActions.MapJsonKey("urn:github:avatar", "avatar_url");
+                        options.ClaimActions.MapJsonKey(GitHubClaimTypes.Avatar, "avatar_url");
 
                         if (Environment.GetEnvironmentVariable("ALLOW_INSECURE_OAUTH") == "true")
                         {
@@ -582,7 +582,7 @@ public sealed class Program
                             var username = context.Identity?.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value
                                 ?? string.Empty;
                             var displayName = context.Identity?.FindFirst("urn:github:name")?.Value;
-                            var avatarUrl = context.Identity?.FindFirst("urn:github:avatar")?.Value;
+                            var avatarUrl = context.Identity?.FindFirst(GitHubClaimTypes.Avatar)?.Value;
                             var email = context.Identity?.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
 
                             var userCount = await userService.GetUserCountAsync(ct);
