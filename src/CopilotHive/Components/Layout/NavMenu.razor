@@ -1,5 +1,6 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Orchestration
+@using CopilotHive.Services
 @using System.Text.Encodings.Web
 @implements IDisposable
 
@@ -33,11 +34,11 @@
         <Authorized>
             <div class="nav-user">
                 @{
-                    // AspNet.Security.OAuth.GitHub does not create "urn:github:avatar" on its own;
-                    // Program.cs maps GitHub's "avatar_url" JSON key onto it. When the claim is
-                    // stubbed or absent the value is empty, and rendering an <img> with an empty
-                    // src would show a broken image — so fall back to an initial instead.
-                    var avatarUrl = context.User.FindFirst("urn:github:avatar")?.Value;
+                    // AspNet.Security.OAuth.GitHub does not create the GitHubClaimTypes.Avatar claim
+                    // on its own; Program.cs maps GitHub's "avatar_url" JSON key onto it. When the
+                    // claim is stubbed or absent the value is empty, and rendering an <img> with an
+                    // empty src would show a broken image — so fall back to an initial instead.
+                    var avatarUrl = context.User.FindFirst(GitHubClaimTypes.Avatar)?.Value;
                     var username = context.User.Identity?.Name;
                     var avatar = ComputeNavUserAvatar(avatarUrl, username);
                 }
@@ -85,7 +86,7 @@
 
     /// <summary>
     /// The production-owned nav-bar avatar render decision. <see cref="HasAvatar"/> is true when
-    /// the <c>urn:github:avatar</c> claim supplied a usable URL (the <c>&lt;img&gt;</c> branch);
+    /// the <see cref="GitHubClaimTypes.Avatar"/> claim supplied a usable URL (the <c>&lt;img&gt;</c> branch);
     /// <see cref="Markup"/> is the exact avatar markup fragment the component emits.
     /// </summary>
     /// <param name="HasAvatar">Whether the avatar claim URL was used instead of the fallback.</param>
@@ -102,7 +103,7 @@
     /// <see cref="AvatarFallbackInitial"/>; the component's markup renders this result, so tests
     /// exercise the same production code without bUnit.
     /// </summary>
-    /// <param name="avatarUrl">The <c>urn:github:avatar</c> claim value, or <c>null</c> when absent.</param>
+    /// <param name="avatarUrl">The <see cref="GitHubClaimTypes.Avatar"/> claim value, or <c>null</c> when absent.</param>
     /// <param name="username">The authenticated username, used only for the fallback initial.</param>
     internal static NavUserAvatarRender ComputeNavUserAvatar(string? avatarUrl, string? username)
     {

@@ -5,6 +5,7 @@ using System.Text.Json;
 using AspNet.Security.OAuth.GitHub;
 
 using CopilotHive.Git;
+using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.OAuth.Claims;
@@ -188,12 +189,11 @@ public sealed class AuthenticatedModeTests : IDisposable
     }
 
     // ── avatar claim-action mapping ───────────────────────────────────────────
-    // Program.cs must map GitHub's "avatar_url" JSON key onto "urn:github:avatar", because
-    // AspNet.Security.OAuth.GitHub maps only id/login/email/name/url on its own. Without the
-    // MapJsonKey action the claim is never emitted, so both the stored User.AvatarUrl and the
-    // nav-bar <img> stay empty.
+    // Program.cs must map GitHub's "avatar_url" JSON key onto the GitHubClaimTypes.Avatar claim
+    // type, because AspNet.Security.OAuth.GitHub maps only id/login/email/name/url on its own.
+    // Without the MapJsonKey action the claim is never emitted, so both the stored User.AvatarUrl
+    // and the nav-bar <img> stay empty.
 
-    private const string AvatarClaimType = "urn:github:avatar";
     private const string AvatarJsonKey = "avatar_url";
 
     [Fact]
@@ -206,10 +206,10 @@ public sealed class AuthenticatedModeTests : IDisposable
 
         var avatarAction = Assert.Single(options.ClaimActions, action =>
             action is JsonKeyClaimAction jsonKey
-            && jsonKey.ClaimType == AvatarClaimType
+            && jsonKey.ClaimType == GitHubClaimTypes.Avatar
             && jsonKey.JsonKey == AvatarJsonKey);
 
-        Assert.Equal(AvatarClaimType, avatarAction.ClaimType);
+        Assert.Equal(GitHubClaimTypes.Avatar, avatarAction.ClaimType);
         Assert.Equal(AvatarJsonKey, ((JsonKeyClaimAction)avatarAction).JsonKey);
     }
 
@@ -232,7 +232,7 @@ public sealed class AuthenticatedModeTests : IDisposable
             action.Run(user.RootElement, identity, issuer: "GitHub");
         }
 
-        var avatarClaim = Assert.Single(identity.FindAll(AvatarClaimType));
+        var avatarClaim = Assert.Single(identity.FindAll(GitHubClaimTypes.Avatar));
         Assert.Equal("https://avatars.githubusercontent.com/u/1", avatarClaim.Value);
     }
 
