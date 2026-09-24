@@ -662,9 +662,10 @@ public sealed class PipelineDriverWorkerOutputTests
         var task = Assert.Single(enqueued);
         Assert.Equal(harness.Pipeline.GoalId, task.GoalId);
         Assert.Equal(WorkerRole.Coder, task.Role);
-        // The captured task id encodes the position: {goalId}-{role}-{iteration:D3}-{occurrence:D2}-{attempt:D3}.
+        // The captured task id encodes the position: {goalId}-{role}-{iteration:D3}-{occurrence:D2}-{attempt:D3}-{nonce}.
         // Iteration 2 here proves the retry iteration's dispatch, not a re-run of iteration 1.
-        // (WorkTask.Iteration itself is left unset by TaskBuilder, so the id is the honest source.)
+        // (The id is the honest source: the pipeline MINTs it from the captured slot position and
+        // TaskBuilder stamps it verbatim, so the id — not any caller-supplied field — carries it.)
         Assert.StartsWith($"{harness.Pipeline.GoalId}-coder-002-", task.TaskId, StringComparison.Ordinal);
         // The dispatched prompt IS the built craft prompt — same string, byte for byte.
         Assert.Equal(expectedPrompt, task.Prompt);

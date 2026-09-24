@@ -37,8 +37,6 @@ public sealed record WorkTask
     public BranchSpec? BranchInfo { get; set; }
     /// <summary>Repositories the worker should operate on.</summary>
     public required List<TargetRepository> Repositories { get; init; }
-    /// <summary>Current iteration number.</summary>
-    public int Iteration { get; init; }
     /// <summary>Additional key-value metadata for the task.</summary>
     public Dictionary<string, string> Metadata { get; init; } = new();
     /// <summary>Context window size in tokens for the worker's agent. Used for heartbeat Ctx% calculation and compaction threshold.</summary>

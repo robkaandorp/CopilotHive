@@ -472,8 +472,11 @@ internal sealed class GatedOverlapDetectingRequestStream : FakeClientStreamWrite
 /// <summary>
 /// A channel-backed <see cref="IAsyncStreamReader{OrchestratorMessage}"/> for driving the REAL
 /// <c>WorkerService.ProcessMessagesAsync</c> loop. Tests push orchestrator messages and await
-/// <see cref="Consumed"/> as a deterministic barrier proving the loop has processed them; a
-/// <c>null</c> push ends the stream. No sleeps, no polling.
+/// <see cref="Consumed"/> as a deterministic barrier proving the READER has delivered them to the
+/// loop — <c>MoveNext</c> counts and signals a message BEFORE returning it, so <c>Consumed(n)</c>
+/// proves delivery of message n, NOT that its handler completed; a <c>null</c> push ends the stream.
+/// No sleeps, no polling. (Proving that a handler RETURNED needs a later read or a separate probe,
+/// e.g. <see cref="ReadsStarted"/>, which the loop re-arms only after the handler returns.)
 /// </summary>
 internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMessage>
 {
@@ -513,7 +516,11 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
 
     internal void TryComplete() => _channel.Writer.TryComplete();
 
-    /// <summary>Completes once the loop has consumed at least <paramref name="count"/> messages.</summary>
+    /// <summary>
+    /// Completes once <c>MoveNext</c> has DELIVERED at least <paramref name="count"/> messages to the
+    /// loop. The count advances and the waiters are signalled BEFORE the message is returned, so this
+    /// proves delivery only — never that the loop's handler for message n has completed.
+    /// </summary>
     internal Task Consumed(int count)
     {
         lock (_gate)
@@ -596,7 +603,9 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
 /// <summary>
 /// A channel-backed reader that behaves exactly like <see cref="ChannelResponseReader"/> until
 /// <see cref="ArmFault"/> is called, then throws the ORIGINAL exception from the next
-/// <c>MoveNext</c> — modelling a reader fault whose identity the loop must propagate.
+/// <c>MoveNext</c> — modelling a reader fault whose identity the loop must propagate. Its
+/// <see cref="Consumed"/> barrier therefore proves DELIVERY of a message, never that the loop's
+/// handler for it completed.
 /// </summary>
 internal sealed class FaultingResponseReader : IAsyncStreamReader<OrchestratorMessage>
 {
@@ -625,7 +634,11 @@ internal sealed class FaultingResponseReader : IAsyncStreamReader<OrchestratorMe
         _channel.Writer.TryComplete();
     }
 
-    /// <summary>Completes once the loop has consumed at least <paramref name="count"/> messages.</summary>
+    /// <summary>
+    /// Completes once <c>MoveNext</c> has DELIVERED at least <paramref name="count"/> messages to the
+    /// loop. The count advances and the waiters are signalled BEFORE the message is returned, so this
+    /// proves delivery only — never that the loop's handler for message n has completed.
+    /// </summary>
     internal Task Consumed(int count)
     {
         lock (_gate)

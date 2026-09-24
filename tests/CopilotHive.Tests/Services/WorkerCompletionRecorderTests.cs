@@ -168,9 +168,7 @@ public sealed class WorkerCompletionRecorderTests : IDisposable
 
     /// <summary>
     /// The ACTIVE task the transport validated. Its <see cref="CopilotHive.Services.WorkTask.Model"/>
-    /// is deliberately DIFFERENT from the stored assignment's model, and its
-    /// <see cref="CopilotHive.Services.WorkTask.Iteration"/> deliberately disagrees with the stored
-    /// slot — neither may reach the receipt.
+    /// is deliberately DIFFERENT from the stored assignment's model — it may not reach the receipt.
     /// </summary>
     private static CopilotHive.Services.WorkTask ActiveTask() => new()
     {
@@ -180,7 +178,6 @@ public sealed class WorkerCompletionRecorderTests : IDisposable
         Prompt = "do the work",
         Role = WorkerRole.Coder,
         Model = "queue-model",
-        Iteration = 99,
         Repositories = [],
     };
 
@@ -271,14 +268,13 @@ public sealed class WorkerCompletionRecorderTests : IDisposable
     /// <summary>
     /// A GENUINE STORED CONTEXT AND A MAPPED RESULT produce a DURABLE receipt whose canonical text
     /// survives a FRESH store instance over the same file, and whose identity is the STORED facts:
-    /// the authoritative slot position/attempt (never <c>WorkTask.Iteration</c>), the stored
-    /// goal/worker/role, and the RESULT's own model (never the stored assignment's model).
+    /// the authoritative slot position/attempt (never a reconstruction from the task id's text),
+    /// the stored goal/worker/role, and the RESULT's own model (never the stored assignment's model).
     /// </summary>
     /// <remarks>
-    /// DISCRIMINATING: a recorder that reconstructed the position from the task id's text, used
-    /// <c>WorkTask.Iteration</c> (99), or overwrote the result's model with the stored assignment's
-    /// model ("assigned-model") fails here, and a receipt that was not durable fails the fresh-store
-    /// readback.
+    /// DISCRIMINATING: a recorder that reconstructed the position from the task id's text or
+    /// overwrote the result's model with the stored assignment's model ("assigned-model") fails
+    /// here, and a receipt that was not durable fails the fresh-store readback.
     /// </remarks>
     [Fact]
     public void Record_StoredContext_WritesReceiptThatSurvivesFreshStoreReadback()

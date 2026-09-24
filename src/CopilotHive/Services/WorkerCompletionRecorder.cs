@@ -123,7 +123,7 @@ public interface IWorkerCompletionRecorder
 /// <para>
 /// IDENTITY COMES FROM THE STORED CONTEXT, NEVER FROM TEXT. The receipt's goal, worker, role and the
 /// FULL <see cref="WorkSlot"/> are the STORED context's own values; nothing is reconstructed from the
-/// task id's text, from <see cref="WorkTask.Iteration"/>, from the pipeline's current phase or from a
+/// task id's text, from the delivered task's own fields, from the pipeline's current phase or from a
 /// guessed default. The task id is used only as the OPAQUE lookup key and as an ordinal agreement
 /// check.
 /// </para>

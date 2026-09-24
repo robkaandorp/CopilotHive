@@ -75,10 +75,11 @@ public interface IWorkerAssignmentPublisher
 /// <para>
 /// THE SLOT IS AUTHORITATIVE. The recorded position (iteration, phase, occurrence) and attempt are
 /// the values the pipeline's OWN registry holds for the delivered task at capture time. They are
-/// NEVER reconstructed from the task ID's text, from the pipeline's current phase, or from the
-/// legacy <see cref="WorkTask.Iteration"/> value — a caller that passes a stale or unpopulated
-/// iteration therefore cannot make the recorded position disagree with the registry. A delivery for
-/// which no matching Pending slot / pointer exists is REFUSED; no context is ever synthesized.
+/// NEVER reconstructed from the task ID's text, from the pipeline's current phase, or from any other
+/// field on the delivered task — the task id serves ONLY as the lookup key — so a caller that passes
+/// a stale or unpopulated task cannot make the recorded position disagree with the registry. A
+/// delivery for which no matching Pending slot / pointer exists is REFUSED; no context is ever
+/// synthesized.
 /// </para>
 /// <para>
 /// THE PINNED-INSTANCE CHECK IS A POINT-IN-TIME OBSERVATION, NOT ATOMIC RESERVATION.

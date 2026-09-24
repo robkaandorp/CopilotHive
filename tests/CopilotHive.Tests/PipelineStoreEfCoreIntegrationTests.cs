@@ -6090,8 +6090,9 @@ internal sealed class RollbackRowCountInterceptor : DbCommandInterceptor
 /// An exception whose <see cref="Exception.Message"/> GETTER ITSELF THROWS — the genuine mechanism
 /// for the never-masked-cleanup vectors: <c>Exception.Message</c> is virtual, so a cleanup catch
 /// that reads the message BEFORE entering its no-throw guard would let this escape the finally and
-/// mask the authoritative outcome. The default instance throws on <c>Message</c> AND on
-/// <see cref="Exception.ToString"/>; an optional wrapped cause is supported for diagnostics.
+/// mask the authoritative outcome. ONLY <c>Message</c> throws: <see cref="Exception.ToString"/> is
+/// overridden to RETURN a string and never throws, so a diagnostic that renders this exception
+/// through <c>ToString</c> still works. An optional wrapped cause is supported for diagnostics.
 /// </summary>
 internal sealed class ThrowingMessageException : Exception
 {
@@ -6110,8 +6111,8 @@ internal sealed class ThrowingMessageException : Exception
 
     public override string ToString() =>
         _innerMessage is null
-            ? "ThrowingMessageException (ToString also throws)"
-            : _innerMessage + " / ThrowinigMessageException (ToString also throws)";
+            ? "ThrowingMessageException (Message getter throws; ToString does not)"
+            : _innerMessage + " / ThrowingMessageException (Message getter throws; ToString does not)";
 }
 
 /// <summary>
