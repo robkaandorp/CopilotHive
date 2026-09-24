@@ -759,8 +759,24 @@ public sealed class GoalDispatcher : BackgroundService
                 return true;
             }
 
-            pipeline.SetPlan(validatedPlan);
-            pipeline.StateMachine.StartIteration(validatedPlan.Phases);
+            // The plan INSTALLATION is the second half of the plan contract: the variant-A
+            // Coding-first check above only inspects the first phase, while the state machine
+            // rejects an empty plan and any plan that does not END with Merging. The goal is
+            // already persisted as InProgress/Planning, so a throw here would strand it — the
+            // rejection is converted into an explicit goal failure instead.
+            try
+            {
+                pipeline.SetPlan(validatedPlan);
+                pipeline.StateMachine.StartIteration(validatedPlan.Phases);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                _logger.LogWarning(
+                    ex, "Resumed plan for goal {GoalId} was rejected on installation", goalId);
+                await FailResumedGoalAsync(pipeline, $"Resume plan rejected: {ex.Message}");
+                return true;
+            }
+
             var firstPhase = validatedPlan.Phases[0];
             pipeline.AdvanceTo(firstPhase);
             pipeline.PhaseLog.Add(PhaseResult.Create(firstPhase, pipeline.Iteration, 1));

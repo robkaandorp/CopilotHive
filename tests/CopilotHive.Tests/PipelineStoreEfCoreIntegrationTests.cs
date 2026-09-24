@@ -654,6 +654,21 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
     private PipelineStore CreateStore(IInterceptor? interceptor = null, ILogger<PipelineStore>? logger = null) =>
         new(CreateContext(interceptor), logger ?? NullLogger<PipelineStore>.Instance);
 
+    /// <summary>
+    /// Creates a context on the SUPPLIED connection — no connection of its own is opened, so a
+    /// wrapper connection's injected transaction fault reaches the context under test.
+    /// </summary>
+    private CopilotHiveDbContext ContextOn(DbConnection connection, IInterceptor? interceptor = null)
+    {
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
     private void ExecuteOnKeeper(string sql)
     {
         using var command = _keeper.CreateCommand();
@@ -1052,6 +1067,330 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         // The rollback still made the aborted mapping insert invisible.
         Assert.Null(ExecuteScalarOnKeeper(
             "SELECT goal_id FROM task_mappings WHERE task_id = 'task-dispfail'"));
+    }
+
+    /// <summary>
+    /// THE TRACKED-STATE-CLEANUP FAULT WHOSE <c>Message</c> GETTER THROWS, on the
+    /// PROPAGATING-PRIMARY path: the pipeline flush fails, the real rollback CONFIRMS, and the
+    /// guarded tracked-state cleanup's own reload SELECT throws a
+    /// <see cref="ThrowingMessageException"/>. The original operation exception must still
+    /// propagate BY IDENTITY (the cleanup fault neither replaces nor wraps it), the cleanup step's
+    /// diagnostic must have reached the logger with the PLACEHOLDER text instead of the unreadable
+    /// message, and the LATER cleanup steps must still have run.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: revert the <c>admission-cleanup</c> guard to the direct
+    /// <c>cleanupEx.Message</c> form and the getter's throw escapes the <c>finally</c>, REPLACING the
+    /// propagating original — the identity assertion below fails on the substituted
+    /// <see cref="InvalidOperationException"/>, the transaction-disposal attempt count stays 0 (the
+    /// step after the failure never runs) and no placeholder ever reaches the logger.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_ThrowingMessageTrackedStateCleanupFault_OriginalExceptionStillPropagatesByIdentity()
+    {
+        const string goalId = "goal-throwmsg-cleanup";
+        const string taskId = "task-throwmsg-cleanup";
+        var flushInterceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);   // SQLITE_BUSY at the flush
+        var reloadInterceptor = new CleanupReloadThrowingInterceptor(throwOnSelectOrdinal: 2);
+        var logger = new TestLogger<PipelineStore>();
+        var connection = new ThrowingMessageCleanupConnection(_connectionString);
+        _connections.Add(connection);
+        connection.Open();
+        var context = ContextOn(connection, new CompositeCommandInterceptor(flushInterceptor, reloadInterceptor));
+        var store = new PipelineStore(context, logger);
+
+        var ex = Record.Exception(() => store.SaveAdmissionWithPointer(CreatePipeline(goalId, taskId), taskId));
+
+        // THE ORIGINAL operation exception, BY IDENTITY, at chain depth one — never the cleanup's
+        // throwing-Message failure, never a wrapper level.
+        AssertSentinelPropagatedAtDepthOne(ex, flushInterceptor.Sentinel);
+        Assert.Equal(1, flushInterceptor.ThrowCount);
+        // The cleanup reload really ran AND really threw its throwing-Message exception.
+        Assert.True(reloadInterceptor.PipelinesSelectCount >= 2,
+            "the cleanup-time reload SELECT never ran");
+        Assert.Equal(1, reloadInterceptor.ThrowCount);
+        Assert.DoesNotContain(EnumerateChain(ex!), e => e is ThrowingMessageException);
+        // THE GUARDED DIAGNOSTIC RAN with the PLACEHOLDER (the unreadable message degraded, never
+        // escaped), and it carried the identifiers.
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning
+            && e.Message.Contains("admission-cleanup", StringComparison.Ordinal));
+        Assert.Contains(goalId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains(taskId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("<message getter threw: InvalidOperationException>", warning.Message, StringComparison.Ordinal);
+        // THE LATER CLEANUP STEPS STILL RAN: the guarded transaction disposal was attempted…
+        Assert.Equal(1, connection.TransactionDisposeAttemptCount);
+        // …and the tracked-state cleanup's earlier work held (the mapping entry was detached).
+        Assert.Empty(context.ChangeTracker.Entries<TaskMappingEntity>().ToList());
+        // The rollback made the aborted insert invisible.
+        Assert.Null(ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{taskId}'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (8b) The THROWING-MESSAGE cleanup faults — the recorded outcome is never masked
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE CONTEXT-DISPOSE FAULT WHOSE <c>Message</c> GETTER THROWS, on the RECORDED-RESULT path:
+    /// the factory-owned context disposal throws <see cref="ThrowingMessageException"/> and the
+    /// authoritative <see cref="AdmissionStoreResult.Committed"/> still comes back, with the durable
+    /// rows intact. The guards AROUND the failing step are proven to have run: the earlier
+    /// transaction disposal was ATTEMPTED and PRECEDED it (the shared order witness, so the claim is
+    /// reorder-sensitive), and no cleanup exception escapes the operation.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: revert the <c>admission-context-dispose</c> guard to the direct
+    /// <c>contextDisposeEx.Message</c> form and the getter's <see cref="InvalidOperationException"/>
+    /// escapes the <c>finally</c> — this call THROWS instead of returning Committed. Swap the (c)/(d)
+    /// blocks and the observed witness order reverses —
+    /// <c>["context-dispose", "transaction-dispose"]</c> instead of
+    /// <c>["transaction-dispose", "context-dispose"]</c> — failing the order assertion below.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_ThrowingMessageContextDisposeFault_CommittedStillReturned()
+    {
+        const string goalId = "goal-throwmsg-context";
+        const string taskId = "task-throwmsg-context";
+        // ONE witness shared by BOTH seams of the guarded (c) → (d) cleanup sequence.
+        var order = new CleanupOrderWitness();
+        var factory = new CleanupFaultContextFactory(
+            _connectionString, ContextOn, orderWitness: order);
+        AdmissionStoreResult result;
+        var disposerCalls = 0;
+        try
+        {
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+            store.ContextDisposerForTest = _ =>
+            {
+                // The context-dispose site (production step (d)) records into the SHARED witness
+                // BEFORE throwing, so the throwing seam still yields an ordered observation.
+                order.Record(CleanupOrderWitness.ContextDisposeSite);
+                disposerCalls++;
+                throw new ThrowingMessageException("the context dispose failure's Message getter throws");
+            };
+
+            result = store.SaveAdmissionWithPointer(CreatePipeline(goalId, taskId), taskId);
+        }
+        finally
+        {
+            factory.Dispose();
+        }
+
+        // THE RECORDED OUTCOME SURVIVES the failing cleanup step…
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        // …the disposal really fired (the guard swallowed a throwing-Message exception)…
+        Assert.Equal(1, disposerCalls);
+        // …and the EARLIER guarded transaction disposal was really attempted (its own cleanup ran).
+        Assert.Equal(1, factory.LatestTransactionDisposeAttemptCount);
+        // ── THE ORDER WITNESS: the earlier step really PRECEDED the failing last one ──────────
+        Assert.Equal(
+            [CleanupOrderWitness.TransactionDisposeSite, CleanupOrderWitness.ContextDisposeSite],
+            order.Sites);
+        Assert.Equal([1L, 2L], order.Sequences);
+        // …the durable admission is intact.
+        Assert.Equal(goalId, ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{taskId}'"));
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+    }
+
+    /// <summary>
+    /// THE CONTEXT-DISPOSE FAULT WHOSE <c>Message</c> GETTER THROWS on a REFUSAL path: a pre-seeded
+    /// mapping row makes the admission a <see cref="AdmissionStoreResult.PersistConflict"/>, which
+    /// must survive the failing cleanup step — never replaced by the getter's throw — and the
+    /// admission wrote nothing.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: revert the <c>admission-context-dispose</c> guard to the direct
+    /// <c>contextDisposeEx.Message</c> form and the throw escapes the <c>finally</c>; the conflict
+    /// result is never returned.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_ThrowingMessageContextDisposeFault_PersistConflictStillReturned()
+    {
+        const string goalId = "goal-throwmsg-conflict";
+        const string taskId = "task-throwmsg-conflict";
+        ExecuteOnKeeper($"INSERT INTO task_mappings (task_id, goal_id) VALUES ('{taskId}', 'goal-seed')");
+        var factory = new CleanupFaultContextFactory(_connectionString, ContextOn);
+        AdmissionStoreResult result;
+        var disposerCalls = 0;
+        try
+        {
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+            store.ContextDisposerForTest = _ =>
+            {
+                disposerCalls++;
+                throw new ThrowingMessageException("the context dispose failure's Message getter throws");
+            };
+
+            result = store.SaveAdmissionWithPointer(CreatePipeline(goalId, taskId), taskId);
+        }
+        finally
+        {
+            factory.Dispose();
+        }
+
+        // THE RECORDED REFUSAL SURVIVES the failing cleanup step…
+        Assert.Equal(AdmissionStoreResult.PersistConflict, result);
+        Assert.Equal(1, disposerCalls);
+        // …the earlier guarded transaction disposal was attempted…
+        Assert.Equal(1, factory.LatestTransactionDisposeAttemptCount);
+        // …and the refused admission wrote nothing: the seed is intact, no pipeline row exists.
+        Assert.Equal("goal-seed", ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{taskId}'"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper(
+            $"SELECT COUNT(*) FROM pipelines WHERE goal_id = '{goalId}'"));
+    }
+
+    /// <summary>
+    /// THE TRANSACTION-DISPOSE FAULT WHOSE <c>Message</c> GETTER THROWS, FOLLOWED BY the
+    /// context-dispose fault (also a throwing-Message exception): the guarded transaction disposal
+    /// fails, and the LATER cleanup step — the factory context's disposal — still RUNS and is itself
+    /// guarded. The recorded <see cref="AdmissionStoreResult.Committed"/> survives both, and the
+    /// durable admission landed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE ORDER IS ASSERTED, NOT JUST THE COUNTS. Both cleanup seams record into ONE shared
+    /// <see cref="CleanupOrderWitness"/> — the armed transaction double's <c>Dispose()</c> (production
+    /// step (c)) and the <see cref="PipelineStore.ContextDisposerForTest"/> context disposer
+    /// (production step (d)) — and the observed site sequence must be EXACTLY
+    /// <c>[transaction-dispose, context-dispose]</c> with sequence numbers 1 and 2. The per-site
+    /// counters alone are NOT reorder-sensitive (a (c)/(d) swap leaves both at 1); the shared
+    /// sequence is.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF, REORDER MUTANT — EXECUTED against production commit 9842541. Move the guarded
+    /// context-dispose block (d) ABOVE the guarded transaction-dispose block (c) in
+    /// <c>SaveAdmissionWithPointerCore</c> (a pure reorder of the two existing blocks, no other edit),
+    /// rebuild, and this vector FAILS on the order witness while BOTH attempt counts stay 1 and
+    /// <c>Committed</c> is still returned. The recorded failure signature was:
+    /// <c>Assert.Equal() Failure: Collections differ at index 0 / Expected: "transaction-dispose" /
+    /// Actual: "context-dispose"</c> at this vector's <c>order.Sites</c> assertion. That is exactly
+    /// the count-equality hole this vector used to have, now closed: the count assertions above still
+    /// pass under the mutant, and it is the ORDER assertion that kills it.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF, EXCEPTION-MESSAGE MUTANTS: revert the <c>admission-dispose</c> guard to the
+    /// direct <c>disposeEx.Message</c> form and the getter's throw escapes the <c>finally</c> BEFORE
+    /// the context disposal is reached: this call throws and the context's disposer count stays 0
+    /// (and the witness never records the (d) site). Revert <c>admission-context-dispose</c> instead
+    /// and the context getter's throw escapes, so the Committed result never returns — either mutant
+    /// fails this vector.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_ThrowingMessageTransactionDisposeFault_LaterContextCleanupStillRuns()
+    {
+        const string goalId = "goal-throwmsg-dispose-chain";
+        const string taskId = "task-throwmsg-dispose-chain";
+        // ONE witness shared by BOTH seams of the guarded (c) → (d) cleanup sequence.
+        var order = new CleanupOrderWitness();
+        var factory = new CleanupFaultContextFactory(
+            _connectionString, ContextOn, transactionDisposeFault: true, orderWitness: order);
+        AdmissionStoreResult result;
+        var disposerCalls = 0;
+        try
+        {
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+            store.ContextDisposerForTest = _ =>
+            {
+                // The context-dispose site (production step (d)) records INTO THE SHARED witness
+                // BEFORE throwing, so a throwing seam still yields an ordered observation.
+                order.Record(CleanupOrderWitness.ContextDisposeSite);
+                disposerCalls++;
+                throw new ThrowingMessageException("the context dispose failure's Message getter throws");
+            };
+
+            result = store.SaveAdmissionWithPointer(CreatePipeline(goalId, taskId), taskId);
+        }
+        finally
+        {
+            factory.Dispose();
+        }
+
+        // THE RECORDED OUTCOME SURVIVES the chain of throwing-Message cleanup faults.
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        // The armed transaction-dispose fault really fired (the guard swallowed it)…
+        Assert.Equal(1, factory.LatestTransactionDisposeAttemptCount);
+        // …and the FOLLOWING cleanup step ran as well, with its own fault swallowed too.
+        Assert.Equal(1, disposerCalls);
+
+        // ── THE ORDER WITNESS — the reorder-sensitive witness ──────────────────
+        // The EXACT observed site sequence: (c) transaction disposal, THEN (d) context disposal.
+        Assert.Equal(
+            [CleanupOrderWitness.TransactionDisposeSite, CleanupOrderWitness.ContextDisposeSite],
+            order.Sites);
+        // …with the CONTIGUOUS 1-based sequence numbers of that order.
+        Assert.Equal([1L, 2L], order.Sequences);
+        // …and the pairwise ordering probe: the transaction-disposal event strictly PRECEDES the
+        // context-disposal event. Each site must have been observed EXACTLY once (a missing or
+        // duplicated observation yields -1 and fails here rather than passing silently).
+        var transactionDisposeSeq = order.SequenceOf(CleanupOrderWitness.TransactionDisposeSite);
+        var contextDisposeSeq = order.SequenceOf(CleanupOrderWitness.ContextDisposeSite);
+        Assert.Equal(1L, transactionDisposeSeq);
+        Assert.Equal(2L, contextDisposeSeq);
+        Assert.True(transactionDisposeSeq < contextDisposeSeq,
+            $"the transaction disposal (seq {transactionDisposeSeq}) must precede the context " +
+            $"disposal (seq {contextDisposeSeq}); observed order: [{string.Join(", ", order.Sites)}]");
+
+        // The durable admission landed: the commit preceded the cleanup faults.
+        Assert.Equal(goalId, ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{taskId}'"));
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+    }
+
+    /// <summary>
+    /// THE ROLLBACK FAULT WHOSE <c>Message</c> GETTER THROWS, on the PROPAGATING-PRIMARY path: the
+    /// pipeline flush fails and the guarded rollback ALSO fails (with a throwing-Message exception).
+    /// The original operation exception still propagates BY IDENTITY — the rollback's getter throw
+    /// neither replaces nor wraps it — and the LATER guarded cleanup steps still run (the
+    /// transaction-disposal attempt counter, and the tracked-state detach leaving no stale entry).
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: revert the <c>admission-rollback</c> guard to the direct <c>rollbackEx.Message</c>
+    /// form and the getter's throw escapes the <c>finally</c>, replacing the propagating original —
+    /// the identity assertion below fails on the substituted exception (and the transaction-dispose
+    /// attempt counter stays 0, since the step after the failure never runs).
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_ThrowingMessageRollbackFault_OriginalExceptionStillPropagatesByIdentity()
+    {
+        const string goalId = "goal-throwmsg-rollback";
+        const string taskId = "task-throwmsg-rollback";
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);   // SQLITE_BUSY at the flush
+        var factory = new CleanupFaultContextFactory(
+            _connectionString, ContextOn, rollbackFault: true, interceptor: interceptor);
+        Exception? thrown;
+        try
+        {
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+
+            thrown = Record.Exception(() => store.SaveAdmissionWithPointer(CreatePipeline(goalId, taskId), taskId));
+        }
+        finally
+        {
+            factory.Dispose();
+        }
+
+        // THE ORIGINAL operation exception, BY IDENTITY, at chain depth one — never the rollback's
+        // throwing-Message failure, never a wrapper level.
+        AssertSentinelPropagatedAtDepthOne(thrown, interceptor.Sentinel);
+        Assert.Equal(1, interceptor.ThrowCount);
+        // The rollback's own exception appears NOWHERE in the propagated chain.
+        Assert.DoesNotContain(EnumerateChain(thrown!), e => e is ThrowingMessageException);
+        // The armed rollback really fired (and its own throwing-Message failure was swallowed)…
+        Assert.Equal(1, factory.LatestRollbackAttemptCount);
+        // …and the LATER guarded transaction cleanup still ran.
+        Assert.Equal(1, factory.LatestTransactionDisposeAttemptCount);
+        // The aborted mapping insert is invisible (the rollback really reached SQLite).
+        Assert.Null(ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{taskId}'"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper(
+            $"SELECT COUNT(*) FROM pipelines WHERE goal_id = '{goalId}'"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2016,6 +2355,365 @@ internal sealed class DisposeThrowingConnection : DbConnection
         public override void Prepare() => _inner.Prepare();
         protected override DbParameter CreateDbParameter() => _inner.CreateParameter();
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
+    }
+}
+
+/// <summary>
+/// THE SHARED ORDER WITNESS for the guarded cleanup sequence of
+/// <c>SaveAdmissionWithPointerCore</c>'s <c>finally</c>: ONE thread-safe, APPEND-ONLY log of
+/// (monotonic sequence number, site label) events written by BOTH cleanup seams under test — the
+/// transaction double's <c>Dispose()</c> (production step (c)) and the
+/// <see cref="PipelineStore.ContextDisposerForTest"/> context disposer (production step (d)).
+/// </summary>
+/// <remarks>
+/// <para>
+/// WHY IT EXISTS: per-site attempt counters prove that EACH step ran, but they can NOT prove the
+/// (c) → (d) ORDER — swapping the two guarded blocks in the production <c>finally</c> leaves every
+/// count at 1. The sequence number is assigned INSIDE one lock at the instant the seam is entered,
+/// so <see cref="Sites"/> is the genuinely OBSERVED order and an exact-sequence assertion on it is
+/// reorder-sensitive: the swapped mutant observes the reverse order and fails.
+/// </para>
+/// <para>
+/// THE WITNESS IS INERT FOR PRODUCTION: it is a test-only object the two seams are EXPLICITLY handed
+/// (a null-default on both), it holds no production reference, runs no production code, and its
+/// absence changes nothing about the store's behavior.
+/// </para>
+/// </remarks>
+internal sealed class CleanupOrderWitness
+{
+    /// <summary>The site label the transaction-disposal seam records (production step (c)).</summary>
+    public const string TransactionDisposeSite = "transaction-dispose";
+
+    /// <summary>The site label the context-disposal seam records (production step (d)).</summary>
+    public const string ContextDisposeSite = "context-dispose";
+
+    private readonly Lock _gate = new();
+    private readonly List<(long Seq, string Site)> _events = [];
+    private long _nextSeq;
+
+    /// <summary>Records one seam entry and returns its 1-based monotonic sequence number.</summary>
+    public long Record(string site)
+    {
+        lock (_gate)
+        {
+            var seq = ++_nextSeq;
+            _events.Add((seq, site));
+            return seq;
+        }
+    }
+
+    /// <summary>The observed sites IN ORDER — a snapshot copy, safe to read after the call returned.</summary>
+    public IReadOnlyList<string> Sites
+    {
+        get
+        {
+            lock (_gate)
+                return _events.Select(e => e.Site).ToList();
+        }
+    }
+
+    /// <summary>The observed, CONTIGUOUS 1-based sequence numbers IN ORDER.</summary>
+    public IReadOnlyList<long> Sequences
+    {
+        get
+        {
+            lock (_gate)
+                return _events.Select(e => e.Seq).ToList();
+        }
+    }
+
+    /// <summary>
+    /// The sequence number of the SINGLE observation of <paramref name="site"/>, or <c>-1</c> when
+    /// the site was never observed or was observed more than once — so the order probes below cannot
+    /// silently pass on a duplicated or missing event.
+    /// </summary>
+    public long SequenceOf(string site)
+    {
+        lock (_gate)
+        {
+            var observed = _events.Where(e => e.Site == site).ToList();
+            return observed.Count == 1 ? observed[0].Seq : -1;
+        }
+    }
+}
+
+/// <summary>
+/// THE THROWING-MESSAGE CLEANUP FAULTS: the shared forwarding connection whose transaction can be
+/// armed to fail at <c>Rollback()</c> and/or at the transaction's <c>Dispose()</c> with a DISTINCT
+/// pre-created <see cref="ThrowingMessageException"/> — an exception whose
+/// <see cref="Exception.Message"/> GETTER itself throws.
+/// </summary>
+internal sealed class ThrowingMessageCleanupConnection : AdmissionTransactionConnectionBase
+{
+    private readonly bool _rollbackFault;
+    private readonly bool _transactionDisposeFault;
+    private int _rollbackAttemptCount;
+    private int _transactionDisposeAttemptCount;
+
+    public ThrowingMessageCleanupConnection(
+        string connectionString,
+        bool rollbackFault = false,
+        bool transactionDisposeFault = false,
+        CleanupOrderWitness? orderWitness = null)
+        : base(connectionString)
+    {
+        _rollbackFault = rollbackFault;
+        _transactionDisposeFault = transactionDisposeFault;
+        OrderWitness = orderWitness;
+    }
+
+    /// <summary>
+    /// THE SHARED ORDER WITNESS this connection's transaction-disposal seam records into (production
+    /// step (c)) — the same instance the test also hands to
+    /// <see cref="PipelineStore.ContextDisposerForTest"/>, so the two events land in ONE ordered log.
+    /// <c>null</c> (the default) makes the seam record nothing: the witness is purely additive.
+    /// </summary>
+    public CleanupOrderWitness? OrderWitness { get; }
+
+    /// <summary>The DISTINCT exception the armed rollback fault throws (its <c>Message</c> getter throws).</summary>
+    public ThrowingMessageException RollbackSentinel { get; } =
+        new("the armed rollback failure's Message getter throws");
+
+    /// <summary>The DISTINCT exception the armed transaction-dispose fault throws.</summary>
+    public ThrowingMessageException TransactionDisposeSentinel { get; } =
+        new("the armed transaction dispose failure's Message getter throws");
+
+    /// <summary>How many times the guarded rollback was attempted (the armed fault or a real one).</summary>
+    public int RollbackAttemptCount => Volatile.Read(ref _rollbackAttemptCount);
+
+    /// <summary>
+    /// How many times the guarded transaction disposal was ATTEMPTED — the "the later cleanup step
+    /// still ran" probe. The count alone is NOT reorder-sensitive; the shared
+    /// <see cref="OrderWitness"/> sequence is what pins the (c) → (d) order.
+    /// </summary>
+    public int TransactionDisposeAttemptCount => Volatile.Read(ref _transactionDisposeAttemptCount);
+
+    protected override DbTransaction WrapTransaction(SqliteTransaction transaction) =>
+        new FaultTransaction(this, transaction);
+
+    /// <summary>Records the rollback attempt and returns the armed fault (or <c>null</c> for a real rollback).</summary>
+    private ThrowingMessageException? RecordRollbackAttempt()
+    {
+        Interlocked.Increment(ref _rollbackAttemptCount);
+        return _rollbackFault ? RollbackSentinel : null;
+    }
+
+    /// <summary>
+    /// RECORDS THE DISPOSAL EVENT: the attempt counter is incremented AND — when a witness is
+    /// installed — the (c) site is appended to the SHARED sequence BEFORE the armed fault is thrown,
+    /// so a throwing seam still yields an ordered observation. Returns the armed fault, or
+    /// <c>null</c> for an unarmed (real) disposal.
+    /// </summary>
+    private ThrowingMessageException? RecordTransactionDisposeAttempt()
+    {
+        Interlocked.Increment(ref _transactionDisposeAttemptCount);
+        OrderWitness?.Record(CleanupOrderWitness.TransactionDisposeSite);
+        return _transactionDisposeFault ? TransactionDisposeSentinel : null;
+    }
+
+    private sealed class FaultTransaction : DbTransaction
+    {
+        private readonly ThrowingMessageCleanupConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public FaultTransaction(ThrowingMessageCleanupConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection DbConnection => _owner;
+
+        public override void Commit() => _inner.Commit();
+
+        public override void Rollback()
+        {
+            if (_owner.RecordRollbackAttempt() is { } armed)
+                throw armed;
+
+            _inner.Rollback();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (!disposing)
+                return;
+
+            // The UNDERLYING transaction is always released (no leak); the attempt is recorded
+            // BEFORE the armed failure so the count proves the step ran.
+            _inner.Dispose();
+            if (_owner.RecordTransactionDisposeAttempt() is { } armed)
+                throw armed;
+        }
+    }
+}
+
+/// <summary>
+/// Forwards every interception to a list of inner command interceptors IN ORDER, so one context can
+/// carry several injected faults at once (e.g. a write-flush failure AND a cleanup-reload failure) —
+/// the composite is a pure forwarder: no policy of its own.
+/// </summary>
+internal sealed class CompositeCommandInterceptor : DbCommandInterceptor
+{
+    private readonly DbCommandInterceptor[] _inner;
+
+    public CompositeCommandInterceptor(params DbCommandInterceptor[] inner) => _inner = inner;
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        foreach (var interceptor in _inner)
+            result = interceptor.NonQueryExecuting(command, eventData, result);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        foreach (var interceptor in _inner)
+            result = interceptor.ReaderExecuting(command, eventData, result);
+        return result;
+    }
+}
+
+/// <summary>
+/// Throws a <see cref="ThrowingMessageException"/> (whose <c>Message</c> getter ITSELF throws) from
+/// the Nth <c>SELECT … FROM "pipelines"</c> read — the genuine mechanism for the
+/// <c>admission-cleanup</c> vector: the guarded tracked-state cleanup's own reload SELECT is real
+/// production work, and its failure is a real exception carrying an unreadable message.
+/// </summary>
+/// <remarks>
+/// <see cref="PipelinesSelectCount"/> counts every observed pipelines SELECT, so the test can pin the
+/// ordinal semantics (the earlier <c>UpsertPipelineCore</c> lookup is select #1, the cleanup reload is
+/// select #2) and distinguish "the reload really ran" from "the interceptor never fired".
+/// </remarks>
+internal sealed class CleanupReloadThrowingInterceptor : DbCommandInterceptor
+{
+    private readonly int _throwOnSelectOrdinal;
+    private int _pipelinesSelectCount;
+    private int _throwCount;
+
+    public CleanupReloadThrowingInterceptor(int throwOnSelectOrdinal = 2) =>
+        _throwOnSelectOrdinal = throwOnSelectOrdinal;
+
+    /// <summary>The DISTINCT exception the cleanup reload throws (its <c>Message</c> getter throws).</summary>
+    public ThrowingMessageException Sentinel { get; } =
+        new("the tracked-state cleanup reload's Message getter throws");
+
+    /// <summary>How many pipelines SELECTs were observed.</summary>
+    public int PipelinesSelectCount => Volatile.Read(ref _pipelinesSelectCount);
+
+    /// <summary>How many times the sentinel was thrown (the reload really failed, exactly once).</summary>
+    public int ThrowCount => Volatile.Read(ref _throwCount);
+
+    private void ThrowOnTargetedSelect(DbCommand command)
+    {
+        var text = command.CommandText;
+        if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
+            return;
+        if (!text.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var ordinal = Interlocked.Increment(ref _pipelinesSelectCount);
+        if (ordinal != _throwOnSelectOrdinal)
+            return;
+
+        Interlocked.Increment(ref _throwCount);
+        throw Sentinel;
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        ThrowOnTargetedSelect(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowOnTargetedSelect(command);
+        return ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
+/// A factory handing out contexts on connection wrappers whose transactions can carry the armed
+/// <see cref="ThrowingMessageCleanupConnection"/> faults — the <c>ownsContext == true</c> route, so
+/// the guarded transaction/context cleanup steps are exercised for real. The wrapper OWNS its inner
+/// connection (disposed with the wrapper), so no handle survives the test and the later raw readback
+/// is a genuine fresh open. The per-wrapper <see cref="LatestRollbackAttemptCount"/> /
+/// <see cref="LatestTransactionDisposeAttemptCount"/> counters prove each guarded step RAN; the
+/// OPTIONAL shared <see cref="OrderWitness"/> additionally receives the transaction-disposal event,
+/// so a test can assert the (c) → (d) ORDER against the context-disposal event recorded into the
+/// same witness.
+/// </summary>
+internal sealed class CleanupFaultContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+{
+    private readonly string _connectionString;
+    private readonly Func<DbConnection, IInterceptor?, CopilotHiveDbContext> _contextOn;
+    private readonly bool _rollbackFault;
+    private readonly bool _transactionDisposeFault;
+    private readonly IInterceptor? _interceptor;
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+    private readonly List<ThrowingMessageCleanupConnection> _wrappers = [];
+
+    public CleanupFaultContextFactory(
+        string connectionString,
+        Func<DbConnection, IInterceptor?, CopilotHiveDbContext> contextOn,
+        bool rollbackFault = false,
+        bool transactionDisposeFault = false,
+        IInterceptor? interceptor = null,
+        CleanupOrderWitness? orderWitness = null)
+    {
+        _connectionString = connectionString;
+        _contextOn = contextOn;
+        _rollbackFault = rollbackFault;
+        _transactionDisposeFault = transactionDisposeFault;
+        _interceptor = interceptor;
+        OrderWitness = orderWitness;
+    }
+
+    /// <summary>
+    /// The shared order witness every created wrapper records its transaction-disposal event into —
+    /// the SAME instance the test installs on <see cref="PipelineStore.ContextDisposerForTest"/>, so
+    /// both cleanup steps land in ONE ordered log. <c>null</c> (the default) records nothing.
+    /// </summary>
+    public CleanupOrderWitness? OrderWitness { get; }
+
+    /// <summary>The most recent wrapper's guarded-rollback attempt count (0 until a context exists).</summary>
+    public int LatestRollbackAttemptCount =>
+        _wrappers.Count == 0 ? 0 : _wrappers[^1].RollbackAttemptCount;
+
+    /// <summary>The most recent wrapper's guarded transaction-disposal attempt count.</summary>
+    public int LatestTransactionDisposeAttemptCount =>
+        _wrappers.Count == 0 ? 0 : _wrappers[^1].TransactionDisposeAttemptCount;
+
+    public CopilotHiveDbContext CreateDbContext()
+    {
+        var wrapper = new ThrowingMessageCleanupConnection(
+            _connectionString, _rollbackFault, _transactionDisposeFault, OrderWitness);
+        wrapper.Open();
+        _wrappers.Add(wrapper);
+
+        // The context is created on the WRAPPER: its transactions are the armed fault ones.
+        var context = _contextOn(wrapper, _interceptor);
+        _contexts.Add(context);
+        return context;
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var wrapper in _wrappers)
+            wrapper.Dispose();
     }
 }
 

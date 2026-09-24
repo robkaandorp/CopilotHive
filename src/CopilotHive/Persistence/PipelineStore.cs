@@ -1203,9 +1203,9 @@ public sealed class PipelineStore : IAsyncDisposable
                 }
                 catch (Exception rollbackEx)
                 {
-                    BestEffortWarning(
+                    SafeCleanupWarning(
                         "WorkSlotIntegrity: admission-rollback goal={GoalId} task={TaskId} — the rollback step failed (unconfirmed; the detach-only cleanup will be used): {Message}",
-                        pipeline.GoalId, taskId, rollbackEx.Message);
+                        pipeline.GoalId, taskId, rollbackEx);
                 }
             }
 
@@ -1240,9 +1240,9 @@ public sealed class PipelineStore : IAsyncDisposable
             }
             catch (Exception cleanupEx)
             {
-                BestEffortWarning(
+                SafeCleanupWarning(
                     "WorkSlotIntegrity: admission-cleanup goal={GoalId} task={TaskId} — the tracked-state cleanup failed: {Message}",
-                    pipeline.GoalId, taskId, cleanupEx.Message);
+                    pipeline.GoalId, taskId, cleanupEx);
             }
 
             // (c) Guarded transaction disposal — EVERY path INCLUDING THE SUCCESS PATH (a
@@ -1257,9 +1257,9 @@ public sealed class PipelineStore : IAsyncDisposable
             }
             catch (Exception disposeEx)
             {
-                BestEffortWarning(
+                SafeCleanupWarning(
                     "WorkSlotIntegrity: admission-dispose goal={GoalId} task={TaskId} — the transaction dispose failed: {Message}",
-                    pipeline.GoalId, taskId, disposeEx.Message);
+                    pipeline.GoalId, taskId, disposeEx);
             }
 
             // (d) Factory-owned context disposal — the caller-owned direct context is NEVER
@@ -1274,9 +1274,9 @@ public sealed class PipelineStore : IAsyncDisposable
                 }
                 catch (Exception contextDisposeEx)
                 {
-                    BestEffortWarning(
+                    SafeCleanupWarning(
                         "WorkSlotIntegrity: admission-context-dispose goal={GoalId} task={TaskId} — the context dispose failed: {Message}",
-                        pipeline.GoalId, taskId, contextDisposeEx.Message);
+                        pipeline.GoalId, taskId, contextDisposeEx);
                 }
             }
         }

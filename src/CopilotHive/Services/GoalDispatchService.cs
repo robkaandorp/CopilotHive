@@ -282,8 +282,22 @@ internal sealed class GoalDispatchService
 
         iterationPlan = planResult.Plan!;
 
-        pipeline.SetPlan(iterationPlan);
-        pipeline.StateMachine.StartIteration(iterationPlan.Phases);
+        // The plan INSTALLATION is the second half of the plan contract: the state machine
+        // rejects an empty plan, a plan that does not start with Coding/DocWriting and a plan
+        // that does not end with Merging. The pipeline is half-started at this point, so a
+        // throw would strand the goal — the rejection fails the goal explicitly instead.
+        try
+        {
+            pipeline.SetPlan(iterationPlan);
+            pipeline.StateMachine.StartIteration(iterationPlan.Phases);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Plan for goal '{GoalId}' was rejected on installation", goal.Id);
+            await FailNewGoalAsync(goal, pipeline, $"Plan rejected: {ex.Message}");
+            return;
+        }
+
         var firstPhase = iterationPlan.Phases[0];
         pipeline.AdvanceTo(firstPhase);
 

@@ -947,6 +947,98 @@ public sealed class ResumeRestartGateTests
         Assert.Empty(gateway.SentTasks);
     }
 
+    // ── The installation-time plan rejection ─────────────────────────────────
+
+    /// <summary>
+    /// THE INSTALLATION-TIME REJECTION (variant B, branchless): the branchless resume has NO
+    /// Coding-first check, so the plan reaches INSTALLATION. A DocWriting-first plan is accepted
+    /// by that first-phase check but REJECTED by the state machine because it does not end with
+    /// Merging — the resume must fail the goal cleanly instead of letting the ArgumentException
+    /// escape and strand the goal with no pipeline dispatch.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: unwrap the <c>SetPlan</c>/<c>StartIteration</c> pair and
+    /// <see cref="GoalDispatcher.ResumeGoalAsync"/> throws out of the resume: the goal keeps its
+    /// InProgress status, no Failed status update is recorded and this vector fails on the
+    /// propagated exception instead of the assertions below.
+    /// </remarks>
+    [Fact]
+    public async Task VariantB_PlanRejectedByStartIteration_FailsGoalWithResumePlanRejectedReason()
+    {
+        const string goalId = "gate-install-reject-b";
+        var store = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Exceeded max iterations");
+        store.AddGoal(goal);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = FailedPipeline(manager, goal, coderBranch: null);
+
+        var gateway = new CapturingWorkerGateway();
+        var brain = new GateFakeBrain
+        {
+            // DocWriting-first is ACCEPTED by the state machine's first-phase rule, so ONLY the
+            // missing-Merging rule of StartIteration can reject it.
+            Plan = new IterationPlan { Phases = [GoalPhase.DocWriting, GoalPhase.Review], Reason = "no merging" },
+        };
+        var dispatcher = CreateDispatcher(store, manager, brain: brain, workerGateway: gateway);
+
+        var resumed = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.True(resumed);
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Equal(GoalPhase.Failed, pipeline.StateMachine.Phase);
+        var failure = Assert.Single(store.StatusUpdates, u => u.Status == GoalStatus.Failed);
+        Assert.StartsWith("Resume plan rejected:", failure.Reason);
+        Assert.Contains("must end with Merging", failure.Reason, StringComparison.Ordinal);
+        Assert.Equal(failure.Reason, goal.FailureReason);
+        // The rejection preceded any dispatch: no worker ever saw a task.
+        Assert.Empty(gateway.SentTasks);
+    }
+
+    /// <summary>
+    /// THE INSTALLATION-TIME REJECTION (variant A): a Coding-first plan PASSES the variant-A
+    /// shape check and is rejected only at installation because it does not end with Merging —
+    /// the exact gap between the two checks.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: without the installation guard the ArgumentException escapes
+    /// <see cref="GoalDispatcher.ResumeGoalAsync"/> — no Failed status update is recorded and this
+    /// vector fails on the propagated exception.
+    /// </remarks>
+    [Fact]
+    public async Task VariantA_CodingFirstPlanNotEndingWithMerging_FailsGoalWithResumePlanRejectedReason()
+    {
+        const string goalId = "gate-install-reject-a";
+        var store = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Review rejected the changes");
+        store.AddGoal(goal);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = FailedPipeline(manager, goal, $"copilothive/{goalId}");
+
+        var gateway = new CapturingWorkerGateway();
+        var brain = new GateFakeBrain
+        {
+            // Coding-first, so the variant-A shape check passes; it is the Merging rule that the
+            // state machine enforces at installation.
+            Plan = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing], Reason = "truncated plan" },
+        };
+        var dispatcher = CreateDispatcher(store, manager, brain: brain, workerGateway: gateway);
+        dispatcher.BranchListerForTest = (repo, ct) => Task.FromResult(new List<string> { $"copilothive/{goalId}" });
+
+        var resumed = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.True(resumed);
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var failure = Assert.Single(store.StatusUpdates, u => u.Status == GoalStatus.Failed);
+        Assert.StartsWith("Resume plan rejected:", failure.Reason);
+        Assert.Contains("must end with Merging", failure.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain(store.StatusUpdates, u => u.Reason == "Resume plan must start with Coding");
+        Assert.Empty(gateway.SentTasks);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static string Snapshot(Goal goal, GoalPipeline pipeline) =>
