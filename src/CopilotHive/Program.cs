@@ -180,6 +180,12 @@ public sealed class Program
     /// The lookup lambda defers to the provider at INVOKE time — the service resolves the token
     /// per discovery call, so OAuth rotation/removal between calls is always observed. No token
     /// is captured at registration or singleton construction.
+    /// <para>
+    /// The optional <see cref="CopilotEndpointResolver"/> is resolved from the container as a
+    /// SEAM: production registers none, so <c>GetService</c> returns null and the service falls
+    /// back to the provider SDK's own per-account endpoint discovery — unchanged behaviour.
+    /// Like the token lookup it is passed as a delegate, never invoked at registration.
+    /// </para>
     /// </remarks>
     /// <param name="services">The service collection to register into.</param>
     internal static void AddModelDiscovery(IServiceCollection services)
@@ -187,7 +193,8 @@ public sealed class Program
         services.AddSingleton(sp => new ModelDiscoveryService(
             sp.GetRequiredService<ILogger<ModelDiscoveryService>>(),
             sp.GetService<IHttpClientFactory>(),
-            ct => sp.GetRequiredService<UserService>().GetActiveAccessTokenAsync(ct)));
+            ct => sp.GetRequiredService<UserService>().GetActiveAccessTokenAsync(ct),
+            sp.GetService<CopilotEndpointResolver>()));
     }
 
     private static async Task<int> Main(string[] args)

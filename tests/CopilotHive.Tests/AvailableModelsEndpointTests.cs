@@ -1106,6 +1106,13 @@ internal sealed class CustomEndpointFactory : WebApplicationFactory<Program>
             services.AddSingleton(_config);
             services.AddSingleton<ConfigRepoManager>(_repo);
             services.AddSingleton<ConfigModelService>();
+            // Endpoint-resolution stub: the DI-constructed discovery service below resolves this
+            // delegate instead of the provider's real per-account lookup, so no test performs
+            // network I/O for endpoint resolution. It answers with the provider default (trailing
+            // slash, so "models" resolves to https://api.githubcopilot.com/models), leaving every
+            // request this suite observes unchanged.
+            services.AddSingleton<CopilotEndpointResolver>(
+                (token, ct) => Task.FromResult(new Uri("https://api.githubcopilot.com/")));
             services.AddSingleton<ModelDiscoveryService>();
         });
     }

@@ -1,4 +1,5 @@
 using System.Net;
+using System.Reflection;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using Microsoft.Data.Sqlite;
@@ -41,12 +42,24 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Environment.SetEnvironmentVariable("OLLAMA_URL", _origOllamaUrl);
     }
 
+    /// <summary>
+    /// Stub per-account endpoint resolver passed to EVERY service created in this suite: it
+    /// answers with the provider's default endpoint and performs NO network I/O, so the real
+    /// per-account lookup is never reached from a test. The returned base mirrors
+    /// <c>ChatClientFactory.DefaultCopilotApiEndpoint</c> (trailing slash), so <c>models</c>
+    /// resolves to <c>https://api.githubcopilot.com/models</c> exactly as before.
+    /// </summary>
+    private static Task<Uri> StubCopilotEndpointResolver(string token, CancellationToken ct)
+        => Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+
     private static ModelDiscoveryService CreateService(HttpMessageHandler handler)
     {
         var factory = new Mock<IHttpClientFactory>();
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
-        return new ModelDiscoveryService(NullLogger<ModelDiscoveryService>.Instance, factory.Object);
+        return new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, factory.Object,
+            resolveCopilotEndpointAsync: StubCopilotEndpointResolver);
     }
 
     private static ModelDiscoveryService CreateService(
@@ -57,7 +70,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
         return new ModelDiscoveryService(
-            NullLogger<ModelDiscoveryService>.Instance, factory.Object, storedTokenLookup);
+            NullLogger<ModelDiscoveryService>.Instance, factory.Object, storedTokenLookup,
+            StubCopilotEndpointResolver);
     }
 
     private static ModelDiscoveryService CreateService(
@@ -68,7 +82,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         var factory = new Mock<IHttpClientFactory>();
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
-        return new ModelDiscoveryService(logger, factory.Object, storedTokenLookup);
+        return new ModelDiscoveryService(
+            logger, factory.Object, storedTokenLookup, StubCopilotEndpointResolver);
     }
 
     /// <summary>Body describing a single Copilot model for discovery tests.</summary>
@@ -703,16 +718,434 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal(0, requests);
     }
 
+    // ── Per-account Copilot endpoint resolver ────────────────────────────────
+
+    /// <summary>
+    /// Creates a service with an EXPLICIT recording resolver: every invocation records the
+    /// credential it was handed and answers with <paramref name="endpointBase"/>, so the
+    /// "/models request goes to the resolved host" contract is observed without any network I/O.
+    /// </summary>
+    private static (ModelDiscoveryService Service, List<(string? Token, Uri Base)> Calls)
+        CreateServiceWithRecordingResolver(
+            HttpMessageHandler handler,
+            Func<CancellationToken, Task<string?>>? storedTokenLookup,
+            Uri endpointBase,
+            ILogger<ModelDiscoveryService>? logger = null)
+    {
+        var calls = new List<(string? Token, Uri Base)>();
+        CopilotEndpointResolver resolver = (token, _) =>
+        {
+            calls.Add((token, endpointBase));
+            return Task.FromResult(endpointBase);
+        };
+        var factory = new Mock<IHttpClientFactory>();
+        factory.Setup(f => f.CreateClient(It.IsAny<string>()))
+               .Returns(() => new HttpClient(handler, disposeHandler: false));
+        var service = new ModelDiscoveryService(
+            logger ?? NullLogger<ModelDiscoveryService>.Instance,
+            factory.Object, storedTokenLookup, resolver);
+        return (service, calls);
+    }
+
     [Fact]
-    public async Task DiscoverCopilotModelsAsync_CancellationDuringHttp_ThrowsOperationCanceled()
+    public async Task DiscoverCopilotModelsAsync_SendsModelsRequestToResolvedEndpointHost()
+    {
+        const string ResolvedBase = "https://api.business.githubcopilot.com/";
+        const string ExpectedRequestUri = "https://api.business.githubcopilot.com/models";
+
+        HttpRequestMessage? captured = null;
+        var (svc, calls) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, req => captured = req),
+            storedTokenLookup: _ => Task.FromResult<string?>(null),
+            endpointBase: new Uri(ResolvedBase));
+
+        Environment.SetEnvironmentVariable("GH_TOKEN", "business-account-token");
+
+        var models = await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        // The /models catalogue is served by the per-account endpoint: the request host must be
+        // the RESOLVED host, never the fixed api.githubcopilot.com default.
+        Assert.NotNull(captured);
+        Assert.Equal(ExpectedRequestUri, captured!.RequestUri?.ToString());
+        Assert.Single(calls);
+        Assert.Equal("business-account-token", calls[0].Token);
+        Assert.Equal(new Uri(ResolvedBase), calls[0].Base);
+
+        // Parsing on the resolved host is unchanged: the model body is read exactly as before.
+        Assert.Single(models);
+        Assert.Equal("copilot/claude", models[0].Id);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolvesPathAgainstTrailingSlashBase()
+    {
+        HttpRequestMessage? captured = null;
+        var (svc, _) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, req => captured = req),
+            storedTokenLookup: _ => Task.FromResult<string?>(null),
+            endpointBase: new Uri("https://api.business.githubcopilot.com/"));
+
+        Environment.SetEnvironmentVariable("GITHUB_TOKEN", "tenant-token");
+
+        var models = await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.NotNull(captured);
+        // "models" resolved against the base — one path segment, no double slash.
+        Assert.Equal("https://api.business.githubcopilot.com/models", captured!.RequestUri?.ToString());
+        Assert.Single(models);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolvedEndpointKeepsAllExistingHeaders()
+    {
+        HttpRequestMessage? captured = null;
+        var (svc, _) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, req => captured = req),
+            storedTokenLookup: _ => Task.FromResult<string?>("stored-oauth-token"),
+            endpointBase: new Uri("https://api.business.githubcopilot.com/"));
+
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.NotNull(captured);
+        Assert.Equal("https://api.business.githubcopilot.com/models", captured!.RequestUri?.ToString());
+        // ALL existing headers ride along unchanged on the per-account request.
+        Assert.Equal("Bearer", captured.Headers.Authorization?.Scheme);
+        Assert.Equal("stored-oauth-token", captured.Headers.Authorization?.Parameter);
+        Assert.True(captured.Headers.TryGetValues("X-GitHub-Api-Version", out var versions));
+        Assert.Contains("2025-04-01", versions!);
+        AssertCopilotIntegrationHeader(captured);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolverReceivesStoredOAuthToken()
+    {
+        const string Stored = "stored-oauth-SENTINEL-e1a2b3";
+        var (svc, calls) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody),
+            storedTokenLookup: _ => Task.FromResult<string?>(Stored),
+            endpointBase: new Uri("https://api.githubcopilot.com/"));
+
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        // The resolver must receive EXACTLY the SELECTED credential — the stored OAuth token.
+        Assert.Single(calls);
+        Assert.Equal(Stored, calls[0].Token);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolverReceivesGhToken()
+    {
+        const string EnvToken = "gh-env-SENTINEL-d4c5b6";
+        Environment.SetEnvironmentVariable("GH_TOKEN", EnvToken);
+        var (svc, calls) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody),
+            storedTokenLookup: _ => Task.FromResult<string?>(null),
+            endpointBase: new Uri("https://api.githubcopilot.com/"));
+
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(calls);
+        Assert.Equal(EnvToken, calls[0].Token);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolverReceivesGithubToken()
+    {
+        const string EnvToken = "github-env-SENTINEL-7e8f9a";
+        Environment.SetEnvironmentVariable("GITHUB_TOKEN", EnvToken);
+        var (svc, calls) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody),
+            storedTokenLookup: _ => Task.FromResult<string?>(null),
+            endpointBase: new Uri("https://api.githubcopilot.com/"));
+
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(calls);
+        Assert.Equal(EnvToken, calls[0].Token);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolverReceivesSelectedTokenForEachChainPosition()
+    {
+        // One test per credential-chain position is authoritative; this aggregate pins the
+        // END-TO-END chain contract: three sequential calls on ONE service instance, each
+        // rotating the selected credential (stored → GH_TOKEN → GITHUB_TOKEN), each resolving
+        // the endpoint for exactly the credential selected for THAT call.
+        const string Stored = "chain-stored-SENTINEL-aa11";
+        const string Gh = "chain-gh-SENTINEL-bb22";
+        const string Github = "chain-github-SENTINEL-cc33";
+
+        Environment.SetEnvironmentVariable("GH_TOKEN", Gh);
+        Environment.SetEnvironmentVariable("GITHUB_TOKEN", Github);
+
+        // The stored-token lookup answers through a MUTABLE holder so the credential chain can
+        // be rotated between calls on the same service instance (mirrors stored-token rotation).
+        string? stored = Stored;
+        HttpRequestMessage? captured = null;
+        var resolverCalls = new List<string?>();
+        var svc = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, CreateFactory(
+                new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody,
+                    req => captured = req)).Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>(stored),
+            resolveCopilotEndpointAsync: (token, _) =>
+            {
+                resolverCalls.Add(token);
+                return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+            });
+
+        // Call 1: stored OAuth wins.
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(Stored, captured!.Headers.Authorization?.Parameter);
+
+        // Rotate to the GH_TOKEN position: the stored lookup now answers null.
+        stored = null;
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(Gh, captured.Headers.Authorization?.Parameter);
+
+        // Rotate to the GITHUB_TOKEN position.
+        Environment.SetEnvironmentVariable("GH_TOKEN", null);
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(Github, captured.Headers.Authorization?.Parameter);
+
+        var recordedTokens = resolverCalls.Select(t => t ?? string.Empty).ToArray();
+        Assert.Equal(3, recordedTokens.Length);
+        Assert.Equal(new[] { Stored, Gh, Github }, recordedTokens);
+    }
+
+    // ── No-token short-circuit must precede endpoint resolution ─────────────
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_NoToken_ResolverNeverInvoked()
+    {
+        // No stored token, no GH_TOKEN, no GITHUB_TOKEN (cleared by the fixture ctor).
+        var handlerRequests = 0;
+        var logger = new TestLogger<ModelDiscoveryService>();
+        var (svc, calls) = CreateServiceWithRecordingResolver(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, _ => handlerRequests++),
+            storedTokenLookup: _ => Task.FromResult<string?>(null),
+            endpointBase: new Uri("https://api.githubcopilot.com/"),
+            logger: logger);
+
+        var models = await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        // The no-token short-circuit precedes endpoint resolution: the resolver must NEVER run.
+        Assert.Empty(calls);
+        Assert.Equal(0, handlerRequests);
+        Assert.Empty(models);
+        // ...and the documented warning identifies the no-token short-circuit.
+        var warning = Assert.Single(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Warning
+                 && e.Message ==
+                 "No stored GitHub OAuth token, GH_TOKEN or GITHUB_TOKEN set — skipping Copilot model discovery.");
+        Assert.Null(warning.Exception);
+    }
+
+    // ── Cancellation rules at the endpoint-resolution seam ───────────────────
+
+    /// <summary>
+    /// A shared IHttpClientFactory stub over a fixed handler, matching the pattern of the
+    /// CreateService helpers above but usable when a custom resolver is injected directly.
+    /// </summary>
+    private static Mock<IHttpClientFactory> CreateFactory(HttpMessageHandler handler)
+    {
+        var factory = new Mock<IHttpClientFactory>();
+        factory.Setup(f => f.CreateClient(It.IsAny<string>()))
+               .Returns(() => new HttpClient(handler, disposeHandler: false));
+        return factory;
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_ResolverCancelsCallerToken_PropagatesWithoutModelsRequest()
     {
         using var cts = new CancellationTokenSource();
-        var svc = CreateService(
-            new CancellingHttpMessageHandler(() => cts.Cancel()),
-            storedTokenLookup: _ => Task.FromResult<string?>("stored-oauth-token"));
+        var requests = 0;
+        CopilotEndpointResolver resolver = (_, ct) =>
+        {
+            cts.Cancel();
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        };
+        var svc = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, CreateFactory(
+                new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, _ => requests++)).Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>("stored-oauth-token"),
+            resolveCopilotEndpointAsync: resolver);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => svc.DiscoverCopilotModelsAsync(cts.Token));
+
+        // Rule (a): the cancellation raised BY the resolver terminates the caller and the
+        // /models request is never sent.
+        Assert.Equal(0, requests);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_CancelledAfterResolverReturns_ThrowsBeforeModelsRequest()
+    {
+        using var cts = new CancellationTokenSource();
+        var requests = 0;
+        var resolverInvocations = 0;
+        CopilotEndpointResolver resolver = (_, _) =>
+        {
+            resolverInvocations++;
+            cts.Cancel(); // cancellation arrives while the resolver runs
+            return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        };
+        var svc = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, CreateFactory(
+                new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, _ => requests++)).Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>("stored-oauth-token"),
+            resolveCopilotEndpointAsync: resolver);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => svc.DiscoverCopilotModelsAsync(cts.Token));
+
+        // Rule (b): even though the resolver returned a valid endpoint, the cancellation it
+        // observed must terminate the caller BEFORE the /models request is sent.
+        Assert.Equal(1, resolverInvocations);
+        Assert.Equal(0, requests);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_NonCancellationResolverErrorWhileCancelled_ThrowsOperationCanceled()
+    {
+        using var cts = new CancellationTokenSource();
+        var requests = 0;
+        CopilotEndpointResolver resolver = (_, _) =>
+        {
+            cts.Cancel();
+            throw new InvalidOperationException("resolver failed after cancellation");
+        };
+        var svc = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, CreateFactory(
+                new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, _ => requests++)).Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>("stored-oauth-token"),
+            resolveCopilotEndpointAsync: resolver);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => svc.DiscoverCopilotModelsAsync(cts.Token));
+
+        // Rule (c): classification uses the CALLER'S cancellation state at the catch point,
+        // not the exception type — a non-cancellation resolver exception with an already-
+        // cancelled caller is still a cancellation, NOT a "discovery failed" empty list.
+        Assert.IsType<OperationCanceledException>(exception.GetBaseException());
+        Assert.Equal(cts.Token, exception.CancellationToken);
+        Assert.Equal(0, requests);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_NonCancellationResolverError_LogsAndReturnsEmptyList()
+    {
+        const string Detail = "endpoint lookup failed for a NON-cancellation reason";
+        var logger = new TestLogger<ModelDiscoveryService>();
+        var requests = 0;
+        Exception? resolverException = null;
+        CopilotEndpointResolver resolver = (_, _) =>
+        {
+            resolverException = new InvalidOperationException(Detail);
+            throw resolverException;
+        };
+        var svc = new ModelDiscoveryService(
+            logger, CreateFactory(
+                new FakeHttpMessageHandler(HttpStatusCode.OK, SingleCopilotModelBody, _ => requests++)).Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>("stored-oauth-token"),
+            resolveCopilotEndpointAsync: resolver);
+
+        var models = await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        // Rule (d): an ordinary resolver failure is logged and answered with the SAME
+        // empty-list contract as every other discovery failure — and no request is sent.
+        Assert.Empty(models);
+        Assert.Equal(0, requests);
+        var failure = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Error);
+        Assert.Same(resolverException, failure.Exception);
+        // The failure log identifies the discovery step; the resolver's own message rides on
+        // the attached exception object (not interpolated into the log template).
+        Assert.Equal("Failed to discover Copilot models.", failure.Message);
+        Assert.Equal(Detail, failure.Exception!.Message);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_CancellationDuringHttp_ThrowsOperationCanceled()
+    {
+        // RESTORED (iteration-2): caller cancellation arriving DURING SendAsync must propagate
+        // — never be swallowed into an empty "discovery failed" list. The resolver answers
+        // normally first, so the cancellation fires inside the HTTP phase itself, exercising
+        // the send/catch block and NOT the endpoint-resolution seam (covered separately by
+        // the rule (a)-(c) tests above). Uses the same handler pattern as the pre-existing
+        // CancellationDuringHttp test this file always carried.
+        using var cts = new CancellationTokenSource();
+        var resolverInvocations = 0;
+        CopilotEndpointResolver countingResolver = (_, _) =>
+        {
+            resolverInvocations++;
+            return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        };
+        var factory = new Mock<IHttpClientFactory>();
+        factory.Setup(f => f.CreateClient(It.IsAny<string>()))
+               .Returns(() => new HttpClient(
+                   new CancellingHttpMessageHandler(() => cts.Cancel()), disposeHandler: false));
+        var svc = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, factory.Object,
+            getStoredAccessTokenAsync: _ => Task.FromResult<string?>("stored-oauth-token"),
+            resolveCopilotEndpointAsync: countingResolver);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => svc.DiscoverCopilotModelsAsync(cts.Token));
+
+        // The exact cancellation the transport observed — the caller's token — is the one
+        // that surfaced; no successful /models result can be returned on this path.
+        Assert.Equal(cts.Token, exception.CancellationToken);
+        Assert.Equal(1, resolverInvocations);
+    }
+
+    // ── Default-resolver fallback (structural, offline) ──────────────────────
+
+    [Fact]
+    public void Constructor_WithoutExplicitResolver_CarriesProviderDefaultResolver()
+    {
+        // The default-resolver fallback is a STRUCTURAL invariant: production passes null so
+        // the service must carry the SDK delegate. A behavioural test would perform the real
+        // per-account endpoint-resolution network I/O against api.github.com — forbidden by
+        // this goal — so the seam is verified by delegate EQUALITY on the private field
+        // instead: two method-group conversions to the same static method are distinct
+        // delegate INSTANCES but equal per Delegate.Equals, which is exactly the contract
+        // (the field must hold a delegate bound to the provider's static entry point).
+        var field = typeof(ModelDiscoveryService).GetField(
+            "_resolveCopilotEndpointAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+
+        var service = new ModelDiscoveryService(NullLogger<ModelDiscoveryService>.Instance);
+
+        var carried = (CopilotEndpointResolver)field!.GetValue(service)!;
+        Assert.Equal(
+            (CopilotEndpointResolver)SharpCoder.Providers.ChatClientFactory.GetCopilotApiEndpointAsync,
+            carried);
+    }
+
+    [Fact]
+    public void Constructor_WithExplicitResolver_UsesExplicitResolverInsteadOfDefault()
+    {
+        // Control for the equality assertion above: the explicit stub must take precedence
+        // over the provider default, so the '??' direction cannot be silently swapped. An
+        // EQUAL-identity default would fail this control, so both tests together pin the
+        // exact fallback wiring.
+        var field = typeof(ModelDiscoveryService).GetField(
+            "_resolveCopilotEndpointAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+
+        CopilotEndpointResolver explicitResolver =
+            (_, _) => Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        var service = new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance,
+            resolveCopilotEndpointAsync: explicitResolver);
+
+        var carried = (CopilotEndpointResolver)field!.GetValue(service)!;
+        Assert.Same(explicitResolver, carried);
     }
 
     [Fact]
@@ -784,6 +1217,19 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
             return new SharedDbContextFactory(connection, options);
         });
         services.AddSingleton<UserService>();
+
+        // Endpoint-resolver seam: registered BEFORE Program.AddModelDiscovery so the production
+        // registration resolves THIS delegate. The stub performs no network I/O and records the
+        // credential it was handed, which is how the production wiring's "resolver receives the
+        // SELECTED token" contract is observed.
+        var resolvedTokens = new List<string?>();
+        CopilotEndpointResolver stubResolver = (token, _) =>
+        {
+            resolvedTokens.Add(token);
+            return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        };
+        services.AddSingleton<CopilotEndpointResolver>(stubResolver);
+
         Program.AddModelDiscovery(services);
 
         await using var provider = services.BuildServiceProvider();
@@ -791,13 +1237,15 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         var userService = provider.GetRequiredService<UserService>();
         var discovery = provider.GetRequiredService<ModelDiscoveryService>();
 
-        // Before any sign-in: no stored token and no env fallback — no Copilot request.
+        // Before any sign-in: no stored token and no env fallback — no Copilot request, and the
+        // no-token path must not consult the endpoint resolver at all.
         Assert.Null(await userService.GetActiveAccessTokenAsync(TestContext.Current.CancellationToken));
         var withoutToken = await discovery.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
         Assert.Empty(withoutToken);
         Assert.Equal(0, handler.RequestCount);
         Assert.Null(handler.LastAuthorizationParameter);
         Assert.Empty(handler.LastCopilotIntegrationIdValues);
+        Assert.Empty(resolvedTokens);
 
         // After a GitHub sign-in the SAME production-resolved singleton must pick up the
         // stored token through the live UserService lookup.
@@ -813,6 +1261,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal(1, handler.RequestCount);
         Assert.Equal("Bearer", handler.LastAuthorizationScheme);
         Assert.Equal("stored-oauth-token", handler.LastAuthorizationParameter);
+        // The production wiring handed the resolver the credential SELECTED for this call.
+        Assert.Equal(["stored-oauth-token"], resolvedTokens);
         // The production DI-resolved singleton must send the exact integration header too.
         Assert.Equal(["copilot-developer-cli"], handler.LastCopilotIntegrationIdValues);
     }
