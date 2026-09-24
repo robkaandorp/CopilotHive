@@ -5103,6 +5103,63 @@ public sealed class ComposerActorTests
         }
     }
 
+    /// <summary>
+    /// Regression for the load-dependent flake in
+    /// <see cref="TerminalCleanupDone_LatchSetExactlyOnce_AfterFinalTransition"/>: the final
+    /// transition callback is the public completion signal, so <c>_terminalCleanupDone</c>
+    /// must already be <c>true</c> when it runs. The latch is sampled INSIDE the callback
+    /// (no timing, no polling), so moving the latch assignment back after the transition
+    /// call makes the captured value <c>false</c> and fails this test deterministically.
+    /// </summary>
+    [Fact]
+    public async Task TerminalCleanupDone_LatchSetBeforeFinalTransitionCallback()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hello");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        bool? latchAtFinalTransition = null;
+        var completedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        ComposerActor? actor = null;
+        actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (_, keep) =>
+            {
+                if (keep)
+                    return;
+                var captured = GetTerminalCleanupDone(actor!);
+                latchAtFinalTransition = captured;
+                completedGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.NotNull(latchAtFinalTransition);
+            Assert.True(
+                latchAtFinalTransition!.Value,
+                "_terminalCleanupDone must already be true when the final transition callback runs");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
     // ── Shutdown: OnShutdownAsync skips transition when _terminalCleanupDone ──
 
     [Fact]
