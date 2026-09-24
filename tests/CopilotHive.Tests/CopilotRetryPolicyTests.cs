@@ -89,6 +89,88 @@ public class CopilotRetryPolicyTests
         Assert.Equal(TimeSpan.FromMinutes(5), CopilotRetryPolicy.MaxDelay);
     }
 
+    /// <summary>
+    /// <see cref="KeyNotFoundException"/> is the missing-child / missing-goal signal and is NEVER
+    /// transient: it must propagate immediately on the FIRST attempt — exactly one action
+    /// invocation, no delay, no onRetry callback — otherwise a cancelled goal's missing child
+    /// actor burns the entire retry budget (with multi-minute backoffs) instead of failing at once.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_KeyNotFoundException_NotRetried_NoDelayAndSingleAttempt()
+    {
+        var attempts = 0;
+        var delayInvocations = 0;
+        var retryCallbacks = 0;
+        var thrown = new KeyNotFoundException("No child actor for goal 'goal-cancelled'.");
+
+        var ex = await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            CopilotRetryPolicy.ExecuteAsync<int>(
+                () =>
+                {
+                    attempts++;
+                    throw thrown;
+                },
+                onRetry: (_, _, _) => retryCallbacks++,
+                delayFunc: (_, _) => { delayInvocations++; return Task.CompletedTask; },
+                ct: TestContext.Current.CancellationToken));
+
+        // The exact instance propagates — never wrapped, never replaced.
+        Assert.Same(thrown, ex);
+        Assert.Equal(1, attempts);
+        Assert.Equal(0, delayInvocations);
+        Assert.Equal(0, retryCallbacks);
+    }
+
+    /// <summary>
+    /// The complement of the test above: a generic (transient-looking) exception keeps its
+    /// current retry behaviour — one initial attempt plus <see cref="CopilotRetryPolicy.MaxRetries"/>
+    /// retries, each preceded by its backoff delay.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_GenericException_StillRetried()
+    {
+        var attempts = 0;
+        var delayInvocations = 0;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            CopilotRetryPolicy.ExecuteAsync<int>(
+                () =>
+                {
+                    attempts++;
+                    throw new InvalidOperationException("provider timeout");
+                },
+                delayFunc: (_, _) => { delayInvocations++; return Task.CompletedTask; },
+                ct: TestContext.Current.CancellationToken));
+
+        Assert.Equal("provider timeout", ex.Message);
+        Assert.Equal(CopilotRetryPolicy.MaxRetries + 1, attempts);
+        Assert.Equal(CopilotRetryPolicy.MaxRetries, delayInvocations);
+    }
+
+    /// <summary>
+    /// The non-generic overload routes through the same retry loop, so it inherits the
+    /// never-retried <see cref="KeyNotFoundException"/> contract too.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_VoidOverload_KeyNotFoundException_NotRetried()
+    {
+        var attempts = 0;
+        var delayInvocations = 0;
+
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            CopilotRetryPolicy.ExecuteAsync(
+                () =>
+                {
+                    attempts++;
+                    throw new KeyNotFoundException("missing goal");
+                },
+                delayFunc: (_, _) => { delayInvocations++; return Task.CompletedTask; },
+                ct: TestContext.Current.CancellationToken));
+
+        Assert.Equal(1, attempts);
+        Assert.Equal(0, delayInvocations);
+    }
+
     [Fact]
     public async Task ExecuteAsync_VoidOverload_Works()
     {

@@ -24,8 +24,21 @@ public static class CopilotRetryPolicy
 
     /// <summary>
     /// Executes an async operation with exponential backoff retries.
-    /// On the last attempt the exception propagates to the caller.
+    /// <see cref="KeyNotFoundException"/> is the missing-child / missing-goal signal and is NEVER
+    /// transient: it is rethrown immediately on the FIRST attempt — no retry, no delay, no
+    /// <paramref name="onRetry"/> invocation. For the remaining exceptions, the exception from the
+    /// last attempt propagates to the caller once the retries are exhausted.
     /// </summary>
+    /// <remarks>
+    /// <see cref="KeyNotFoundException"/> is NEVER retried: it is the missing-child /
+    /// missing-goal signal (e.g. <c>BrainActor.ExecutePromptOnChild</c> reporting
+    /// "No child actor for goal '...'" after the goal's session was removed), which is a
+    /// permanent state — not a transient provider failure — so retrying it only burns the
+    /// retry budget and the backoff delays. It propagates immediately on the first attempt
+    /// with no delay and no <paramref name="onRetry"/> invocation. Every other exception
+    /// keeps the existing retry behaviour, and <see cref="OperationCanceledException"/>
+    /// carrying the caller's token still propagates unretried.
+    /// </remarks>
     /// <param name="action">The async operation to execute.</param>
     /// <param name="onRetry">Optional callback invoked before each retry wait (attempt 1-based, delay, exception).</param>
     /// <param name="ct">Cancellation token.</param>
@@ -47,6 +60,11 @@ public static class CopilotRetryPolicy
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw; // Real cancellation — don't retry
+            }
+            catch (KeyNotFoundException)
+            {
+                // The missing-child / missing-goal signal — never transient, so never retried.
+                throw;
             }
             catch (Exception ex) when (attempt < MaxRetries)
             {
