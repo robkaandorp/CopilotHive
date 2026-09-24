@@ -21,7 +21,15 @@ curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0
 
 ## Set Environment Variables
 
-After installation, set the following so `dotnet` is available:
+The worker image already sets `DOTNET_ROOT=/root/.dotnet` and puts `/root/.dotnet` and
+`/root/.dotnet/tools` on `PATH`. The SDK installer writes to `$HOME/.dotnet`, which is
+`/root/.dotnet` for the root user the container runs as, so a freshly installed SDK is on
+`PATH` in every new shell. No exports are needed on current images.
+
+Each `execute_bash_command` call starts a fresh shell, so the exports only last for the
+current shell and are never inherited by later calls. If `dotnet` is still not found (an
+older worker image without the image-level variables), run the following in the same shell
+call as any `dotnet` command that needs it:
 
 ```bash
 export DOTNET_ROOT="$HOME/.dotnet"
