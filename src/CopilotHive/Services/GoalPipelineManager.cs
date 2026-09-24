@@ -1116,6 +1116,30 @@ public sealed class GoalPipelineManager
         }
     }
 
+    /// <summary>
+    /// TEST SEAM ONLY (production code never calls this): replaces the in-memory pipeline
+    /// registered for <paramref name="goalId"/> with <paramref name="pipeline"/>, without touching
+    /// the durable store. The production registration entries are created exclusively by
+    /// <see cref="CreatePipeline"/> (first-registration wins) and
+    /// <see cref="RestoreFromStore"/>, so tests that must observe a SPECIFIC instance under
+    /// <see cref="GetByGoalId"/> — e.g. the cancellation-predicate's registration-vs-phase
+    /// disjuncts — need this seam to install that exact instance.
+    /// </summary>
+    /// <param name="goalId">The goal whose registration entry is replaced.</param>
+    /// <param name="pipeline">The pipeline instance that becomes the registered entry.</param>
+    /// <remarks>Must NOT be called with a null pipeline; no other registration entry is mutated
+    /// and the store is left untouched.</remarks>
+    internal void RegisterPipelineInstanceForTest(string goalId, GoalPipeline pipeline)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
+        ArgumentNullException.ThrowIfNull(pipeline);
+
+        lock (_mappingLock)
+        {
+            _pipelines[goalId] = pipeline;
+        }
+    }
+
     /// <summary>Restore pipelines from persistent store (called once at startup).</summary>
     public List<GoalPipeline> RestoreFromStore()
     {

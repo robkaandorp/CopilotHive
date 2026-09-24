@@ -754,6 +754,122 @@ public sealed class GoalDispatchPlanningCancellationTests
             l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
     }
 
+    /// <summary>
+    /// DISJUNCT ISOLATION for the new-goal path's cancellation predicate: the registration term
+    /// alone must make the late planning result inert, WITHOUT the Phase==Failed term firing.
+    /// The cancelled pipeline keeps its live Planning phase but is no longer the instance
+    /// registered for the goal — the state a real cancellation's second step produces
+    /// (RemovePipeline) plus a DIFFERENT pipeline registered afterwards. If the registration
+    /// disjunct were dropped from the predicate, this late APPROVED plan would fall through to
+    /// SetPlan/StartIteration/dispatch — an approved plan applied to a cancelled goal — and this
+    /// test's Plan/PhaseLog/dispatch assertions would fail.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_DifferentPipelineRegistered_LateApprovedPlanIsDiscarded()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Success(IterationPlan.Default()));
+
+        var dispatchTask = GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(fixture.Dispatcher, ct);
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        var pipeline = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.NotNull(pipeline);
+        Assert.Equal(GoalPhase.Planning, pipeline!.Phase);
+
+        // REGISTRATION-ONLY cancellation signal: the pipeline keeps its live Planning phase, but
+        // it is replaced as the registered instance — a DIFFERENT pipeline is now the manager's
+        // entry for this goal. The phase disjunct never fires.
+        Assert.True(fixture.PipelineManager.RemovePipeline(fixture.Goal.Id));
+        var replacement = fixture.PipelineManager.CreatePipeline(fixture.Goal, maxRetries: 3, maxIterations: 3);
+        Assert.NotSame(replacement, pipeline);
+
+        var registered = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.True(ReferenceEquals(registered, replacement),
+            "setup: the REPLACEMENT pipeline must be the registered instance so only the registration disjunct fires");
+        Assert.NotSame(replacement, pipeline);
+        Assert.Equal(GoalPhase.Planning, pipeline.Phase);
+
+        // Release the late APPROVED plan.
+        fixture.Brain.ReleasePlan.TrySetResult();
+        await dispatchTask.WaitAsync(Bounded, ct);
+
+        // The late approved plan was applied to NOTHING: the cancelled pipeline keeps its
+        // Planning phase and carries no plan, no state-machine start, no phase log.
+        Assert.Equal(GoalPhase.Planning, pipeline.Phase);
+        Assert.Null(pipeline.Plan);
+        Assert.Empty(pipeline.PhaseLog);
+
+        // The replacement pipeline is likewise untouched — the late result was discarded, not
+        // attributed to whatever the manager now returns for the goal.
+        Assert.Equal(GoalPhase.Planning, registered!.Phase);
+        Assert.Null(registered.Plan);
+        Assert.Empty(registered.PhaseLog);
+
+        // Nothing was dispatched for the cancelled goal.
+        Assert.Empty(fixture.Dispatched);
+        Assert.Contains(fixture.Logger.Logs, l =>
+            l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
+    }
+
+    /// <summary>
+    /// DISJUNCT ISOLATION for the new-goal path's cancellation predicate: the Phase==Failed term
+    /// alone must make the late planning result inert, WITHOUT the registration term firing. The
+    /// cancelled pipeline is transitioned to Failed (the genuine first cancellation step) and is
+    /// then re-registered as the CURRENT instance, so <c>GetByGoalId</c> returns the identical
+    /// reference and only the phase term can fire. If the Phase==Failed disjunct were dropped from
+    /// the predicate, this late FAILED plan would fall through to FailNewGoalAsync — overwriting
+    /// "Cancelled by user" with a planning reason and adding a SECOND Failed update — which this
+    /// test's single-failure and reason assertions kill.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_PipelineFailedWithoutRemoval_LateFailedPlanIsDiscarded()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Failed("late plan failure after phase-only cancel"));
+
+        var dispatchTask = GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(fixture.Dispatcher, ct);
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        var pipeline = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.NotNull(pipeline);
+        Assert.Equal(GoalPhase.Planning, pipeline!.Phase);
+
+        // PHASE-ONLY cancellation signal: store the "Cancelled by user" outcome and transition the
+        // pipeline to Failed (the genuine first cancellation step), keeping the instance
+        // registered. The registration disjunct must never fire.
+        await fixture.GoalStore.UpdateGoalStatusAsync(
+            fixture.Goal.Id, GoalStatus.Failed,
+            new GoalUpdateMetadata { FailureReason = "Cancelled by user" }, ct);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+
+        // Prove the registration disjunct is inert: the SAME instance is still what the manager
+        // returns for the goal.
+        var registered = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.True(ReferenceEquals(registered, pipeline),
+            "setup: the cancelled pipeline must remain registered so only the phase disjunct fires");
+
+        // Release the late FAILED plan.
+        fixture.Brain.ReleasePlan.TrySetResult();
+        await dispatchTask.WaitAsync(Bounded, ct);
+
+        // The cancellation outcome survives: exactly ONE Failed update, still "Cancelled by user".
+        Assert.Equal("Cancelled by user", fixture.Goal.FailureReason);
+        Assert.Equal(GoalStatus.Failed, fixture.Goal.Status);
+        var failures = fixture.GoalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
+        Assert.Single(failures);
+        Assert.Equal("Cancelled by user", failures[0].Metadata?.FailureReason);
+
+        // The late result was discarded — not applied — so the pipeline never left Failed: no
+        // state-machine advance, no phase log, and no dispatch.
+        Assert.Equal(GoalPhase.Failed, registered!.Phase);
+        Assert.Empty(registered.PhaseLog);
+        Assert.Empty(fixture.Dispatched);
+        Assert.Contains(fixture.Logger.Logs, l =>
+            l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
+    }
+
     /// <summary>Test fixture for the cancel-while-planning interleaving.</summary>
     private sealed record Fixture(        Goal Goal,
         GoalDispatcher Dispatcher,
@@ -892,6 +1008,78 @@ public sealed class GoalDispatcherResumePlanningCancellationTests
         Assert.Equal("resume plan rejected", failures[0].Metadata?.FailureReason);
         Assert.Equal("resume plan rejected", fixture.Goal.FailureReason);
         Assert.Empty(fixture.Dispatched);
+    }
+
+    /// <summary>
+    /// DISJUNCT ISOLATION for the resume path's cancellation predicate: the Phase==Failed term
+    /// alone must make the late planning result inert, WITHOUT the registration term firing.
+    /// The real resume machinery is driven (the goal reaches InProgress/Planning with a registered
+    /// pipeline) and the cancellation's phase transition is then applied with the registration
+    /// INTACT — a Phase==Failed pipeline that stays registered, the state a genuine in-flight
+    /// cancellation's first step produces (MarkGoalFailedAsync before RemovePipeline). If the
+    /// Phase==Failed disjunct were dropped from the predicate, this late FAILED plan would fall
+    /// through to FailResumedGoalAsync, overwrite "Cancelled by user" with a planning reason and
+    /// add a SECOND Failed update — exactly what this test's single-failure assertions kill.
+    /// </summary>
+    [Fact]
+    public async Task ResumeGoalAsync_PipelineFailedWithoutRemoval_LateFailedPlanIsDiscarded()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fixture = CreateFixture(PlanResult.Failed("late plan failure after phase-only cancel"));
+
+        var resumeTask = fixture.Dispatcher.ResumeGoalAsync(fixture.Goal.Id, 5, ct);
+        await fixture.Brain.PlanningStarted.Task.WaitAsync(Bounded, ct);
+
+        var pipeline = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.NotNull(pipeline);
+        Assert.Equal(GoalPhase.Planning, pipeline!.Phase);
+
+        // PHASE-ONLY cancellation signal: mark the goal Failed in the store (the stored
+        // "Cancelled by user" outcome) and transition the pipeline to Failed, but DO NOT leave
+        // the slot empty for the registration disjunct — a fresh registration is installed and
+        // then swapped for the SAME cancelled instance, so GetByGoalId returns the identical
+        // instance and only the Phase==Failed term can fire.
+        await fixture.GoalStore.UpdateGoalStatusAsync(
+            fixture.Goal.Id, GoalStatus.Failed,
+            new GoalUpdateMetadata { FailureReason = "Cancelled by user" }, ct);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.True(fixture.PipelineManager.RemovePipeline(fixture.Goal.Id));
+
+        // CreatePipeline installs a FRESH instance (RemovePipeline first — registration refuses
+        // duplicates); RegisterPipelineInstanceForTest then swaps the CANCELLED instance back in,
+        // so the registration disjunct is provably inert and the phase term acts alone.
+        var placeholder = fixture.PipelineManager.CreatePipeline(fixture.Goal, maxRetries: 3, maxIterations: 3);
+        Assert.NotSame(placeholder, pipeline);
+        fixture.PipelineManager.RegisterPipelineInstanceForTest(fixture.Goal.Id, pipeline);
+
+        var registered = fixture.PipelineManager.GetByGoalId(fixture.Goal.Id);
+        Assert.True(ReferenceEquals(registered, pipeline),
+            "setup: the SAME cancelled pipeline instance must be registered so only the phase disjunct fires");
+        Assert.Equal(GoalPhase.Failed, registered!.Phase);
+
+        // Release the late FAILED plan.
+        fixture.Brain.ReleasePlan.TrySetResult();
+        var resumed = await resumeTask.WaitAsync(Bounded, ct);
+
+        // The resume itself completed normally...
+        Assert.True(resumed);
+        // ...but the late planning outcome was attributed to NOTHING: the goal's stored
+        // "Cancelled by user" reason survived and FailResumedGoalAsync never ran.
+        Assert.Equal("Cancelled by user", fixture.Goal.FailureReason);
+        Assert.Equal(GoalStatus.Failed, fixture.Goal.Status);
+        var failures = fixture.GoalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
+        Assert.Single(failures);
+        Assert.Equal("Cancelled by user", failures[0].Metadata?.FailureReason);
+
+        // The late result was discarded — not applied — so the pipeline never left Failed: no
+        // fresh plan, no state-machine advance, no phase log, and no dispatch. (The resume itself
+        // seeded IterationPlan.Default before planning; the discard must not have replaced it.)
+        Assert.Equal(GoalPhase.Failed, registered.Phase);
+        Assert.Empty(registered.PhaseLog);
+        Assert.Empty(fixture.Dispatched);
+        Assert.Contains(fixture.Logger.Logs, l =>
+            l.Level == LogLevel.Information && l.Message.Contains("Discarding the planning outcome"));
     }
 
     private sealed record Fixture(
