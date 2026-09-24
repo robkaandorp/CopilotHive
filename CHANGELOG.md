@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+## [0.39.1] — 2026-09-24
+
+### Fixed
+- Copilot model discovery — and inference via the SharpCoder 0.20.2 upgrade — now send the `Copilot-Integration-Id: copilot-developer-cli` header, fixing reduced model catalogs for GitHub OAuth installations (reduced /models catalog and 400 rejections of fine-grained PATs without the header); SharpCoder and SharpCoder.Providers upgraded to 0.20.2.
+
 ## [0.39.0] — 2026-09-21
 
 ### Added

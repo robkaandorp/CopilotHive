@@ -138,6 +138,31 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Empty(models);
     }
 
+    /// <summary>
+    /// Asserts the exact <c>Copilot-Integration-Id</c> integration header contract on a
+    /// captured Copilot /models request: the header exists EXACTLY ONCE with the exact
+    /// value <c>copilot-developer-cli</c>. Duplicate or differently-valued occurrences fail.
+    /// Kept adjacent to the header tests so both credential paths assert the same contract.
+    /// </summary>
+    private static void AssertCopilotIntegrationHeader(HttpRequestMessage request)
+    {
+        Assert.True(
+            request.Headers.TryGetValues("Copilot-Integration-Id", out var values),
+            "The Copilot /models request must carry a Copilot-Integration-Id header.");
+        Assert.Equal(["copilot-developer-cli"], values!.ToArray());
+    }
+
+    /// <summary>
+    /// Asserts the captured request carries NO <c>Copilot-Integration-Id</c> header at all —
+    /// the header is Copilot-specific and must never leak onto Ollama discovery.
+    /// </summary>
+    private static void AssertCopilotIntegrationHeaderAbsent(HttpRequestMessage request)
+    {
+        Assert.False(
+            request.Headers.Contains("Copilot-Integration-Id"),
+            "The request must NOT carry a Copilot-Integration-Id header.");
+    }
+
     [Fact]
     public async Task DiscoverCopilotModelsAsync_SendsCorrectHeaders()
     {
@@ -153,6 +178,29 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal("test-token", captured.Headers.Authorization?.Parameter);
         Assert.True(captured.Headers.TryGetValues("X-GitHub-Api-Version", out var versions));
         Assert.Contains("2025-04-01", versions!);
+        // The integration header rides along on the SAME request — exactly one instance
+        // with the exact value, alongside the unchanged Authorization/Api-Version pair.
+        AssertCopilotIntegrationHeader(captured);
+    }
+
+    [Fact]
+    public async Task DiscoverCopilotModelsAsync_StoredOAuth_SendsCorrectHeaders()
+    {
+        // Stored-OAuth credential path: the integration header must be present with the
+        // SAME exact contract as the environment-token path above.
+        HttpRequestMessage? captured = null;
+        var svc = CreateService(
+            new FakeHttpMessageHandler(HttpStatusCode.OK, """{ "data": [] }""", req => captured = req),
+            storedTokenLookup: _ => Task.FromResult<string?>("stored-oauth-token"));
+
+        await svc.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.NotNull(captured);
+        Assert.Equal("Bearer", captured!.Headers.Authorization?.Scheme);
+        Assert.Equal("stored-oauth-token", captured.Headers.Authorization?.Parameter);
+        Assert.True(captured.Headers.TryGetValues("X-GitHub-Api-Version", out var versions));
+        Assert.Contains("2025-04-01", versions!);
+        AssertCopilotIntegrationHeader(captured);
     }
 
     [Fact]
@@ -217,6 +265,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal("https://ollama.com/api/tags", captured!.RequestUri?.ToString());
         Assert.Equal("Bearer", captured.Headers.Authorization?.Scheme);
         Assert.Equal("ollama-key", captured.Headers.Authorization?.Parameter);
+        // The integration header is Copilot-specific: Ollama discovery must stay header-free.
+        AssertCopilotIntegrationHeaderAbsent(captured);
     }
 
     [Fact]
@@ -232,6 +282,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.NotNull(captured);
         Assert.Equal("http://custom-host:9999/api/tags", captured!.RequestUri?.ToString());
         Assert.Null(captured.Headers.Authorization);
+        // The integration header is Copilot-specific: Ollama discovery must stay header-free.
+        AssertCopilotIntegrationHeaderAbsent(captured);
     }
 
     [Fact]
@@ -745,6 +797,7 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Empty(withoutToken);
         Assert.Equal(0, handler.RequestCount);
         Assert.Null(handler.LastAuthorizationParameter);
+        Assert.Empty(handler.LastCopilotIntegrationIdValues);
 
         // After a GitHub sign-in the SAME production-resolved singleton must pick up the
         // stored token through the live UserService lookup.
@@ -760,6 +813,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal(1, handler.RequestCount);
         Assert.Equal("Bearer", handler.LastAuthorizationScheme);
         Assert.Equal("stored-oauth-token", handler.LastAuthorizationParameter);
+        // The production DI-resolved singleton must send the exact integration header too.
+        Assert.Equal(["copilot-developer-cli"], handler.LastCopilotIntegrationIdValues);
     }
 }
 
@@ -805,11 +860,16 @@ internal sealed class CountingHttpMessageHandler : HttpMessageHandler
 
     public string? LastAuthorizationScheme { get; private set; }
 
+    public IReadOnlyList<string> LastCopilotIntegrationIdValues { get; private set; } = [];
+
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         RequestCount++;
         LastAuthorizationParameter = request.Headers.Authorization?.Parameter;
         LastAuthorizationScheme = request.Headers.Authorization?.Scheme;
+        LastCopilotIntegrationIdValues = request.Headers.TryGetValues("Copilot-Integration-Id", out var integration)
+            ? integration.ToArray()
+            : [];
         return Task.FromResult(new HttpResponseMessage(_statusCode)
         {
             Content = new StringContent(_body, System.Text.Encoding.UTF8, "application/json")

@@ -125,6 +125,11 @@ public sealed class ModelDiscoveryService
             using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.githubcopilot.com/models");
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             request.Headers.Add("X-GitHub-Api-Version", "2025-04-01");
+            // Without this integration ID the Copilot API treats the request as third-party-app
+            // traffic: CopilotHive's own OAuth-app token gets a reduced /models catalog and
+            // fine-grained PATs are rejected with 400. The earlier "vscode-chat" value does not
+            // fix this. Set per request so Ollama discovery stays header-free.
+            request.Headers.Add("Copilot-Integration-Id", "copilot-developer-cli");
 
             using var response = await client.SendAsync(request, ct);
             response.EnsureSuccessStatusCode();
