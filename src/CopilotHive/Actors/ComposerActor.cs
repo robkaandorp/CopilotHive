@@ -52,7 +52,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
 
     /// <summary>
     /// Latch guarding the final terminal cleanup (transition, idle registry, queue clear).
-    /// Reset in <see cref="StartStream"/> and set after the final transition of a stream —
+    /// Reset in <see cref="StartStream"/> and set immediately before the final transition
+    /// callback of a stream (so completion observers never see a stale latch) —
     /// either by the mailbox handler's terminal sequence or by the streaming task's
     /// failed-<c>Tell</c> fallback. <see cref="OnShutdownAsync"/> checks it to avoid
     /// double-running the terminal sequence.
@@ -494,9 +495,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             // The idle refresh therefore runs BEFORE the transition callback: the callback is the
             // public completion signal, and any subscriber that wakes on it (a UI refresh, a test
             // gate) must never be able to read a stale "streaming" entry from the registry.
+            // The latch is also set before the transition callback, so completion observers
+            // never see a stale latch.
             TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
-            TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
             _terminalCleanupDone = true;
+            TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
         }
     }
 
@@ -781,9 +784,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 // events), THE IDLE STATUS IS ALREADY PUBLISHED to the registry. The idle
                 // refresh therefore precedes the transition callback on this path too, so the
                 // observable ordering does not depend on which path ran the terminal sequence.
+                // The latch is also set before the transition callback, so completion observers
+                // never see a stale latch.
                 TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
-                TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
                 _terminalCleanupDone = true;
+                TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
             }
         }
     }
@@ -872,10 +877,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             // STREAMING COMPLETION IS OBSERVABLE (via the transition callback / facade events),
             // THE IDLE STATUS IS ALREADY PUBLISHED to the registry. Shutdown is no exception:
             // a subscriber woken by the shutdown transition must read "idle", never a stale
-            // "streaming" left behind by the aborted stream.
+            // "streaming" left behind by the aborted stream. The latch is also set before the
+            // transition callback, so completion observers never see a stale latch.
             TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
-            TryInvoke(() => _onStreamingTransition(0, false), nameof(_onStreamingTransition));
             _terminalCleanupDone = true;
+            TryInvoke(() => _onStreamingTransition(0, false), nameof(_onStreamingTransition));
         }
 
         // Only now — after the task and its callbacks are done — may the owner release the
