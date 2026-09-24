@@ -995,6 +995,13 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// Returns <see cref="BranchDeleteResult.Failed"/> when git reports an error other than
     /// "remote ref not found" (i.e. a genuine failure rather than a missing branch).
     /// Also attempts to delete the local tracking branch; local-branch failure is silently ignored.
+    /// <para>
+    /// <b>Caller cancellation is never a git result.</b> An <see cref="OperationCanceledException"/>
+    /// raised while <paramref name="ct"/> is cancelled propagates to the caller — it is never mapped
+    /// to <see cref="BranchDeleteResult.NotFound"/>/<see cref="BranchDeleteResult.Failed"/>, and if
+    /// the delete <em>push</em> was cancelled the best-effort local <c>branch -D</c> cleanup is not
+    /// attempted at all (the caller asked us to stop).
+    /// </para>
     /// </summary>
     /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
     /// <param name="branchName">Branch name to delete from the remote (e.g. "copilothive/my-goal").</param>
@@ -1028,6 +1035,15 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
                 result = BranchDeleteResult.Success;
             }
+            catch (Exception ex) when (ex is OperationCanceledException && ct.IsCancellationRequested)
+            {
+                // A CALLER cancellation is not a git outcome: mapping it to NotFound/Failed would
+                // misreport a shutdown as a branch-delete result, and the local `branch -D` cleanup
+                // below must not run at all once the caller asked us to stop. Propagate it — the
+                // credential boundary above leaves a credential-free OCE untouched, so this stays
+                // an OperationCanceledException carrying the caller's token.
+                throw;
+            }
             catch (Exception ex)
             {
                 var message = ex.Message;
@@ -1053,10 +1069,17 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 }
             }
 
-            // Best-effort: delete the local tracking branch
+            // Best-effort: delete the local tracking branch. Reachable only when the delete push
+            // was NOT cancelled — a cancelled push rethrows above and never reaches this point.
             try
             {
                 await RunGitAsync(clonePath, ["branch", "-D", branchName], ct);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException && ct.IsCancellationRequested)
+            {
+                // Cancellation observed DURING the cleanup is still the caller's cancellation, not
+                // a missing local branch: propagate it instead of reporting a branch-delete result.
+                throw;
             }
             catch
             {
