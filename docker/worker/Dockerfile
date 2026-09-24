@@ -75,6 +75,16 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/ent
 # token) over the GetWorkerConfig gRPC call. Baking a default here would masquerade as an
 # operator override and permanently suppress the provisioned value.
 
+# .NET SDK location. The image ships without .NET; the SDK is installed on demand into
+# /root/.dotnet by the install-dotnet-sdk skill (the container runs as root, so $HOME is
+# /root). Setting DOTNET_ROOT and PATH here — rather than exporting them in the skill —
+# makes a freshly installed SDK visible to every new shell, since each execute_bash_command
+# call starts a fresh shell. These lines are harmless before the SDK is installed: the
+# paths simply do not exist yet. The worker binary itself is self-contained and does not
+# use DOTNET_ROOT.
+ENV DOTNET_ROOT=/root/.dotnet
+ENV PATH="/root/.dotnet:/root/.dotnet/tools:${PATH}"
+
 WORKDIR /copilot-home
 
 ENTRYPOINT ["entrypoint.sh"]
