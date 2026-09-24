@@ -1119,9 +1119,10 @@ public sealed class GoalPipelineManager
     /// <summary>
     /// TEST SEAM ONLY (production code never calls this): replaces the in-memory pipeline
     /// registered for <paramref name="goalId"/> with <paramref name="pipeline"/>, without touching
-    /// the durable store. The production registration entries are created exclusively by
-    /// <see cref="CreatePipeline"/> (first-registration wins) and
-    /// <see cref="RestoreFromStore"/>, so tests that must observe a SPECIFIC instance under
+    /// the durable store. The production registration entries are created by
+    /// <see cref="CreatePipeline"/>, <see cref="RestoreFromStore"/> and
+    /// <see cref="RestorePipeline"/> — all three first-registration wins (a refused duplicate is
+    /// left as it is) — so tests that must observe a SPECIFIC instance under
     /// <see cref="GetByGoalId"/> — e.g. the cancellation-predicate's registration-vs-phase
     /// disjuncts — need this seam to install that exact instance.
     /// </summary>

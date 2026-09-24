@@ -24,7 +24,10 @@ public static class CopilotRetryPolicy
 
     /// <summary>
     /// Executes an async operation with exponential backoff retries.
-    /// On the last attempt the exception propagates to the caller.
+    /// <see cref="KeyNotFoundException"/> is the missing-child / missing-goal signal and is NEVER
+    /// transient: it is rethrown immediately on the FIRST attempt — no retry, no delay, no
+    /// <paramref name="onRetry"/> invocation. For the remaining exceptions, the exception from the
+    /// last attempt propagates to the caller once the retries are exhausted.
     /// </summary>
     /// <remarks>
     /// <see cref="KeyNotFoundException"/> is NEVER retried: it is the missing-child /

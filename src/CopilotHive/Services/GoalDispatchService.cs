@@ -160,8 +160,8 @@ internal sealed class GoalDispatchService
             return false;
 
         _logger.LogInformation(
-            "Discarding the planning outcome for goal '{GoalId}': the goal was cancelled while planning was in flight (phase={Phase}, stillRegistered={StillRegistered}) — the stored failure reason is preserved and nothing is dispatched",
-            goal.Id, pipeline.Phase, registered is not null);
+            "Discarding the planning outcome for goal '{GoalId}': the goal was cancelled while planning was in flight (phase={Phase}, sameInstanceRegistered={SameInstanceRegistered}) — the stored failure reason is preserved and nothing is dispatched",
+            goal.Id, pipeline.Phase, ReferenceEquals(registered, pipeline));
         return true;
     }
 
