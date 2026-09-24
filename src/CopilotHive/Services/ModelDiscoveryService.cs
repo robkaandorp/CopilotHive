@@ -21,6 +21,17 @@ public sealed record DiscoveredModel(
     bool Enabled);
 
 /// <summary>
+/// Resolves the per-account Copilot API endpoint base URI for ONE selected credential.
+/// The <c>models</c> path is resolved against the returned base, so an account whose API is
+/// advertised on a different host (for example a tenant-specific
+/// <c>*.githubcopilot.com</c> subdomain) is discovered against its own endpoint.
+/// </summary>
+/// <param name="token">The Copilot credential selected for this discovery call.</param>
+/// <param name="ct">Cancellation token propagated into the endpoint lookup.</param>
+/// <returns>The base endpoint URI that <c>models</c> is resolved against.</returns>
+public delegate Task<Uri> CopilotEndpointResolver(string token, CancellationToken ct);
+
+/// <summary>
 /// Queries GitHub Copilot and Ollama for the list of available models.
 /// </summary>
 public sealed class ModelDiscoveryService
@@ -36,6 +47,7 @@ public sealed class ModelDiscoveryService
     private readonly ILogger<ModelDiscoveryService> _logger;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly Func<CancellationToken, Task<string?>>? _storedTokenLookup;
+    private readonly CopilotEndpointResolver _resolveCopilotEndpointAsync;
 
     /// <summary>
     /// Initialises a new <see cref="ModelDiscoveryService"/>.
@@ -49,14 +61,24 @@ public sealed class ModelDiscoveryService
     /// PER DISCOVERY CALL — never at construction — so token rotation/removal between calls
     /// is always observed.
     /// </param>
+    /// <param name="resolveCopilotEndpointAsync">
+    /// Optional per-account Copilot endpoint resolver. When null, the provider default
+    /// <see cref="SharpCoder.Providers.ChatClientFactory.GetCopilotApiEndpointAsync"/> is used —
+    /// the SDK performs discovery and falls back to its own default endpoint on any failure, so
+    /// production behaviour is unchanged. It is invoked PER DISCOVERY CALL with the credential
+    /// selected for that call, never at construction.
+    /// </param>
     public ModelDiscoveryService(
         ILogger<ModelDiscoveryService> logger,
         IHttpClientFactory? httpClientFactory = null,
-        Func<CancellationToken, Task<string?>>? getStoredAccessTokenAsync = null)
+        Func<CancellationToken, Task<string?>>? getStoredAccessTokenAsync = null,
+        CopilotEndpointResolver? resolveCopilotEndpointAsync = null)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _storedTokenLookup = getStoredAccessTokenAsync;
+        _resolveCopilotEndpointAsync =
+            resolveCopilotEndpointAsync ?? SharpCoder.Providers.ChatClientFactory.GetCopilotApiEndpointAsync;
     }
 
     private HttpClient CreateClient() =>
@@ -95,7 +117,10 @@ public sealed class ModelDiscoveryService
 
     /// <summary>
     /// Discovers models available via the GitHub Copilot models API.
-    /// The credential is resolved per call (stored OAuth, then GH_TOKEN, then GITHUB_TOKEN).
+    /// The credential is resolved per call (stored OAuth, then GH_TOKEN, then GITHUB_TOKEN) and
+    /// <c>models</c> is resolved against the per-account endpoint returned by
+    /// <see cref="_resolveCopilotEndpointAsync"/> for THAT credential — the request never
+    /// hardcodes <c>https://api.githubcopilot.com</c>.
     /// Returns an empty list if no token is configured or on any failure.
     /// A caller cancellation is ALWAYS propagated — never swallowed.
     /// </summary>
@@ -119,10 +144,41 @@ public sealed class ModelDiscoveryService
         }
 
         var results = new List<DiscoveredModel>();
+        Uri endpoint;
+        try
+        {
+            // Resolve the per-account endpoint for the credential SELECTED for this call, before
+            // any request is built: the /models catalogue is not necessarily served by the fixed
+            // api.githubcopilot.com host. The resolver is invoked per call (like the credential
+            // lookup), so an account switch or rotation between calls is observed.
+            endpoint = await _resolveCopilotEndpointAsync(token, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation raised by the resolver is the caller's cancellation — never a
+            // "discovery failed" answer — so it must terminate the caller.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Classification uses the CALLER'S cancellation state AT THIS CATCH POINT, not the
+            // exception type: a resolver that failed for a non-cancellation reason while the
+            // caller was already cancelled is still a cancellation and must terminate the call
+            // instead of degrading to an empty list. Any other resolver failure is an ordinary
+            // discovery failure: logged, then the empty list. No /models request is sent.
+            ct.ThrowIfCancellationRequested();
+            _logger.LogError(ex, "Failed to discover Copilot models.");
+            return [];
+        }
+
+        // The resolver returned an endpoint: a cancellation requested while it ran must
+        // terminate the caller BEFORE the /models request is sent.
+        ct.ThrowIfCancellationRequested();
+
         try
         {
             using var client = CreateClient();
-            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.githubcopilot.com/models");
+            using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(endpoint, "models"));
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             request.Headers.Add("X-GitHub-Api-Version", "2025-04-01");
             // Without this integration ID the Copilot API treats the request as third-party-app

@@ -41,12 +41,24 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Environment.SetEnvironmentVariable("OLLAMA_URL", _origOllamaUrl);
     }
 
+    /// <summary>
+    /// Stub per-account endpoint resolver passed to EVERY service created in this suite: it
+    /// answers with the provider's default endpoint and performs NO network I/O, so the real
+    /// per-account lookup is never reached from a test. The returned base mirrors
+    /// <c>ChatClientFactory.DefaultCopilotApiEndpoint</c> (trailing slash), so <c>models</c>
+    /// resolves to <c>https://api.githubcopilot.com/models</c> exactly as before.
+    /// </summary>
+    private static Task<Uri> StubCopilotEndpointResolver(string token, CancellationToken ct)
+        => Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+
     private static ModelDiscoveryService CreateService(HttpMessageHandler handler)
     {
         var factory = new Mock<IHttpClientFactory>();
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
-        return new ModelDiscoveryService(NullLogger<ModelDiscoveryService>.Instance, factory.Object);
+        return new ModelDiscoveryService(
+            NullLogger<ModelDiscoveryService>.Instance, factory.Object,
+            resolveCopilotEndpointAsync: StubCopilotEndpointResolver);
     }
 
     private static ModelDiscoveryService CreateService(
@@ -57,7 +69,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
         return new ModelDiscoveryService(
-            NullLogger<ModelDiscoveryService>.Instance, factory.Object, storedTokenLookup);
+            NullLogger<ModelDiscoveryService>.Instance, factory.Object, storedTokenLookup,
+            StubCopilotEndpointResolver);
     }
 
     private static ModelDiscoveryService CreateService(
@@ -68,7 +81,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         var factory = new Mock<IHttpClientFactory>();
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
-        return new ModelDiscoveryService(logger, factory.Object, storedTokenLookup);
+        return new ModelDiscoveryService(
+            logger, factory.Object, storedTokenLookup, StubCopilotEndpointResolver);
     }
 
     /// <summary>Body describing a single Copilot model for discovery tests.</summary>
@@ -784,6 +798,19 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
             return new SharedDbContextFactory(connection, options);
         });
         services.AddSingleton<UserService>();
+
+        // Endpoint-resolver seam: registered BEFORE Program.AddModelDiscovery so the production
+        // registration resolves THIS delegate. The stub performs no network I/O and records the
+        // credential it was handed, which is how the production wiring's "resolver receives the
+        // SELECTED token" contract is observed.
+        var resolvedTokens = new List<string?>();
+        CopilotEndpointResolver stubResolver = (token, _) =>
+        {
+            resolvedTokens.Add(token);
+            return Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+        };
+        services.AddSingleton<CopilotEndpointResolver>(stubResolver);
+
         Program.AddModelDiscovery(services);
 
         await using var provider = services.BuildServiceProvider();
@@ -791,13 +818,15 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         var userService = provider.GetRequiredService<UserService>();
         var discovery = provider.GetRequiredService<ModelDiscoveryService>();
 
-        // Before any sign-in: no stored token and no env fallback — no Copilot request.
+        // Before any sign-in: no stored token and no env fallback — no Copilot request, and the
+        // no-token path must not consult the endpoint resolver at all.
         Assert.Null(await userService.GetActiveAccessTokenAsync(TestContext.Current.CancellationToken));
         var withoutToken = await discovery.DiscoverCopilotModelsAsync(TestContext.Current.CancellationToken);
         Assert.Empty(withoutToken);
         Assert.Equal(0, handler.RequestCount);
         Assert.Null(handler.LastAuthorizationParameter);
         Assert.Empty(handler.LastCopilotIntegrationIdValues);
+        Assert.Empty(resolvedTokens);
 
         // After a GitHub sign-in the SAME production-resolved singleton must pick up the
         // stored token through the live UserService lookup.
@@ -813,6 +842,8 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.Equal(1, handler.RequestCount);
         Assert.Equal("Bearer", handler.LastAuthorizationScheme);
         Assert.Equal("stored-oauth-token", handler.LastAuthorizationParameter);
+        // The production wiring handed the resolver the credential SELECTED for this call.
+        Assert.Equal(["stored-oauth-token"], resolvedTokens);
         // The production DI-resolved singleton must send the exact integration header too.
         Assert.Equal(["copilot-developer-cli"], handler.LastCopilotIntegrationIdValues);
     }

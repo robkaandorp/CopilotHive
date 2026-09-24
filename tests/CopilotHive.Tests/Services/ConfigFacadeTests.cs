@@ -1143,6 +1143,14 @@ internal sealed class ThrowingConfigRepoManager(string url, string path, Excepti
 public sealed class ConfigFacadeDiscoveryTests
 {
     /// <summary>
+    /// Stub per-account endpoint resolver used by every service constructed here: it answers
+    /// with the provider's default endpoint and performs NO network I/O, so the real
+    /// per-account lookup is never reached from a test.
+    /// </summary>
+    private static Task<Uri> StubCopilotEndpointResolver(string token, CancellationToken ct)
+        => Task.FromResult(new Uri("https://api.githubcopilot.com/"));
+
+    /// <summary>
     /// DiscoverModelsAsync with the real <see cref="ModelDiscoveryService"/> and no provider
     /// credentials → success with an empty list: both providers report unconfigured, so the
     /// facade's success path maps an empty DTO list.
@@ -1162,7 +1170,9 @@ public sealed class ConfigFacadeDiscoveryTests
             Environment.SetEnvironmentVariable("OLLAMA_API_KEY", null);
             Environment.SetEnvironmentVariable("OLLAMA_URL", null);
 
-            var discovery = new ModelDiscoveryService(NullLogger<ModelDiscoveryService>.Instance);
+            var discovery = new ModelDiscoveryService(
+                NullLogger<ModelDiscoveryService>.Instance,
+                resolveCopilotEndpointAsync: StubCopilotEndpointResolver);
             using var factory = new ConfigFacadeTests.FacadeFactory(config, service, discovery);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
@@ -1225,7 +1235,8 @@ public sealed class ConfigFacadeDiscoveryTests
             var discovery = new ModelDiscoveryService(
                 NullLogger<ModelDiscoveryService>.Instance,
                 new StaticHttpClientFactory(
-                    new HttpClient(new StubHttpHandler(body), disposeHandler: false)));
+                    new HttpClient(new StubHttpHandler(body), disposeHandler: false)),
+                resolveCopilotEndpointAsync: StubCopilotEndpointResolver);
 
             using var factory = new ConfigFacadeTests.FacadeFactory(config, service, discovery);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
