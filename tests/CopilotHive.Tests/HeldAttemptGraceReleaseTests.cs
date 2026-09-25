@@ -246,17 +246,39 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         return harness;
     }
 
+    /// <summary>Give the reclaimed task a real active queue entry so completion/retention is observable.</summary>
+    private static WorkTask SeedActiveQueueEntry(Harness harness, string goalId, string taskId)
+    {
+        var entry = new WorkTask
+        {
+            TaskId = taskId,
+            GoalId = goalId,
+            GoalDescription = "held attempt",
+            Prompt = "x",
+            Role = WorkerRole.Coder,
+            Repositories = [],
+        };
+        harness.Queue.Enqueue(entry);
+        Assert.Same(entry, harness.Queue.TryDequeueAny());
+        harness.Queue.Activate(entry, "restored-worker");
+        Assert.Same(entry, harness.Queue.GetActiveTask(taskId));
+        return entry;
+    }
+
     private static int CountWarnings(TestLogger<StaleWorkerCleanupService> logger, string marker) =>
         logger.LogEntries.Count(e => e.LogLevel == LogLevel.Warning && e.Message.Contains(marker, StringComparison.Ordinal));
 
     /// <summary>Asserts the held attempt is EXACTLY as restored and nothing was enqueued or notified.</summary>
-    private void AssertUntouched(Harness harness, GoalPipelineManager manager, GoalPipeline pipeline, string taskId)
+    private void AssertUntouched(Harness harness, GoalPipelineManager manager, GoalPipeline pipeline, WorkTask entry)
     {
+        var taskId = entry.TaskId;
         Assert.True(pipeline.IsRestoredActiveAttemptHold, "the hold must still be in force");
         Assert.Equal(taskId, pipeline.ActiveTaskId, StringComparer.Ordinal);
         Assert.Equal(WorkSlotState.Pending, SlotState(pipeline, taskId));
         Assert.Same(pipeline, manager.GetByTaskId(taskId));
         Assert.Equal(1, RawMappingCount(taskId));
+        Assert.Same(entry, harness.Queue.GetActiveTask(taskId));
+        Assert.Null(harness.Queue.TryDequeueAny());
         Assert.Empty(QueuedRedispatches(harness.Dispatcher));
         Assert.Equal(0, Volatile.Read(ref harness.DashboardNotifications));
     }
@@ -277,11 +299,12 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         var pipeline = RestoreHeld(manager, goalId, taskId, mappingExpected: true);
         var logger = new TestLogger<StaleWorkerCleanupService>();
         var harness = CreateHarness(manager, logger);
+        var entry = SeedActiveQueueEntry(harness, goalId, taskId);
 
         harness.Now = Origin + Grace - TimeSpan.FromTicks(1);
         await harness.RunCycleAsync();
 
-        AssertUntouched(harness, manager, pipeline, taskId);
+        AssertUntouched(harness, manager, pipeline, entry);
         Assert.Equal(0, CountWarnings(logger, SweepWarningMarker));
 
         harness.Now = Origin + Grace;
@@ -290,6 +313,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         Assert.False(pipeline.IsRestoredActiveAttemptHold);
         Assert.Equal(WorkSlotState.Abandoned, SlotState(pipeline, taskId));
         Assert.Null(pipeline.ActiveTaskId);
+        Assert.Null(harness.Queue.GetActiveTask(taskId));
         Assert.Equal([goalId], QueuedRedispatches(harness.Dispatcher));
     }
 
@@ -308,6 +332,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         var pipeline = RestoreHeld(manager, goalId, taskId, mappingExpected: true);
         var logger = new TestLogger<StaleWorkerCleanupService>();
         var harness = CreateHarness(manager, logger);
+        SeedActiveQueueEntry(harness, goalId, taskId);
 
         harness.Now = Origin + Grace;
         await harness.RunCycleAsync();
@@ -351,6 +376,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         var pipeline = RestoreHeld(manager, goalId, taskId, mappingExpected: false);
         var logger = new TestLogger<StaleWorkerCleanupService>();
         var harness = CreateHarness(manager, logger);
+        SeedActiveQueueEntry(harness, goalId, taskId);
 
         harness.Now = Origin + Grace + TimeSpan.FromMinutes(3);
         await harness.RunCycleAsync();
@@ -359,6 +385,8 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         Assert.Equal(WorkSlotState.Abandoned, SlotState(pipeline, taskId));
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(harness.Queue.GetActiveTask(taskId));
+        Assert.Null(harness.Queue.TryDequeueAny());
         Assert.Equal([goalId], QueuedRedispatches(harness.Dispatcher));
         Assert.Equal(1, Volatile.Read(ref harness.DashboardNotifications));
         Assert.Equal(1, CountWarnings(logger, SweepWarningMarker));
@@ -385,6 +413,8 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
 
         var logger = new TestLogger<StaleWorkerCleanupService>();
         var harness = CreateHarness(manager, logger);
+        var adoptedEntry = SeedActiveQueueEntry(harness, adoptedGoal, adoptedTask);
+        SeedActiveQueueEntry(harness, controlGoal, controlTask);
 
         harness.Now = Origin + Grace;
         await harness.RunCycleAsync();
@@ -394,6 +424,8 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         Assert.Equal(WorkSlotState.Pending, SlotState(adopted, adoptedTask));
         Assert.Same(adopted, manager.GetByTaskId(adoptedTask));
         Assert.Equal(1, RawMappingCount(adoptedTask));
+        Assert.Same(adoptedEntry, harness.Queue.GetActiveTask(adoptedTask));
+        Assert.Null(harness.Queue.GetActiveTask(controlTask));
         Assert.False(adopted.TryReleaseRestoredActiveAttemptHold(), "an adopted attempt must stay adopted");
         Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains(adoptedTask, StringComparison.Ordinal));
 
@@ -427,6 +459,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
 
         var logger = new TestLogger<StaleWorkerCleanupService>();
         var harness = CreateHarness(manager, logger);
+        var entry = SeedActiveQueueEntry(harness, goalId, taskId);
 
         harness.Now = Origin + Grace;
         await harness.RunCycleAsync();
@@ -436,6 +469,8 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         Assert.Equal(WorkSlotState.Pending, SlotState(pipeline, taskId));
         Assert.Same(pipeline, manager.GetByTaskId(taskId));
         Assert.Equal(1, RawMappingCount(taskId));
+        Assert.Same(entry, harness.Queue.GetActiveTask(taskId));
+        Assert.Null(harness.Queue.TryDequeueAny());
         Assert.Empty(QueuedRedispatches(harness.Dispatcher));
         Assert.Equal(0, Volatile.Read(ref harness.DashboardNotifications));
         Assert.Equal(0, CountWarnings(logger, SweepWarningMarker));
@@ -461,6 +496,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         var pipeline = RestoreHeld(manager, goalId, taskId, mappingExpected: true);
         var logger = new ThrowingLogger();
         var harness = CreateHarness(manager, logger);
+        SeedActiveQueueEntry(harness, goalId, taskId);
         Assert.Empty(harness.Pool.GetAllWorkers());
 
         harness.Now = Origin + Grace;
@@ -471,6 +507,8 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Null(manager.GetByTaskId(taskId));
         Assert.Equal(0, RawMappingCount(taskId));
+        Assert.Null(harness.Queue.GetActiveTask(taskId));
+        Assert.Null(harness.Queue.TryDequeueAny());
         Assert.Equal([goalId], QueuedRedispatches(harness.Dispatcher));
         Assert.Equal(1, Volatile.Read(ref harness.DashboardNotifications));
 
