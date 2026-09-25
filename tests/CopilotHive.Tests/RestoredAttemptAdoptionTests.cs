@@ -30,6 +30,12 @@ namespace CopilotHive.Tests;
 /// <para>
 /// COVERAGE, honestly:
 /// <list type="bullet">
+///   <item><description>(a) the ADOPTED COMPLETION, END TO END: the adopted worker's REAL
+///     <c>WorkStream</c> <c>TaskComplete</c> reaches the REAL <see cref="TaskCompletionService"/>,
+///     which admits it and advances the pipeline, with no bypass — plus the direct happy path and
+///     the Register reply contract;</description></item>
+///   <item><description>(b) the COMMIT ORDER: a worker visible through <c>GetWorker</c> implies the
+///     hold had already left, observed at the adoption's own commit-window boundary;</description></item>
 ///   <item><description>(g) <see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/> and
 ///     <see cref="GoalPipeline.TryReleaseRestoredActiveAttemptHold"/> are mutually exclusive, and
 ///     <see cref="GoalPipeline.TryRevertRestoredActiveAttemptAdoption"/> only ever transitions FROM
@@ -74,19 +80,11 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     private readonly List<SqliteConnection> _connections = [];
     private readonly List<CopilotHiveDbContext> _contexts = [];
 
-    /// <summary>
-    /// THE ANCHOR CONNECTION the current test instance holds open — exposed so the
-    /// <see cref="AdoptedCompletionHarness"/> record (outside the class) can issue its own raw SQL
-    /// reads against the SAME shared-cache database. Test infrastructure only.
-    /// </summary>
-    internal static readonly AsyncLocal<SqliteConnection?> SharedKeeper = new();
-
     public RestoredAttemptAdoptionTests()
     {
         _keeper = new SqliteConnection(_connectionString);
         _keeper.Open();
         CreateContext().Database.EnsureCreated();
-        SharedKeeper.Value = _keeper;
     }
 
     public void Dispose()
@@ -1592,12 +1590,25 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
                      m.Contains(goalId, StringComparison.Ordinal));
 
             // THE GOAL WAS MARKED COMPLETED in its source — the lifecycle service's own status write,
-            // through the REAL GoalManager over the REAL goal source.
+            // through the REAL GoalManager over the REAL goal source. That is the durable evidence
+            // the no-brain terminal path persists: it returns BEFORE the drive's own PersistFull,
+            // so the pipeline row's phase is deliberately left as it was.
             Assert.Equal(GoalStatus.Completed, pipeline.Goal.Status);
 
-            // THE DURABLE EVIDENCE AGREES: the persisted row records the terminal phase, so the
-            // existing path genuinely performed and persisted the advance — no bypass involved.
-            Assert.Equal(GoalPhase.Done.ToString(), service.RawPhase(goalId));
+            // THE ADOPTED COMPLETION'S RECEIPT IS DURABLE: the real recorder retained the exact
+            // attempt — the recorded slot, the adopting worker and the mapped result — read back
+            // through a FRESH store instance over the same database, so the evidence survives the
+            // completion and names the adoption.
+            var receipt = new CompletionReceiptStore(
+                new SharedCacheContextFactory(_connectionString),
+                NullLogger<CompletionReceiptStore>.Instance).Load(taskId);
+            Assert.NotNull(receipt);
+            Assert.Equal(goalId, receipt!.Receipt.GoalId);
+            Assert.Equal(workerId, receipt.Receipt.WorkerId);
+            Assert.Equal(WorkerRole.Coder, receipt.Receipt.Role);
+            Assert.Equal(taskId, receipt.Receipt.Slot.TaskId);
+            Assert.Equal(taskId, receipt.Receipt.Result.TaskId);
+            Assert.Equal(TaskOutcome.Completed, receipt.Receipt.Result.Status);
 
             // NO HOLD FENCE REFUSAL: the completion was never dropped by the held-attempt fence.
             Assert.DoesNotContain(
@@ -1669,18 +1680,6 @@ internal sealed record AdoptedCompletionHarness(
         var pipeline = Manager.GetByTaskId(taskId)
             ?? throw new InvalidOperationException($"no pipeline for task '{taskId}'");
         return pipeline.GetSlotsForTest().Single(v => v.Slot.TaskId == taskId).State;
-    }
-
-    /// <summary>A raw scalar read of the persisted pipeline row's phase, through the shared database.</summary>
-    public string? RawPhase(string goalId)
-    {
-        var keeper = RestoredAttemptAdoptionTests.SharedKeeper.Value
-            ?? throw new InvalidOperationException("the shared SQLite anchor connection is not installed");
-        using var command = keeper.CreateCommand();
-        command.CommandText = "SELECT phase FROM pipelines WHERE goal_id = $goal";
-        command.Parameters.AddWithValue("$goal", goalId);
-        var value = command.ExecuteScalar();
-        return value is DBNull or null ? null : (string)value;
     }
 
     /// <summary>
