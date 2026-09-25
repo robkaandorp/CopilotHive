@@ -43,6 +43,15 @@ namespace CopilotHive.Services;
 /// non-null active pointer is HELD (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) and the
 /// reclaim refuses it entirely — see <see cref="RescheduleAbandonedTask"/>.
 /// </para>
+/// <para>
+/// THE UNADOPTED-HOLD SWEEP. A held attempt whose worker never re-registers to adopt it would
+/// otherwise stay paused forever. Once <see cref="CleanupDefaults.HeldAttemptAdoptionGraceMinutes"/>
+/// have elapsed since this service was constructed, every cleanup pass releases each still-held
+/// attempt (<see cref="GoalPipeline.TryReleaseRestoredActiveAttemptHold"/>) and runs the ordinary
+/// unheld reclaim on it — see <see cref="SweepUnadoptedHeldAttempts"/>. The grace is a POLICY
+/// timeout, not proof that the worker is gone: a worker that re-registers after the release loses
+/// the attempt (its adoption is refused) and the goal proceeds through the ordinary re-dispatch.
+/// </para>
 /// </remarks>
 public sealed class StaleWorkerCleanupService : BackgroundService
 {
@@ -59,6 +68,26 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     /// Settable internally to enable fast-cycle testing without waiting 60 s.
     /// </summary>
     internal TimeSpan CleanupDelay { get; set; } = TimeSpan.FromSeconds(CleanupDefaults.CleanupIntervalSeconds);
+
+    /// <summary>
+    /// The clock the held-attempt grace is measured with. Defaults to <see cref="DateTime.UtcNow"/>;
+    /// settable internally so tests can drive the grace boundary deterministically.
+    /// </summary>
+    internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
+
+    private DateTime _startedAtUtc;
+
+    /// <summary>
+    /// The grace origin: captured ONCE, at construction, from <see cref="UtcNow"/>. The held-attempt
+    /// sweep runs only once <c>UtcNow() - StartedAtUtc</c> reaches
+    /// <see cref="CleanupDefaults.HeldAttemptAdoptionGraceMinutes"/>. Settable internally so tests
+    /// get a defined boundary.
+    /// </summary>
+    internal DateTime StartedAtUtc
+    {
+        get => _startedAtUtc;
+        set => _startedAtUtc = value;
+    }
 
     /// <summary>
     /// Initialises the service with the worker pool, task queue, pipeline manager, and a logger.
@@ -79,6 +108,7 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         _goalDispatcher = goalDispatcher;
         _config = config;
         _dashboardNotifier = dashboardNotifier;
+        _startedAtUtc = UtcNow();
     }
 
     /// <summary>
@@ -134,6 +164,9 @@ public sealed class StaleWorkerCleanupService : BackgroundService
 
         var reclaimResult = ReclaimTimedOutTasks();
         anyRemoval = anyRemoval || reclaimResult;
+
+        var sweepResult = SweepUnadoptedHeldAttempts();
+        anyRemoval = anyRemoval || sweepResult;
 
         if (anyRemoval)
             _dashboardNotifier?.NotifyStateChanged();
@@ -246,6 +279,21 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         // It is a pure read — nothing is mutated by it — so the unheld path keeps its exact
         // existing behavior.
         var pipeline = _pipelineManager.GetByTaskId(taskId);
+        ReclaimTask(workerId, taskId, pipeline);
+    }
+
+    /// <summary>
+    /// The reclaim body shared by <see cref="RescheduleAbandonedTask"/> (which resolves the pipeline
+    /// from the task mapping) and <see cref="SweepUnadoptedHeldAttempts"/> (which passes the pipeline
+    /// it just released, so no second lookup happens). See <see cref="RescheduleAbandonedTask"/> for
+    /// the steps. Every diagnostic emission is best-effort (<see cref="LogSafely"/>), so a failing
+    /// logger can never interrupt the reclaim.
+    /// </summary>
+    /// <param name="workerId">The id of the worker that was removed, or a descriptive label.</param>
+    /// <param name="taskId">The task id being reclaimed.</param>
+    /// <param name="pipeline">The pipeline that owns the task, or <c>null</c> for an orphan.</param>
+    private void ReclaimTask(string workerId, string taskId, GoalPipeline? pipeline)
+    {
 
         // THE HOLD FENCE — BEFORE the previously unconditional _taskQueue.MarkComplete. A held
         // pipeline still owns the attempt it was restored with, so the reclaim refuses: NO queue
@@ -271,9 +319,9 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         // The pipeline may not exist for the task (an orphan) — everything below is then skipped.
         if (pipeline is null)
         {
-            _logger.LogWarning(
+            LogSafely(() => _logger.LogWarning(
                 "Worker {WorkerId} task {TaskId} reclaimed with no pipeline — the active entry removed; no re-dispatch (orphan; a persisted mapping, if any, survives for the successor's reconciliation)",
-                workerId, taskId);
+                workerId, taskId));
             return;
         }
 
@@ -298,24 +346,24 @@ public sealed class StaleWorkerCleanupService : BackgroundService
             // here is a contract violation (no runtime vector — the same sealed/non-virtual
             // treatment as the chain's established defensive paths, deliberately WITHOUT a
             // runtime-injection seam). The reclaim continues.
-            _logger.LogWarning(
+            LogSafely(() => _logger.LogWarning(
                 ex,
                 "WorkSlotIntegrity: reclaim-unregister-throw goal={GoalId} task={TaskId} — the unregister call threw; the reclaim continues",
-                pipeline.GoalId, taskId);
+                pipeline.GoalId, taskId));
         }
 
-        _logger.LogDebug(
+        LogSafely(() => _logger.LogDebug(
             "WorkSlotIntegrity: reclaim-unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved}",
-            pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved);
+            pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved));
 
         if (unregister.MemoryRemoved && !unregister.PersistenceRemoved)
         {
             // THE UNCONFIRMED PERSISTED REMOVAL, in CONSERVATIVE wording: no row-survival claim —
             // the delete did not confirm; a restart may still resolve the task to this pipeline.
             // The completion-protocol successor owns the durable reconciliation.
-            _logger.LogWarning(
+            LogSafely(() => _logger.LogWarning(
                 "WorkSlotIntegrity: reclaim-unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved} — the mapping's persisted removal did not confirm; a restart may resolve the retired task to this pipeline; the completion-protocol successor owns the durable reconciliation",
-                pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved);
+                pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved));
         }
 
         // (4) THE REDISPATCH: the replacement comes from a FRESH dispatch on the retired slot's
@@ -327,31 +375,106 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         {
             if (_goalDispatcher is not null)
             {
-                _logger.LogInformation(
+                LogSafely(() => _logger.LogInformation(
                     "Worker {WorkerId} task {TaskId} reclaimed — slot retired; queued for re-dispatch (goal {GoalId})",
-                    workerId, taskId, pipeline.GoalId);
+                    workerId, taskId, pipeline.GoalId));
             }
             else
             {
-                _logger.LogInformation(
+                LogSafely(() => _logger.LogInformation(
                     "Worker {WorkerId} task {TaskId} reclaimed — slot retired; no dispatcher available for re-dispatch (goal {GoalId})",
-                    workerId, taskId, pipeline.GoalId);
+                    workerId, taskId, pipeline.GoalId));
             }
         }
         else
         {
             if (_goalDispatcher is not null)
             {
-                _logger.LogInformation(
+                LogSafely(() => _logger.LogInformation(
                     "Worker {WorkerId} task {TaskId} reclaimed — slot already retired or absent (outcome={Outcome}); queued for re-dispatch (goal {GoalId})",
-                    workerId, taskId, outcome, pipeline.GoalId);
+                    workerId, taskId, outcome, pipeline.GoalId));
             }
             else
             {
-                _logger.LogInformation(
+                LogSafely(() => _logger.LogInformation(
                     "Worker {WorkerId} task {TaskId} reclaimed — slot already retired or absent (outcome={Outcome}); no dispatcher available for re-dispatch (goal {GoalId})",
-                    workerId, taskId, outcome, pipeline.GoalId);
+                    workerId, taskId, outcome, pipeline.GoalId));
             }
         }
+    }
+    /// <summary>
+    /// THE UNADOPTED-HOLD SWEEP: once the adoption grace
+    /// (<see cref="CleanupDefaults.HeldAttemptAdoptionGraceMinutes"/>, measured from
+    /// <see cref="StartedAtUtc"/> with <see cref="UtcNow"/>) has elapsed, releases every restored
+    /// held attempt whose worker has not re-registered to adopt it and hands it to the ordinary
+    /// unheld reclaim (<see cref="ReclaimTask"/>): queue entry completed, slot retired and pointer
+    /// cleared if current, mapping unregistered (harmless when none exists), goal queued for a fresh
+    /// re-dispatch. Held pipelines inside the grace window, and adopted ones, are untouched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// POLICY. The grace is a policy timeout, not proof that the worker is gone. A worker that
+    /// re-registers AFTER this sweep released its attempt loses that attempt: its adoption is
+    /// refused (the Held → Adopted CAS can no longer succeed), and the goal proceeds through the
+    /// ordinary re-dispatch.
+    /// </para>
+    /// <para>
+    /// BOUNDED LIMITATION. A held pipeline whose active-task pointer is blank (the empty string is
+    /// non-null, so it is held) names no task that could be reclaimed; it is left held with a
+    /// warning on each pass and must be cancelled or reset manually.
+    /// </para>
+    /// <para>
+    /// DURABILITY BOUND. As for every reclaim, the retire and the pointer clear are IN MEMORY only —
+    /// no persistence is added here. If the orchestrator restarts again before the re-dispatch
+    /// persists a new attempt, the pipeline is restored held again and is swept again after the
+    /// next grace.
+    /// </para>
+    /// </remarks>
+    /// <returns><c>true</c> when at least one held attempt was released and reclaimed.</returns>
+    private bool SweepUnadoptedHeldAttempts()
+    {
+        if (UtcNow() - _startedAtUtc < TimeSpan.FromMinutes(CleanupDefaults.HeldAttemptAdoptionGraceMinutes))
+            return false;
+
+        var anyReleased = false;
+        foreach (var p in _pipelineManager.GetActivePipelines())
+        {
+            if (!p.IsRestoredActiveAttemptHold)
+                continue;
+
+            var taskId = p.ActiveTaskId;
+            if (string.IsNullOrWhiteSpace(taskId))
+            {
+                LogSafely(() => _logger.LogWarning(
+                    "held attempt for goal {GoalId} has a blank active-task pointer — left held; cancel or reset the goal manually",
+                    p.GoalId));
+                continue;
+            }
+
+            // THE RELEASE: a compare-and-swap FROM Held. It loses (and nothing is touched) when a
+            // re-registering worker adopted the attempt first.
+            if (!p.TryReleaseRestoredActiveAttemptHold())
+                continue;
+
+            // WHY RELEASE → RETIRE NEEDS NO EXTRA FENCE. After the successful release CAS above,
+            // adoption for this pipeline is impossible: its Held → Adopted CAS can no longer
+            // succeed. After a restart, a worker can only be pool-busy with this task and own its
+            // active TaskQueue entry THROUGH adoption, and RegisterAdoptedWorker undoes itself when
+            // its CAS loses. So no completion for the task can pass
+            // HiveOrchestratorService.HandleClassifiedTaskComplete's ownership checks
+            // (WorkerNotBusyWithTask / NoActiveQueueEntry) in the window between this release and
+            // the retire inside ReclaimTask — nothing can reach TaskCompletionService. No
+            // additional fence is required.
+            LogSafely(() => _logger.LogWarning(
+                "held attempt {TaskId} for goal {GoalId} not adopted within grace — releasing to ordinary reclaim",
+                taskId, p.GoalId));
+
+            // The SAME instance is passed on — no second lookup. It is no longer held, so the
+            // reclaim runs its ordinary unheld path.
+            ReclaimTask("(not adopted after restart)", taskId, p);
+            anyReleased = true;
+        }
+
+        return anyReleased;
     }
 }
