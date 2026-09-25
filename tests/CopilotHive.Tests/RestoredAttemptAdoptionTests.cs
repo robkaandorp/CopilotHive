@@ -2134,8 +2134,11 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// contended, the thread blocks, and the pending interrupt raises a REAL
     /// <see cref="ThreadInterruptedException"/> out of the removal itself. Uncontended monitor entries
     /// in between (the pool's own reentrant lock, the dictionary) never block, so nothing earlier
-    /// consumes the interrupt. Disposing clears any unconsumed interrupt and releases the helper, on
-    /// every path.
+    /// consumes the interrupt. Disposing clears any unconsumed interrupt, releases the helper, and
+    /// REQUIRES the helper's termination before anything is disposed: a timed-out join is a test
+    /// failure with a diagnostic, and no event is disposed while the holder is still live. An
+    /// interrupted removal blocks the cleanup path for one monitor-entry attempt only, so the helper
+    /// is always released within the bounded wait below.
     /// </summary>
     private sealed class ContendedQueueLock(TaskQueue queue) : IDisposable
     {
@@ -2160,11 +2163,24 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
                 }
             }) { IsBackground = true };
             _holder.Start();
-            Assert.True(_held.Wait(CommitOrderWait), "the helper must hold the queue lock");
+
+            if (!_held.Wait(CommitOrderWait))
+            {
+                // THE HELPER IS RELEASED BEFORE THE FAILURE IS RAISED, so a failed rendezvous cannot
+                // leave a thread blocked on this fixture's own event while the test tears down.
+                _release.Set();
+                Assert.Fail(
+                    $"the contended-lock helper must hold the queue lock within {CommitOrderWait.TotalSeconds:F0}s");
+            }
 
             Thread.CurrentThread.Interrupt();
         }
 
+        /// <summary>
+        /// Bounded, ASSERTED teardown. The helper is released and its termination is REQUIRED before
+        /// either event is disposed: a timed-out join fails the test with a diagnostic instead of
+        /// silently leaking a live thread that could still run against disposed handles.
+        /// </summary>
         public void Dispose()
         {
             // Clear an interrupt that was armed but never consumed, so it cannot leak into the runner.
@@ -2178,7 +2194,21 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             }
 
             _release.Set();
-            _holder?.Join(CommitOrderWait);
+
+            if (_holder is { } holder)
+            {
+                if (!holder.Join(CommitOrderWait))
+                {
+                    // NO EVENT IS DISPOSED WHILE THE HOLDER IS STILL LIVE: failing here is the honest
+                    // outcome, and the fixture's handles are deliberately left undisposed.
+                    Assert.Fail(
+                        $"the contended-lock helper must terminate within {CommitOrderWait.TotalSeconds:F0}s " +
+                        "of being released; a live holder thread would outlive this test and could fault on " +
+                        "disposed events");
+                }
+            }
+
+            // CONFIRMED TERMINATION (or the holder was never started): disposal is now safe.
             _held.Dispose();
             _release.Dispose();
         }
@@ -2333,6 +2363,52 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         logger.AssertReadersJoined();
         Assert.True(warning.ReadFinishedAtEmission,
             "the independent GetIdleWorker read must FINISH while the warning is emitted, after the pool lock is released");
+    }
+
+    /// <summary>
+    /// (W1) THE <c>Unobserved</c> WORDING, pinned through the production rendering itself
+    /// (<see cref="WorkerPool.DescribeCleanupObservation"/>). When the follow-up queue lookup throws,
+    /// nothing may be claimed about the queue — the sentence must say the state could NOT be observed
+    /// AND must not rule out THIS registration's own entry still remaining. The three positive
+    /// observations keep their exact, unchanged sentences (M1's distinctions are preserved), and an
+    /// undefined value is a loud failure rather than a fabricated sentence.
+    /// <para>
+    /// WHY THE PURE RENDERING IS THE RIGHT PIN: <see cref="TaskQueue"/> is sealed and its
+    /// <c>GetActiveTask</c> is non-virtual, and the only input it throws for — a null key — is rejected
+    /// earlier by <c>TryRemoveOwned</c>/<c>TryActivateNew</c>. The observation branch is therefore
+    /// unreachable through the real queue API, and a fabricated lookup would pin something other than
+    /// the production sentence. This test pins the production sentence directly, and the
+    /// throwing-removal vectors above prove the warning really appends it.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void DescribeCleanupObservation_Unobserved_AdmitsTheUnobservedStateWithoutRulingOutOwnResidue()
+    {
+        var unobserved = WorkerPool.DescribeCleanupObservation(WorkerPool.CleanupObservation.Unobserved);
+
+        Assert.Contains("could NOT be observed", unobserved, StringComparison.Ordinal);
+        Assert.Contains("unknown", unobserved, StringComparison.Ordinal);
+        // THE OWN-RESIDUE POSSIBILITY IS EXPLICIT — the pre-fix sentence listed only the two benign
+        // possibilities and so understated the risk.
+        Assert.Contains("own entry still remains", unobserved, StringComparison.Ordinal);
+        Assert.Contains("already absent", unobserved, StringComparison.Ordinal);
+        Assert.Contains("owned by another assignment", unobserved, StringComparison.Ordinal);
+
+        // THE OTHER OBSERVATIONS KEEP THEIR EXACT SENTENCES: the unobserved fix did not blur M1's
+        // absent / foreign / own distinctions.
+        Assert.Equal(
+            "the entry is already absent (e.g. a concurrent completion removed it); no residue remains",
+            WorkerPool.DescribeCleanupObservation(WorkerPool.CleanupObservation.EntryAbsent));
+        Assert.Equal(
+            "the task's entry is now owned by another assignment and was left untouched",
+            WorkerPool.DescribeCleanupObservation(WorkerPool.CleanupObservation.ForeignEntryRemains));
+        Assert.Equal(
+            "this registration's own entry remains in the queue as residue",
+            WorkerPool.DescribeCleanupObservation(WorkerPool.CleanupObservation.OwnEntryRemains));
+
+        // AN UNDEFINED OBSERVATION IS A LOUD FAILURE, never a fabricated sentence.
+        Assert.Throws<InvalidOperationException>(
+            () => WorkerPool.DescribeCleanupObservation((WorkerPool.CleanupObservation)42));
     }
 
     /// <summary>

@@ -1355,7 +1355,7 @@ public sealed class WorkerPool : IWorkerPool
         string TaskId, string WorkerId, CleanupObservation Observation, Exception? RemovalException);
 
     /// <summary>What the queue was OBSERVED to hold for the task after an unconfirmed cleanup.</summary>
-    private enum CleanupObservation
+    internal enum CleanupObservation
     {
         /// <summary>No entry exists for the task (e.g. a concurrent completion already removed it).</summary>
         EntryAbsent,
@@ -1437,19 +1437,7 @@ public sealed class WorkerPool : IWorkerPool
                 ? "removal refused"
                 : $"removal threw {failure.RemovalException.GetType().Name}";
 
-            var observed = failure.Observation switch
-            {
-                CleanupObservation.EntryAbsent =>
-                    "the entry is already absent (e.g. a concurrent completion removed it); no residue remains",
-                CleanupObservation.ForeignEntryRemains =>
-                    "the task's entry is now owned by another assignment and was left untouched",
-                CleanupObservation.OwnEntryRemains =>
-                    "this registration's own entry remains in the queue as residue",
-                CleanupObservation.Unobserved =>
-                    "the entry may already be absent or owned by another assignment",
-                _ => throw new InvalidOperationException(
-                    $"Unhandled CleanupObservation: {failure.Observation}"),
-            };
+            var observed = DescribeCleanupObservation(failure.Observation);
 
             _logger.LogWarning(
                 "WorkerPool: cleanup-unconfirmed task={TaskId} worker={WorkerId} — the adopted registration's " +
@@ -1464,4 +1452,31 @@ public sealed class WorkerPool : IWorkerPool
             // Diagnostic failure only — the caller's outcome (or original exception) stands.
         }
     }
+
+    /// <summary>
+    /// THE PURE OBSERVATION RENDERING used by <see cref="ReportUnconfirmedCleanup"/>: each
+    /// <see cref="CleanupObservation"/> becomes the exact sentence the warning appends, so the
+    /// wording can be pinned directly for every observation — including
+    /// <see cref="CleanupObservation.Unobserved"/>, which no test can construct through the real
+    /// <see cref="TaskQueue"/> (its <c>GetActiveTask</c> is non-virtual on a sealed type, and the only
+    /// input it throws for — a null key — is rejected earlier by <see cref="TaskQueue.TryRemoveOwned"/>
+    /// and <see cref="TaskQueue.TryActivateNew"/>).
+    /// </summary>
+    /// <param name="observation">What the queue was observed to hold, or that it could not be observed.</param>
+    /// <returns>The single sentence describing that observation.</returns>
+    /// <exception cref="InvalidOperationException"><paramref name="observation"/> is not a defined value.</exception>
+    internal static string DescribeCleanupObservation(CleanupObservation observation) => observation switch
+    {
+        CleanupObservation.EntryAbsent =>
+            "the entry is already absent (e.g. a concurrent completion removed it); no residue remains",
+        CleanupObservation.ForeignEntryRemains =>
+            "the task's entry is now owned by another assignment and was left untouched",
+        CleanupObservation.OwnEntryRemains =>
+            "this registration's own entry remains in the queue as residue",
+        CleanupObservation.Unobserved =>
+            "the queue's entry state could NOT be observed, so it is unknown whether this " +
+            "registration's own entry still remains, was already absent, or is now owned by " +
+            "another assignment",
+        _ => throw new InvalidOperationException($"Unhandled CleanupObservation: {observation}"),
+    };
 }
