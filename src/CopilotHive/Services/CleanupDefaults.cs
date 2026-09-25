@@ -21,4 +21,16 @@ public static class CleanupDefaults
     /// generous headroom while still bounding a hung task.
     /// </summary>
     public const int WorkerTaskTimeoutMinutes = 60;
+
+    /// <summary>
+    /// The grace period, in minutes, measured from the cleanup service's construction (the
+    /// orchestrator start), during which a restored HELD attempt
+    /// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) waits for its worker to re-register
+    /// and adopt it. Once the grace has elapsed, the cleanup sweep releases every still-held attempt
+    /// to the ordinary reclaim (slot retired, pointer cleared, mapping unregistered, goal queued
+    /// for re-dispatch). This is a POLICY timeout, not proof that the worker is gone: a worker that
+    /// re-registers after the release loses the attempt — its adoption is refused and the goal
+    /// proceeds through the ordinary re-dispatch. This single value governs the sweep.
+    /// </summary>
+    public const int HeldAttemptAdoptionGraceMinutes = 5;
 }
