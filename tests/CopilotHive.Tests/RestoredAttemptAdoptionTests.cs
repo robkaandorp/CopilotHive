@@ -311,13 +311,14 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// An existing queue to share — the pre-existing-entry vectors arrange it BEFORE the harness is
     /// built — or <c>null</c> for a fresh one.
     /// </param>
-    /// <returns>The harness, with fresh pool, queue and loggers.</returns>
+    /// <param name="pool">An existing real pool, or <c>null</c> for a fresh one.</param>
+    /// <returns>The harness, with a shared pool and queue and fresh loggers.</returns>
     private RegisterHarness CreateRegisterHarness(
-        GoalPipelineManager manager, bool withAdopter, TaskQueue? queue = null)
+        GoalPipelineManager manager, bool withAdopter, TaskQueue? queue = null, WorkerPool? pool = null)
     {
         // ONE pool and ONE queue, shared by the harness and the adopter: the adopter's registration
         // must land in the very pool and queue the Register reply is then asserted against.
-        var pool = new WorkerPool();
+        pool ??= new WorkerPool();
         queue ??= new TaskQueue();
         var logger = new AdoptionCapturingLogger<HiveOrchestratorService>();
         var adopterLogger = new AdoptionCapturingLogger<RestoredAttemptAdopter>();
@@ -1738,22 +1739,31 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
 
         var harness = CreateRegisterHarness(manager, withAdopter: true);
+        var gateField = typeof(GoalPipeline).GetField("_lock",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(gateField);
+        var gate = Assert.IsType<object>(gateField!.GetValue(pipeline));
+        Assert.False(Monitor.IsEntered(gate));
 
         Task<AdmissionOutcome>? admission = null;
         var writerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         pipeline.InsideAdoptionCommitRegionForTest = () =>
         {
+            // Observe the REAL lock inside the production method's validation/CAS region.
+            // This assertion, not elapsed time, kills removal of the lock at this boundary.
+            Assert.True(Monitor.IsEntered(gate),
+                "the commit-region hook must run while owning the pipeline's real registry lock");
             admission = Task.Run(() =>
             {
                 writerStarted.TrySetResult();
                 return pipeline.AdmitCompletion(taskId);
             });
 
-            // The writer is running and contending — but it cannot enter while the region holds the
-            // pipeline lock, so it has NOT completed by the time the region proceeds to its CAS.
-            writerStarted.Task.Wait(CommitOrderWait);
-            Assert.False(admission.Wait(TimeSpan.FromMilliseconds(200)),
-                "a writer contending for the pipeline lock must block until the region's CAS commits");
+            // The writer has started; while this hook owns the lock it cannot complete admission.
+            // The positive join below then proves it entered after the CAS. No timed absence probe.
+            Assert.True(writerStarted.Task.Wait(CommitOrderWait));
+            Assert.False(admission.IsCompleted,
+                "the writer cannot admit a slot inside the locked validation/CAS region");
         };
 
         var response = await RegisterAsync(harness, workerId, taskId);
@@ -1816,14 +1826,18 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
         Assert.Equal(AdoptedRegistrationOutcome.DuplicateId, result.Outcome);
         Assert.Null(result.Worker);
+        Assert.NotNull(pool.GetWorker("worker-residue-race"));
 
         // THE FOREIGN ENTRY IS UNTOUCHED, and the refused cleanup is REPORTED exactly once.
         Assert.Same(foreign, queue.GetActiveTask(task.TaskId));
+        Assert.Equal("worker-foreign", foreign!.Metadata["assigned_worker"]);
         var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
         Assert.Contains("stale-active-entry", warning.Message, StringComparison.Ordinal);
         Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
         Assert.Contains("worker-residue-race", warning.Message, StringComparison.Ordinal);
         Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("nothing remains mutated", warning.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -1858,8 +1872,108 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
         var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
         Assert.Contains("stale-active-entry", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
         Assert.Contains("worker-residue-throw", warning.Message, StringComparison.Ordinal);
         Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("nothing remains mutated", warning.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A faulting diagnostic must not replace the ORIGINAL commit exception: the real queue's
+    /// reference check still refuses after a foreign replacement, the warning is attempted, and
+    /// only the warning's logger throws. Every other log passes through unchanged.
+    /// </summary>
+    private sealed class FaultingResidueLogger : ILogger<WorkerPool>
+    {
+        public int WarningAttempts { get; private set; }
+        public InvalidOperationException Failure { get; } = new("residue diagnostic failed");
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel level) => true;
+        public void Log<TState>(LogLevel level, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (level != LogLevel.Warning ||
+                !formatter(state, exception).Contains("stale-active-entry", StringComparison.Ordinal))
+                return;
+            WarningAttempts++;
+            throw Failure;
+        }
+    }
+
+    [Fact]
+    public void RegisterAdoptedWorker_ResidueWarningLoggerThrows_OriginalCommitExceptionStillWins()
+    {
+        var logger = new FaultingResidueLogger();
+        var pool = new WorkerPool(logger);
+        var queue = new TaskQueue();
+        var task = BuildTask("task-residue-logger-fault");
+        var commitFailure = new InvalidOperationException("the original commit exception");
+        WorkTask? foreign = null;
+        pool.BeforeAdoptedWorkerPublicationForTest = _ =>
+        {
+            foreign = ReplaceActiveEntryWithForeignInstance(queue, task.TaskId);
+            throw commitFailure;
+        };
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => pool.RegisterAdoptedWorker(
+            "worker-residue-logger-fault", [], false, false, task, queue));
+
+        Assert.Same(commitFailure, thrown);
+        Assert.NotSame(logger.Failure, thrown);
+        Assert.Equal(1, logger.WarningAttempts);
+        Assert.Same(foreign, queue.GetActiveTask(task.TaskId));
+        Assert.Null(pool.GetWorker("worker-residue-logger-fault"));
+    }
+
+    /// <summary>
+    /// The adopter must revert its hold when the same real queue replacement causes a failed
+    /// registration; the foreign residue remains, and the normal idle registration is honest.
+    /// The pool warning and the service's single AdoptionCommitFailed warning describe DISTINCT
+    /// events, so the refusal-count helper still counts exactly one across the service/adopter.
+    /// </summary>
+    [Fact]
+    public async Task Register_CommitFailureWithForeignQueueResidue_RevertsHoldAndRegistersIdle()
+    {
+        var goalId = "adopt-residue-rollback";
+        var workerId = "worker-residue-rollback";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+        var poolLogger = new AdoptionCapturingLogger<WorkerPool>();
+        var pool = new WorkerPool(poolLogger);
+        var queue = new TaskQueue();
+        var harness = CreateRegisterHarness(manager, withAdopter: true, queue: queue, pool: pool);
+        var original = new InvalidOperationException("commit-failure-with-residue");
+        WorkTask? foreign = null;
+        pool.BeforeAdoptedWorkerPublicationForTest = _ =>
+        {
+            foreign = ReplaceActiveEntryWithForeignInstance(queue, taskId);
+            throw original;
+        };
+
+        var response = await RegisterAsync(harness, workerId, taskId);
+
+        Assert.True(response.Accepted);
+        Assert.False(response.AdoptedTask);
+        var warnings = harness.AllEntries.Where(e => e.LogLevel >= LogLevel.Warning).ToList();
+        Assert.True(warnings.Count == 1, $"exactly one service/adopter warning; got {warnings.Count}");
+        var refusal = warnings[0];
+        Assert.Contains("check=AdoptionCommitFailed", refusal.Message, StringComparison.Ordinal);
+        Assert.Contains(taskId, refusal.Message, StringComparison.Ordinal);
+        Assert.Contains(workerId, refusal.Message, StringComparison.Ordinal);
+        Assert.Contains("put back under hold", refusal.Message, StringComparison.Ordinal);
+        Assert.Contains(original.Message, refusal.Message, StringComparison.Ordinal);
+        Assert.Empty(harness.AdopterLogger!.LogEntries);
+        var residue = Assert.Single(poolLogger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("stale-active-entry", residue.Message, StringComparison.Ordinal);
+        Assert.Contains(taskId, residue.Message, StringComparison.Ordinal);
+        Assert.Contains("remains in the queue as residue", residue.Message, StringComparison.Ordinal);
+        Assert.Same(foreign, queue.GetActiveTask(taskId));
+        Assert.True(pipeline.IsRestoredActiveAttemptHold);
+        var registered = Assert.IsType<ConnectedWorker>(pool.GetWorker(workerId));
+        Assert.False(registered.IsBusy);
+        Assert.Null(registered.CurrentTaskId);
+        Assert.Equal(1, pool.ConnectedWorkerCount);
     }
 
     /// <summary>
