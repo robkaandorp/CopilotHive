@@ -212,7 +212,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
     /// <summary>
     /// Optional substitute for the real git process invocation. <c>null</c> in production, where
-    /// the private process-based runner is used.
+    /// the single private process-based runner (<see cref="RunGitCoreAsync"/>) is used.
     /// </summary>
     private readonly Func<BrainGitRequest, BrainGitResult>? _gitRunner;
 
@@ -251,7 +251,8 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <param name="logger">Logger instance.</param>
     /// <param name="gitRunner">
     /// Optional substitute for the real git process invocation. When <c>null</c> (the production
-    /// default, and what every existing call site gets) the private process-based runner is used.
+    /// default, and what every existing call site gets) the single private process-based runner
+    /// (<see cref="RunGitCoreAsync"/>) is used.
     /// The seam returns RAW process results — this class stays responsible for constructing and
     /// redacting the resulting log lines and failure messages.
     /// </param>
@@ -459,7 +460,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
             box.Credential = credential;
 
         // LOCAL read of the persisted fetch destination(s).
-        var (originExit, originStdout, _) = await RunGitCaptureAsync(
+        var (originExit, originStdout, _) = await RunGitCoreAsync(
             clonePath, ["remote", "get-url", "--all", "origin"], ct);
 
         var origins = originExit == 0
@@ -492,7 +493,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         //             effect we have not established, so it is never treated as absence.
         //   • anything else is an inspection FAILURE (unreadable/locked config, invalid key),
         //             which likewise cannot establish the policy and is rejected.
-        var (pushExit, pushStdout, _) = await RunGitCaptureAsync(
+        var (pushExit, pushStdout, _) = await RunGitCoreAsync(
             clonePath, ["config", "--get-all", "remote.origin.pushurl"], ct);
 
         if (pushExit == 0)
@@ -883,8 +884,22 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     SanitizeException(mergeEx, credential),
                     "Squash merge failed for {Repo} — resetting clone to clean state", repoName);
 
-                // Abort the merge and reset to clean state
-                try { await RunGitAsync(clonePath, ["merge", "--abort"], ct, credential); } catch { }
+                // Abort the merge and reset to clean state. The abort is best-effort, but a CALLER
+                // cancellation is deliberately NOT swallowed here (same filter as
+                // ConfigRepoManager.TryAbortMergeAsync): swallowing it would let a cancelled
+                // operation continue running further git commands.
+                try
+                {
+                    await RunGitAsync(clonePath, ["merge", "--abort"], ct, credential);
+                }
+                catch (Exception abortEx)
+                {
+                    if (abortEx is OperationCanceledException && ct.IsCancellationRequested)
+                        throw;
+
+                    // Best-effort: ignore failures (e.g., no merge in progress).
+                }
+
                 await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, credential);
                 await RunGitAsync(clonePath, ["clean", "-fd"], ct, credential);
 
@@ -1193,10 +1208,24 @@ public sealed class BrainRepoManager : IBrainRepoManager
     }
 
     /// <summary>
-    /// Runs a git command and returns its RAW exit code, stdout and stderr, using the injected
-    /// runner seam when present and the real git process otherwise. Never redacts and never
-    /// throws on a non-zero exit code — message construction (and redaction) is the caller's job.
+    /// The SINGLE real-process git runner for this class: every git invocation — the raw
+    /// exit-code/stdout/stderr consumers (<see cref="CreateTagAsync"/>, <see cref="DeleteTagAsync"/>,
+    /// <see cref="FetchOriginAsync"/>, the origin inspection in
+    /// <see cref="RefreshOriginCredentialAsync"/>, the merge cleanup) and the throwing wrappers
+    /// (<see cref="RunGitAsync"/>, <see cref="RunGitWithOutputAsync"/>) — goes through here.
+    /// Returns the RAW exit code, stdout and stderr, using the injected runner seam when present and
+    /// the real git process otherwise. Never redacts and never throws on a non-zero exit code —
+    /// message construction (and redaction) is the caller's job.
     /// </summary>
+    /// <remarks>
+    /// <b>Cancellation.</b> <c>ReadToEndAsync(ct)</c>/<c>WaitForExitAsync(ct)</c> observe the token
+    /// but do NOT terminate the child process, so a cancelled caller would otherwise return while
+    /// git is still mutating the clone (and would release the per-repo semaphore on a clone that is
+    /// still being written). A caller cancellation therefore performs the SAME best-effort
+    /// termination before rethrowing, through the ONE shared
+    /// <see cref="GitProcessTermination.TerminateTreeBestEffort"/> helper. Nothing here can block
+    /// indefinitely, and failing to confirm termination never suppresses the cancellation.
+    /// </remarks>
     private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCoreAsync(
         string workingDir, string[] args, CancellationToken ct)
     {
@@ -1229,11 +1258,33 @@ public sealed class BrainRepoManager : IBrainRepoManager
         var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
         var stderrTask = process.StandardError.ReadToEndAsync(ct);
 
-        await Task.WhenAll(stdoutTask, stderrTask);
-        await process.WaitForExitAsync(ct);
+        try
+        {
+            await Task.WhenAll(stdoutTask, stderrTask);
+            await process.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller's token was canceled while the git process was still running. Terminate the
+            // whole process tree (bounded, best-effort — see the shared helper) BEFORE rethrowing so
+            // a cancelled operation never leaves a git process mutating the clone after the caller
+            // has been released.
+            GitProcessTermination.TerminateTreeBestEffort(process);
+
+            throw; // Always rethrow the OperationCanceledException.
+        }
 
         return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
     }
+
+    /// <summary>
+    /// Test-only entry point that drives the real core runner (the <c>gitRunner</c> seam is left
+    /// <c>null</c> by the caller) so cancellation and process termination can be observed against a
+    /// REAL git process.
+    /// </summary>
+    internal Task<(int ExitCode, string Stdout, string Stderr)> RunGitForTestAsync(
+        string workingDir, string[] args, CancellationToken ct) =>
+        RunGitCoreAsync(workingDir, args, ct);
 
     /// <summary>
     /// Merges a source branch into a target branch (non-squash) and pushes the result.
@@ -1293,7 +1344,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             var preMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, credential)).Trim();
 
-            // The merge command is run with a directly-managed Process (NOT RunGitCaptureAsync) so
+            // The merge command is run with a directly-managed Process (NOT RunGitCoreAsync) so
             // that on cancellation we can Kill(entireProcessTree) and block until the process is
             // confirmed dead BEFORE the finally-block cleanup runs `git merge --abort`. This avoids
             // racing the cleanup against a still-live merge process. `mergeStarted` signals that a
@@ -1406,10 +1457,10 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                     try
                     {
-                        var (verifyExit, _, _) = await RunGitCaptureAsync(
+                        var (verifyExit, _, _) = await RunGitCoreAsync(
                             clonePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"], cleanupCts.Token);
                         if (verifyExit == 0)
-                            await RunGitCaptureAsync(clonePath, ["merge", "--abort"], cleanupCts.Token);
+                            await RunGitCoreAsync(clonePath, ["merge", "--abort"], cleanupCts.Token);
                     }
                     catch
                     {
@@ -1619,101 +1670,6 @@ public sealed class BrainRepoManager : IBrainRepoManager
     }
 
     /// <summary>
-    /// Runs a git command capturing exit code, stdout, and stderr without throwing on non-zero exit.
-    /// Routed through the optional runner seam when one was supplied.
-    /// </summary>
-    /// <remarks>
-    /// The returned stdout/stderr are RAW and are never redacted here — they are functional data
-    /// (tag listings, ref names) that callers parse. Redaction is applied by each caller at the
-    /// point where a log entry or exception message is CONSTRUCTED from them.
-    /// </remarks>
-    /// <param name="workingDir">Working directory for the git process.</param>
-    /// <param name="args">Arguments to pass to git.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>The exit code, standard output, and standard error of the git command.</returns>
-    private async Task<(int exitCode, string stdout, string stderr)> RunGitCaptureAsync(
-        string workingDir, string[] args, CancellationToken ct)
-    {
-        if (_gitRunner is { } runner)
-        {
-            ct.ThrowIfCancellationRequested();
-            var injected = runner(new BrainGitRequest(workingDir, args));
-            return (injected.ExitCode, injected.Stdout, injected.Stderr);
-        }
-
-        // The SAME pre-launch cancellation check the fake-runner branch performs — see
-        // RunGitCoreAsync. Process.Start observes no token, so the check must be explicit.
-        ct.ThrowIfCancellationRequested();
-
-        var psi = new ProcessStartInfo("git")
-        {
-            WorkingDirectory = workingDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-
-        foreach (var arg in args)
-            psi.ArgumentList.Add(arg);
-
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start git process");
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-
-        try
-        {
-            await Task.WhenAll(stdoutTask, stderrTask);
-            await process.WaitForExitAsync(ct);
-        }
-        catch (OperationCanceledException)
-        {
-            // The caller's token was canceled while the git process was still running.
-            // WaitForExitAsync/ReadToEndAsync do NOT terminate the child process, so kill the whole
-            // process tree and wait (bounded) for it to actually exit before rethrowing. We must not
-            // silently swallow kill/wait failures: we check process.HasExited before and after each
-            // step so post-cancellation cleanup does not race a still-running merge process.
-            try
-            {
-                if (!process.HasExited)
-                {
-                    try
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                    catch (InvalidOperationException) when (process.HasExited)
-                    {
-                        // Process already exited between the HasExited check and Kill — safe to proceed.
-                    }
-                    catch (Exception)
-                    {
-                        // Kill failed for another reason. If the process has since exited we are safe;
-                        // otherwise there is nothing more we can do — proceed best-effort. The
-                        // MergeBranchAsync finally block runs its cleanup on a fresh bounded token and
-                        // tolerates failures, so a still-running process cannot deadlock cleanup.
-                    }
-
-                    if (!process.HasExited)
-                    {
-                        // Best-effort bounded wait. If this returns false the process may still be
-                        // alive after 5s; we still rethrow so cancellation propagates, and cleanup
-                        // (guarded by a fresh token) degrades gracefully.
-                        process.WaitForExit(5000);
-                    }
-                }
-            }
-            catch
-            {
-                // Last-resort guard: never prevent the cancellation from propagating.
-            }
-            throw; // Always rethrow the OperationCanceledException.
-        }
-
-        return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
-    }
-
-    /// <summary>
     /// Creates an annotated tag pointing at the tip of the given branch and pushes it to origin.
     /// </summary>
     /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
@@ -1753,7 +1709,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
             // Check whether the tag already exists on origin (no fetch needed).
             // The clone's `origin` is the credential-bearing URL refreshed above, so a
             // failing REMOTE command echoes it through stderr — redact where the message is built.
-            var (lsExit, lsStdout, lsStderr) = await RunGitCaptureAsync(
+            var (lsExit, lsStdout, lsStderr) = await RunGitCoreAsync(
                 clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
             if (lsExit != 0)
                 throw new InvalidOperationException(Sanitize(
@@ -1899,7 +1855,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 ? ["fetch", "origin", $"+refs/heads/{branch}:refs/remotes/origin/{branch}"]
                 : ["fetch", "origin"];
 
-            var (exitCode, stdout, stderr) = await RunGitCaptureAsync(clonePath, args, ct);
+            var (exitCode, stdout, stderr) = await RunGitCoreAsync(clonePath, args, ct);
 
             if (exitCode != 0)
             {
@@ -1959,7 +1915,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             // The REMOTE query talks to the credential-bearing `origin`, so its stderr can echo
             // the full clone URL. Redact where the exception message is constructed.
-            var (remoteExit, remoteStdout, remoteStderr) = await RunGitCaptureAsync(
+            var (remoteExit, remoteStdout, remoteStderr) = await RunGitCoreAsync(
                 clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
             if (remoteExit != 0)
                 throw new InvalidOperationException(Sanitize(
@@ -1967,7 +1923,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             // The LOCAL query never contacts origin, but its message is constructed the same way
             // so a remote-bearing message can never slip through this boundary either.
-            var (localExit, localStdout, localStderr) = await RunGitCaptureAsync(
+            var (localExit, localStdout, localStderr) = await RunGitCoreAsync(
                 clonePath, ["tag", "-l", tag], ct);
             if (localExit != 0)
                 throw new InvalidOperationException(Sanitize(
@@ -1986,11 +1942,11 @@ public sealed class BrainRepoManager : IBrainRepoManager
             string? localError = null;
             string? remoteError = null;
 
-            // OperationCanceledException from RunGitCaptureAsync propagates out of this method
+            // OperationCanceledException from RunGitCoreAsync propagates out of this method
             // (it is not caught here), rather than being recorded as a partial deletion error.
             if (localExists)
             {
-                var (delExit, _, delStderr) = await RunGitCaptureAsync(clonePath, ["tag", "-d", tag], ct);
+                var (delExit, _, delStderr) = await RunGitCoreAsync(clonePath, ["tag", "-d", tag], ct);
                 if (delExit == 0)
                     anyDeleted = true;
                 else
@@ -1999,7 +1955,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             if (remoteExists)
             {
-                var (pushExit, _, pushStderr) = await RunGitCaptureAsync(
+                var (pushExit, _, pushStderr) = await RunGitCoreAsync(
                     clonePath, ["push", "origin", $":refs/tags/{tag}"], ct);
                 if (pushExit == 0)
                     anyDeleted = true;

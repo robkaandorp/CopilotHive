@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using CopilotHive.Git;
 using CopilotHive.Services;
 using CopilotHive.Shared;
 using CopilotHive.Workers;
@@ -768,11 +769,12 @@ public class ConfigRepoManager
     /// but do NOT terminate the child process, so a cancelled caller would otherwise return while
     /// git is still mutating the clone (and would release the caller's lock on a repo that is still
     /// being written). A caller cancellation (<see cref="OperationCanceledException"/> raised while
-    /// <paramref name="ct"/> is cancelled) therefore performs the SAME best-effort termination the
-    /// Brain's capture runner does — a guarded <c>Kill(entireProcessTree: true)</c> followed by a
-    /// bounded <c>WaitForExit(5000)</c> — and then always rethrows the ORIGINAL cancellation.
-    /// Nothing here can block indefinitely, and failing to confirm termination never suppresses the
-    /// cancellation.
+    /// <paramref name="ct"/> is cancelled) therefore performs the SAME best-effort termination every
+    /// real-process git runner in the orchestrator performs — via the ONE shared
+    /// <see cref="GitProcessTermination.TerminateTreeBestEffort"/> helper, a guarded
+    /// <c>Kill(entireProcessTree: true)</c> followed by a bounded <c>WaitForExit(5000)</c> — and then
+    /// always rethrows the ORIGINAL cancellation. Nothing here can block indefinitely, and failing to
+    /// confirm termination never suppresses the cancellation.
     /// </para>
     /// </summary>
     private async Task<GitRunResult> RunGitCoreAsync(string workingDir, string[] args, CancellationToken ct)
@@ -810,57 +812,15 @@ public class ConfigRepoManager
         catch (OperationCanceledException)
         {
             // The caller's token was canceled while the git process was still running. Terminate the
-            // whole process tree (bounded, best-effort — see the helper) BEFORE rethrowing so a
-            // cancelled config-repo operation never leaves a git process mutating the clone after
+            // whole process tree (bounded, best-effort — see the shared helper) BEFORE rethrowing so
+            // a cancelled config-repo operation never leaves a git process mutating the clone after
             // the caller has been released.
-            TerminateProcessTreeBestEffort(process);
+            GitProcessTermination.TerminateTreeBestEffort(process);
 
             throw; // Always rethrow the OperationCanceledException.
         }
 
         return new GitRunResult(process.ExitCode, stdoutTask.Result, stderrTask.Result);
-    }
-
-    /// <summary>
-    /// Best-effort, BOUNDED termination of a cancelled git process tree — the same shape as
-    /// <c>BrainRepoManager.RunGitCaptureAsync</c>'s cancellation cleanup. <c>Kill</c> is guarded by
-    /// <see cref="Process.HasExited"/> (checked before and after) so post-cancellation cleanup does
-    /// not race a process that is exiting anyway, the confirming wait is bounded by 5s, and the
-    /// whole helper is wrapped so that NO cleanup failure — including an unconfirmable termination —
-    /// can ever prevent the caller's cancellation from propagating.
-    /// </summary>
-    private static void TerminateProcessTreeBestEffort(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch (InvalidOperationException) when (process.HasExited)
-                {
-                    // Process already exited between the HasExited check and Kill — safe to proceed.
-                }
-                catch (Exception)
-                {
-                    // Kill failed for another reason. If the process has since exited we are safe;
-                    // otherwise there is nothing more we can do — proceed best-effort.
-                }
-
-                if (!process.HasExited)
-                {
-                    // Best-effort bounded wait. If this returns false the process may still be alive
-                    // after 5s; the cancellation is still rethrown by the caller.
-                    process.WaitForExit(5000);
-                }
-            }
-        }
-        catch
-        {
-            // Last-resort guard: never prevent the cancellation from propagating.
-        }
     }
 
     /// <summary>

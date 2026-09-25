@@ -283,7 +283,7 @@ public sealed class BrainRepoManagerRedactionTests : IDisposable
         Assert.Contains(PlainUrl, entry.Message);
     }
 
-    // ── Remote-tag boundaries (RunGitCaptureAsync consumers) ──────────────────
+    // ── Remote-tag boundaries (RunGitCoreAsync consumers) ─────────────────────
     //
     // The Brain clone persists the injected credential-bearing URL as `origin`, so a failing
     // REMOTE tag command (`ls-remote ... origin`, `push origin :refs/tags/...`) echoes that URL
@@ -1543,7 +1543,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     // ── FIX 1 (real launch): the pre-launch guards, observably ────────────────
     //
     // The fake-runner branches perform their OWN pre-invocation cancellation check, so the
-    // pre-launch guards in the REAL-process paths cannot be exercised through the seam. These
+    // pre-launch guard in the REAL-process path cannot be exercised through the seam. These
     // tests therefore run the manager WITHOUT a runner seam.
     //
     // ── Why NOT a child-written marker file ──────────────────────────────────
@@ -1555,8 +1555,8 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     //   1. The cancelled parent can return before the spawned shell is ever scheduled, and the
     //      shell can then write its marker AFTER the window closed. Writing the marker as the
     //      shell's first action is NOT synchronous with the parent's Process.Start.
-    //   2. On the capture path, production cancellation cleanup kills the whole process tree, so
-    //      the shell can die before its first write and NO marker is ever produced.
+    //   2. On the real-process runner path, production cancellation cleanup kills the whole process
+    //      tree, so the shell can die before its first write and NO marker is ever produced.
     //
     // ── The launch-failure sentinel used instead ─────────────────────────────
     //
@@ -1660,11 +1660,12 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     }
 
     /// <summary>
-    /// POSITIVE CONTROL for the <c>RunGitCaptureAsync</c> launch path — a DIFFERENT real-process
-    /// runner with its own pre-launch guard. <c>FetchOriginAsync</c> reaches it directly.
+    /// POSITIVE CONTROL for the <c>RunGitCoreAsync</c> launch path reached from the
+    /// <c>FetchOriginAsync</c> route — the SAME real-process runner as the control above, and the
+    /// same pre-launch guard. <c>FetchOriginAsync</c> reaches it directly.
     /// </summary>
     [Fact]
-    public async Task PositiveControl_RunGitCapturePath_LaunchIsAttemptedAndObserved()
+    public async Task PositiveControl_FetchOriginRoute_LaunchIsAttemptedAndObserved()
     {
         var manager = new BrainRepoManager(
             _tempDir,
@@ -1677,7 +1678,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         var clonePath = manager.GetClonePath(RepoName);
         Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
 
-        // FetchOriginAsync's capture command runs with the clone path as its working directory.
+        // FetchOriginAsync's first command runs with the clone path as its working directory.
         // The `.git` precheck has already been satisfied above; the configured-URL lookup fires
         // AFTER it, so arming from there removes the directory immediately before the launch.
         var armed = false;
@@ -1699,7 +1700,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         Assert.True(armed, "The arming seam never triggered — the control is not set up.");
         Assert.True(
             IsLaunchAttempt(ex),
-            $"The capture launch path was never reached — the control cannot validate the guard. Got: {ex}");
+            $"The core launch path was never reached on the FetchOriginAsync route — the control cannot validate the guard. Got: {ex}");
     }
 
     // ── NEGATIVE TESTS: each guard, independently ────────────────────────────
@@ -1763,14 +1764,15 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     }
 
     /// <summary>
-    /// The <c>RunGitCaptureAsync</c> pre-launch guard, ISOLATED so no upstream check can mask it.
+    /// The <c>RunGitCoreAsync</c> pre-launch guard on the <c>FetchOriginAsync</c> route, ISOLATED so
+    /// no upstream check can mask it.
     /// <para>
     /// Finding a route with no earlier cancellation check takes care: every path into the refresh
     /// passes checks at the top of <c>RefreshOriginCredentialAsync</c> and inside
     /// <c>ResolveCredentialAsync</c>. The exception is an UNCONFIGURED repository — the refresh
     /// returns as soon as the configured-URL lookup yields nothing, resolving no credential.
-    /// Cancelling from inside that lookup lands the operation on <c>FetchOriginAsync</c>'s capture
-    /// command with a cancelled token and NOTHING between them but this guard.
+    /// Cancelling from inside that lookup lands the operation on <c>FetchOriginAsync</c>'s first
+    /// git command with a cancelled token and NOTHING between them but this guard.
     /// </para>
     /// <para>
     /// Guard present → cancellation. Guard removed → the armed sentinel throws synchronously from
@@ -1779,7 +1781,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     /// </para>
     /// </summary>
     [Fact]
-    public async Task RunGitCapturePreLaunchGuard_CancelledBeforeFirstCapture_NeverReachesProcessStart()
+    public async Task FetchOriginRoutePreLaunchGuard_CancelledBeforeFirstCommand_NeverReachesProcessStart()
     {
         using var cts = new CancellationTokenSource();
         var lookupInvoked = false;
@@ -1813,7 +1815,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         Assert.False(
             IsLaunchAttempt(ex),
             "Process.Start was REACHED after the caller cancelled — the pre-launch guard in "
-            + $"RunGitCaptureAsync is missing. Observed launch failure: {ex}");
+            + $"RunGitCoreAsync is missing. Observed launch failure: {ex}");
 
         Assert.IsAssignableFrom<OperationCanceledException>(ex);
     }
