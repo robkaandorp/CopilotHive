@@ -65,6 +65,41 @@ internal readonly record struct WorkerOwnershipSnapshot
 }
 
 /// <summary>
+/// The outcome of <see cref="WorkerPool.RegisterAdoptedWorker"/>: which of the three dispositions
+/// the atomic busy registration reached, plus the instance when one was registered.
+/// </summary>
+/// <remarks>
+/// <see cref="AdoptedRegistrationOutcome.DuplicateId"/> and
+/// <see cref="AdoptedRegistrationOutcome.ActiveEntryExists"/> are REFUSALS REPORTED AS RESULTS —
+/// neither ever throws, and neither mutates anything (not the pool, not the queue, not the existing
+/// entry). The three values are mutually exclusive and exhaustive.
+/// </remarks>
+internal readonly record struct AdoptedRegistrationResult
+{
+    /// <summary>Which disposition this call reached.</summary>
+    public required AdoptedRegistrationOutcome Outcome { get; init; }
+
+    /// <summary>
+    /// The instance that was registered, or <c>null</c> for either refusal. It is the EXACT
+    /// instance the pool now holds under the id — the sole instance the caller may mutate.
+    /// </summary>
+    public ConnectedWorker? Worker { get; init; }
+}
+
+/// <summary>
+/// The dispositions of <see cref="WorkerPool.RegisterAdoptedWorker"/>, exhaustively.
+/// </summary>
+internal enum AdoptedRegistrationOutcome
+{
+    /// <summary>The id was free and the active entry was claimed: the worker is registered, FULLY BUSY.</summary>
+    Registered,
+    /// <summary>A worker is already registered under the id: nothing was mutated.</summary>
+    DuplicateId,
+    /// <summary>An active queue entry already exists for the task: nothing was mutated.</summary>
+    ActiveEntryExists,
+}
+
+/// <summary>
 /// Thread-safe registry of currently connected workers. Supports registration,
 /// lookup, heartbeat tracking, and busy/idle state management.
 /// </summary>
@@ -1133,5 +1168,132 @@ public sealed class WorkerPool : IWorkerPool
             worker.MessageChannel.Writer.TryComplete();
 
         return removed.AsReadOnly();
+    }
+    /// <summary>
+    /// THE ATOMIC ADOPTED-WORKER REGISTRATION: registers a worker that is ALREADY EXECUTING
+    /// <paramref name="task"/> — the reconnecting-worker case — as ONE step inside a single
+    /// <c>_activityLock</c> span, so the instance is never observable as a registered-but-idle
+    /// worker that some other dispatcher could newly select.
+    /// </summary>
+    /// <remarks>
+    /// <para>THE ORDER, and why every refusal mutates nothing:</para>
+    /// <list type="number">
+    ///   <item><description>The instance is built and made FULLY BUSY BEFORE it is published — the
+    ///     same <see cref="PublishBusyFieldsNoLock"/> field set <see cref="TryClaimAndActivate"/>
+    ///     uses, plus <c>Role = task.Role</c> and <c>CurrentModel = task.Model</c>. Nothing else can
+    ///     observe the instance yet, so building it mutates no shared state.</description></item>
+    ///   <item><description><c>_workers.ContainsKey(id)</c> → <see cref="AdoptedRegistrationOutcome.DuplicateId"/>.
+    ///     The ALREADY-REGISTERED instance — and any queue entry — is left exactly as it is.</description></item>
+    ///   <item><description><c>queue.TryActivateNew</c> refuses → <see cref="AdoptedRegistrationOutcome.ActiveEntryExists"/>.
+    ///     The EXISTING active entry is untouched (that primitive never overwrites) and no worker is
+    ///     published.</description></item>
+    ///   <item><description><c>_workers.TryAdd</c> refuses (a race lost against a concurrent
+    ///     registration under the same id) → the entry this call just added is removed through the
+    ///     REFERENCE-CHECKED <see cref="TaskQueue.TryRemoveOwned"/>, so only OUR instance's entry can
+    ///     be removed, and the outcome is <see cref="AdoptedRegistrationOutcome.DuplicateId"/>.</description></item>
+    /// </list>
+    /// <para>
+    /// A DUPLICATE ID IS A RESULT, NEVER AN EXCEPTION: unlike
+    /// <see cref="RegisterWorker(string, string[], bool, bool)"/> — which throws its existing
+    /// <see cref="InvalidOperationException"/> — this entry point reports every refusal through
+    /// <see cref="AdoptedRegistrationResult"/> so the caller can fall back to ordinary registration.
+    /// </para>
+    /// <para>
+    /// EXCEPTION CONTAINMENT. Anything thrown inside the span leaves nothing mutated: when this
+    /// call's own active entry had already been added it is removed with the same reference-checked
+    /// removal before the ORIGINAL exception is rethrown. That cleanup is best-effort — a failure
+    /// inside the removal itself can neither be reported nor allowed to replace the original
+    /// exception, which is the authoritative outcome.
+    /// </para>
+    /// <para>
+    /// WHAT IT DOES NOT DO: no channel write, no notification, no database or session operation, no
+    /// logging and no <c>await</c> — only the worker's own fields, the pool dictionary and the
+    /// queue's active-entry insert.
+    /// </para>
+    /// </remarks>
+    /// <param name="id">The worker id to register under.</param>
+    /// <param name="capabilities">Capabilities advertised by the worker.</param>
+    /// <param name="requestCompletionReceiptAck">Whether the worker requested durable completion-receipt acknowledgement.</param>
+    /// <param name="completionReceiptAckEnabled">The orchestrator's enablement decision for this registration.</param>
+    /// <param name="task">The task the reconnecting worker is already executing.</param>
+    /// <param name="queue">The concrete queue whose active entry must be claimed with the registration.</param>
+    /// <returns>The disposition reached, plus the registered instance for the successful one.</returns>
+    /// <exception cref="ArgumentNullException">Any reference argument is <c>null</c>.</exception>
+    internal AdoptedRegistrationResult RegisterAdoptedWorker(
+        string id,
+        string[] capabilities,
+        bool requestCompletionReceiptAck,
+        bool completionReceiptAckEnabled,
+        WorkTask task,
+        TaskQueue queue)
+    {
+        ArgumentNullException.ThrowIfNull(id);
+        ArgumentNullException.ThrowIfNull(capabilities);
+        ArgumentNullException.ThrowIfNull(task);
+        ArgumentNullException.ThrowIfNull(queue);
+
+        // THE INSTANCE IS FULLY BUSY BEFORE IT CAN BE SEEN — and it is not published until the very
+        // end, so this construction touches no shared state.
+        var worker = new ConnectedWorker
+        {
+            Id = id,
+            Role = task.Role,
+            Capabilities = capabilities,
+            RequestCompletionReceiptAck = requestCompletionReceiptAck,
+            CompletionReceiptAckEnabled = completionReceiptAckEnabled,
+        };
+        PublishBusyFieldsNoLock(worker, task.TaskId, DateTime.UtcNow);
+        worker.CurrentModel = task.Model;
+
+        lock (_activityLock)
+        {
+            var activeEntryAdded = false;
+            try
+            {
+                // 1. DUPLICATE ID FIRST: the already-registered instance is never touched.
+                if (_workers.ContainsKey(id))
+                    return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
+
+                // 2. THE ACTIVE ENTRY, claimed by the NON-OVERWRITING primitive: a refusal leaves
+                //    the existing entry (and the already recorded assigned worker) exactly as it is.
+                if (!queue.TryActivateNew(task, id))
+                    return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.ActiveEntryExists };
+
+                activeEntryAdded = true;
+
+                // 3. THE PUBLICATION. Losing this race is still a duplicate — and unwinds ONLY our
+                //    own entry, by reference.
+                if (!_workers.TryAdd(id, worker))
+                {
+                    queue.TryRemoveOwned(task.TaskId, task);
+                    activeEntryAdded = false;
+                    return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
+                }
+
+                return new AdoptedRegistrationResult
+                {
+                    Outcome = AdoptedRegistrationOutcome.Registered,
+                    Worker = worker,
+                };
+            }
+            catch
+            {
+                // NOTHING MUTATED ON A THROW. The removal is guarded so it can never replace the
+                // original exception, which stays the authoritative outcome.
+                if (activeEntryAdded)
+                {
+                    try
+                    {
+                        queue.TryRemoveOwned(task.TaskId, task);
+                    }
+                    catch
+                    {
+                        // Best-effort cleanup only: the original exception below is the outcome.
+                    }
+                }
+
+                throw;
+            }
+        }
     }
 }

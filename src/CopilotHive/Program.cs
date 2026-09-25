@@ -341,6 +341,25 @@ public sealed class Program
             builder.Services.AddSingleton<IWorkerCompletionRecorder>(sp =>
                 sp.GetRequiredService<WorkerCompletionRecorder>());
 
+            // Restored-attempt adoption: the fail-closed decision and the atomic commit by which a
+            // reconnecting worker reclaims the exact attempt a restart-restored pipeline still holds.
+            //
+            // Registered BOTH as the concrete adopter and as its narrow interface, resolved to the
+            // SAME singleton instance (the existing WorkerPool/IWorkerPool pattern). The concrete
+            // registration is the production adopter — the interface is only the injection seam.
+            // Unlike the publisher and the recorder there is deliberately NO fail-closed fallback
+            // here: an absent adopter simply adopts nothing, and registration proceeds exactly as it
+            // does today.
+            builder.Services.AddSingleton(sp =>
+                new RestoredAttemptAdopter(
+                    sp.GetRequiredService<GoalPipelineManager>(),
+                    sp.GetRequiredService<WorkerPool>(),
+                    sp.GetRequiredService<TaskQueue>(),
+                    sp.GetRequiredService<WorkerAssignmentContextStore>(),
+                    sp.GetRequiredService<ILogger<RestoredAttemptAdopter>>()));
+            builder.Services.AddSingleton<IRestoredAttemptAdopter>(sp =>
+                sp.GetRequiredService<RestoredAttemptAdopter>());
+
             // Backup service: creates tar.gz archives of runtime state
             builder.Services.AddSingleton(sp =>
                 new BackupService(stateDir,

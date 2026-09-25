@@ -129,6 +129,13 @@ message RegisterRequest {
   // is NOT processing, NOT phase advancement, NOT transport release and NOT recovery.
   // Absent/false = "this worker requests nothing"; an old orchestrator ignores the field.
   bool request_completion_receipt_ack = 4;
+
+  // ADDITIVE: the task the CALLER says it is still executing, or empty for "none". Deliberately
+  // NOT authentication and NOT proof of ownership: the orchestrator compares it against its OWN
+  // recorded assignment evidence (see `RegisterResponse.adopted_task`), which is the only thing
+  // that can authorize anything. An empty value means "the caller claims no task" and takes
+  // today's exact registration path. An old orchestrator ignores the field.
+  string current_task_id = 5;
 }
 
 message RegisterResponse {
@@ -156,6 +163,18 @@ message RegisterResponse {
   // added by this advertisement. An old orchestrator that omits the field parses it as false, and
   // an older tracking-only worker that ignores it keeps sending its existing Ready unchanged.
   bool completion_ready_required = 5;
+
+  // THE ANSWER TO RegisterRequest.current_task_id. True ONLY for an ACCEPTED registration whose
+  // claimed task this orchestrator ADOPTED: the exact task id was already the pipeline's active
+  // attempt, that attempt was still held, and the caller-supplied worker id equaled the id
+  // RECORDED at assignment together with matching slot and phase evidence. The instance is then
+  // registered BUSY with that task.
+  //
+  // WHAT IT DOES NOT MEAN: not worker authentication, not a delivery guarantee, not a replay of
+  // the assignment prompt, not proof that the worker actually holds the task, and not any
+  // authorization beyond the one attempt it names. An old orchestrator that omits the field
+  // parses it as false, and a worker that ignores it keeps today's behavior unchanged.
+  bool adopted_task = 6;
 }
 
 // === Worker Roles (used only in TaskAssignment for per-task role) ===
