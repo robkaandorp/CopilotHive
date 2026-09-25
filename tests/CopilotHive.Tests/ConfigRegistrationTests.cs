@@ -59,6 +59,13 @@ public sealed class ConfigRegistrationTests : IDisposable
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
+
+            // The Brain is mandatory in production (Program registers it unconditionally and
+            // resolves it eagerly after builder.Build()). This host has no config repo, so its
+            // HiveConfigFile is the null-orchestrator.model fallback — it supplies a Brain
+            // explicitly instead of relying on a configured model.
+            builder.ConfigureServices(services =>
+                services.ReplaceDistributedBrain(new NoOpDistributedBrain()));
         }
     }
 

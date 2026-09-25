@@ -10,6 +10,11 @@ public sealed class OrchestratorConfig
     /// blank/whitespace values are normalized to <c>null</c> at parse time (see
     /// <see cref="ConfigRepoManager.ParseConfig"/>). The no-config-repo fallback also uses
     /// <c>null</c> (see <see cref="CreateEmptyModelFallback"/>).
+    /// <para>
+    /// CopilotHive requires a Brain, so a <c>null</c> model is NOT a "no Brain" operating mode:
+    /// startup fails (see <c>Program.RequireBrainModel</c>) unless a Brain is supplied explicitly
+    /// — which is what test hosts do.
+    /// </para>
     /// </summary>
     public string? Model { get; set; }
     /// <summary>Maximum number of goal iterations before giving up.</summary>
@@ -50,10 +55,13 @@ public sealed class OrchestratorConfig
     /// <summary>
     /// Creates an orchestrator config with an UNSET <see cref="Model"/> (<c>null</c>,
     /// never <see cref="Constants.DefaultWorkerModel"/>). This is the fallback used by
-    /// <c>Program.cs</c> for the no-config-repo <see cref="HiveConfigFile"/> singleton:
-    /// a null model means the Brain is not registered at all (config-driven registration,
-    /// no environment-variable seeding) and the Composer stays a disconnected,
-    /// resolver-only shell.
+    /// <c>Program.cs</c> for the no-config-repo <see cref="HiveConfigFile"/> singleton.
+    /// <para>
+    /// A null model is NOT a no-Brain operating mode: CopilotHive requires a Brain, so startup
+    /// fails with the Brain startup-contract error unless a Brain is supplied explicitly — which
+    /// is exactly what test hosts do by registering their own <c>IDistributedBrain</c>. The
+    /// Composer stays a disconnected, resolver-only shell either way.
+    /// </para>
     /// </summary>
     public static OrchestratorConfig CreateEmptyModelFallback() => new() { Model = null };
 }

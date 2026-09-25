@@ -58,6 +58,11 @@ public sealed class AuthenticatedModeTests : IDisposable
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
+
+            // The Brain is mandatory in production (Program registers it unconditionally and
+            // resolves it eagerly after builder.Build()); this host supplies its own explicitly.
+            builder.ConfigureServices(services =>
+                services.ReplaceDistributedBrain(new NoOpDistributedBrain()));
         }
 
         protected override void Dispose(bool disposing)

@@ -1246,7 +1246,16 @@ public class GoalsApiEndpointTests
         // Spin up a separate factory without forcing the Testing environment to verify the
         // production code path still registers GoalDispatcher as a hosted service. This
         // is the companion assertion to the Testing-environment gate above.
-        using var factory = new WebApplicationFactory<Program>();
+        //
+        // The base factory is deliberately NOT the shared HiveTestFactory (which forces
+        // UseEnvironment("Testing")) — this test needs a non-Testing host. It therefore supplies
+        // its own Brain explicitly via WithWebHostBuilder: this host has no config repo, so its
+        // HiveConfigFile carries the null orchestrator.model fallback, and the eager Brain
+        // resolution after builder.Build() would otherwise fail startup with the mandatory-Brain
+        // contract error.
+        using var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+            builder.ConfigureServices(services =>
+                services.ReplaceDistributedBrain(new NoOpDistributedBrain())));
         Assert.NotNull(factory.Services.GetService<GoalDispatcher>());
 
         var hostedServices = factory.Services.GetServices<IHostedService>();
