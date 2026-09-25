@@ -1499,6 +1499,9 @@ public sealed class WorkSlotRegistryTests
         // Added with the detached admission carrier: the ownership capture reads the pointer AND
         // the whole registry, and must do so in ONE _lock span.
         "CaptureAdmissionOwnership",
+        // F7 atomic validate+adopt region: revalidates the live slot, pointer and phase and takes the
+        // restored-attempt hold, all in ONE _lock span.
+        "TryAdoptRestoredActiveAttemptIfStillValid",
     ];
 
     /// <summary>
@@ -2203,6 +2206,8 @@ public sealed class WorkSlotRegistryTests
         "CaptureAdmissionOwnership",
         // Retires the slot AND if-current-clears the pointer in a single acquisition.
         "RetireSlotAndClearIfCurrent",
+        // F7 atomic validate+adopt region: reads the live pointer AND the slot in the same _lock span.
+        "TryAdoptRestoredActiveAttemptIfStillValid",
     ];
 
     /// <summary>Theory feed of <see cref="PointerAndRegistryMethodNames"/> (strings only — the

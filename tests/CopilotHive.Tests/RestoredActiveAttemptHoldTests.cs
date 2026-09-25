@@ -25,8 +25,11 @@ namespace CopilotHive.Tests;
 /// <summary>
 /// THE RESTORE-ORIGIN HOLD end to end: a pipeline restored from a persisted snapshot with a
 /// NONTERMINAL phase and a NON-NULL active-task pointer is HELD
-/// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) and every automatic consumer refuses
-/// it — orchestrator restart alone is not permission to invalidate or replace a valid attempt.
+/// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) and every DESTRUCTIVE automatic step
+/// refuses it — orchestrator restart alone is not permission to invalidate or replace a valid
+/// attempt. The NON-DESTRUCTIVE Brain setup (registration plus the goal-session fork/reattach) is
+/// performed for a held restore, exactly as it is for an unheld one, because a surviving worker may
+/// reclaim the attempt at Register.
 /// <para>
 /// The evidence is reached through the REAL production chain: genuinely admitted Pending attempts
 /// are persisted through the live manager APIs, reopened through BOTH restore routes
@@ -650,14 +653,15 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
     }
 
     /// <summary>
-    /// THE STARTUP GATE, through the ACTUAL RestoreActivePipelinesAsync: a held attempt gets NO
-    /// Brain registration, no fork, no session-existence probe, no goal-row status repair, no
-    /// queue entry and no redispatch; the instance STAYS in the manager (GetActivePipelines keeps
-    /// naming it) and the durable evidence — pointer, mapping, phase, blob — is untouched even
-    /// though the goal row drifted to a terminal status.
+    /// THE STARTUP GATE, through the ACTUAL RestoreActivePipelinesAsync: a held attempt DOES get the
+    /// NON-DESTRUCTIVE Brain setup — the goal session is probed and reattached, so a worker that
+    /// reconnects can adopt the attempt at Register — while still skipping EVERY destructive step:
+    /// no goal-row status repair, no queue entry and no redispatch. The instance STAYS in the manager
+    /// (GetActivePipelines keeps naming it) and the durable evidence — pointer, mapping, phase, blob —
+    /// is untouched even though the goal row drifted to a terminal status.
     /// </summary>
     [Fact]
-    public async Task RestoreActivePipelinesAsync_HeldAttempt_NoBrainWork_NoGoalChange_NoQueueEntry()
+    public async Task RestoreActivePipelinesAsync_HeldAttempt_BrainSetupButNoDestruction_NoGoalChange_NoQueueEntry()
     {
         var goalId = "hold-startup-held";
         var store = CreateStore();
@@ -674,10 +678,15 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
 
         await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
 
-        // NOTHING was done: no session existence probe, no fork, no registration, no goal-row repair.
-        Assert.False(brain.GoalSessionExistsCalled);
+        // THE NON-DESTRUCTIVE HALF IS PERFORMED: the session existence was probed and, because the
+        // fake reports it already exists, the goal session was REATTACHED — exactly the unheld
+        // path's own outcome, so the Brain tracks the goal a surviving worker may adopt into.
+        Assert.True(brain.GoalSessionExistsCalled,
+            "a held restoration gets the non-destructive Brain setup, so the session is probed");
         Assert.Empty(brain.ForkCalls);
-        Assert.Empty(brain.RegisterExistingCalls);
+        Assert.Equal([goalId], brain.RegisterExistingCalls);
+
+        // THE DESTRUCTIVE HALF IS STILL SKIPPED: no goal-row repair and no redispatch.
         goalStore.Verify(
             s => s.UpdateGoalStatusAsync(It.IsAny<string>(), It.IsAny<GoalStatus>(),
                 It.IsAny<GoalUpdateMetadata?>(), It.IsAny<CancellationToken>()),
@@ -698,14 +707,15 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
     /// <summary>
     /// THE CONCRETE BRAIN-REGISTRATION WITNESS. DispatcherMaintenance's registration call is a
     /// <c>DistributedBrain</c>-only cast, so an interface fake cannot observe it. This vector runs
-    /// startup with a REAL connected DistributedBrain and queries its BrainActor mailbox: the HELD
-    /// pipeline is absent while an otherwise identical UNHELD null-pointer Coding control is
-    /// present. Moving the hold gate below RegisterActivePipeline (or removing it) registers the
-    /// held goal and fails the first assertion; inverting the gate fails the control assertion.
-    /// No held object is driven through PlanIterationAsync.
+    /// startup with a REAL connected DistributedBrain and queries its BrainActor mailbox: BOTH the
+    /// HELD and the otherwise identical UNHELD null-pointer Coding control are present. Removing the
+    /// held path's non-destructive setup — or restoring the early <c>continue</c> ahead of it —
+    /// leaves the held goal unregistered and fails the held assertion; inverting or breaking the
+    /// unheld path fails the control assertion, so a single shared call is still proven to serve
+    /// both. No held object is driven through PlanIterationAsync.
     /// </summary>
     [Fact]
-    public async Task RestoreActivePipelinesAsync_ConcreteBrain_DoesNotRegisterHeldPipeline_ButRegistersUnheldControl()
+    public async Task RestoreActivePipelinesAsync_ConcreteBrain_RegistersHeldPipeline_AndUnheldControl()
     {
         var heldGoalId = "hold-concrete-brain-held";
         var controlGoalId = "hold-concrete-brain-control";
@@ -742,10 +752,15 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
             Assert.False(unheld!.IsRestoredActiveAttemptHold);
 
             // These mailbox queries are ordered AFTER any fire-and-forget registration message.
-            Assert.Null(await GetConcreteBrainPipelineAsync(
+            Assert.Same(held, await GetConcreteBrainPipelineAsync(
                 brain, heldGoalId, TestContext.Current.CancellationToken));
             Assert.Same(unheld, await GetConcreteBrainPipelineAsync(
                 brain, controlGoalId, TestContext.Current.CancellationToken));
+
+            // THE HOLD SURVIVED THE REGISTRATION: the Brain knowing the goal is knowledge, not
+            // authority, so the attempt is still held and its pointer is untouched.
+            Assert.True(held.IsRestoredActiveAttemptHold);
+            Assert.NotNull(held.ActiveTaskId);
         }
         finally
         {
@@ -840,13 +855,13 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
     ///     no exception object may reach the sink. The MALFORMED-parser channel is proven by the
     ///     sibling vector, which needs an undecodable blob and therefore its own isolated
     ///     run;</description></item>
-    ///   <item><description>the early `continue` is STILL REACHED and that loop iteration still
-    ///     performs NO work behind the warning: no Brain registration/session work/LLM work, no
-    ///     goal-row read or status repair, no pointer clear, no TaskQueue.MarkComplete, no
-    ///     pipeline removal and no redispatch enqueue — proven by a real tracking Brain, the REAL
-    ///     TaskQueue THE MAINTENANCE INSTANCE ITSELF RECEIVED seeded with an ACTIVE entry for the
-    ///     held attempt (a MarkComplete on that queue would consume it), a live Mock IGoalStore,
-    ///     and the untouched durable row;</description></item>
+    ///   <item><description>the loop iteration performs NO DESTRUCTION behind the warning: no goal-row
+    ///     read or status repair, no pointer clear, no TaskQueue.MarkComplete, no pipeline removal and
+    ///     no redispatch enqueue — proven by a real tracking Brain, the REAL TaskQueue THE MAINTENANCE
+    ///     INSTANCE ITSELF RECEIVED seeded with an ACTIVE entry for the held attempt (a MarkComplete on
+    ///     that queue would consume it), a live Mock IGoalStore, and the untouched durable row. The
+    ///     NON-DESTRUCTIVE Brain setup DOES run (it is asserted positively), because a surviving worker
+    ///     may adopt the attempt at Register;</description></item>
     ///   <item><description>the classification stays observable WITHOUT the log line: after the
     ///     same startup run, the pipeline object itself reports the identical values.</description></item>
     /// </list>
@@ -944,10 +959,14 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
         AssertNoSentinelInRecords(logger, RawOnlyLeakMember, "the raw blob's unknown JSON member");
         Assert.DoesNotContain(logger.LogEntries, e => e.Exception is not null);
 
-        // THE CONTINUE IS STILL REACHED — the loop iteration did NOTHING behind the warning.
-        Assert.False(brain.GoalSessionExistsCalled);
+        // THE HOLD IS STILL ENFORCED AGAINST DESTRUCTION, even though the NON-DESTRUCTIVE Brain
+        // setup now runs after the warning: no goal-row READ or repair, no pointer clear, no queue
+        // completion, no removal and no redispatch. The Brain's own knowledge work (the session
+        // probe and reattach below) is explicitly NOT destruction.
+        Assert.True(brain.GoalSessionExistsCalled,
+            "the non-destructive Brain setup runs for a held restoration");
         Assert.Empty(brain.ForkCalls);
-        Assert.Empty(brain.RegisterExistingCalls);
+        Assert.Equal([goalId], brain.RegisterExistingCalls);
         goalStore.Verify(s => s.GetGoalAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         goalStore.Verify(
             s => s.UpdateGoalStatusAsync(It.IsAny<string>(), It.IsAny<GoalStatus>(),
@@ -1094,9 +1113,12 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
         AssertNoSentinelInRecords(logger, ParserEchoedFragment, "parser-echoed malformed content");
         AssertNoSentinelInRecords(logger, ParserLeakSentinel, "raw malformed blob text");
 
-        // The hold path still did nothing, and the rejected bytes survive verbatim.
-        Assert.False(brain.GoalSessionExistsCalled);
+        // The hold and the durable bytes survive: the destructive steps remain skipped (no goal-row
+        // repair, no pointer clear, no queue completion, no redispatch) while the non-destructive
+        // Brain setup legitimately ran.
+        Assert.True(brain.GoalSessionExistsCalled);
         Assert.Empty(brain.ForkCalls);
+        Assert.Equal([goalId], brain.RegisterExistingCalls);
         Assert.Empty(redispatchQueue);
         Assert.NotNull(taskQueue.GetActiveTask(taskId));
         Assert.Null(taskQueue.TryDequeueAny());
@@ -1711,7 +1733,8 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
     /// <summary>
     /// REPEATED RESTART: a held pipeline survives a second full restore cycle unchanged — the
     /// hold is re-classified identically, the evidence stays byte-identical, and the startup gate
-    /// still refuses it (no Brain work, no goal-row change, no queue entry).
+    /// again performs ONLY the non-destructive Brain setup (no destruction, no goal-row change, no
+    /// queue entry).
     /// </summary>
     [Fact]
     public async Task RepeatedRestart_HoldReclassifiedIdentically_EvidencePreserved()
@@ -1726,10 +1749,10 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
 
         for (var cycle = 1; cycle <= 2; cycle++)
         {
+            // A FRESH manager per cycle: the maintenance instance restores the row ITSELF, so the
+            // gate under test genuinely runs instead of being short-circuited by an already-loaded
+            // pipeline.
             var manager = new GoalPipelineManager(CreateFactoryBackedStore(), NullLogger<GoalPipelineManager>.Instance);
-            var restored = Assert.Single(manager.RestoreFromStore(), p => p.GoalId == goalId);
-            Assert.True(restored.IsRestoredActiveAttemptHold);
-            Assert.Equal(taskId, restored.ActiveTaskId);
 
             var brain = new HoldTrackingBrain();
             var goalStore = new Mock<IGoalStore>();
@@ -1738,9 +1761,18 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
                 redispatchQueue: redispatchQueue);
             await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
 
-            Assert.False(brain.GoalSessionExistsCalled);
+            // THE HOLD IS STILL RECOGNISED AND REPORTED for the same evidence every cycle.
+            var restored = Assert.Single(manager.GetActivePipelines(), p => p.GoalId == goalId);
+            Assert.True(restored.IsRestoredActiveAttemptHold,
+                $"cycle {cycle}: the hold must be re-classified identically");
+            Assert.Equal(taskId, restored.ActiveTaskId);
+            Assert.Equal(RestoredRegistryOutcome.Restored, restored.RestoredRegistryClassification);
+            Assert.Equal(RestoredActivePointerOutcome.ActiveSlotPending, restored.RestoredActivePointerClassification);
+
+            Assert.True(brain.GoalSessionExistsCalled,
+                "each cycle performs the non-destructive Brain setup");
             Assert.Empty(brain.ForkCalls);
-            Assert.Empty(brain.RegisterExistingCalls);
+            Assert.Equal([goalId], brain.RegisterExistingCalls);
             Assert.Empty(redispatchQueue);
             goalStore.Verify(
                 s => s.UpdateGoalStatusAsync(It.IsAny<string>(), It.IsAny<GoalStatus>(),
@@ -1802,7 +1834,12 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
 
     // ═══════════════════════════════ test doubles ═══════════════════════════════
 
-    /// <summary>Tracks Brain session work the startup gate must NOT perform for a held object.</summary>
+    /// <summary>
+    /// Tracks the Brain's session work so the vectors can assert BOTH halves of the held contract:
+    /// the non-destructive setup (the session probe and reattach/fork) IS performed, while the
+    /// destructive steps (goal-row repair, pointer clear, queue completion, removal, redispatch) are
+    /// NOT. The recorded calls are what make each half a positive observation rather than an
+    /// absence.</summary>
     private sealed class HoldTrackingBrain : IDistributedBrain
     {
         public List<string> ForkCalls { get; } = [];

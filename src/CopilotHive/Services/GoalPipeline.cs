@@ -201,17 +201,29 @@ public sealed class GoalPipeline
     internal bool OwnershipCheckpointEligible { get; set; }
 
     /// <summary>
-    /// THE RESTORE-ORIGIN HOLD: <c>true</c> only for an instance constructed from a
+    /// THE RESTORE-ORIGIN HOLD STATE, as the ONE <see cref="int"/> every observer reads through
+    /// <see cref="IsRestoredActiveAttemptHold"/> and every transition mutates with a single
+    /// <see cref="Interlocked.CompareExchange{T}(ref T, T, T)"/>. Exactly one of
+    /// <see cref="RestoredActiveAttemptState.Held"/>,
+    /// <see cref="RestoredActiveAttemptState.Adopted"/> or
+    /// <see cref="RestoredActiveAttemptState.Released"/> at any instant, and NOTHING outside the
+    /// three transitions below ever writes it.
+    /// </summary>
+    private int _restoredActiveAttemptState;
+
+    /// <summary>
+    /// THE RESTORE-ORIGIN HOLD: <c>true</c> ONLY while the instance's hold state is
+    /// <see cref="RestoredActiveAttemptState.Held"/> — i.e. only for an instance constructed from a
     /// <see cref="PipelineSnapshot"/> whose phase is NONTERMINAL (neither <see cref="GoalPhase.Done"/>
     /// nor <see cref="GoalPhase.Failed"/>) AND whose captured
     /// <see cref="PipelineSnapshot.ActiveTaskId"/> is NON-NULL — an EMPTY-STRING pointer is non-null
-    /// and is therefore held too.
+    /// and is therefore held too — and only until that hold is ADOPTED or RELEASED.
     /// <para>
-    /// It is assigned ONCE, inside the restoring constructor, BEFORE either restore route
+    /// The state is SET ONCE, inside the restoring constructor, BEFORE either restore route
     /// (<see cref="GoalPipelineManager.RestorePipeline"/> /
-    /// <see cref="GoalPipelineManager.RestoreFromStore"/>) can publish the instance, and it is
-    /// IMMUTABLE for the object's lifetime: a later terminal phase transition or a later pointer
-    /// change does not unlock it.
+    /// <see cref="GoalPipelineManager.RestoreFromStore"/>) can publish the instance. From then on it
+    /// is changed ONLY by the three <see cref="Interlocked"/> transitions below; a later terminal
+    /// phase transition or a later pointer change does not unlock it.
     /// </para>
     /// <para>
     /// WHAT IT MEANS: the persisted attempt this pipeline was restored with is treated as still
@@ -224,6 +236,18 @@ public sealed class GoalPipeline
     /// text decodes never decides the hold, and a successful registry hydration never clears it.
     /// </para>
     /// <para>
+    /// THE TWO EXITS, AND WHY THEY ARE MUTUALLY EXCLUSIVE.
+    /// <see cref="TryAdoptRestoredActiveAttempt"/> takes Held → Adopted for a reconnecting worker
+    /// whose recorded assignment evidence matches (see
+    /// <see cref="RestoredAttemptAdopter"/>); <see cref="TryReleaseRestoredActiveAttemptHold"/>
+    /// takes Held → Released for the unclaimed-attempt reconciliation sweep. Because both are a
+    /// compare-and-swap FROM Held, at most ONE of them can ever succeed for one instance, and the
+    /// property above reports <c>true</c> for neither winner afterwards.
+    /// <see cref="TryRevertRestoredActiveAttemptAdoption"/> takes Adopted → Held and exists ONLY for
+    /// the adopter's own rollback, so a failed commit puts the attempt back under hold rather than
+    /// stranding it.
+    /// </para>
+    /// <para>
     /// WHAT IT IS NOT: not authorization, not automatic resumption, not receipt replay and not
     /// proof of worker survival. A held restore DOES hydrate the persisted registry EVIDENCE into
     /// the in-memory registry (<see cref="RestoreRegistry"/> runs for a held instance only — see
@@ -232,10 +256,198 @@ public sealed class GoalPipeline
     /// <see cref="OwnershipCheckpointEligible"/> stays <c>false</c> for held instances, so the
     /// legacy blob-preserving save paths and the historical raw registry bytes are unchanged.
     /// Fresh (Goal-created) pipelines, terminal snapshot phases and restored null-pointer pipelines
-    /// are never held, consume no registry text, and keep exactly their existing behavior.
+    /// are never held, consume no registry text, keep exactly their existing behavior, and can never
+    /// be adopted or released (their state is
+    /// <see cref="RestoredActiveAttemptState.Released"/> from construction).
     /// </para>
     /// </summary>
-    internal bool IsRestoredActiveAttemptHold { get; }
+    internal bool IsRestoredActiveAttemptHold =>
+        Volatile.Read(ref _restoredActiveAttemptState) == (int)RestoredActiveAttemptState.Held;
+
+    /// <summary>
+    /// THE ADOPTION TRANSITION: Held → Adopted, atomically.
+    /// </summary>
+    /// <remarks>
+    /// The production adopter reaches it ONLY through
+    /// <see cref="TryAdoptRestoredActiveAttemptIfStillValid"/>, which performs it inside the
+    /// synchronized revalidation region FIRST — before the worker becomes visible — so no observer
+    /// can ever see an adopted worker whose attempt is still reported as held. It is a
+    /// compare-and-swap FROM Held, so it can never succeed after a release: the two cannot both win.
+    /// </remarks>
+    /// <returns>
+    /// <c>true</c> when this call moved the state from Held to Adopted; <c>false</c> when the state
+    /// was not Held (already Adopted, already Released, or never held at all) and nothing changed.
+    /// </returns>
+    internal bool TryAdoptRestoredActiveAttempt() =>
+        Interlocked.CompareExchange(
+            ref _restoredActiveAttemptState,
+            (int)RestoredActiveAttemptState.Adopted,
+            (int)RestoredActiveAttemptState.Held) == (int)RestoredActiveAttemptState.Held;
+
+    /// <summary>
+    /// THE COMMIT-REGION SEAM — a test-only hook invoked INSIDE
+    /// <see cref="TryAdoptRestoredActiveAttemptIfStillValid"/>'s <c>_lock</c> span, after the
+    /// live evidence has been revalidated and IMMEDIATELY BEFORE the Held → Adopted
+    /// compare-and-swap. <c>null</c> (the production default) means it is absent, so production is
+    /// byte-identical with or without it. It observes the linearization point; it can neither adopt
+    /// nor bypass any check.
+    /// </summary>
+    internal Action? InsideAdoptionCommitRegionForTest { get; set; }
+
+    /// <summary>
+    /// THE SYNCHRONIZED VALIDATE-AND-ADOPT REGION: revalidates the LIVE evidence a restored-attempt
+    /// adoption depends on and, only when all of it still holds, takes the hold Held → Adopted — as
+    /// ONE step inside a single <c>_lock</c> span.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. The adopter's read-only precondition chain reads the pointer, the registry slot
+    /// and the phase BEFORE the commit, without synchronization with their writers. A concurrent
+    /// cancellation, terminal failure, slot retirement or completion admission landing between those
+    /// reads and the commit would otherwise leave the hold Held — and a bare hold CAS would adopt a
+    /// canceled or invalidated attempt. This region closes that window.
+    /// </para>
+    /// <para>
+    /// THE LINEARIZATION, against every writer that can invalidate the attempt:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>PHASE — <see cref="AdvanceTo"/> (terminal Done/Failed, the NewIteration
+    ///     Planning window, cancellation's <c>MarkGoalFailedAsync</c>) mutates under <c>_lock</c>;</description></item>
+    ///   <item><description>POINTER — <see cref="SetActiveTask"/>, <see cref="TrySetActiveTask"/>,
+    ///     <see cref="ClearActiveTask"/>, <see cref="ClearActiveTaskIfCurrent"/> and
+    ///     <see cref="RetireSlotAndClearIfCurrent"/> all mutate under <c>_lock</c>;</description></item>
+    ///   <item><description>SLOT — completion admission (<see cref="AdmitCompletion"/>, Pending →
+    ///     Claimed), stale-cleanup retirement (<see cref="RetireSlotAndClearIfCurrent"/>) and every
+    ///     other registry transition mutate under <c>_lock</c>;</description></item>
+    ///   <item><description>STATE MACHINE — its terminal and NewIteration moves take the machine's OWN
+    ///     lock, which the lock-order prohibition forbids nesting inside <c>_lock</c>. The region
+    ///     therefore reads <see cref="PipelineStateMachine.Phase"/> RAW (a coherent single value, no
+    ///     lock taken). Every production machine move that invalidates the attempt is PAIRED with a
+    ///     <c>_lock</c>-taking <see cref="AdvanceTo"/> (Fail → Failed, NewIteration → Planning), so a
+    ///     machine move either lands before the raw read (→ refusal) or its paired
+    ///     <see cref="AdvanceTo"/> lands after the CAS (→ the hold is Adopted and the existing paths
+    ///     see the terminal phase).</description></item>
+    /// </list>
+    /// <para>
+    /// So an invalidating transition either happens BEFORE this region's validation (→
+    /// <see cref="RestoredAttemptCommitDecision.AttemptNoLongerValid"/>, nothing mutated, the hold
+    /// untouched) or AFTER its CAS (→ the hold is Adopted, and the existing completion/cancel paths
+    /// observe the terminal state exactly as they would for any busy worker). The hold's release is
+    /// a lock-free CAS FROM Held, so adopt/release mutual exclusion is unchanged.
+    /// </para>
+    /// <para>
+    /// No other lock is taken here, so this region cannot participate in a lock-order cycle.
+    /// </para>
+    /// <para>
+    /// THE ROUTE IS PROVEN INSIDE THE SAME SPAN, IMMEDIATELY BEFORE THE CAS.
+    /// <paramref name="routeStillValid"/> is evaluated after the live-evidence checks (and after the
+    /// test-only commit-region hook) and adjacent to the CAS, so a manager removal — including
+    /// <c>GoalDispatcher.ClearGoalRetryState</c>, which removes a pipeline WITHOUT any preceding
+    /// terminal <see cref="AdvanceTo"/> and therefore invalidates none of the evidence above — that
+    /// has completed by that instant yields
+    /// <see cref="RestoredAttemptCommitDecision.RouteNoLongerValid"/> with nothing mutated. The
+    /// probe must be lock-free (the manager's lookup reads concurrent dictionaries only), so calling
+    /// it under <c>_lock</c> adds no lock-order edge.
+    /// </para>
+    /// <para>
+    /// THE HONEST LIMIT. Manager removal takes the manager's own lock, never this pipeline's, so no
+    /// span on this type can exclude it. The probe is therefore the adoption's ROUTE LINEARIZATION
+    /// POINT: a removal that completes at or before it fails closed; one that lands after it is
+    /// ordered AFTER the adoption, exactly like the removal of any pipeline whose worker is already
+    /// busy (the pre-existing behavior of that removal), and is not something this region can refuse.
+    /// </para>
+    /// </remarks>
+    /// <param name="expectedSlot">The RECORDED slot the adoption claims; must be non-null.</param>
+    /// <param name="routeStillValid">
+    /// The lock-free probe that proves the claimed task still routes to THIS pipeline; must be
+    /// non-null.
+    /// </param>
+    /// <returns>The commit decision.</returns>
+    internal RestoredAttemptCommitDecision TryAdoptRestoredActiveAttemptIfStillValid(
+        WorkSlot expectedSlot, Func<bool> routeStillValid)
+    {
+        ArgumentNullException.ThrowIfNull(expectedSlot);
+        ArgumentNullException.ThrowIfNull(routeStillValid);
+
+        lock (_lock)
+        {
+            var expectedPhase = expectedSlot.Position.Phase;
+
+            // THE LIVE POINTER must still name the claimed task, ordinally.
+            if (!string.Equals(ActiveTaskId, expectedSlot.TaskId, StringComparison.Ordinal))
+                return RestoredAttemptCommitDecision.AttemptNoLongerValid;
+
+            // THE LIVE PHASE: the pipeline's own phase (written only under this lock) and the raw
+            // machine phase must both still be the slot's worker phase — never terminal or Planning.
+            if (Phase is GoalPhase.Planning or GoalPhase.Done or GoalPhase.Failed
+                || Phase != expectedPhase
+                || StateMachine.Phase != expectedPhase)
+            {
+                return RestoredAttemptCommitDecision.AttemptNoLongerValid;
+            }
+
+            // THE LIVE SLOT: still registered, still PENDING (not admitted, not retired), and still
+            // the exact recorded slot (task id, position and attempt).
+            if (!_slots.TryGetValue(expectedSlot.TaskId, out var entry)
+                || entry.State != WorkSlotState.Pending
+                || entry.Slot != expectedSlot)
+            {
+                return RestoredAttemptCommitDecision.AttemptNoLongerValid;
+            }
+
+            InsideAdoptionCommitRegionForTest?.Invoke();
+
+            // THE ROUTE, proven adjacent to the CAS inside the same span: a pipeline no longer
+            // routed for the claimed task (removed from the manager) is refused, nothing mutated.
+            if (!routeStillValid())
+                return RestoredAttemptCommitDecision.RouteNoLongerValid;
+
+            // THE CAS, in the same span as the validation it depends on.
+            return TryAdoptRestoredActiveAttempt()
+                ? RestoredAttemptCommitDecision.Adopted
+                : RestoredAttemptCommitDecision.HoldAlreadyReleased;
+        }
+    }
+
+    /// <summary>
+    /// THE RELEASE TRANSITION: Held → Released, atomically. Used by the unclaimed-held-attempt
+    /// reconciliation sweep, not by the adopter.
+    /// </summary>
+    /// <remarks>
+    /// A compare-and-swap FROM Held, so it can never succeed after an adoption: release and adopt
+    /// are mutually exclusive. A released instance is no longer
+    /// <see cref="IsRestoredActiveAttemptHold"/>, and the transition itself neither dispatches,
+    /// replays nor discards anything — it only ends the hold.
+    /// </remarks>
+    /// <returns>
+    /// <c>true</c> when this call moved the state from Held to Released; <c>false</c> when the state
+    /// was not Held (already Released, already Adopted, or never held at all) and nothing changed.
+    /// </returns>
+    internal bool TryReleaseRestoredActiveAttemptHold() =>
+        Interlocked.CompareExchange(
+            ref _restoredActiveAttemptState,
+            (int)RestoredActiveAttemptState.Released,
+            (int)RestoredActiveAttemptState.Held) == (int)RestoredActiveAttemptState.Held;
+
+    /// <summary>
+    /// THE ROLLBACK TRANSITION: Adopted → Held, atomically. Used ONLY by
+    /// <see cref="RestoredAttemptAdopter"/> when the commit that followed a successful adoption did
+    /// not register the worker, so the attempt goes back under hold instead of being stranded.
+    /// </summary>
+    /// <remarks>
+    /// It is a compare-and-swap FROM Adopted, so it is a no-op for every other state — in
+    /// particular it can never resurrect a RELEASED hold, because Released is not Adopted. There is
+    /// deliberately no reverse transition out of Released.
+    /// </remarks>
+    /// <returns>
+    /// <c>true</c> when this call moved the state from Adopted back to Held; <c>false</c> when the
+    /// state was not Adopted and nothing changed.
+    /// </returns>
+    internal bool TryRevertRestoredActiveAttemptAdoption() =>
+        Interlocked.CompareExchange(
+            ref _restoredActiveAttemptState,
+            (int)RestoredActiveAttemptState.Held,
+            (int)RestoredActiveAttemptState.Adopted) == (int)RestoredActiveAttemptState.Adopted;
 
     /// <summary>
     /// THE RESTORE-TIME REGISTRY-EVIDENCE CLASSIFICATION: what a restoring constructor did with the
@@ -313,15 +525,19 @@ public sealed class GoalPipeline
         Description = snapshot.Description;
         Phase = snapshot.Phase;
 
-        // THE HOLD IS ESTABLISHED BEFORE THIS INSTANCE CAN BE PUBLISHED. Get-only, so this is the
-        // single assignment for the object's lifetime: a later terminal AdvanceTo or a later pointer
-        // clear cannot unlock it. HELD when the snapshot is in a NONTERMINAL phase and still carries
-        // a NON-NULL active-task pointer (an empty string counts: it is non-null). The hold is
-        // decided from the PHASE and POINTER alone — SQL NULL, empty, corrupt and unsupported
-        // registry text are all held, so uncertainty never permits destruction of the attempt, and
-        // the hydration below can never clear the hold.
-        IsRestoredActiveAttemptHold =
-            snapshot.Phase is not (GoalPhase.Done or GoalPhase.Failed) && snapshot.ActiveTaskId is not null;
+        // THE HOLD IS ESTABLISHED BEFORE THIS INSTANCE CAN BE PUBLISHED. The state is written here
+        // and nowhere else: from this point on it is changed ONLY by the three Interlocked
+        // transitions, so a later terminal AdvanceTo or a later pointer clear cannot unlock it.
+        // HELD when the snapshot is in a NONTERMINAL phase and still carries a NON-NULL active-task
+        // pointer (an empty string counts: it is non-null). The hold is decided from the PHASE and
+        // POINTER alone — SQL NULL, empty, corrupt and unsupported registry text are all held, so
+        // uncertainty never permits destruction of the attempt, and the hydration below can never
+        // clear the hold. Every other shape is RELEASED: the hold is not in force and can never be
+        // taken, so such an instance can be neither adopted nor released afterwards.
+        _restoredActiveAttemptState =
+            snapshot.Phase is not (GoalPhase.Done or GoalPhase.Failed) && snapshot.ActiveTaskId is not null
+                ? (int)RestoredActiveAttemptState.Held
+                : (int)RestoredActiveAttemptState.Released;
 
         // ── THE HOLD-GATED EVIDENCE HYDRATION, executed directly after the immutable hold fact and
         //    BEFORE this instance can be published by either restore route. ──
@@ -1842,6 +2058,72 @@ internal enum WorkSlotState
     Recorded,
     /// <summary>The slot has been abandoned; its result must never be recorded.</summary>
     Abandoned,
+}
+
+/// <summary>
+/// The lifecycle state of a restored pipeline's <c>IsRestoredActiveAttemptHold</c> —
+/// <see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>. The three values are mutually exclusive
+/// at every instant, and each of the two hold-ending transitions is a compare-and-swap FROM
+/// <see cref="Held"/>, so <see cref="Held"/> can be left exactly once.
+/// </summary>
+internal enum RestoredActiveAttemptState
+{
+    /// <summary>
+    /// NO HOLD IS IN FORCE, and none can be taken: either the hold was released by the
+    /// reconciliation sweep, or the instance never had one (a fresh Goal-created pipeline, a
+    /// terminal snapshot phase, or a restored null-pointer snapshot). This is the numeric DEFAULT,
+    /// so a pipeline that never went through the restoring constructor is honestly reported as
+    /// not-held and can never be adopted — <see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/>
+    /// only ever succeeds from <see cref="Held"/>. There is deliberately NO transition out of this
+    /// state.
+    /// </summary>
+    Released = 0,
+
+    /// <summary>
+    /// THE HOLD IS IN FORCE: the restored nonterminal pipeline still carries a non-null active-task
+    /// pointer and no consumer may act on the attempt. The only state from which either
+    /// <see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/> or
+    /// <see cref="GoalPipeline.TryReleaseRestoredActiveAttemptHold"/> can succeed.
+    /// </summary>
+    Held = 1,
+
+    /// <summary>
+    /// THE ATTEMPT WAS ADOPTED by a reconnecting worker, so the hold is no longer in force and a
+    /// REGISTERED busy worker owns the attempt. Rolled back to <see cref="Held"/> only by
+    /// <see cref="GoalPipeline.TryRevertRestoredActiveAttemptAdoption"/>, and never re-enterable
+    /// from <see cref="Released"/>.
+    /// </summary>
+    Adopted = 2,
+}
+
+/// <summary>
+/// The outcome of <see cref="GoalPipeline.TryAdoptRestoredActiveAttemptIfStillValid"/> — the
+/// synchronized validate-and-adopt region — exhaustively.
+/// </summary>
+internal enum RestoredAttemptCommitDecision
+{
+    /// <summary>The live evidence still held and the hold moved Held → Adopted.</summary>
+    Adopted,
+
+    /// <summary>
+    /// The live evidence still held but the hold was no longer Held (the release sweep won): nothing
+    /// was mutated.
+    /// </summary>
+    HoldAlreadyReleased,
+
+    /// <summary>
+    /// The live pointer, phase or slot no longer matches the recorded attempt (a cancellation,
+    /// terminal transition, retirement or completion admission landed first): nothing was mutated
+    /// and the hold is untouched.
+    /// </summary>
+    AttemptNoLongerValid,
+
+    /// <summary>
+    /// The live evidence still held, but the claimed task no longer routes to this pipeline — it was
+    /// removed from the manager (e.g. a retry clearing that performs no terminal transition): nothing
+    /// was mutated and the hold is untouched.
+    /// </summary>
+    RouteNoLongerValid,
 }
 
 /// <summary>
