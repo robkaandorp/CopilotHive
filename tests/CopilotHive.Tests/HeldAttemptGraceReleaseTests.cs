@@ -56,6 +56,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
 
     private readonly SqliteConnection _keeper;
     private readonly List<SqliteConnection> _connections = [];
+    private readonly Lock _connectionsLock = new();
     private readonly List<CopilotHiveDbContext> _contexts = [];
 
     public HeldAttemptGraceReleaseTests()
@@ -65,13 +66,36 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
         CreateContext().Database.EnsureCreated();
     }
 
+    /// <summary>
+    /// Closes EVERY connection this fixture opened — the direct ones AND the factory-created ones
+    /// (EF never owns or closes an externally supplied connection, so the factory registers each
+    /// one here) — and the keeper LAST. Disposing a pooled <see cref="SqliteConnection"/> only
+    /// returns it to Microsoft.Data.Sqlite's pool, which keeps it open, so the pool for this
+    /// fixture's own GUID-named connection string is cleared too; after that no connection holds
+    /// the per-instance in-memory database and it is released.
+    /// </summary>
     public void Dispose()
     {
         foreach (var context in _contexts)
             context.Dispose();
-        foreach (var connection in _connections)
+
+        SqliteConnection[] connections;
+        lock (_connectionsLock)
+        {
+            connections = [.. _connections];
+            _connections.Clear();
+        }
+
+        foreach (var connection in connections)
             connection.Dispose();
         _keeper.Dispose();
+        SqliteConnection.ClearPool(_keeper);
+    }
+
+    private void TrackConnection(SqliteConnection connection)
+    {
+        lock (_connectionsLock)
+            _connections.Add(connection);
     }
 
     // ═══════════════════════════════ fixture helpers ═══════════════════════════════
@@ -80,7 +104,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
     {
         var connection = new SqliteConnection(_connectionString);
         connection.Open();
-        _connections.Add(connection);
+        TrackConnection(connection);
 
         var context = new CopilotHiveDbContext(
             new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
@@ -91,12 +115,18 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
     private PipelineStore CreateStore() =>
         new(CreateContext(), NullLogger<PipelineStore>.Instance);
 
-    /// <summary>A factory-created (store-OWNED) context per operation — the production shape.</summary>
-    private sealed class SharedCacheContextFactory(string connectionString) : IDbContextFactory<CopilotHiveDbContext>
+    /// <summary>
+    /// A factory-created (store-OWNED) context per operation — the production shape. The store
+    /// disposes each context, but EF does not close the externally supplied connection, so every
+    /// connection is handed to <paramref name="track"/> and closed by the fixture's Dispose.
+    /// </summary>
+    private sealed class SharedCacheContextFactory(string connectionString, Action<SqliteConnection> track)
+        : IDbContextFactory<CopilotHiveDbContext>
     {
         public CopilotHiveDbContext CreateDbContext()
         {
             var connection = new SqliteConnection(connectionString);
+            track(connection);
             connection.Open();
             return new CopilotHiveDbContext(
                 new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
@@ -104,7 +134,7 @@ public sealed class HeldAttemptGraceReleaseTests : IDisposable
     }
 
     private PipelineStore CreateFactoryBackedStore() =>
-        new(new SharedCacheContextFactory(_connectionString), NullLogger<PipelineStore>.Instance);
+        new(new SharedCacheContextFactory(_connectionString, TrackConnection), NullLogger<PipelineStore>.Instance);
 
     private static Goal NewGoal(string id) =>
         new() { Id = id, Description = "grace goal " + id, RepositoryNames = ["test-repo"] };
