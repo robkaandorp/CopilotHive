@@ -28,7 +28,8 @@ public sealed class HiveOrchestratorService(
     UserService? userService = null,
     ConfigRepoManager? configRepoManager = null,
     IWorkerAssignmentPublisher? assignmentPublisher = null,
-    IWorkerCompletionRecorder? completionRecorder = null) : HiveOrchestrator.HiveOrchestratorBase
+    IWorkerCompletionRecorder? completionRecorder = null,
+    IRestoredAttemptAdopter? restoredAttemptAdopter = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
     private readonly IIssueStore? _issueStore = issueStore;
@@ -57,6 +58,21 @@ public sealed class HiveOrchestratorService(
     /// assignment is exactly what this slice exists to prevent.
     /// </summary>
     private readonly IWorkerAssignmentPublisher? _assignmentPublisher = assignmentPublisher;
+
+    /// <summary>
+    /// THE OPTIONAL RESTORED-ATTEMPT ADOPTER a reconnecting worker's claimed task is offered to at
+    /// registration. Optional in the constructor signature so unrelated fixtures that never send a
+    /// claim keep compiling; the production container always supplies it.
+    /// <para>
+    /// IT IS NOT A FALL-BACK SWITCH, because there is nothing to fall back FROM: unlike the
+    /// recorder and the publisher, an absent adopter is not a fail-closed disposition — it simply
+    /// adopts nothing (<see cref="RestoredAttemptAdoptionOutcome.NoAdopter"/>), the warning names
+    /// that check, and the worker is registered ordinarily and idle, exactly as it would be without
+    /// a claim. A claim is only ever an OPPORTUNITY to reclaim an attempt, never an authorization
+    /// whose absence must fail the registration.
+    /// </para>
+    /// </summary>
+    private readonly IRestoredAttemptAdopter? _restoredAttemptAdopter = restoredAttemptAdopter;
 
     /// <summary>
     /// Reads an orchestrator process environment variable. Overridable for tests so
@@ -232,6 +248,36 @@ public sealed class HiveOrchestratorService(
             "the latest eligible task is still active in the queue or still held by the pinned worker";
     }
 
+    /// <summary>
+    /// THE CHECK NAMES A DECLINED ADOPTION LOGS — one fixed token per decision the registration path
+    /// itself makes, complementing <see cref="RestoredAttemptAdoptionRefusal"/>'s own per-precondition
+    /// names. Every name here corresponds to exactly one reachable branch, so the emitted token names
+    /// the check that ACTUALLY refused rather than a related one.
+    /// </summary>
+    internal static class AdoptionRefusalNames
+    {
+        /// <summary>No adopter was configured, so nothing could be adopted.</summary>
+        public const string NoAdopter = nameof(NoAdopter);
+
+        /// <summary>
+        /// The attempt's hold was already gone when the adoption was attempted — the release sweep
+        /// won the race. Nothing was adopted and nothing was mutated.
+        /// </summary>
+        public const string HoldAlreadyReleased = nameof(HoldAlreadyReleased);
+
+        /// <summary>
+        /// An active queue entry already existed for the claimed task, so the busy registration was
+        /// refused; the entry is untouched and the attempt was put back under hold.
+        /// </summary>
+        public const string ActiveQueueEntryExists = nameof(ActiveQueueEntryExists);
+
+        /// <summary>
+        /// The adoption was attempted but its commit threw, or the adopter itself failed. Either way
+        /// the attempt was put back under hold and the worker is registered ordinarily.
+        /// </summary>
+        public const string AdoptionCommitFailed = nameof(AdoptionCommitFailed);
+    }
+
 
     /// <summary>
     /// Registers a worker with the orchestrator and assigns it an ID.
@@ -259,6 +305,37 @@ public sealed class HiveOrchestratorService(
     /// a successful negotiated completion release. It advertises that requirement only; it confirms no
     /// acknowledgement, guarantees no delivery and gates no initial registration.
     /// </para>
+    /// <para>
+    /// THE OPTIONAL CLAIM: <see cref="RegisterRequest.CurrentTaskId"/>. A NON-EMPTY value asks the
+    /// orchestrator to ADOPT the exact restored attempt it names (see
+    /// <see cref="IRestoredAttemptAdopter"/>) so a worker that survived an orchestrator restart can
+    /// still deliver its result. The decision is FAIL-CLOSED and the answer is
+    /// <see cref="RegisterResponse.AdoptedTask"/>:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>EMPTY → today's exact path: the same call, the same log records and a
+    ///     reply with <c>adopted_task = false</c>. No adoption check runs and no adoption warning is
+    ///     emitted.</description></item>
+    ///   <item><description>A DUPLICATE worker id TAKES PRECEDENCE OVER EVERYTHING ELSE: the existing
+    ///     duplicate warning and rejection reply, with NO adoption check and NO adoption warning. The
+    ///     instance already registered under that id is untouched, and so is any attempt it may
+    ///     own.</description></item>
+    ///   <item><description>ANY FAILED PRECONDITION → the worker is registered exactly as it is
+    ///     today (idle), the reply says <c>adopted_task = false</c>, and exactly ONE Warning names the
+    ///     failed check. It is an OPPORTUNITY DECLINED, never an error: the attempt stays held and
+    ///     waits for the reconciliation sweep.</description></item>
+    ///   <item><description>ALL PRECONDITIONS HOLD → the hold is taken FIRST (so the attempt is
+    ///     never left adopted without a worker), then the worker is registered BUSY with the
+    ///     adopter-built task, and the reply says <c>adopted_task = true</c>. EVERY failure of that
+    ///     commit — a lost registration race, a pre-existing active queue entry, or a throw — ROLLS
+    ///     THE ATTEMPT BACK UNDER HOLD first and then falls back to ordinary registration (or, for a
+    ///     lost duplicate race, to today's duplicate rejection).</description></item>
+    /// </list>
+    /// <para>
+    /// AFTER ADOPTION THE EXISTING COMPLETION PATH IS USED UNCHANGED: there is no bypass, no second
+    /// completion route and no replay. The adopted instance is an ordinary busy worker whose
+    /// completion flows through <see cref="WorkStream"/> exactly as any other.
+    /// </para>
     /// </remarks>
     /// <param name="request">Registration request containing the worker's role and capabilities.</param>
     /// <param name="context">Server call context.</param>
@@ -269,14 +346,145 @@ public sealed class HiveOrchestratorService(
             ? $"worker-{Guid.NewGuid():N}"[..24]
             : request.WorkerId;
 
+        // THE ENABLEMENT DECISION, taken from the REQUEST and the orchestrator's OWN capability —
+        // nothing else. The recorder must be configured here, at registration time, because it is
+        // the recorder that retains the evidence an acknowledgement would be about. It is decided
+        // ONCE, ahead of every branch below, so the ordinary, duplicate and adopted replies and the
+        // adopted instance all report the SAME answer.
+        var requested = request.RequestCompletionReceiptAck;
+        var ackEnabled = requested && _completionRecorder is not null;
+
+        // ── THE DUPLICATE PRE-CHECK, AHEAD OF EVERYTHING ELSE. ──────────────────────────────────
+        // A duplicate id takes precedence OVER the claim: the instance already registered under that
+        // id is untouched — and so is whatever attempt it may own — so no adoption check runs, no
+        // adoption warning is emitted, and the reply is today's duplicate rejection. This is a
+        // PRE-CHECK rather than a replacement for the pool's own refusal: the pool remains the
+        // arbiter (the check below is an observation that may race), and the catch further down
+        // still handles the case where the registration itself throws.
+        if (workerPool.GetWorker(workerId) is not null)
+            return Task.FromResult(RejectedDuplicate(workerId));
+
+        var claimedTaskId = request.CurrentTaskId;
+
+        // ── THE EMPTY CLAIM: today's exact path, unchanged and unlogged beyond it. ──────────────
+        if (string.IsNullOrWhiteSpace(claimedTaskId))
+            return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+
+        // ── THE NON-EMPTY CLAIM: the adopter decides, FAIL-CLOSED. ──────────────────────────────
+        if (_restoredAttemptAdopter is null)
+        {
+            // No adopter configured: nothing is adopted and the check is named, exactly like every
+            // other refusal. The registration itself proceeds ordinarily.
+            LogAdoptionRefused(workerId, claimedTaskId, AdoptionRefusalNames.NoAdopter);
+            return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+        }
+
+        RestoredAttemptAdoptionResult adoption;
         try
         {
-            // THE ENABLEMENT DECISION, taken from the REQUEST and the orchestrator's OWN capability —
-            // nothing else. The recorder must be configured here, at registration time, because it is
-            // the recorder that retains the evidence an acknowledgement would be about.
-            var requested = request.RequestCompletionReceiptAck;
-            var ackEnabled = requested && _completionRecorder is not null;
+            adoption = _restoredAttemptAdopter.TryAdoptRestoredAttempt(
+                workerId, claimedTaskId, [.. request.Capabilities], requested, ackEnabled);
+        }
+        catch (Exception adoptionFailure)
+        {
+            // THE ADOPTER'S OWN FAILURE IS CONTAINED. It has already rolled its attempt back (its
+            // commit contract) or refused before committing anything, so this is an OPPORTUNITY
+            // DECLINED like any other refusal: name it, then register ordinarily.
+            LogAdoptionCommitFailed(workerId, claimedTaskId, adoptionFailure);
+            return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+        }
 
+        switch (adoption.Outcome)
+        {
+            case RestoredAttemptAdoptionOutcome.Adopted:
+                // THE SUCCESSFUL ADOPTION. The instance is the one the adopter registered busy, so
+                // the reply is built from IT — never from a later lookup — and the same single
+                // Information line records the adoption.
+                var adoptedWorker = adoption.Worker
+                    ?? throw new InvalidOperationException(
+                        "An adopted registration must carry the registered worker instance.");
+                LogAdoptionSucceeded(workerId, claimedTaskId, adoptedWorker.Id);
+
+                lock (_heartbeatLock)
+                {
+                    _heartbeatState.Remove(workerId);
+                }
+
+                _dashboardNotifier?.NotifyStateChanged();
+
+                return Task.FromResult(new RegisterResponse
+                {
+                    Accepted = true,
+                    OrchestratorVersion = VersionHelper.InformationalVersion,
+                    AssignedWorkerId = workerId,
+                    CompletionReceiptAckEnabled = adoptedWorker.CompletionReceiptAckEnabled,
+                    CompletionReadyRequired = adoptedWorker.CompletionReceiptAckEnabled,
+                    AdoptedTask = true,
+                });
+
+            case RestoredAttemptAdoptionOutcome.Refused:
+                LogAdoptionRefused(workerId, claimedTaskId, adoption.Refusal.ToString());
+                return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+
+            case RestoredAttemptAdoptionOutcome.HoldAlreadyReleased:
+                // The release sweep won the race for this attempt. Nothing was adopted and nothing
+                // was mutated — the worker registers ordinarily.
+                LogAdoptionRefused(workerId, claimedTaskId, AdoptionRefusalNames.HoldAlreadyReleased);
+                return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+
+            case RestoredAttemptAdoptionOutcome.ActiveQueueEntryExists:
+                // An active queue entry already owned the task; the attempt was put back under hold
+                // and the entry is untouched.
+                LogAdoptionRefused(workerId, claimedTaskId, AdoptionRefusalNames.ActiveQueueEntryExists);
+                return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+
+            case RestoredAttemptAdoptionOutcome.DuplicateWorkerId:
+                // A LOST REGISTRATION RACE: another registration claimed the id between this
+                // registration's own pre-check and the adopter's register. Today's exact duplicate
+                // rejection applies, and the attempt has already been rolled back under hold.
+                return Task.FromResult(RejectedDuplicate(workerId));
+
+            case RestoredAttemptAdoptionOutcome.CommitFailed:
+                // The commit threw; the attempt is held again and the ORIGINAL exception is reported.
+                LogAdoptionCommitFailed(
+                    workerId,
+                    claimedTaskId,
+                    adoption.CommitException ?? new InvalidOperationException(
+                        "A failed adoption commit must carry its original exception."));
+                return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+
+            case RestoredAttemptAdoptionOutcome.NoAdopter:
+                // Unreachable for a configured adopter, and handled as a refusal rather than
+                // silently: an adopter that reports it decided nothing.
+                LogAdoptionRefused(workerId, claimedTaskId, AdoptionRefusalNames.NoAdopter);
+                return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
+
+            default:
+                throw new InvalidOperationException(
+                    $"Unhandled RestoredAttemptAdoptionOutcome: {adoption.Outcome}");
+        }
+    }
+
+    /// <summary>
+    /// THE ORDINARY ACCEPTED REGISTRATION: today's exact call, logging and reply, extended only with
+    /// an explicit <c>adopted_task = false</c>.
+    /// </summary>
+    /// <remarks>
+    /// A duplicate id discovered HERE — the registration itself throwing its existing
+    /// <see cref="InvalidOperationException"/>, because the pre-check raced a concurrent
+    /// registration — takes today's duplicate handling exactly: the same warning and the same
+    /// rejection reply.
+    /// </remarks>
+    /// <param name="workerId">The (possibly server-assigned) worker id being registered.</param>
+    /// <param name="request">The original registration request.</param>
+    /// <param name="requested">The requested completion-receipt acknowledgement fact.</param>
+    /// <param name="ackEnabled">The orchestrator's enablement decision for this registration.</param>
+    /// <returns>The accepted or duplicate-rejected reply.</returns>
+    private RegisterResponse RegisterOrRejectDuplicate(
+        string workerId, RegisterRequest request, bool requested, bool ackEnabled)
+    {
+        try
+        {
             var registered = workerPool.RegisterWorker(
                 workerId, [.. request.Capabilities], requested, ackEnabled);
 
@@ -293,30 +501,155 @@ public sealed class HiveOrchestratorService(
             // derived from the SAME instance's own enablement decision, never from a later lookup and
             // never inferred from capabilities, the model or any version, so the two answers a worker
             // is told can never disagree with the instance the pool actually published.
-            return Task.FromResult(new RegisterResponse
+            return new RegisterResponse
             {
                 Accepted = true,
                 OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
                 CompletionReceiptAckEnabled = registered.CompletionReceiptAckEnabled,
                 CompletionReadyRequired = registered.CompletionReceiptAckEnabled,
-            });
+                AdoptedTask = false,
+            };
         }
         catch (InvalidOperationException)
         {
-            logger.LogWarning("Registration rejected — duplicate worker ID: {WorkerId}", workerId);
+            return RejectedDuplicate(workerId);
+        }
+    }
 
-            // A REJECTED DUPLICATE ADVERTISES NOTHING: the instance already registered is untouched,
-            // so this reply is DISABLED — and advertises no readiness requirement — regardless of what
-            // the duplicate asked for.
-            return Task.FromResult(new RegisterResponse
-            {
-                Accepted = false,
-                OrchestratorVersion = VersionHelper.InformationalVersion,
-                AssignedWorkerId = workerId,
-                CompletionReceiptAckEnabled = false,
-                CompletionReadyRequired = false,
-            });
+    /// <summary>
+    /// TODAY'S EXACT DUPLICATE REGISTRATION REJECTION: one guarded Warning and the unchanged
+    /// rejection reply, with <c>adopted_task = false</c>.
+    /// </summary>
+    /// <remarks>
+    /// The reply advertises NOTHING — the instance already registered is untouched — regardless of
+    /// what the duplicate asked for.
+    /// </remarks>
+    /// <param name="workerId">The duplicate worker id.</param>
+    /// <returns>The rejection reply.</returns>
+    private RegisterResponse RejectedDuplicate(string workerId)
+    {
+        logger.LogWarning("Registration rejected — duplicate worker ID: {WorkerId}", workerId);
+
+        return new RegisterResponse
+        {
+            Accepted = false,
+            OrchestratorVersion = VersionHelper.InformationalVersion,
+            AssignedWorkerId = workerId,
+            CompletionReceiptAckEnabled = false,
+            CompletionReadyRequired = false,
+            AdoptedTask = false,
+        };
+    }
+
+    /// <summary>
+    /// THE GUARDED DECLINED-ADOPTION DIAGNOSTIC: the reconnecting worker's claim was NOT adopted, so
+    /// the worker is being registered ordinarily and idle. Exactly ONE line is emitted, and it names
+    /// the check that ACTUALLY refused.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A DECLINED CLAIM IS AN ORDINARY OUTCOME, NOT AN ERROR: this is a Warning because the operator
+    /// may want to know that a surviving worker's attempt was not reclaimed, and the named check is
+    /// what makes the disposition actionable. No success wording appears, because nothing was
+    /// adopted.
+    /// </para>
+    /// <para>
+    /// GUARDED like every other refusal diagnostic: the whole log call sits inside its own no-throw
+    /// guard, so a throwing logger can never turn a refused adoption into an escaping exception that
+    /// would fault an otherwise-acceptable registration.
+    /// </para>
+    /// </remarks>
+    /// <param name="workerId">The registering worker's id.</param>
+    /// <param name="taskId">The task id the worker claimed.</param>
+    /// <param name="check">The name of the check that refused.</param>
+    private void LogAdoptionRefused(string workerId, string taskId, string check)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Registration claim for task {TaskId} by worker {WorkerId} was not adopted " +
+                "(check={Check}); the worker is registered ordinarily and the attempt is unchanged",
+                taskId,
+                workerId,
+                check);
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the registration's own outcome.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED SUCCESSFUL-ADOPTION RECORD: the reconnecting worker reclaimed its restored
+    /// attempt, so it is registered BUSY with that exact task. Information level, one line.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT RECORDS WHAT HAPPENED, NOTHING MORE: the attempt is now owned by a registered instance and
+    /// the existing completion path applies unchanged. It is not a claim that the task will be
+    /// delivered, completed or acknowledged, and it promises no replay.
+    /// </para>
+    /// <para>
+    /// GUARDED, for the same reason as every other emission on this path: an adopted registration has
+    /// already mutated the pool, the queue and the hold, so a throwing logger must never turn that
+    /// success into a failure.
+    /// </para>
+    /// </remarks>
+    /// <param name="workerId">The registering worker's id.</param>
+    /// <param name="taskId">The adopted task id.</param>
+    /// <param name="assignedWorkerId">The id the registered instance actually carries.</param>
+    private void LogAdoptionSucceeded(string workerId, string taskId, string assignedWorkerId)
+    {
+        try
+        {
+            logger.LogInformation(
+                "Restored attempt for task {TaskId} adopted by worker {WorkerId} (assigned id {AssignedWorkerId}); " +
+                "the worker is registered busy with it and the existing completion path applies unchanged",
+                taskId,
+                workerId,
+                assignedWorkerId);
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the adopted registration's outcome.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED COMMIT-FAILURE DIAGNOSTIC: the adoption could not be committed, so the attempt has
+    /// already been rolled back under hold and the worker is being registered ordinarily and idle.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE EXCEPTION IS RENDERED THROUGH <see cref="SanitizedFailureDetail"/>, never attached as an
+    /// exception object: the message is a single bounded line and no raw stack or provider text
+    /// reaches the sink. No success wording appears, because nothing was adopted.
+    /// </para>
+    /// <para>
+    /// GUARDED, so the contained commit failure stays contained and cannot become a registration
+    /// fault.
+    /// </para>
+    /// </remarks>
+    /// <param name="workerId">The registering worker's id.</param>
+    /// <param name="taskId">The task id the worker claimed.</param>
+    /// <param name="failure">The exact commit failure; only its sanitized detail is rendered.</param>
+    private void LogAdoptionCommitFailed(string workerId, string taskId, Exception failure)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Adoption commit failed for task {TaskId} claimed by worker {WorkerId} " +
+                "(check={Check}); the attempt was put back under hold and the worker is registered " +
+                "ordinarily — {Detail}",
+                taskId,
+                workerId,
+                AdoptionRefusalNames.AdoptionCommitFailed,
+                SanitizedFailureDetail(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the registration's own outcome.
         }
     }
 

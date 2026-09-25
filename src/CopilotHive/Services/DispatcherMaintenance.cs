@@ -238,10 +238,15 @@ internal sealed class DispatcherMaintenance
     /// Restore active pipelines from the persistence store on startup.
     /// Re-primes Brain sessions so restored active pipelines are tracked by the pipeline manager.
     /// A RESTORED pipeline holding an active attempt
-    /// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) is deliberately LEFT ALONE: it is
-    /// reported and skipped, with no Brain registration, no session work, no goal-row change, no
-    /// pointer clear, no queue completion, no removal and no re-dispatch. The report carries the
-    /// restore-time classification VALUES the pipeline already holds
+    /// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) is reported and then given ONLY the
+    /// NON-DESTRUCTIVE half of the setup: it is registered with the Brain and its goal session is
+    /// forked or reattached, exactly as an unheld restoration is, because a surviving worker may
+    /// reclaim the attempt at Register and the Brain must already know the goal for the
+    /// <c>get_goal</c> tool and for its own session context. What it still skips is EVERYTHING
+    /// DESTRUCTIVE: no goal-row cleanup or status change, no pointer clear, no
+    /// <see cref="TaskQueue.MarkComplete"/>, no pipeline removal and no re-dispatch enqueue —
+    /// orchestrator restart alone remains no permission to invalidate or replace the attempt. The
+    /// report carries the restore-time classification VALUES the pipeline already holds
     /// (<see cref="GoalPipeline.RestoredRegistryClassification"/>,
     /// <see cref="GoalPipeline.RestoredActivePointerClassification"/> and
     /// <see cref="GoalPipeline.RestoredActiveTaskMappingPresent"/>) and never any registry
@@ -266,14 +271,15 @@ internal sealed class DispatcherMaintenance
             // THE RESTORE-ORIGIN HOLD GATE — recognised BEFORE anything else the loop does. An
             // instance restored with a NONTERMINAL phase and a NON-NULL captured active-task
             // pointer still owns the persisted attempt: orchestrator restart alone is not
-            // permission to invalidate or replace it. Every automatic step below is therefore
-            // skipped — no Brain registration, no session fork/registration, no planning or other
-            // LLM work, no goal-row status cleanup or status repair, no pointer clear, no
+            // permission to invalidate or replace it. What follows the report below is therefore
+            // ONLY the NON-DESTRUCTIVE Brain setup — registration and the session fork/reattach —
+            // and this iteration is then done. Every DESTRUCTIVE step stays skipped: no planning
+            // or other LLM work, no goal-row status cleanup or status repair, no pointer clear, no
             // TaskQueue.MarkComplete, no pipeline removal and no redispatch enqueue. NOTHING is
             // mutated: the goal row and the pipeline are left exactly as restored, and the
             // instance is left in the manager so GetActivePipelines keeps naming it and
-            // orphan-session cleanup retains its session files. The attempt waits for a
-            // reconciliation this slice does not implement.
+            // orphan-session cleanup retains its session files. The attempt waits for the
+            // reconnecting worker's Register adoption, or for the reconciliation sweep.
             if (pipeline.IsRestoredActiveAttemptHold)
             {
                 // THE ENRICHED HOLD REPORT — CLASSIFICATION VALUES ONLY. The three restore-time
@@ -287,8 +293,7 @@ internal sealed class DispatcherMaintenance
                 // exception object (which could carry such text into the sink). The classification
                 // enums and the mapping-present boolean are closed, fixed vocabularies; the goal id
                 // and the active-task pointer were already reported before this enrichment. The
-                // emission stays inside the no-throw LogSafely guard, and the early `continue`
-                // below is unchanged — this is a diagnostic enrichment, never a behavior change.
+                // emission stays inside the no-throw LogSafely guard.
                 LogSafely(() => _logger.LogWarning(
                     "Restored pipeline {GoalId} holds restored active attempt {TaskId} — awaiting reconciliation; the attempt is retained and no automatic re-dispatch is performed (registry evidence {RegistryClassification}, active slot {ActiveSlotClassification}, active mapping present {ActiveMappingPresent})",
                     pipeline.GoalId,
@@ -296,26 +301,22 @@ internal sealed class DispatcherMaintenance
                     pipeline.RestoredRegistryClassification,
                     pipeline.RestoredActivePointerClassification,
                     pipeline.RestoredActiveTaskMappingPresent));
+
+                // THE NON-DESTRUCTIVE BRAIN SETUP, IDENTICAL TO THE UNHELD PATH BELOW — literally
+                // the same shared call, so a held and an unheld restoration can never drift. A
+                // held attempt's worker may reconnect and adopt it at Register, and the Brain must
+                // already track the goal for get_goal and for the goal session. Registration and
+                // session work are REVERSIBLE knowledge, not authority: neither dispatches,
+                // replays nor releases anything, and the hold itself is untouched by both.
+                await RegisterNonDestructiveBrainSetupAsync(pipeline, ct);
                 continue;
             }
 
-            // Register restored active pipelines with the Brain so get_goal tool works
-            if (pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
-                (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
-
-            // Ensure the goal session exists on disk. If the orchestrator restarted mid-dispatch,
-            // the session may not have been forked yet. Fork from master to recover.
-            if (_brain is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
-            {
-                if (!_brain.GoalSessionExists(pipeline.GoalId))
-                {
-                    await _brain.ForkSessionForGoalAsync(pipeline.GoalId, ct);
-                }
-                else
-                {
-                    await _brain.RegisterExistingGoalSessionAsync(pipeline.GoalId, ct);
-                }
-            }
+            // THE NON-DESTRUCTIVE BRAIN SETUP. The SAME shared call the held path above makes, so
+            // a held and an unheld restoration can never drift apart: the Brain tracks the
+            // restored pipeline for get_goal, and the goal session is forked from master (when it
+            // is missing) or reattached. Neither step dispatches, releases or replays anything.
+            await RegisterNonDestructiveBrainSetupAsync(pipeline, ct);
 
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
                 continue;
@@ -384,6 +385,49 @@ internal sealed class DispatcherMaintenance
 
         // Clean up any orphaned goal session files whose goals are no longer active
         await CleanupOrphanedGoalSessionsAsync(ct);
+    }
+
+    /// <summary>
+    /// THE ONE NON-DESTRUCTIVE BRAIN SETUP, shared by the UNHELD and the HELD restore paths so the
+    /// two can never drift apart.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT DOES, and nothing more: registers a nonterminal restored pipeline with the Brain (so
+    /// the <c>get_goal</c> tool can report its iteration and phase) and makes sure its goal session
+    /// exists on disk — forked from master when it is missing, reattached when it is already there.
+    /// </para>
+    /// <para>
+    /// IT IS REVERSIBLE KNOWLEDGE, NOT AUTHORITY. It dispatches nothing, replays nothing, releases
+    /// no hold, completes no queue entry, changes no goal row, removes no pipeline and enqueues no
+    /// re-dispatch. That is exactly why a HELD pipeline may have it: the held attempt stays held
+    /// and its durable evidence stays untouched, while a surviving worker that reconnects and
+    /// adopts the attempt at Register finds a Brain that already knows the goal and its session.
+    /// </para>
+    /// <para>
+    /// A TERMINAL pipeline gets neither step, matching the pre-existing unheld behavior exactly.
+    /// </para>
+    /// </remarks>
+    /// <param name="pipeline">The restored pipeline to prime.</param>
+    /// <param name="ct">The caller's cancellation token, passed through to the session work.</param>
+    private async Task RegisterNonDestructiveBrainSetupAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
+            return;
+
+        (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
+
+        if (_brain is null)
+            return;
+
+        if (!_brain.GoalSessionExists(pipeline.GoalId))
+        {
+            await _brain.ForkSessionForGoalAsync(pipeline.GoalId, ct);
+        }
+        else
+        {
+            await _brain.RegisterExistingGoalSessionAsync(pipeline.GoalId, ct);
+        }
     }
 
     /// <summary>

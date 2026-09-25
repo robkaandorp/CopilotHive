@@ -276,6 +276,31 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
     private readonly ILogger<RestoredAttemptAdopter> _logger;
 
     /// <summary>
+    /// THE COMMIT-WINDOW SEAM — a test-only hook invoked EXACTLY ONCE, inside the adoption, AFTER
+    /// every read-only precondition has held and IMMEDIATELY BEFORE
+    /// <see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/> takes the hold.
+    /// <para>
+    /// WHY IT EXISTS. The <see cref="RestoredAttemptAdoptionOutcome.HoldAlreadyReleased"/> branch is
+    /// defined by the compare-and-swap LOSING a race against the reconciliation sweep, and that race
+    /// has a window of exactly these few instructions. A post-condition cannot manufacture the
+    /// interleaving — only a hook placed at the real boundary can, and the codebase uses this same
+    /// shape elsewhere (<c>PipelineStateMachine.OnTransitionForTest</c>,
+    /// <see cref="GoalPipeline.TaskIdNonceForTest"/>).
+    /// </para>
+    /// <para>
+    /// IT OBSERVES; IT DOES NOT DECIDE. It cannot adopt, cannot bypass a precondition and cannot
+    /// influence the outcome beyond what any concurrent release could do anyway: its only power is to
+    /// run code at the moment a real race would land. A test uses it to release the hold the way the
+    /// sweep would, which is precisely the production interleaving under test.
+    /// </para>
+    /// <para>
+    /// <c>null</c> (the production default) means the hook is absent and the commit proceeds
+    /// uninterrupted, so production behavior is byte-identical with or without this member.
+    /// </para>
+    /// </summary>
+    internal Action? BeforeAdoptCommitForTest { get; set; }
+
+    /// <summary>
     /// Initialises a new <see cref="RestoredAttemptAdopter"/> over the existing production
     /// collaborators.
     /// </summary>
@@ -396,6 +421,10 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
 
         // ── (a) THE HOLD LEAVES FIRST, BEFORE THE WORKER CAN BE SEEN. A false answer means the
         //    release sweep won the race: nothing was adopted and nothing was mutated. ─────────────
+        // THE TEST-ONLY COMMIT-WINDOW HOOK sits exactly at the boundary the race is defined by:
+        // after every precondition, before the CAS. Production leaves it null.
+        BeforeAdoptCommitForTest?.Invoke();
+
         if (!pipeline.TryAdoptRestoredActiveAttempt())
         {
             return new RestoredAttemptAdoptionResult
