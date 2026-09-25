@@ -1,5 +1,7 @@
+using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
@@ -8,6 +10,7 @@ using Grpc.Core;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -71,11 +74,19 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     private readonly List<SqliteConnection> _connections = [];
     private readonly List<CopilotHiveDbContext> _contexts = [];
 
+    /// <summary>
+    /// THE ANCHOR CONNECTION the current test instance holds open — exposed so the
+    /// <see cref="AdoptedCompletionHarness"/> record (outside the class) can issue its own raw SQL
+    /// reads against the SAME shared-cache database. Test infrastructure only.
+    /// </summary>
+    internal static readonly AsyncLocal<SqliteConnection?> SharedKeeper = new();
+
     public RestoredAttemptAdoptionTests()
     {
         _keeper = new SqliteConnection(_connectionString);
         _keeper.Open();
         CreateContext().Database.EnsureCreated();
+        SharedKeeper.Value = _keeper;
     }
 
     public void Dispose()
@@ -247,11 +258,11 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// The real <see cref="HiveOrchestratorService"/> and the collaborators its Register decision
     /// actually touches, with the log sink exposed for the exactly-one-warning assertions.
     /// </summary>
-    private sealed record RegisterHarness(
+    internal sealed record RegisterHarness(
         HiveOrchestratorService Service,
         WorkerPool Pool,
         TaskQueue Queue,
-        TestLogger<HiveOrchestratorService> Logger,
+        ILogEntrySink Logger,
         RestoredAttemptAdopter? Adopter);
 
     /// <summary>
@@ -320,6 +331,223 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
     /// <summary>A trivial <see cref="ServerCallContext"/>, matching the suite's existing fixtures.</summary>
     private static ServerCallContext MockContext() => new Mock<ServerCallContext>().Object;
+
+    /// <summary>
+    /// THE END-TO-END COMPLETION HARNESS for the adopted-completion vector. The production shape:
+    /// ONE shared <see cref="TaskCompletionNotifier"/> (the transport publishes to it and the REAL
+    /// dispatcher — which owns the REAL <see cref="TaskCompletionService"/> — is subscribed to it,
+    /// exactly as Program.cs wires them), a REAL completion recorder over the shared SQLite
+    /// assignment store and a REAL receipt store, a signalling logger on BOTH the service and the
+    /// dispatcher, and a <see cref="SignallingStreamWriter"/> the real <c>WorkStream</c> pump
+    /// forwards to.
+    /// </summary>
+    /// <param name="manager">The restored pipeline's manager, shared by the service and the dispatcher.</param>
+    /// <param name="goal">The restored pipeline's goal, registered on the dispatcher's goal source.</param>
+    /// <returns>
+    /// The register-level transport harness, the dispatcher's signalling logger, the real WorkStream
+    /// reader, and a join that terminates the stream and asserts the producer drained.
+    /// </returns>
+    private async Task<AdoptedCompletionHarness> CreateCompletionHarnessAsync(
+        GoalPipelineManager manager, Goal goal)
+    {
+        var pool = new WorkerPool();
+        var queue = new TaskQueue();
+        var serviceLogger = new SignallingLogger<HiveOrchestratorService>();
+        var dispatcherLogger = new SignallingLogger<GoalDispatcher>();
+
+        // THE SHARED NOTIFIER: the transport publishes a completion to it and the dispatcher's real
+        // TaskCompletionService is its awaiting subscriber — the production singleton bridge.
+        var completionNotifier = new TaskCompletionNotifier();
+
+        // THE GOAL SOURCE the lifecycle service writes status updates to — the in-memory source the
+        // transport suites use, registered on the dispatcher's own GoalManager so a terminal
+        // finalization can really persist the status.
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new InMemoryGoalSource(goal));
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager, manager, queue,
+            new GrpcWorkerGateway(pool), completionNotifier,
+            dispatcherLogger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+
+        // THE REAL DURABLE EVIDENCE STORES, over the shared SQLite database: the assignment store
+        // the adopter reads and the receipt store the completion recorder writes.
+        var assignmentStore = CreateAssignmentStore();
+        var receiptStore = new CompletionReceiptStore(
+            new SharedCacheContextFactory(_connectionString),
+            NullLogger<CompletionReceiptStore>.Instance);
+
+        var service = new HiveOrchestratorService(
+            pool, queue, manager, completionNotifier, dispatcher, serviceLogger,
+            restoredAttemptAdopter: new RestoredAttemptAdopter(
+                manager, pool, queue, assignmentStore, NullLogger<RestoredAttemptAdopter>.Instance),
+            assignmentPublisher: new WorkerAssignmentPublisher(manager, pool, assignmentStore),
+            completionRecorder: new WorkerCompletionRecorder(assignmentStore, receiptStore));
+
+        var reader = new CompletionStreamReader();
+        var writer = new SignallingStreamWriter();
+
+        // THE REAL WORKSTREAM PRODUCER, retained and joined by the harness's own teardown: a vector
+        // never leaks it, and a fault it terminated with is surfaced rather than swallowed.
+        var streamTask = service.WorkStream(reader, writer, MockContext());
+
+        return new AdoptedCompletionHarness(
+            new RegisterHarness(service, pool, queue, serviceLogger, null),
+            dispatcherLogger, manager, reader, writer, streamTask);
+    }
+
+    /// <summary>
+    /// THE MINIMAL GOAL SOURCE the adopted-completion harness registers on the REAL GoalManager: the
+    /// seeded goal is its only pending goal, so the lifecycle service's own status writes reach it.
+    /// </summary>
+    private sealed class InMemoryGoalSource(Goal goal) : IGoalSource
+    {
+        public string Name => "in-memory-goal-source";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null,
+            CancellationToken ct = default)
+        {
+            if (string.Equals(goalId, goal.Id, StringComparison.Ordinal))
+                goal.Status = status;
+
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// THE LOG-SINK SHAPE every harness logger shares: the retained
+    /// <see cref="TestLogger{T}.LogEntries"/> records. The register-level assertions read this shape,
+    /// so both the plain <see cref="TestLogger{T}"/> and the adopted-completion harness's signalling
+    /// logger satisfy it and the harness record can hold EITHER.
+    /// </summary>
+    internal interface ILogEntrySink
+    {
+        /// <summary>Every record, in emission order — the <see cref="TestLogger{T}"/> shape.</summary>
+        List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; }
+    }
+
+    /// <summary>
+    /// THE SERVICE-SIDE logger for the adopted-completion harness: the full
+    /// <see cref="TestLogger{T}"/>-shaped <see cref="ILogEntrySink.LogEntries"/> PLUS
+    /// <see cref="WaitFor"/> — a FRESH <see cref="TaskCompletionSource"/> completed by the NEXT
+    /// record containing the fragment, the deterministic handle on a production line, allocated
+    /// before the message is produced so it can never be missed.
+    /// </summary>
+    internal sealed class SignallingLogger<TCategory> : ILogger<TCategory>, ILogEntrySink
+    {
+        private readonly List<(LogLevel LogLevel, string Message, Exception? Exception)> _entries = [];
+        private readonly List<(string Fragment, TaskCompletionSource Signal)> _waiters = [];
+
+        /// <summary>Every record, in emission order.</summary>
+        public List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries => _entries;
+
+        /// <summary>Every formatted message, in emission order.</summary>
+        public IReadOnlyList<string> Messages
+        {
+            get
+            {
+                lock (_entries)
+                    return [.. _entries.Select(e => e.Message)];
+            }
+        }
+
+        /// <summary>A FRESH signal completed by the NEXT record containing <paramref name="fragment"/>.</summary>
+        public Task WaitFor(string fragment)
+        {
+            var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_entries)
+                _waiters.Add((fragment, signal));
+            return signal.Task;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            List<TaskCompletionSource> matched = [];
+            lock (_entries)
+            {
+                _entries.Add((logLevel, message, exception));
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    if (!message.Contains(_waiters[i].Fragment, StringComparison.Ordinal))
+                        continue;
+                    matched.Add(_waiters[i].Signal);
+                    _waiters.RemoveAt(i);
+                }
+            }
+
+            foreach (var signal in matched)
+                signal.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// The in-memory request stream the real <c>WorkStream</c> read loop drains, backed by an
+    /// unbounded channel — the same fixture shape the transport-ownership suite uses. The FIRST
+    /// message pins the stream to the worker id it carries, so a vector pushes its own messages.
+    /// </summary>
+    internal sealed class CompletionStreamReader : IAsyncStreamReader<CopilotHive.Shared.Grpc.WorkerMessage>
+    {
+        private readonly System.Threading.Channels.Channel<CopilotHive.Shared.Grpc.WorkerMessage> _channel =
+            System.Threading.Channels.Channel.CreateUnbounded<CopilotHive.Shared.Grpc.WorkerMessage>();
+
+        public CopilotHive.Shared.Grpc.WorkerMessage Current { get; private set; } = new();
+
+        public void Push(CopilotHive.Shared.Grpc.WorkerMessage message) =>
+            _channel.Writer.TryWrite(message);
+
+        public void Complete() => _channel.Writer.TryComplete();
+
+        public async Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            while (await _channel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                if (_channel.Reader.TryRead(out var message))
+                {
+                    Current = message;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// THE PUBLICATION OBSERVATION POINT: the gRPC response writer the real <c>WorkStream</c> pump
+    /// forwards every queued <see cref="CopilotHive.Shared.Grpc.OrchestratorMessage"/> to. It records
+    /// what it is given and signals per predicate; it never intercepts, delays or drops anything.
+    /// </summary>
+    internal sealed class SignallingStreamWriter : IServerStreamWriter<CopilotHive.Shared.Grpc.OrchestratorMessage>
+    {
+        private readonly List<CopilotHive.Shared.Grpc.OrchestratorMessage> _messages = [];
+
+        public WriteOptions? WriteOptions { get; set; }
+
+        public IReadOnlyList<CopilotHive.Shared.Grpc.OrchestratorMessage> Messages
+        {
+            get { lock (_messages) return [.. _messages]; }
+        }
+
+        public Task WriteAsync(CopilotHive.Shared.Grpc.OrchestratorMessage message)
+        {
+            lock (_messages)
+                _messages.Add(message);
+            return Task.CompletedTask;
+        }
+    }
 
     /// <summary>
     /// DRIVES THE REAL <see cref="HiveOrchestratorService.Register"/> with a claim on
@@ -1115,5 +1343,369 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             e => e.LogLevel == LogLevel.Information &&
                  e.Message.Contains("adopted by worker", StringComparison.Ordinal));
         Assert.DoesNotContain(harness.Logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+    }
+
+    // ═══════════════ (b) THE COMMIT ORDER — worker visibility implies the hold already left ═══════════════
+
+    /// <summary>
+    /// (b) THE COMMIT ORDER, OBSERVED AT ITS OWN BOUNDARY. The adopter's commit-window hook sits
+    /// exactly between the read-only evidence phase and the adoption's compare-and-swap — the same
+    /// boundary a racing observer of <see cref="WorkerPool.GetWorker"/> would land on. The test PARKS
+    /// the adoption on that hook with a <see cref="TaskCompletionSource"/> barrier, observes the
+    /// pre-commit state, releases it, and derives the ordered fact from the completed observable
+    /// state.
+    /// <para>
+    /// THE PRE-COMMIT OBSERVATION (the window, held open while the adoption is parked): the attempt
+    /// is STILL HELD, the worker is NOT YET visible through <see cref="WorkerPool.GetWorker"/>, and
+    /// the queue holds no active entry. This kills the register-first mutant outright: an
+    /// implementation that published the worker before taking the hold would be visible inside the
+    /// window.
+    /// </para>
+    /// <para>
+    /// THE ORDERED FACT, DERIVED FROM OBSERVABLE STATE: after the released commit completes, the
+    /// worker IS visible and busy, and the hold IS gone. The worker's visibility is produced ONLY by
+    /// <see cref="RestoredAttemptAdopter"/>'s commit step
+    /// (<see cref="WorkerPool.RegisterAdoptedWorker"/>), which the adopter reaches only AFTER
+    /// <see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/> returned true in the same synchronous
+    /// sequence — a CAS loss never registers the worker at all, which the release-wins vector below
+    /// pins. Worker visibility therefore implies the hold had already left at or before the
+    /// visibility instant: no observer can see a busy worker under a hold, and the in-window
+    /// observation plus the end state pin that order without any timing dependence.
+    /// </para>
+    /// <para>
+    /// DETERMINISTIC SYNCHRONIZATION, NO SLEEPS: the adopter is parked on a
+    /// <see cref="TaskCompletionSource"/> the test completes; the test waits on the entry signal the
+    /// same way. Every await carries a 30-second failure bound, so a lost rendezvous is a named
+    /// failure, never a stall.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task TryAdoptRestoredAttempt_AtTheCommitWindow_TheWorkerIsInvisible_AndVisibilityImpliesTheHoldLeft()
+    {
+        var goalId = "adopt-commit-order";
+        var workerId = "worker-commit-order";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        var pool = new WorkerPool();
+        var queue = new TaskQueue();
+
+        // THE PRE-ADOPTION CONTROL: before the commit, the pool has no worker under this id at all,
+        // so the later positive reading can never be an artifact of a pool that always answers.
+        Assert.Null(pool.GetWorker(workerId));
+        Assert.True(pipeline.IsRestoredActiveAttemptHold);
+
+        // THE HELD COMMIT WINDOW: the hook is invoked exactly once, after every precondition held and
+        // immediately before the CAS. It signals entry and then BLOCKS the adoption until the test
+        // releases it, so the pre-commit state is observable and stable.
+        var windowEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var windowReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookInvocations = 0;
+
+        var adopter = CreateAdopter(manager, pool, queue);
+        adopter.BeforeAdoptCommitForTest = () =>
+        {
+            Interlocked.Increment(ref hookInvocations);
+            windowEntered.TrySetResult();
+            // THE PARK: the adoption cannot proceed until the test releases it. The blocking wait
+            // lives INSIDE the hook, so the whole commit sequence is frozen at the boundary.
+            windowReleased.Task.Wait();
+        };
+
+        var adoptionTask = Task.Run(
+            () => adopter.TryAdoptRestoredAttempt(
+                workerId, taskId, ["dotnet"], requestCompletionReceiptAck: false,
+                completionReceiptAckEnabled: false),
+            CancellationToken.None);
+
+        try
+        {
+            await windowEntered.Task.WaitAsync(CommitOrderWait, CancellationToken.None);
+
+            // ── THE WINDOW: preconditions held, CAS not yet run, nothing published. ──────────────
+            Assert.True(pipeline.IsRestoredActiveAttemptHold,
+                "before the compare-and-swap the attempt is still held — the commit has not begun");
+            Assert.True(pool.GetWorker(workerId) is null,
+                "no worker is visible before the commit");
+            Assert.Null(queue.GetActiveTask(taskId));
+        }
+        finally
+        {
+            // THE RENDEZVOUS IS ALWAYS RELEASED, whatever the window's assertions did — a parked
+            // adoption must never be leaked by a failing assertion above.
+            windowReleased.TrySetResult();
+
+            var result = await adoptionTask;
+
+            Assert.True(result.Adopted, "the fixture's adoption must succeed for this vector");
+            Assert.True(1 == Volatile.Read(ref hookInvocations),
+                "the commit-window hook must fire exactly once per adoption");
+
+            // ── THE END STATE the ordering must be consistent with: the worker is visible and busy,
+            //    the entry is the adopter's own, and the hold is gone. ─────────────────────────────
+            var worker = Assert.IsType<ConnectedWorker>(pool.GetWorker(workerId));
+            Assert.True(worker.IsBusy);
+            Assert.Equal(taskId, worker.CurrentTaskId);
+            var task = Assert.IsType<WorkTask>(queue.GetActiveTask(taskId));
+            Assert.Equal(workerId, task.Metadata["assigned_worker"]);
+            Assert.False(pipeline.IsRestoredActiveAttemptHold,
+                "at the instant the worker is visible via GetWorker the hold must already be gone");
+
+            // THE OUTCOME ITSELF IS ORDER EVIDENCE: an Adopted outcome is reachable ONLY through a
+            // successful CAS followed by the busy registration, in that order, in one synchronous
+            // sequence. The release-wins vector below separately proves a lost CAS never registers
+            // the worker at all — so visibility implies the CAS had already succeeded.
+            Assert.Equal(RestoredAttemptAdoptionOutcome.Adopted, result.Outcome);
+        }
+    }
+
+    /// <summary>Bound for the commit-window rendezvous; a hang is a named failure, never a stall.</summary>
+    private static readonly TimeSpan CommitOrderWait = TimeSpan.FromSeconds(30);
+
+    // ═══════════════ (a) THE ADOPTED COMPLETION, END TO END THROUGH THE REAL PATHS ═══════════════
+
+    /// <summary>
+    /// (a) THE ADOPTED COMPLETION, END TO END: a worker adopts the held attempt through the REAL
+    /// <see cref="HiveOrchestratorService.Register"/>, then delivers a REAL <c>WorkStream</c>
+    /// <c>TaskComplete</c> — the same read loop, ownership classification, receipt recording and
+    /// checked release any ordinary busy worker uses — and the REAL
+    /// <see cref="TaskCompletionService"/> ADMITS it and drives the pipeline OFF the restored
+    /// Coding phase to its terminal completion. There is no bypass and no second completion route:
+    /// the adopted instance is an ordinary busy worker whose completion flows through the existing
+    /// transport path.
+    /// <para>
+    /// THE DRIVE IS REAL THROUGHOUT. The downstream dispatcher is the REAL <see cref="GoalDispatcher"/>,
+    /// which owns the real <c>TaskCompletionService</c> and subscribes to the shared
+    /// <see cref="TaskCompletionNotifier"/> exactly as production wires it; the completion travels
+    /// the real <c>WorkStream</c> read loop, the REAL recorder retains the durable receipt, the
+    /// checked release idles the instance and removes the active entry, and the REAL
+    /// <see cref="GoalLifecycleService"/> marks the goal Completed in its REAL goal source. The
+    /// downstream evidence is a production <c>TaskCompletionService</c> line, so a returned call
+    /// proves the real domain chain ran — not merely that a test handler fired.
+    /// </para>
+    /// <para>
+    /// THE ADVANCEMENT IS READ FROM THE PIPELINE, THE SLOT AND THE DURABLE ROW: with no Brain the
+    /// existing no-brain path is the production advancement — the completing slot is admitted
+    /// (Pending → Claimed, the A1a in-flight exemption the terminal abandon respects), the phase
+    /// reaches <see cref="GoalPhase.Done"/>, the goal row is marked Completed in its source, and the
+    /// persisted pipeline row agrees.
+    /// </para>
+    /// <para>
+    /// DETERMINISTIC SYNCHRONIZATION, NO SLEEPS: the downstream wait is a
+    /// <see cref="TaskCompletionSource"/> completed by the production log line itself, allocated
+    /// before the message is pushed; the only bounded await is the 30-second failure bound every
+    /// existing transport vector uses, which a healthy run never waits out.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AdoptedWorker_TaskComplete_ReachesTaskCompletionService_AndAdvancesThePipeline()
+    {
+        var goalId = "adopt-e2e-complete";
+        var workerId = "worker-adopted-completes";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        // THE COMPLETION HARNESS: the production wiring — the real service, adopter, recorder,
+        // publisher, pool, queue, dispatcher subscribed to the shared notifier, and WorkStream.
+        var service = await CreateCompletionHarnessAsync(manager, pipeline.Goal);
+        var bound = TimeSpan.FromSeconds(30);
+        var harness = service.Harness;
+        var dispatcherLogger = service.DispatcherLogger;
+
+        Exception? primary = null;
+        try
+        {
+            // THE ADOPTION, through the REAL Register over the REAL adopter: the instance becomes an
+            // ordinary busy worker with the active entry and the recorded evidence already in place.
+            var response = await RegisterAsync(harness, workerId, taskId);
+
+            Assert.True(response.Accepted);
+            Assert.True(response.AdoptedTask);
+            var worker = Assert.IsType<ConnectedWorker>(harness.Pool.GetWorker(workerId));
+            Assert.True(worker.IsBusy);
+            Assert.Equal(taskId, worker.CurrentTaskId);
+            Assert.Equal(HeldModel, worker.CurrentModel);
+            Assert.NotNull(harness.Queue.GetActiveTask(taskId));
+            Assert.False(pipeline.IsRestoredActiveAttemptHold, "the hold must leave before any completion");
+
+            // THE COMPLETION IS DELIVERED ON THE WORKER'S OWN STREAM — the same path any assignment
+            // completion travels: the read loop pins the worker on this first message, classifies
+            // the delivery, validates ownership, records the receipt and releases the instance. The
+            // downstream signal is the REAL lifecycle service's own terminal line ("Goal {GoalId}
+            // completed"), which the no-brain completion path reaches only AFTER the admission, the
+            // pointer release, the phase advance to Done and the goal-status write — so a returned
+            // call proves the whole real chain ran and SETTLED.
+            var downstream = dispatcherLogger.WaitFor("completed in");
+
+            service.Reader.Push(new CopilotHive.Shared.Grpc.WorkerMessage
+            {
+                WorkerId = workerId,
+                Complete = new CopilotHive.Shared.Grpc.TaskComplete
+                {
+                    TaskId = taskId,
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
+                    Output = "adopted-completion-output",
+                    Model = HeldModel,
+
+                    // FILE CHANGES: a Coder completion reporting none is the production no-op
+                    // path (a stronger-prompt retry instead of an advance), so the completing
+                    // delivery carries real change counts — exactly what a working coder reports.
+                    GitStatus = new CopilotHive.Shared.Grpc.GitStatus
+                    {
+                        FilesChanged = 3,
+                        Insertions = 10,
+                        Deletions = 2,
+                        Pushed = true,
+                        CurrentBranch = "copilothive/" + goalId,
+                    },
+                },
+            });
+
+            await downstream.WaitAsync(bound, TestContext.Current.CancellationToken);
+
+            // ── THE ADOPTED COMPLETION WAS ADMITTED AND THE PIPELINE ADVANCED TO ITS TERMINAL. ────
+            // With no Brain the existing no-brain path is the production advancement: the completing
+            // slot is admitted (Pending → Claimed), the phase reaches Done, and the goal row is
+            // marked Completed in its source. (The state machine is NOT part of this terminal path:
+            // MarkGoalCompletedAsync advances the pipeline phase directly.)
+            Assert.Equal(GoalPhase.Done, pipeline.Phase);
+
+            // THE ADMITTED SLOT STAYS CLAIMED — the A1a in-flight exemption the terminal abandon
+            // leaves it with (never Recorded on the no-brain path, never Abandoned).
+            Assert.Equal(WorkSlotState.Claimed, service.SlotState(taskId));
+
+            // The completion release: the instance is idle again with no task, and the active entry
+            // is gone — the EXISTING transport behavior, unchanged by the adoption.
+            Assert.False(worker.IsBusy);
+            Assert.Null(worker.CurrentTaskId);
+            Assert.Null(harness.Queue.GetActiveTask(taskId));
+
+            // THE REAL DOWNSTREAM CHAIN RAN — the production admitted-completion line naming the
+            // goal, plus the terminal line the wait observed, not a counter.
+            Assert.Contains(
+                dispatcherLogger.Messages,
+                m => m.Contains("task completed", StringComparison.Ordinal) &&
+                     m.Contains(goalId, StringComparison.Ordinal));
+            Assert.Contains(
+                dispatcherLogger.Messages,
+                m => m.Contains("completed in", StringComparison.Ordinal) &&
+                     m.Contains(goalId, StringComparison.Ordinal));
+
+            // THE GOAL WAS MARKED COMPLETED in its source — the lifecycle service's own status write,
+            // through the REAL GoalManager over the REAL goal source.
+            Assert.Equal(GoalStatus.Completed, pipeline.Goal.Status);
+
+            // THE DURABLE EVIDENCE AGREES: the persisted row records the terminal phase, so the
+            // existing path genuinely performed and persisted the advance — no bypass involved.
+            Assert.Equal(GoalPhase.Done.ToString(), service.RawPhase(goalId));
+
+            // NO HOLD FENCE REFUSAL: the completion was never dropped by the held-attempt fence.
+            Assert.DoesNotContain(
+                dispatcherLogger.Messages,
+                m => m.Contains("completion-refused", StringComparison.Ordinal));
+        }
+        catch (Exception failure)
+        {
+            primary = failure;
+        }
+        finally
+        {
+            // THE STRICT TEARDOWN, ON EVERY PATH: the producer is joined under the bound. A leaked
+            // or faulted stream is reported, and the PRIMARY failure stays authoritative.
+            service.Reader.Complete();
+            Exception? cleanup = null;
+            try
+            {
+                await service.StreamTask.WaitAsync(bound, CancellationToken.None);
+            }
+            catch (Exception teardown) when (teardown is not OperationCanceledException
+                                             and not TaskCanceledException)
+            {
+                cleanup = teardown;
+            }
+
+            if (primary is not null)
+                throw primary;
+
+            if (cleanup is not null)
+                throw new InvalidOperationException(
+                    "THE WORKSTREAM FAILED TO DRAIN CLEANLY on teardown — a live producer remains " +
+                    "or the stream terminated with a fault.", cleanup);
+        }
+    }
+}
+
+/// <summary>
+/// THE END-TO-END COMPLETION HARNESS for the adopted-completion vector: the REAL
+/// <see cref="HiveOrchestratorService"/> with the REAL adopter, recorder and assignment publisher
+/// wired in, over the REAL <see cref="WorkerPool"/>, <see cref="TaskQueue"/>, SQLite assignment store
+/// and receipt store — and the REAL <see cref="GoalDispatcher"/> subscribed to the shared
+/// <see cref="TaskCompletionNotifier"/>, so a published completion genuinely reaches the real
+/// <see cref="TaskCompletionService"/>.
+/// </summary>
+/// <param name="Harness">The register-level transport collaborators (service, pool, queue, logger, adopter).</param>
+/// <param name="DispatcherLogger">The REAL dispatcher's signalling logger — the source of the production completion lines.</param>
+/// <param name="Manager">The manager shared by the service, the dispatcher and the restored pipeline.</param>
+/// <param name="Reader">The real WorkStream's request stream the vector pushes messages onto.</param>
+/// <param name="Writer">The response writer the real pump forwards to — the publication ledger.</param>
+/// <param name="StreamTask">The retained WorkStream producer; the teardown joins exactly this task.</param>
+internal sealed record AdoptedCompletionHarness(
+    RestoredAttemptAdoptionTests.RegisterHarness Harness,
+    RestoredAttemptAdoptionTests.SignallingLogger<GoalDispatcher> DispatcherLogger,
+    GoalPipelineManager Manager,
+    RestoredAttemptAdoptionTests.CompletionStreamReader Reader,
+    RestoredAttemptAdoptionTests.SignallingStreamWriter Writer,
+    Task StreamTask) : IAsyncDisposable
+{
+    /// <summary>The bounded wait every transport await carries; a hang is a named failure.</summary>
+    private static readonly TimeSpan Bound = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The state of a task's slot in its pipeline's own registry, read through
+    /// <see cref="GoalPipeline.GetSlotsForTest"/>.
+    /// </summary>
+    public WorkSlotState SlotState(string taskId)
+    {
+        var pipeline = Manager.GetByTaskId(taskId)
+            ?? throw new InvalidOperationException($"no pipeline for task '{taskId}'");
+        return pipeline.GetSlotsForTest().Single(v => v.Slot.TaskId == taskId).State;
+    }
+
+    /// <summary>A raw scalar read of the persisted pipeline row's phase, through the shared database.</summary>
+    public string? RawPhase(string goalId)
+    {
+        var keeper = RestoredAttemptAdoptionTests.SharedKeeper.Value
+            ?? throw new InvalidOperationException("the shared SQLite anchor connection is not installed");
+        using var command = keeper.CreateCommand();
+        command.CommandText = "SELECT phase FROM pipelines WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        var value = command.ExecuteScalar();
+        return value is DBNull or null ? null : (string)value;
+    }
+
+    /// <summary>
+    /// THE STRICT TEARDOWN: the request stream is completed and the retained producer is joined under
+    /// the bound, on EVERY path — a leaked or faulted WorkStream is a test failure, never a leak.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        Reader.Complete();
+
+        try
+        {
+            await StreamTask.WaitAsync(Bound, CancellationToken.None);
+        }
+        catch (TimeoutException)
+        {
+            throw new TimeoutException(
+                $"TEARDOWN LEAK: the adopted worker's WorkStream did not terminate within " +
+                $"{Bound.TotalSeconds:F0}s — a live producer remains.");
+        }
+        catch (Exception ex) when (StreamTask.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                "THE WORKSTREAM TERMINATED WITH A FAULT. A clean vector must leave the transport " +
+                "draining normally; a fault here means a handler escaped instead of returning.", ex);
+        }
     }
 }
