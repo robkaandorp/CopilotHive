@@ -78,6 +78,24 @@ public class BrainActorChildTests
         public void Dispose() { }
     }
 
+    /// <summary>Chat client that always throws from the LLM call, to exercise relayed child faults.</summary>
+    private sealed class ThrowingChatClient : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("throwing", null, "throwing-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new HttpRequestException("boom");
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
     // ── Helpers ──
 
     private static async Task<T> AwaitReplyAsync<T>(TaskCompletionSource<T> reply)
@@ -703,6 +721,38 @@ public class BrainActorChildTests
             await AwaitSettledAsync(execMsg.Reply);
             Assert.True(execMsg.Reply.Task.IsCompletedSuccessfully,
                 "ExecutePromptOnChild reply must complete successfully after slow client releases.");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    /// <summary>
+    /// A faulted child reply relayed through <c>BrainActor.Relay</c> must surface the ORIGINAL
+    /// exception to awaiters of the outer reply. Forwarding the framework's AggregateException
+    /// wrapper (<c>inner.Exception</c>) double-wraps it, so awaiting the outer reply would throw
+    /// AggregateException(AggregateException(original)) instead of the original exception.
+    /// </summary>
+    [Fact]
+    public async Task ExecutePromptOnChild_FaultedChild_RelaysOriginalExceptionNotAggregateWrapper()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir, FakeFactory(new ThrowingChatClient()));
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkAsync(actor, "goal-1");
+
+            var msg = BrainActorMessages.CreateExecutePromptOnChildMessage("goal-1", "prompt", CancellationToken.None);
+            Assert.True(actor.Tell(msg));
+            await AwaitSettledAsync(msg.Reply);
+
+            Assert.True(msg.Reply.Task.IsFaulted);
+            Assert.IsType<HttpRequestException>(msg.Reply.Task.Exception!.InnerException);
+
+            // Awaiting the outer reply must throw the original exception, not its AggregateException wrapper.
+            var thrown = await Assert.ThrowsAsync<HttpRequestException>(
+                async () => await msg.Reply.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken));
+            Assert.IsNotType<AggregateException>(thrown);
         }
         finally { DeleteTempPath(dir); }
     }

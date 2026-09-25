@@ -224,7 +224,10 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             {
                 if (inner.IsFaulted)
                 {
-                    outer.TrySetException(inner.Exception!);
+                    // Forward the original exception(s), never the framework's AggregateException wrapper:
+                    // forwarding inner.Exception would double-wrap, so awaiters of the outer reply would see
+                    // AggregateException(AggregateException(original)) instead of the original exception.
+                    outer.TrySetException(inner.Exception!.InnerExceptions);
                 }
                 else if (inner.IsCanceled)
                 {
