@@ -141,6 +141,17 @@ public enum RestoredAttemptAdoptionRefusal
     /// transition won, exactly as it would have if it had landed before the precondition reads.
     /// </summary>
     AttemptNoLongerValid,
+
+    /// <summary>
+    /// Every read-only precondition and the live evidence held, but by the SYNCHRONIZED commit the
+    /// claimed task no longer routed to this pipeline: it was removed from the manager (for example
+    /// by a user retry clearing the goal's runtime state, which performs no terminal transition and
+    /// so invalidates none of the pointer/phase/slot evidence). The route is proven inside the same
+    /// pipeline-lock span as the CAS, immediately before it. Nothing was adopted, nothing was mutated,
+    /// the hold is untouched, and no busy worker is published for an attempt whose completion could
+    /// never reach its pipeline.
+    /// </summary>
+    RouteNoLongerValid,
 }
 
 /// <summary>
@@ -261,7 +272,10 @@ public sealed record RestoredAttemptAdoptionResult
 ///     hold Held → Adopted in the same <c>_lock</c> span. An invalidating writer (cancellation,
 ///     terminal transition, slot admission or retirement) that lands before it yields
 ///     <see cref="RestoredAttemptAdoptionRefusal.AttemptNoLongerValid"/> with nothing mutated; one
-///     that lands after it sees an Adopted attempt. A lost hold CAS (the release sweep won) is
+///     that lands after it sees an Adopted attempt. The MANAGER ROUTE is proven inside the same span,
+///     immediately before the CAS: a removal completed by then (including a retry clearing with no
+///     terminal transition) yields <see cref="RestoredAttemptAdoptionRefusal.RouteNoLongerValid"/>,
+///     nothing mutated. A lost hold CAS (the release sweep won) is
 ///     <see cref="RestoredAttemptAdoptionOutcome.HoldAlreadyReleased"/>, nothing mutated. The hold
 ///     leaves BEFORE the worker is visible;</description></item>
 ///   <item><description>the busy registration
@@ -455,15 +469,15 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
         // after every read-only precondition, before the synchronized region. Production leaves it null.
         BeforeAdoptCommitForTest?.Invoke();
 
-        // THE ROUTE IS RECHECKED TOO: a pipeline removed from the manager after the precondition
-        // reads (cancellation, retry-state clearing) no longer owns the claimed task. Every
-        // production removal is PRECEDED by a terminal AdvanceTo under the pipeline lock, which the
-        // synchronized region below rejects atomically; this recheck additionally refuses a removal
-        // that already completed, without claiming atomicity with the manager's own lock.
-        if (!ReferenceEquals(_pipelineManager.GetByTaskId(taskId), pipeline))
-            return Refused(RestoredAttemptAdoptionRefusal.AttemptNoLongerValid);
-
-        var decision = pipeline.TryAdoptRestoredActiveAttemptIfStillValid(context.Slot);
+        // THE ROUTE IS PROVEN INSIDE THE SYNCHRONIZED REGION, adjacent to the CAS — never in a
+        // separate step before it. A manager removal can land with NO preceding terminal AdvanceTo
+        // (GoalDispatcher.ClearGoalRetryState on a user retry), which invalidates none of the
+        // pointer/phase/slot evidence; a pre-region recheck would leave a window in which such a
+        // removal lands and the attempt is still adopted with no manager route. The probe is the
+        // manager's lock-free lookup, compared by reference to the pipeline being adopted.
+        var decision = pipeline.TryAdoptRestoredActiveAttemptIfStillValid(
+            context.Slot,
+            () => ReferenceEquals(_pipelineManager.GetByTaskId(taskId), pipeline));
         switch (decision)
         {
             case RestoredAttemptCommitDecision.Adopted:
@@ -477,6 +491,10 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
             case RestoredAttemptCommitDecision.AttemptNoLongerValid:
                 // An invalidating transition won: nothing was adopted, the hold is untouched.
                 return Refused(RestoredAttemptAdoptionRefusal.AttemptNoLongerValid);
+            case RestoredAttemptCommitDecision.RouteNoLongerValid:
+                // The pipeline lost its manager route before the CAS: nothing was adopted, the hold
+                // is untouched, and no busy worker is ever published for a routeless attempt.
+                return Refused(RestoredAttemptAdoptionRefusal.RouteNoLongerValid);
             default:
                 throw new InvalidOperationException(
                     $"Unhandled RestoredAttemptCommitDecision: {decision}");

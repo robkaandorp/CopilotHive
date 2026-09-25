@@ -558,6 +558,14 @@ public sealed class HiveOrchestratorService(
     /// adopted.
     /// </para>
     /// <para>
+    /// IT CLAIMS ONLY WHAT THE ADOPTION ITSELF DID: "the adoption made no further change". It does NOT
+    /// claim the attempt is unchanged, because for some refusals a CONCURRENT writer did change it
+    /// before the commit — the hold was already released (<c>HoldAlreadyReleased</c>), the pointer,
+    /// phase or slot was invalidated (<c>AttemptNoLongerValid</c>), or the pipeline lost its manager
+    /// route (<c>RouteNoLongerValid</c>). The refusal itself mutates nothing beyond any rollback it
+    /// performs.
+    /// </para>
+    /// <para>
     /// A READ FAILURE KEEPS ITS CAUSE VISIBLE IN THIS SAME LINE: when <paramref name="cause"/> is
     /// supplied (the <c>ReadFailed</c> refusal) its SANITIZED, bounded detail is appended — never
     /// the exception object, whose raw message and stack a sink would render verbatim.
@@ -580,7 +588,7 @@ public sealed class HiveOrchestratorService(
             {
                 logger.LogWarning(
                     "Registration claim for task {TaskId} by worker {WorkerId} was not adopted " +
-                    "(check={Check}); the worker is registered ordinarily and the attempt is unchanged",
+                    "(check={Check}); the worker is registered ordinarily and the adoption made no further change",
                     taskId,
                     workerId,
                     check);
@@ -589,7 +597,7 @@ public sealed class HiveOrchestratorService(
             {
                 logger.LogWarning(
                     "Registration claim for task {TaskId} by worker {WorkerId} was not adopted " +
-                    "(check={Check}); the worker is registered ordinarily and the attempt is unchanged " +
+                    "(check={Check}); the worker is registered ordinarily and the adoption made no further change " +
                     "— cause: {Detail}",
                     taskId,
                     workerId,

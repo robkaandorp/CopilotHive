@@ -338,12 +338,36 @@ public sealed class GoalPipeline
     /// <para>
     /// No other lock is taken here, so this region cannot participate in a lock-order cycle.
     /// </para>
+    /// <para>
+    /// THE ROUTE IS PROVEN INSIDE THE SAME SPAN, IMMEDIATELY BEFORE THE CAS.
+    /// <paramref name="routeStillValid"/> is evaluated after the live-evidence checks (and after the
+    /// test-only commit-region hook) and adjacent to the CAS, so a manager removal — including
+    /// <c>GoalDispatcher.ClearGoalRetryState</c>, which removes a pipeline WITHOUT any preceding
+    /// terminal <see cref="AdvanceTo"/> and therefore invalidates none of the evidence above — that
+    /// has completed by that instant yields
+    /// <see cref="RestoredAttemptCommitDecision.RouteNoLongerValid"/> with nothing mutated. The
+    /// probe must be lock-free (the manager's lookup reads concurrent dictionaries only), so calling
+    /// it under <c>_lock</c> adds no lock-order edge.
+    /// </para>
+    /// <para>
+    /// THE HONEST LIMIT. Manager removal takes the manager's own lock, never this pipeline's, so no
+    /// span on this type can exclude it. The probe is therefore the adoption's ROUTE LINEARIZATION
+    /// POINT: a removal that completes at or before it fails closed; one that lands after it is
+    /// ordered AFTER the adoption, exactly like the removal of any pipeline whose worker is already
+    /// busy (the pre-existing behavior of that removal), and is not something this region can refuse.
+    /// </para>
     /// </remarks>
     /// <param name="expectedSlot">The RECORDED slot the adoption claims; must be non-null.</param>
+    /// <param name="routeStillValid">
+    /// The lock-free probe that proves the claimed task still routes to THIS pipeline; must be
+    /// non-null.
+    /// </param>
     /// <returns>The commit decision.</returns>
-    internal RestoredAttemptCommitDecision TryAdoptRestoredActiveAttemptIfStillValid(WorkSlot expectedSlot)
+    internal RestoredAttemptCommitDecision TryAdoptRestoredActiveAttemptIfStillValid(
+        WorkSlot expectedSlot, Func<bool> routeStillValid)
     {
         ArgumentNullException.ThrowIfNull(expectedSlot);
+        ArgumentNullException.ThrowIfNull(routeStillValid);
 
         lock (_lock)
         {
@@ -372,6 +396,11 @@ public sealed class GoalPipeline
             }
 
             InsideAdoptionCommitRegionForTest?.Invoke();
+
+            // THE ROUTE, proven adjacent to the CAS inside the same span: a pipeline no longer
+            // routed for the claimed task (removed from the manager) is refused, nothing mutated.
+            if (!routeStillValid())
+                return RestoredAttemptCommitDecision.RouteNoLongerValid;
 
             // THE CAS, in the same span as the validation it depends on.
             return TryAdoptRestoredActiveAttempt()
@@ -2088,6 +2117,13 @@ internal enum RestoredAttemptCommitDecision
     /// and the hold is untouched.
     /// </summary>
     AttemptNoLongerValid,
+
+    /// <summary>
+    /// The live evidence still held, but the claimed task no longer routes to this pipeline — it was
+    /// removed from the manager (e.g. a retry clearing that performs no terminal transition): nothing
+    /// was mutated and the hold is untouched.
+    /// </summary>
+    RouteNoLongerValid,
 }
 
 /// <summary>

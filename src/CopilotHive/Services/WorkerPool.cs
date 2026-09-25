@@ -1218,14 +1218,16 @@ public sealed class WorkerPool : IWorkerPool
     /// <see cref="AdoptedRegistrationResult"/> so the caller can fall back to ordinary registration.
     /// </para>
     /// <para>
-    /// HONEST CLEANUP. When this call's own active entry must be unwound — the lost
+    /// HONEST, GUARDED CLEANUP. When this call's own active entry must be unwound — the lost
     /// <c>TryAdd</c> race, or an exception after the entry was added — the reference-checked
-    /// <see cref="TaskQueue.TryRemoveOwned"/> result is CHECKED. A removal that is refused (or that
-    /// itself throws) leaves a STALE ACTIVE ENTRY behind, and that residue is reported through a
-    /// guarded warning naming the task and worker rather than being assumed away. The outcome is
-    /// unchanged by the residue: the lost race still returns
-    /// <see cref="AdoptedRegistrationOutcome.DuplicateId"/>, and a throw still rethrows the ORIGINAL
-    /// exception, which stays authoritative.
+    /// <see cref="TaskQueue.TryRemoveOwned"/> runs inside a guard on BOTH paths: a removal that
+    /// returns <c>false</c> OR THROWS is captured as an unconfirmed cleanup, together with what the
+    /// queue was then OBSERVED to hold (entry absent, a foreign entry, or this call's own entry). The
+    /// outcome is never changed by the cleanup: the lost race still returns
+    /// <see cref="AdoptedRegistrationOutcome.DuplicateId"/>, and the exception path rethrows the
+    /// ORIGINAL exception — a cleanup exception can replace neither. The guarded warning is emitted
+    /// only AFTER <c>_activityLock</c> is released, so no external logger runs under the lock, and it
+    /// asserts residue only when this call's own entry was actually observed to remain.
     /// </para>
     /// <para>
     /// LOCK ORDER, DOCUMENTED. This method holds <c>_activityLock</c> while the queue takes its own
@@ -1240,8 +1242,8 @@ public sealed class WorkerPool : IWorkerPool
     /// <para>
     /// WHAT IT DOES NOT DO: no channel write, no notification, no database or session operation and
     /// no <c>await</c> — only the worker's own fields, the pool dictionary and the queue's
-    /// active-entry insert. The only log it can write is the guarded residue warning above, and only
-    /// when a cleanup genuinely failed.
+    /// active-entry insert. The only log it can write is the guarded unconfirmed-cleanup warning
+    /// above, only when a cleanup did not confirm its removal, and only after the lock is released.
     /// </para>
     /// </remarks>
     /// <param name="id">The worker id to register under.</param>
@@ -1278,64 +1280,128 @@ public sealed class WorkerPool : IWorkerPool
         PublishBusyFieldsNoLock(worker, task.TaskId, DateTime.UtcNow);
         worker.CurrentModel = task.Model;
 
-        lock (_activityLock)
+        // THE CLEANUP FACT, captured under the lock and REPORTED ONLY AFTER IT IS RELEASED: the
+        // external logger never runs while _activityLock is held.
+        CleanupFailure? cleanupFailure = null;
+
+        try
         {
-            var activeEntryAdded = false;
-            try
+            lock (_activityLock)
             {
-                // 1. DUPLICATE ID FIRST: the already-registered instance is never touched.
-                if (_workers.ContainsKey(id))
-                    return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
-
-                // 2. THE ACTIVE ENTRY, claimed by the NON-OVERWRITING primitive: a refusal leaves
-                //    the existing entry (and the already recorded assigned worker) exactly as it is.
-                if (!queue.TryActivateNew(task, id))
-                    return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.ActiveEntryExists };
-
-                activeEntryAdded = true;
-
-                // THE PUBLICATION-BOUNDARY OBSERVATION: the last instant before the worker becomes
-                // visible through GetWorker. Null in production.
-                BeforeAdoptedWorkerPublicationForTest?.Invoke(id);
-
-                // 3. THE PUBLICATION. Losing this race is still a duplicate — and unwinds ONLY our
-                //    own entry, by reference, with the removal's result checked.
-                if (!_workers.TryAdd(id, worker))
+                var activeEntryAdded = false;
+                try
                 {
-                    activeEntryAdded = false;
-                    if (!queue.TryRemoveOwned(task.TaskId, task))
-                        ReportStaleActiveEntry(task.TaskId, id, cleanupFailure: null);
+                    // 1. DUPLICATE ID FIRST: the already-registered instance is never touched.
+                    if (_workers.ContainsKey(id))
+                        return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
 
-                    return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
-                }
+                    // 2. THE ACTIVE ENTRY, claimed by the NON-OVERWRITING primitive: a refusal leaves
+                    //    the existing entry (and the already recorded assigned worker) exactly as it is.
+                    if (!queue.TryActivateNew(task, id))
+                        return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.ActiveEntryExists };
 
-                return new AdoptedRegistrationResult
-                {
-                    Outcome = AdoptedRegistrationOutcome.Registered,
-                    Worker = worker,
-                };
-            }
-            catch
-            {
-                // THE ORIGINAL EXCEPTION STAYS AUTHORITATIVE. When our own entry had been added it is
-                // unwound by reference; a refused or throwing removal is REPORTED as residue — never
-                // silently assumed away — and can never replace the original exception.
-                if (activeEntryAdded)
-                {
-                    try
+                    activeEntryAdded = true;
+
+                    // THE PUBLICATION-BOUNDARY OBSERVATION: the last instant before the worker becomes
+                    // visible through GetWorker. Null in production.
+                    BeforeAdoptedWorkerPublicationForTest?.Invoke(id);
+
+                    // 3. THE PUBLICATION. Losing this race is still a duplicate — and unwinds ONLY our
+                    //    own entry, by reference. The removal is GUARDED: a refused OR throwing removal
+                    //    is captured as a cleanup failure, and DuplicateId stays the authoritative
+                    //    outcome — a cleanup exception can never replace it.
+                    if (!_workers.TryAdd(id, worker))
                     {
-                        if (!queue.TryRemoveOwned(task.TaskId, task))
-                            ReportStaleActiveEntry(task.TaskId, id, cleanupFailure: null);
+                        activeEntryAdded = false;
+                        cleanupFailure = TryUnwindOwnEntry(queue, task, id);
+                        return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
                     }
-                    catch (Exception cleanupFailure)
-                    {
-                        ReportStaleActiveEntry(task.TaskId, id, cleanupFailure);
-                    }
-                }
 
-                throw;
+                    return new AdoptedRegistrationResult
+                    {
+                        Outcome = AdoptedRegistrationOutcome.Registered,
+                        Worker = worker,
+                    };
+                }
+                catch
+                {
+                    // THE ORIGINAL EXCEPTION STAYS AUTHORITATIVE. When our own entry had been added it
+                    // is unwound by reference through the SAME guarded removal: a refused or throwing
+                    // removal is captured as a cleanup failure and can never replace the original.
+                    if (activeEntryAdded)
+                        cleanupFailure = TryUnwindOwnEntry(queue, task, id);
+
+                    throw;
+                }
             }
         }
+        finally
+        {
+            // OUTSIDE the lock, on every path (result or original exception): the guarded report.
+            if (cleanupFailure is { } failure)
+                ReportUnconfirmedCleanup(failure);
+        }
+    }
+
+    /// <summary>
+    /// The facts of one unconfirmed cleanup, captured inside <c>_activityLock</c> so they can be
+    /// reported after the lock is released.
+    /// </summary>
+    /// <param name="TaskId">The task whose own entry the cleanup tried to remove.</param>
+    /// <param name="WorkerId">The worker the entry was claimed for.</param>
+    /// <param name="Observation">What the queue held for the task after the cleanup attempt.</param>
+    /// <param name="RemovalException">The removal's own exception, or <c>null</c> for a refused removal.</param>
+    private readonly record struct CleanupFailure(
+        string TaskId, string WorkerId, CleanupObservation Observation, Exception? RemovalException);
+
+    /// <summary>What the queue was OBSERVED to hold for the task after an unconfirmed cleanup.</summary>
+    private enum CleanupObservation
+    {
+        /// <summary>No entry exists for the task (e.g. a concurrent completion already removed it).</summary>
+        EntryAbsent,
+        /// <summary>A DIFFERENT instance now owns the task id; it was not touched.</summary>
+        ForeignEntryRemains,
+        /// <summary>This call's OWN instance is still registered — genuine residue.</summary>
+        OwnEntryRemains,
+        /// <summary>The follow-up observation itself failed, so nothing is claimed about the queue.</summary>
+        Unobserved,
+    }
+
+    /// <summary>
+    /// THE GUARDED UNWIND of this call's own active entry: removes it by reference and returns
+    /// <c>null</c> when the removal is confirmed. A refused OR throwing removal is never propagated —
+    /// it is returned as a <see cref="CleanupFailure"/> carrying what the queue was actually
+    /// observed to hold, so the caller's authoritative outcome (or original exception) stands.
+    /// </summary>
+    private static CleanupFailure? TryUnwindOwnEntry(TaskQueue queue, WorkTask task, string workerId)
+    {
+        Exception? removalException = null;
+        try
+        {
+            if (queue.TryRemoveOwned(task.TaskId, task))
+                return null;
+        }
+        catch (Exception thrown)
+        {
+            removalException = thrown;
+        }
+
+        CleanupObservation observation;
+        try
+        {
+            var current = queue.GetActiveTask(task.TaskId);
+            observation = current is null
+                ? CleanupObservation.EntryAbsent
+                : ReferenceEquals(current, task)
+                    ? CleanupObservation.OwnEntryRemains
+                    : CleanupObservation.ForeignEntryRemains;
+        }
+        catch
+        {
+            observation = CleanupObservation.Unobserved;
+        }
+
+        return new CleanupFailure(task.TaskId, workerId, observation, removalException);
     }
 
     /// <summary>
@@ -1355,24 +1421,43 @@ public sealed class WorkerPool : IWorkerPool
     internal Action<string>? BeforeAdoptedWorkerPublicationForTest { get; set; }
 
     /// <summary>
-    /// Reports — through the guarded pool logger — that a cleanup left a STALE ACTIVE ENTRY behind.
-    /// A throwing logger is swallowed: the diagnostic can never replace the caller's outcome or
-    /// original exception.
+    /// Reports — through the guarded pool logger, and ONLY after <c>_activityLock</c> was released —
+    /// that an adopted registration's cleanup did not CONFIRM the removal of its own active entry.
+    /// The wording states only what was OBSERVED: an absent entry is not called residue, a foreign
+    /// entry is named as another assignment's, and only this call's own still-registered instance
+    /// is reported as residue. A throwing logger is swallowed: the diagnostic can never replace the
+    /// caller's outcome or original exception.
     /// </summary>
-    /// <param name="taskId">The task whose entry remains.</param>
-    /// <param name="workerId">The worker the entry was claimed for.</param>
-    /// <param name="cleanupFailure">The removal's own exception, or <c>null</c> for a refused removal.</param>
-    private void ReportStaleActiveEntry(string taskId, string workerId, Exception? cleanupFailure)
+    /// <param name="failure">The facts captured inside the lock.</param>
+    private void ReportUnconfirmedCleanup(CleanupFailure failure)
     {
         try
         {
+            var cause = failure.RemovalException is null
+                ? "removal refused"
+                : $"removal threw {failure.RemovalException.GetType().Name}";
+
+            var observed = failure.Observation switch
+            {
+                CleanupObservation.EntryAbsent =>
+                    "the entry is already absent (e.g. a concurrent completion removed it); no residue remains",
+                CleanupObservation.ForeignEntryRemains =>
+                    "the task's entry is now owned by another assignment and was left untouched",
+                CleanupObservation.OwnEntryRemains =>
+                    "this registration's own entry remains in the queue as residue",
+                CleanupObservation.Unobserved =>
+                    "the entry may already be absent or owned by another assignment",
+                _ => throw new InvalidOperationException(
+                    $"Unhandled CleanupObservation: {failure.Observation}"),
+            };
+
             _logger.LogWarning(
-                "WorkerPool: stale-active-entry task={TaskId} worker={WorkerId} — the adopted registration's " +
-                "own active queue entry could NOT be removed during cleanup ({Cause}); it remains in the " +
-                "queue as residue",
-                taskId,
-                workerId,
-                cleanupFailure is null ? "removal refused" : cleanupFailure.GetType().Name);
+                "WorkerPool: cleanup-unconfirmed task={TaskId} worker={WorkerId} — the adopted registration's " +
+                "cleanup did not confirm removal of its own active queue entry ({Cause}); {Observed}",
+                failure.TaskId,
+                failure.WorkerId,
+                cause,
+                observed);
         }
         catch
         {

@@ -631,6 +631,12 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             $"the warning must name the check '{expectedCheck}'; actual: {warning.Message}");
         Assert.Contains(workerId, warning.Message, StringComparison.Ordinal);
         Assert.Contains(taskId, warning.Message, StringComparison.Ordinal);
+
+        // M3 — THE WARNING CLAIMS ONLY WHAT THE ADOPTION DID: for some refusals a concurrent writer DID
+        // change the attempt (hold released, pointer/phase/slot invalidated, route removed), so the
+        // single warning never asserts the attempt itself is unchanged.
+        Assert.Contains("the adoption made no further change", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("the attempt is unchanged", warning.Message, StringComparison.Ordinal);
         return warning.Message;
     }
 
@@ -1724,6 +1730,72 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     }
 
     /// <summary>
+    /// (G1) THE MANAGER-REMOVAL RACE WITH NO TERMINAL TRANSITION — the exact window the reviewer
+    /// found. <c>GoalDispatcher.ClearGoalRetryState</c> (a user retry of a Failed goal row that
+    /// coexists with a held Coding pipeline) removes the pipeline from the manager WITHOUT any
+    /// preceding <c>AdvanceTo</c>, so it invalidates none of the pointer/phase/slot evidence.
+    /// <para>
+    /// THE INTERLEAVING: every read-only precondition has passed, the adoption has ENTERED the
+    /// synchronized region, and its live pointer/phase/slot revalidation has already SUCCEEDED
+    /// (the commit-region hook fires only after it) — so any route check placed BEFORE the region
+    /// would already have passed too. The real <c>ClearGoalRetryState</c> runs at that instant; the
+    /// adoption is released. The route, proven inside the same span adjacent to the CAS, must fail
+    /// closed: <c>RouteNoLongerValid</c>, <c>adopted_task = false</c> (NEVER true), no busy worker,
+    /// no active entry, the hold untouched.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOFNESS (scratch-verified): deleting the in-region route check makes this vector
+    /// fail with <c>adopted_task = true</c> and a busy worker published for a routeless attempt.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Register_RetryClearsThePipelineAfterValidationBeforeTheCas_RefusesWithRouteNoLongerValid()
+    {
+        var goalId = "adopt-route-retry-cleared";
+        var workerId = "worker-route-retry-cleared";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        var harness = CreateRegisterHarness(manager, withAdopter: true);
+
+        // THE REAL RETRY-CLEARING WRITER: the production dispatcher over the SAME manager. Its
+        // ClearGoalRetryState removes the pipeline with no terminal transition (no Brain configured,
+        // so it performs the removal alone).
+        var retryDispatcher = new GoalDispatcher(
+            new GoalManager(), manager, harness.Queue,
+            new GrpcWorkerGateway(harness.Pool), new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+
+        var regionReached = false;
+        pipeline.InsideAdoptionCommitRegionForTest = () =>
+        {
+            regionReached = true;
+
+            // Precondition of the vector: the route was STILL valid when the region was entered, so
+            // a pre-region route check could not have refused.
+            Assert.Same(pipeline, manager.GetByTaskId(taskId));
+
+            retryDispatcher.ClearGoalRetryState(goalId);
+
+            // The removal genuinely changed only the ROUTE — no terminal transition, the live
+            // evidence the region already validated is exactly as it was.
+            Assert.Null(manager.GetByTaskId(taskId));
+            Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+            Assert.Equal(taskId, pipeline.ActiveTaskId);
+        };
+
+        var response = await RegisterAsync(harness, workerId, taskId);
+
+        Assert.True(regionReached, "the removal must land inside the synchronized region for this vector");
+        Assert.True(response.Accepted, "a lost route never fails the registration itself");
+        Assert.False(response.AdoptedTask, "a routeless attempt must NEVER be reported adopted");
+
+        AssertSingleAdoptionRefusalWarning(harness, "RouteNoLongerValid", workerId, taskId);
+        AssertDeclinedClaim(harness, pipeline, workerId, taskId, expectHeld: true);
+    }
+
+    /// <summary>
     /// THE LINEARIZATION POINT ITSELF: an invalidating writer that tries to land INSIDE the
     /// synchronized region blocks on the pipeline lock until the region's CAS has committed, so the
     /// adoption wins and the writer then sees an ADOPTED attempt — the "after the CAS" half of the
@@ -1832,11 +1904,14 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         Assert.Same(foreign, queue.GetActiveTask(task.TaskId));
         Assert.Equal("worker-foreign", foreign!.Metadata["assigned_worker"]);
         var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
-        Assert.Contains("stale-active-entry", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("cleanup-unconfirmed", warning.Message, StringComparison.Ordinal);
         Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
         Assert.Contains("worker-residue-race", warning.Message, StringComparison.Ordinal);
         Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
-        Assert.Contains("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        // HONEST WORDING: the OBSERVED foreign entry is named as another assignment's — it is NOT
+        // mislabelled as this registration's residue.
+        Assert.Contains("owned by another assignment", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("nothing remains mutated", warning.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -1871,11 +1946,12 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         Assert.Same(foreign, queue.GetActiveTask(task.TaskId));
 
         var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
-        Assert.Contains("stale-active-entry", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("cleanup-unconfirmed", warning.Message, StringComparison.Ordinal);
         Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
         Assert.Contains("worker-residue-throw", warning.Message, StringComparison.Ordinal);
         Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
-        Assert.Contains("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("owned by another assignment", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("nothing remains mutated", warning.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -1894,7 +1970,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             Exception? exception, Func<TState, Exception?, string> formatter)
         {
             if (level != LogLevel.Warning ||
-                !formatter(state, exception).Contains("stale-active-entry", StringComparison.Ordinal))
+                !formatter(state, exception).Contains("cleanup-unconfirmed", StringComparison.Ordinal))
                 return;
             WarningAttempts++;
             throw Failure;
@@ -1965,9 +2041,9 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         Assert.Contains(original.Message, refusal.Message, StringComparison.Ordinal);
         Assert.Empty(harness.AdopterLogger!.LogEntries);
         var residue = Assert.Single(poolLogger.LogEntries, e => e.LogLevel == LogLevel.Warning);
-        Assert.Contains("stale-active-entry", residue.Message, StringComparison.Ordinal);
+        Assert.Contains("cleanup-unconfirmed", residue.Message, StringComparison.Ordinal);
         Assert.Contains(taskId, residue.Message, StringComparison.Ordinal);
-        Assert.Contains("remains in the queue as residue", residue.Message, StringComparison.Ordinal);
+        Assert.Contains("owned by another assignment", residue.Message, StringComparison.Ordinal);
         Assert.Same(foreign, queue.GetActiveTask(taskId));
         Assert.True(pipeline.IsRestoredActiveAttemptHold);
         var registered = Assert.IsType<ConnectedWorker>(pool.GetWorker(workerId));
@@ -1998,6 +2074,239 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
         Assert.Null(queue.GetActiveTask(task.TaskId));
         Assert.Empty(logger.LogEntries);
+    }
+
+    // ═══════════════ (F4-remainder) A THROWING REMOVAL — on BOTH unwind paths ═══════════════
+
+    /// <summary>
+    /// THE GENUINE THROWING-REMOVAL FIXTURE, with no production seam. <see cref="Engage"/> is called
+    /// FROM THE PUBLICATION HOOK — i.e. only after the pool's <see cref="TaskQueue.TryActivateNew"/>
+    /// has already claimed the entry (engaging earlier would block that claim on the held lock). It
+    /// makes a helper thread take the queue's REAL <c>_activeLock</c>, then arms a pending
+    /// <see cref="Thread.Interrupt"/> on the registering thread. When
+    /// <see cref="TaskQueue.TryRemoveOwned"/> reaches its own <c>lock (_activeLock)</c> the monitor is
+    /// contended, the thread blocks, and the pending interrupt raises a REAL
+    /// <see cref="ThreadInterruptedException"/> out of the removal itself. Uncontended monitor entries
+    /// in between (the pool's own reentrant lock, the dictionary) never block, so nothing earlier
+    /// consumes the interrupt. Disposing clears any unconsumed interrupt and releases the helper, on
+    /// every path.
+    /// </summary>
+    private sealed class ContendedQueueLock(TaskQueue queue) : IDisposable
+    {
+        private readonly object _gate = typeof(TaskQueue)
+            .GetField("_activeLock", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.GetValue(queue)
+            ?? throw new InvalidOperationException("TaskQueue no longer has a private '_activeLock' field.");
+
+        private readonly ManualResetEventSlim _held = new();
+        private readonly ManualResetEventSlim _release = new();
+        private Thread? _holder;
+
+        /// <summary>Takes the queue lock on a helper thread, then arms the interrupt on THIS thread.</summary>
+        public void Engage()
+        {
+            _holder = new Thread(() =>
+            {
+                lock (_gate)
+                {
+                    _held.Set();
+                    _release.Wait();
+                }
+            }) { IsBackground = true };
+            _holder.Start();
+            Assert.True(_held.Wait(CommitOrderWait), "the helper must hold the queue lock");
+
+            Thread.CurrentThread.Interrupt();
+        }
+
+        public void Dispose()
+        {
+            // Clear an interrupt that was armed but never consumed, so it cannot leak into the runner.
+            try
+            {
+                Thread.Sleep(0);
+            }
+            catch (ThreadInterruptedException)
+            {
+                // Consumed here — the vector's own assertions report whether the removal threw.
+            }
+
+            _release.Set();
+            _holder?.Join(CommitOrderWait);
+            _held.Dispose();
+            _release.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A capturing logger that also records whether the pool's <c>_activityLock</c> was held by the
+    /// emitting thread at the instant of EACH record — the M2 witness that the guarded warning is
+    /// emitted only AFTER the lock is released.
+    /// </summary>
+    private sealed class LockAwarePoolLogger(WorkerPool pool) : ILogger<WorkerPool>
+    {
+        private readonly Lock _activityLock = (Lock)(typeof(WorkerPool)
+            .GetField("_activityLock", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.GetValue(pool)
+            ?? throw new InvalidOperationException("WorkerPool no longer has a private '_activityLock' field."));
+
+        public List<(LogLevel Level, string Message, bool LockHeld)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception), _activityLock.IsHeldByCurrentThread));
+    }
+
+    /// <summary>
+    /// A WorkerPool whose logger is a <see cref="LockAwarePoolLogger"/> over that same pool (the
+    /// logger must reach the pool's own lock, so it is bound after construction).
+    /// </summary>
+    private static (WorkerPool Pool, LockAwarePoolLogger Logger) CreateLockAwarePool()
+    {
+        LockAwarePoolLogger? logger = null;
+        var forwarding = new ForwardingPoolLogger(() => logger!);
+        var pool = new WorkerPool(forwarding);
+        logger = new LockAwarePoolLogger(pool);
+        return (pool, logger);
+    }
+
+    /// <summary>Forwards to a logger bound after the pool exists.</summary>
+    private sealed class ForwardingPoolLogger(Func<ILogger<WorkerPool>> target) : ILogger<WorkerPool>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            target().Log(logLevel, eventId, state, exception, formatter);
+    }
+
+    /// <summary>
+    /// LOST-TryAdd PATH, THROWING REMOVAL. A same-id registration wins at the publication point, so
+    /// the pool must unwind its own entry — and <see cref="TaskQueue.TryRemoveOwned"/> genuinely
+    /// THROWS. The authoritative outcome is still <c>DuplicateId</c> (the cleanup exception never
+    /// escapes and never replaces it), the unconfirmed cleanup is reported ONCE with the task and
+    /// worker ids and the removal's own failure type, and — because this call's own instance was
+    /// OBSERVED still registered — it is honestly reported as residue. The warning is emitted with
+    /// the pool lock RELEASED (M2).
+    /// <para>
+    /// REMOVAL-PROOFNESS: the pre-fix code cleared <c>activeEntryAdded</c> and then called the
+    /// removal unguarded, so this throw escaped as a <see cref="ThreadInterruptedException"/> with no
+    /// warning, failing the outcome assertion.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void RegisterAdoptedWorker_LostRaceWithThrowingRemoval_ReturnsDuplicateId_AndReportsTheCleanup()
+    {
+        var (pool, logger) = CreateLockAwarePool();
+        var queue = new TaskQueue();
+        var task = BuildTask("task-throwing-race");
+
+        using var contended = new ContendedQueueLock(queue);
+        pool.BeforeAdoptedWorkerPublicationForTest = id =>
+        {
+            pool.RegisterWorker(id, []); // the lost race
+            contended.Engage();          // the removal will now throw
+        };
+
+        var result = pool.RegisterAdoptedWorker(
+            "worker-throwing-race", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false,
+            task, queue);
+
+        Assert.Equal(AdoptedRegistrationOutcome.DuplicateId, result.Outcome);
+        Assert.Null(result.Worker);
+        Assert.NotNull(pool.GetWorker("worker-throwing-race"));
+
+        // THE OWN ENTRY GENUINELY REMAINS (the removal never ran to completion) and is reported so.
+        Assert.Same(task, queue.GetActiveTask(task.TaskId));
+        var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains("cleanup-unconfirmed", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("worker-throwing-race", warning.Message, StringComparison.Ordinal);
+        Assert.Contains($"removal threw {nameof(ThreadInterruptedException)}", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("own entry remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        Assert.False(warning.LockHeld, "the warning must be emitted only AFTER _activityLock is released");
+    }
+
+    /// <summary>
+    /// EXCEPTION PATH, THROWING REMOVAL. A throw lands after the active entry was claimed, and the
+    /// guarded removal itself THROWS. The ORIGINAL exception is rethrown — never the cleanup's — no
+    /// worker is published, and the unconfirmed cleanup is reported ONCE, after the lock is released.
+    /// </summary>
+    [Fact]
+    public void RegisterAdoptedWorker_ThrowWithThrowingRemoval_RethrowsTheOriginal_AndReportsTheCleanup()
+    {
+        var (pool, logger) = CreateLockAwarePool();
+        var queue = new TaskQueue();
+        var task = BuildTask("task-throwing-throw");
+        var original = new InvalidOperationException("original-commit-failure");
+
+        using var contended = new ContendedQueueLock(queue);
+        pool.BeforeAdoptedWorkerPublicationForTest = _ =>
+        {
+            contended.Engage();
+            throw original;
+        };
+
+        var thrown = Assert.ThrowsAny<Exception>(() => pool.RegisterAdoptedWorker(
+            "worker-throwing-throw", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false,
+            task, queue));
+
+        Assert.Same(original, thrown);
+        Assert.Null(pool.GetWorker("worker-throwing-throw"));
+        Assert.Same(task, queue.GetActiveTask(task.TaskId));
+
+        var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains("cleanup-unconfirmed", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("worker-throwing-throw", warning.Message, StringComparison.Ordinal);
+        Assert.Contains($"removal threw {nameof(ThreadInterruptedException)}", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("own entry remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        Assert.False(warning.LockHeld, "the warning must be emitted only AFTER _activityLock is released");
+    }
+
+    /// <summary>
+    /// (M1) A FALSE REMOVAL WHOSE ENTRY IS ALREADY ABSENT: a concurrent completion
+    /// (<see cref="TaskQueue.MarkComplete"/>) removed the adopted registration's entry before the
+    /// lost-race cleanup ran, so <see cref="TaskQueue.TryRemoveOwned"/> returns <c>false</c> with
+    /// NOTHING left behind. The warning must NOT claim residue: it states the entry is already
+    /// absent. The authoritative outcome is still <c>DuplicateId</c>, and the warning is emitted
+    /// with the pool lock released.
+    /// </summary>
+    [Fact]
+    public void RegisterAdoptedWorker_LostRaceWithAlreadyAbsentEntry_DoesNotClaimResidue()
+    {
+        var (pool, logger) = CreateLockAwarePool();
+        var queue = new TaskQueue();
+        var task = BuildTask("task-absent-race");
+
+        pool.BeforeAdoptedWorkerPublicationForTest = id =>
+        {
+            pool.RegisterWorker(id, []);     // the lost race
+            queue.MarkComplete(task.TaskId); // a concurrent completion removes the entry first
+        };
+
+        var result = pool.RegisterAdoptedWorker(
+            "worker-absent-race", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false,
+            task, queue);
+
+        Assert.Equal(AdoptedRegistrationOutcome.DuplicateId, result.Outcome);
+        Assert.Null(queue.GetActiveTask(task.TaskId));
+
+        var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains("cleanup-unconfirmed", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("already absent", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("no residue remains", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
+        Assert.False(warning.LockHeld, "the warning must be emitted only AFTER _activityLock is released");
     }
 
     // ═══════════════ (a) THE ADOPTED COMPLETION, END TO END THROUGH THE REAL PATHS ═══════════════
