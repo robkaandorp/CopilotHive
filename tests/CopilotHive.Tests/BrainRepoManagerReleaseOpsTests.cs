@@ -740,8 +740,8 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
     public async Task MergeBranchAsync_AlreadyCanceledToken_ThrowsAndLeavesNoMergeState()
     {
         // Deterministic cancellation test: pass an already-canceled token. The first git
-        // subprocess (fetch) observes cancellation immediately, RunGitCaptureAsync/RunGitAsync
-        // terminate the process tree, and the method throws OperationCanceledException. Crucially,
+        // subprocess (fetch) observes cancellation immediately, RunGitCoreAsync terminates the
+        // process tree, and the method throws OperationCanceledException. Crucially,
         // no MERGE_HEAD must be left behind (the merge either never started or was aborted by the
         // finally-block cleanup, which runs on a fresh bounded token).
         var (remoteDir, clonePath, manager) = SetupRepo("cancel-repo");
@@ -760,9 +760,10 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
     // Note: reliably racing cancellation against a *mid-flight* merge (as opposed to an
     // already-canceled token) is timing-dependent and flaky, because it requires the merge
     // subprocess to still be writing when the token trips. The production code guards that path via
-    // a `mergeStarted` flag, process-tree kill with bounded wait in RunGitCaptureAsync, and a
-    // fresh-token MERGE_HEAD abort in the finally block. Fully deterministic coverage would require
-    // an injectable process factory to pause the merge; that refactor is out of scope here.
+    // a `mergeStarted` flag, process-tree kill with bounded wait in the directly-managed merge
+    // process block, and a fresh-token MERGE_HEAD abort in the finally block. Fully deterministic
+    // coverage would require an injectable process factory to pause the merge; that refactor is out
+    // of scope here.
 
     [Fact]
     public async Task MergeBranchAsync_CanceledDuringMerge_KillsProcessAndCleansUp()
@@ -772,7 +773,8 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         // canceling, so the token can only trip AFTER the merge process has started (not during
         // fetch/checkout/pre-merge steps). This exercises MergeBranchAsync's directly-managed merge
         // process path: Process.Start, Kill(entireProcessTree), the blocking WaitForExit, and the
-        // fresh-token MERGE_HEAD abort in the finally block. (The merge no longer uses RunGitCaptureAsync.)
+        // fresh-token MERGE_HEAD abort in the finally block. (The merge has its own directly-managed
+        // process block and never goes through the shared real-process git runner.)
         var (remoteDir, clonePath, manager) = SetupRepo("cancel-mid-repo");
         // Diverge both branches (non-conflicting, different files) so the merge creates a real
         // merge commit rather than fast-forwarding — a merge commit invokes prepare-commit-msg.
