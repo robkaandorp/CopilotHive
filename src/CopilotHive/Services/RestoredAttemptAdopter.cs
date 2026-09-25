@@ -126,10 +126,21 @@ public enum RestoredAttemptAdoptionRefusal
     /// </summary>
     PhaseMismatch,
     /// <summary>
-    /// A read of the recorded assignment context or of the restored registry failed; the failure was
-    /// logged and deliberately not allowed to escape.
+    /// A read of the recorded assignment context or of the restored registry failed. The failure
+    /// is NOT logged by the adopter: it is carried in
+    /// <see cref="RestoredAttemptAdoptionResult.ReadException"/> so the caller emits the ONE
+    /// warning naming this check (with a sanitized cause), and it never escapes as an exception.
     /// </summary>
     ReadFailed,
+
+    /// <summary>
+    /// Every read-only precondition held, but by the SYNCHRONIZED commit the LIVE attempt was no
+    /// longer the recorded one: a cancellation or terminal transition moved the phase, the pointer
+    /// was cleared or moved, or the slot was admitted (Claimed) or retired (Abandoned) in between.
+    /// Nothing was adopted, nothing was mutated and the hold is untouched — the invalidating
+    /// transition won, exactly as it would have if it had landed before the precondition reads.
+    /// </summary>
+    AttemptNoLongerValid,
 }
 
 /// <summary>
@@ -171,6 +182,14 @@ public sealed record RestoredAttemptAdoptionResult
     /// or <c>null</c> for every other outcome.
     /// </summary>
     public Exception? CommitException { get; init; }
+
+    /// <summary>
+    /// The EXACT read failure carried for a <see cref="RestoredAttemptAdoptionRefusal.ReadFailed"/>
+    /// refusal, or <c>null</c> for every other outcome. The adopter deliberately does NOT log it:
+    /// the caller owns the single refusal warning and renders this cause (sanitized) into it, so the
+    /// whole production path emits exactly ONE warning for the refusal.
+    /// </summary>
+    public Exception? ReadException { get; init; }
 }
 
 /// <summary>
@@ -226,16 +245,25 @@ public sealed record RestoredAttemptAdoptionResult
 ///     <see cref="PipelineStateMachine.Phase"/> both equal the context slot's phase, and neither is
 ///     Planning, Done or Failed → else <see cref="RestoredAttemptAdoptionRefusal.PhaseMismatch"/>.</description></item>
 /// </list>
-/// Any exception thrown by those reads is logged and reported as
-/// <see cref="RestoredAttemptAdoptionRefusal.ReadFailed"/> — it never escapes and never adopts.
+/// Any exception thrown by those reads is reported as
+/// <see cref="RestoredAttemptAdoptionRefusal.ReadFailed"/> carrying the exact exception in
+/// <see cref="RestoredAttemptAdoptionResult.ReadException"/> — it never escapes and never adopts.
+/// THE ADOPTER LOGS NO REFUSAL: the caller (<see cref="HiveOrchestratorService"/>'s Register) owns
+/// the single warning that names the check, so the production path emits exactly ONE warning per
+/// declined claim.
 /// </para>
 /// <para>
 /// THE COMMIT ORDER, once every precondition holds:
 /// <list type="letter">
-///   <item><description><see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/> FIRST — the hold
-///     leaves BEFORE the worker is visible, so no observer can ever see an adopted worker whose
-///     attempt is still reported as held. <c>false</c> means the release sweep won the race:
-///     <see cref="RestoredAttemptAdoptionOutcome.HoldAlreadyReleased"/>, nothing mutated;</description></item>
+///   <item><description><see cref="GoalPipeline.TryAdoptRestoredActiveAttemptIfStillValid"/> FIRST
+///     — ONE synchronized region on the pipeline that REVALIDATES the load-bearing live evidence
+///     (the pointer, the pipeline and machine phase, and the exact Pending slot) and then takes the
+///     hold Held → Adopted in the same <c>_lock</c> span. An invalidating writer (cancellation,
+///     terminal transition, slot admission or retirement) that lands before it yields
+///     <see cref="RestoredAttemptAdoptionRefusal.AttemptNoLongerValid"/> with nothing mutated; one
+///     that lands after it sees an Adopted attempt. A lost hold CAS (the release sweep won) is
+///     <see cref="RestoredAttemptAdoptionOutcome.HoldAlreadyReleased"/>, nothing mutated. The hold
+///     leaves BEFORE the worker is visible;</description></item>
 ///   <item><description>the busy registration
 ///     (<see cref="WorkerPool.RegisterAdoptedWorker"/>) with a NEW <see cref="WorkTask"/> built from
 ///     the context: the slot's task id, the recorded goal and role, the recorded model VERBATIM,
@@ -261,10 +289,6 @@ public sealed record RestoredAttemptAdoptionResult
 /// </remarks>
 internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
 {
-    private const string ReadFailedTemplate =
-        "RestoredAttemptAdopter: read-failed task={TaskId} worker={WorkerId} — the recorded assignment " +
-        "evidence could not be read; nothing was adopted: {Message}";
-
     private const string RollbackFailedTemplate =
         "RestoredAttemptAdopter: rollback-not-applied task={TaskId} worker={WorkerId} — the attempt was " +
         "not in the adopted state when its failed commit was rolled back; no transition was applied";
@@ -277,21 +301,21 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
 
     /// <summary>
     /// THE COMMIT-WINDOW SEAM — a test-only hook invoked EXACTLY ONCE, inside the adoption, AFTER
-    /// every read-only precondition has held and IMMEDIATELY BEFORE
-    /// <see cref="GoalPipeline.TryAdoptRestoredActiveAttempt"/> takes the hold.
+    /// every read-only precondition has held and IMMEDIATELY BEFORE the synchronized
+    /// validate-and-adopt region (<see cref="GoalPipeline.TryAdoptRestoredActiveAttemptIfStillValid"/>)
+    /// is entered.
     /// <para>
-    /// WHY IT EXISTS. The <see cref="RestoredAttemptAdoptionOutcome.HoldAlreadyReleased"/> branch is
-    /// defined by the compare-and-swap LOSING a race against the reconciliation sweep, and that race
-    /// has a window of exactly these few instructions. A post-condition cannot manufacture the
-    /// interleaving — only a hook placed at the real boundary can, and the codebase uses this same
-    /// shape elsewhere (<c>PipelineStateMachine.OnTransitionForTest</c>,
-    /// <see cref="GoalPipeline.TaskIdNonceForTest"/>).
+    /// WHY IT EXISTS. The <see cref="RestoredAttemptAdoptionOutcome.HoldAlreadyReleased"/> and
+    /// <see cref="RestoredAttemptAdoptionRefusal.AttemptNoLongerValid"/> branches are defined by a
+    /// concurrent writer landing between the unsynchronized precondition reads and the commit. A
+    /// post-condition cannot manufacture that interleaving — only a hook placed at the real
+    /// boundary can, and the codebase uses this same shape elsewhere
+    /// (<c>PipelineStateMachine.OnTransitionForTest</c>, <see cref="GoalPipeline.TaskIdNonceForTest"/>).
     /// </para>
     /// <para>
     /// IT OBSERVES; IT DOES NOT DECIDE. It cannot adopt, cannot bypass a precondition and cannot
-    /// influence the outcome beyond what any concurrent release could do anyway: its only power is to
-    /// run code at the moment a real race would land. A test uses it to release the hold the way the
-    /// sweep would, which is precisely the production interleaving under test.
+    /// influence the outcome beyond what any concurrent writer could do anyway: its only power is to
+    /// run code at the moment a real race would land.
     /// </para>
     /// <para>
     /// <c>null</c> (the production default) means the hook is absent and the commit proceeds
@@ -308,7 +332,7 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
     /// <param name="workerPool">The pool the adopted worker is registered busy in.</param>
     /// <param name="taskQueue">The queue whose active entry must be claimed with the registration.</param>
     /// <param name="assignmentStore">The INSERT-ONCE assignment-context store the recorded binding is loaded from.</param>
-    /// <param name="logger">Logger for the guarded read-failure diagnostics.</param>
+    /// <param name="logger">Logger for the guarded rollback diagnostic (the adopter logs no refusal).</param>
     /// <exception cref="ArgumentNullException">Any dependency is <c>null</c>.</exception>
     internal RestoredAttemptAdopter(
         GoalPipelineManager pipelineManager,
@@ -412,25 +436,50 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
         }
         catch (Exception readFailure)
         {
-            // CONTAINED: the failure is reported, never rethrown, so a corrupt or unreadable store
-            // can only refuse the adoption and the caller keeps its ordinary registration path.
-            LogSafely(() => _logger.LogWarning(
-                readFailure, ReadFailedTemplate, taskId, workerId, MessageOrPlaceholder(readFailure)));
-            return Refused(RestoredAttemptAdoptionRefusal.ReadFailed);
-        }
-
-        // ── (a) THE HOLD LEAVES FIRST, BEFORE THE WORKER CAN BE SEEN. A false answer means the
-        //    release sweep won the race: nothing was adopted and nothing was mutated. ─────────────
-        // THE TEST-ONLY COMMIT-WINDOW HOOK sits exactly at the boundary the race is defined by:
-        // after every precondition, before the CAS. Production leaves it null.
-        BeforeAdoptCommitForTest?.Invoke();
-
-        if (!pipeline.TryAdoptRestoredActiveAttempt())
-        {
+            // CONTAINED AND CARRIED, NOT LOGGED: the caller owns the ONE refusal warning and renders
+            // this exact cause into it, so the production path emits a single warning for the
+            // refusal. A corrupt or unreadable store can only refuse the adoption.
             return new RestoredAttemptAdoptionResult
             {
-                Outcome = RestoredAttemptAdoptionOutcome.HoldAlreadyReleased,
+                Outcome = RestoredAttemptAdoptionOutcome.Refused,
+                Refusal = RestoredAttemptAdoptionRefusal.ReadFailed,
+                ReadException = readFailure,
             };
+        }
+
+        // ── (a) THE SYNCHRONIZED VALIDATE-AND-ADOPT REGION. The load-bearing live evidence — the
+        //    pointer, the pipeline and machine phase and the exact Pending slot — is REVALIDATED and
+        //    the hold taken Held → Adopted in ONE pipeline-lock span, so an invalidating transition
+        //    either lands before it (→ refusal, nothing mutated) or after the CAS (→ Adopted). ─────
+        // THE TEST-ONLY COMMIT-WINDOW HOOK sits exactly at the boundary the race is defined by:
+        // after every read-only precondition, before the synchronized region. Production leaves it null.
+        BeforeAdoptCommitForTest?.Invoke();
+
+        // THE ROUTE IS RECHECKED TOO: a pipeline removed from the manager after the precondition
+        // reads (cancellation, retry-state clearing) no longer owns the claimed task. Every
+        // production removal is PRECEDED by a terminal AdvanceTo under the pipeline lock, which the
+        // synchronized region below rejects atomically; this recheck additionally refuses a removal
+        // that already completed, without claiming atomicity with the manager's own lock.
+        if (!ReferenceEquals(_pipelineManager.GetByTaskId(taskId), pipeline))
+            return Refused(RestoredAttemptAdoptionRefusal.AttemptNoLongerValid);
+
+        var decision = pipeline.TryAdoptRestoredActiveAttemptIfStillValid(context.Slot);
+        switch (decision)
+        {
+            case RestoredAttemptCommitDecision.Adopted:
+                break;
+            case RestoredAttemptCommitDecision.HoldAlreadyReleased:
+                // The release sweep won the race: nothing was adopted and nothing was mutated.
+                return new RestoredAttemptAdoptionResult
+                {
+                    Outcome = RestoredAttemptAdoptionOutcome.HoldAlreadyReleased,
+                };
+            case RestoredAttemptCommitDecision.AttemptNoLongerValid:
+                // An invalidating transition won: nothing was adopted, the hold is untouched.
+                return Refused(RestoredAttemptAdoptionRefusal.AttemptNoLongerValid);
+            default:
+                throw new InvalidOperationException(
+                    $"Unhandled RestoredAttemptCommitDecision: {decision}");
         }
 
         // ── (b) THE ATOMIC BUSY REGISTRATION, with the task built from the RECORDED context. ──────
@@ -469,18 +518,29 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
             };
         }
 
-        if (registration.Outcome != AdoptedRegistrationOutcome.Registered)
+        // EVERY non-Registered outcome rolls the attempt back under hold FIRST. The registration
+        // primitive has already left the pool and the existing entry as they were. Each outcome is
+        // enumerated explicitly — an unknown one is a programming error, surfaced after the rollback.
+        switch (registration.Outcome)
         {
-            // EVERY non-Registered outcome rolls the attempt back under hold. The registration
-            // primitive has already left nothing mutated — in particular the pre-existing active
-            // entry is exactly as it was.
-            RollBack(pipeline, taskId, workerId);
-            return new RestoredAttemptAdoptionResult
-            {
-                Outcome = registration.Outcome == AdoptedRegistrationOutcome.ActiveEntryExists
-                    ? RestoredAttemptAdoptionOutcome.ActiveQueueEntryExists
-                    : RestoredAttemptAdoptionOutcome.DuplicateWorkerId,
-            };
+            case AdoptedRegistrationOutcome.Registered:
+                break;
+            case AdoptedRegistrationOutcome.ActiveEntryExists:
+                RollBack(pipeline, taskId, workerId);
+                return new RestoredAttemptAdoptionResult
+                {
+                    Outcome = RestoredAttemptAdoptionOutcome.ActiveQueueEntryExists,
+                };
+            case AdoptedRegistrationOutcome.DuplicateId:
+                RollBack(pipeline, taskId, workerId);
+                return new RestoredAttemptAdoptionResult
+                {
+                    Outcome = RestoredAttemptAdoptionOutcome.DuplicateWorkerId,
+                };
+            default:
+                RollBack(pipeline, taskId, workerId);
+                throw new InvalidOperationException(
+                    $"Unhandled AdoptedRegistrationOutcome: {registration.Outcome}");
         }
 
         // ── (d) ADOPTED: the instance the pool now holds is the one built fully busy. ─────────────
@@ -549,7 +609,4 @@ internal sealed class RestoredAttemptAdopter : IRestoredAttemptAdopter
             // Diagnostic failure only — the reported outcome stands.
         }
     }
-
-    private static string MessageOrPlaceholder(Exception exception) =>
-        string.IsNullOrWhiteSpace(exception.Message) ? exception.GetType().Name : exception.Message;
 }

@@ -254,18 +254,53 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
     /// <summary>
     /// The real <see cref="HiveOrchestratorService"/> and the collaborators its Register decision
-    /// actually touches, with the log sink exposed for the exactly-one-warning assertions.
+    /// actually touches, with BOTH log sinks exposed — the service's and the adopter's — so the
+    /// exactly-one-warning assertions count every warning the production path can emit.
     /// </summary>
     internal sealed record RegisterHarness(
         HiveOrchestratorService Service,
         WorkerPool Pool,
         TaskQueue Queue,
         ILogEntrySink Logger,
-        RestoredAttemptAdopter? Adopter);
+        RestoredAttemptAdopter? Adopter,
+        ILogEntrySink? AdopterLogger = null)
+    {
+        /// <summary>
+        /// EVERY record the production path emitted, across BOTH sinks (the service's and, when an
+        /// adopter is wired, the adopter's) — so a second warning hiding in either sink is counted.
+        /// </summary>
+        public IReadOnlyList<(LogLevel LogLevel, string Message, Exception? Exception)> AllEntries =>
+            [.. Logger.LogEntries, .. AdopterLogger?.LogEntries ?? []];
+    }
+
+    /// <summary>
+    /// THE ADOPTION SUITE'S OWN CAPTURING LOGGER: the <see cref="ILogEntrySink"/> shape defined in
+    /// THIS file, so no other suite's logger is widened to serve it. Every record is retained in
+    /// emission order.
+    /// </summary>
+    internal sealed class AdoptionCapturingLogger<TCategory> : ILogger<TCategory>, ILogEntrySink
+    {
+        /// <summary>Every record, in emission order.</summary>
+        public List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (LogEntries)
+                LogEntries.Add((logLevel, formatter(state, exception), exception));
+        }
+    }
 
     /// <summary>
     /// Builds the production Register path: the REAL adopter over the given manager, pool and queue,
     /// wired into a REAL <see cref="HiveOrchestratorService"/> as its optional trailing parameter.
+    /// BOTH the service and the adopter get a CAPTURING logger, so a warning emitted by either is
+    /// visible to the one-warning assertions.
     /// </summary>
     /// <param name="manager">The pipeline manager the claim is resolved through.</param>
     /// <param name="withAdopter">
@@ -276,7 +311,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// An existing queue to share — the pre-existing-entry vectors arrange it BEFORE the harness is
     /// built — or <c>null</c> for a fresh one.
     /// </param>
-    /// <returns>The harness, with fresh pool, queue and logger.</returns>
+    /// <returns>The harness, with fresh pool, queue and loggers.</returns>
     private RegisterHarness CreateRegisterHarness(
         GoalPipelineManager manager, bool withAdopter, TaskQueue? queue = null)
     {
@@ -284,11 +319,12 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         // must land in the very pool and queue the Register reply is then asserted against.
         var pool = new WorkerPool();
         queue ??= new TaskQueue();
-        var logger = new TestLogger<HiveOrchestratorService>();
+        var logger = new AdoptionCapturingLogger<HiveOrchestratorService>();
+        var adopterLogger = new AdoptionCapturingLogger<RestoredAttemptAdopter>();
 
         RestoredAttemptAdopter? concreteAdopter = withAdopter
             ? new RestoredAttemptAdopter(
-                manager, pool, queue, CreateAssignmentStore(), NullLogger<RestoredAttemptAdopter>.Instance)
+                manager, pool, queue, CreateAssignmentStore(), adopterLogger)
             : null;
 
         var dispatcher = new GoalDispatcher(
@@ -301,7 +337,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             pool, queue, manager, new TaskCompletionNotifier(), dispatcher, logger,
             restoredAttemptAdopter: concreteAdopter);
 
-        return new RegisterHarness(service, pool, queue, logger, concreteAdopter);
+        return new RegisterHarness(service, pool, queue, logger, concreteAdopter, adopterLogger);
     }
 
     /// <summary>
@@ -419,20 +455,20 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     }
 
     /// <summary>
-    /// THE LOG-SINK SHAPE every harness logger shares: the retained
-    /// <see cref="TestLogger{T}.LogEntries"/> records. The register-level assertions read this shape,
-    /// so both the plain <see cref="TestLogger{T}"/> and the adopted-completion harness's signalling
-    /// logger satisfy it and the harness record can hold EITHER.
+    /// THE LOG-SINK SHAPE every harness logger shares: the retained records in emission order. The
+    /// register-level assertions read this shape, so both this file's
+    /// <see cref="AdoptionCapturingLogger{TCategory}"/> and the adopted-completion harness's
+    /// signalling logger satisfy it and the harness record can hold EITHER.
     /// </summary>
     internal interface ILogEntrySink
     {
-        /// <summary>Every record, in emission order — the <see cref="TestLogger{T}"/> shape.</summary>
+        /// <summary>Every record, in emission order.</summary>
         List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; }
     }
 
     /// <summary>
     /// THE SERVICE-SIDE logger for the adopted-completion harness: the full
-    /// <see cref="TestLogger{T}"/>-shaped <see cref="ILogEntrySink.LogEntries"/> PLUS
+    /// <see cref="ILogEntrySink.LogEntries"/> shape PLUS
     /// <see cref="WaitFor"/> — a FRESH <see cref="TaskCompletionSource"/> completed by the NEXT
     /// record containing the fragment, the deterministic handle on a production line, allocated
     /// before the message is produced so it can never be missed.
@@ -567,17 +603,25 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
     /// <summary>
     /// THE ONE-WARNING CONTRACT FOR A DECLINED CLAIM: exactly one Warning record exists in the whole
-    /// run, it names the expected check, and it carries BOTH identities. Counting EVERY warning —
-    /// not merely the matching ones — is what kills a mutant that emits an extra unnamed record.
+    /// run ACROSS BOTH SINKS — the service's AND the adopter's — it names the expected check, and it
+    /// carries BOTH identities. Counting EVERY warning in EVERY sink is what kills a mutant that emits
+    /// an extra record, including one hidden in the adopter's own logger.
     /// </summary>
     /// <param name="harness">The harness whose records are inspected.</param>
     /// <param name="expectedCheck">The check name the single warning must carry.</param>
     /// <param name="workerId">The worker id the warning must name.</param>
     /// <param name="taskId">The task id the warning must name.</param>
-    private static void AssertSingleAdoptionRefusalWarning(
+    /// <returns>The single warning's message, for vector-specific follow-up assertions.</returns>
+    private static string AssertSingleAdoptionRefusalWarning(
         RegisterHarness harness, string expectedCheck, string workerId, string taskId)
     {
-        var warning = Assert.Single(harness.Logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        var warnings = harness.AllEntries.Where(e => e.LogLevel >= LogLevel.Warning).ToList();
+        Assert.True(
+            warnings.Count == 1,
+            $"exactly ONE warning must be emitted across BOTH sinks; actual {warnings.Count}: " +
+            string.Join(" | ", warnings.Select(w => w.Message)));
+
+        var warning = warnings[0];
         Assert.True(
             warning.Message.Contains("was not adopted", StringComparison.Ordinal),
             $"the single warning must be the adoption refusal; actual: {warning.Message}");
@@ -586,6 +630,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             $"the warning must name the check '{expectedCheck}'; actual: {warning.Message}");
         Assert.Contains(workerId, warning.Message, StringComparison.Ordinal);
         Assert.Contains(taskId, warning.Message, StringComparison.Ordinal);
+        return warning.Message;
     }
 
     /// <summary>
@@ -945,12 +990,16 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// themselves rather than mutating the shared fixture.
     /// </para>
     /// </summary>
-    /// <param name="expectedCheck">The check name the single warning must carry.</param>
+    /// <param name="caseName">
+    /// The case; its name (before any <c>-Variant</c> suffix) is the check the single warning must
+    /// carry. <c>RegistryEvidenceUntrusted</c> is covered as BOTH DecodeRejected and MissingRegistry.
+    /// </param>
     [Theory]
     [InlineData("NoPipeline")]
     [InlineData("NotHeld")]
     [InlineData("PointerMismatch")]
     [InlineData("RegistryEvidenceUntrusted")]
+    [InlineData("RegistryEvidenceUntrusted-MissingRegistry")]
     [InlineData("SlotNotPending")]
     [InlineData("NoAssignmentContext")]
     [InlineData("WorkerMismatch")]
@@ -958,10 +1007,12 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     [InlineData("SlotMismatch")]
     [InlineData("PhaseMismatch")]
     [InlineData("NoAdopter")]
-    public async Task Register_FailedPrecondition_DeclinesWithOneNamedWarning(string expectedCheck)
+    public async Task Register_FailedPrecondition_DeclinesWithOneNamedWarning(string caseName)
     {
-        var goalId = $"adopt-register-{expectedCheck}".ToLowerInvariant();
-        var workerId = $"worker-{expectedCheck}".ToLowerInvariant();
+        // A case name may carry a "-Variant" suffix; the CHECK the warning must name is the prefix.
+        var expectedCheck = caseName.Split('-')[0];
+        var goalId = $"adopt-register-{caseName}".ToLowerInvariant();
+        var workerId = $"worker-{caseName}".ToLowerInvariant();
 
         string claimedTaskId;
         string registeringWorkerId;
@@ -970,7 +1021,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         GoalPipelineManager manager;
         GoalPipeline pipeline;
 
-        switch (expectedCheck)
+        switch (caseName)
         {
             case "NoPipeline":
             {
@@ -1039,6 +1090,22 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
                 (manager, pipeline) = RestoreForRegister(goalId);
                 Assert.Equal(RestoredRegistryOutcome.DecodeRejected, pipeline.RestoredRegistryClassification);
                 claimedTaskId = pipeline.ActiveTaskId!;
+                registeringWorkerId = workerId;
+                break;
+            }
+
+            case "RegistryEvidenceUntrusted-MissingRegistry":
+            {
+                // A GENUINE SQL-NULL registry column: the evidence is MISSING, so the restore
+                // installs nothing and classifies it MissingRegistry — still held (the hold is
+                // decided from the phase and pointer alone), never adoptable.
+                var seeded = SeedHeldAttempt(goalId, workerId);
+                RawUpdate(goalId, "work_slot_registry_json", null);
+                (manager, pipeline) = RestoreForRegister(goalId);
+                Assert.Equal(RestoredRegistryOutcome.MissingRegistry, pipeline.RestoredRegistryClassification);
+                Assert.Empty(pipeline.CaptureRegistry().Slots);
+                Assert.Equal(seeded.TaskId, pipeline.ActiveTaskId);
+                claimedTaskId = seeded.TaskId;
                 registeringWorkerId = workerId;
                 break;
             }
@@ -1142,7 +1209,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             }
 
             default:
-                throw new InvalidOperationException($"Unhandled case: {expectedCheck}");
+                throw new InvalidOperationException($"Unhandled case: {caseName}");
         }
 
         var harness = CreateRegisterHarness(manager, useAdopter);
@@ -1181,7 +1248,14 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
 
         Assert.True(response.Accepted);
         Assert.False(response.AdoptedTask);
-        AssertSingleAdoptionRefusalWarning(harness, "ReadFailed", workerId, taskId);
+
+        // EXACTLY ONE WARNING ACROSS BOTH SINKS (the adopter's sink is CAPTURED, not discarded), and
+        // the underlying read failure stays visible in that single line as a sanitized cause.
+        var warning = AssertSingleAdoptionRefusalWarning(harness, "ReadFailed", workerId, taskId);
+        Assert.Contains("cause:", warning, StringComparison.Ordinal);
+        Assert.Contains("worker_assignment_contexts", warning, StringComparison.Ordinal);
+        Assert.Empty(harness.AdopterLogger!.LogEntries);
+        Assert.DoesNotContain(harness.AllEntries, e => e.Exception is not null);
         AssertDeclinedClaim(harness, pipeline, workerId, taskId);
     }
 
@@ -1460,6 +1534,358 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// <summary>Bound for the commit-window rendezvous; a hang is a named failure, never a stall.</summary>
     private static readonly TimeSpan CommitOrderWait = TimeSpan.FromSeconds(30);
 
+    // ═══════════════ (b) THE COMMIT ORDER AT THE REAL POOL-PUBLICATION BOUNDARY ═══════════════
+
+    /// <summary>
+    /// (b) THE COMMIT ORDER, WITNESSED AT THE REAL PUBLICATION POINT. The pool's publication-boundary
+    /// hook runs inside <see cref="WorkerPool.RegisterAdoptedWorker"/>'s own lock span, after the
+    /// active entry was claimed and IMMEDIATELY BEFORE the worker enters the pool dictionary. At that
+    /// instant the hold must ALREADY have left (the adopter's CAS precedes publication) and the
+    /// worker must still be INVISIBLE through <see cref="WorkerPool.GetWorker"/>.
+    /// <para>
+    /// REMOVAL-PROOFNESS. A register-before-adopt reversal would reach this hook while the attempt is
+    /// still HELD, failing the in-hook assertion — which is captured and re-thrown after the call so
+    /// it cannot be swallowed by the adopter's commit-failure containment. The hook firing exactly
+    /// once proves the witness genuinely sat on the publication path.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void TryAdoptRestoredAttempt_AtThePoolPublicationBoundary_TheHoldHasAlreadyLeft_AndTheWorkerIsInvisible()
+    {
+        var goalId = "adopt-publication-order";
+        var workerId = "worker-publication-order";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        var pool = new WorkerPool();
+        var queue = new TaskQueue();
+        var adopter = CreateAdopter(manager, pool, queue);
+
+        var hookInvocations = 0;
+        bool? heldAtPublication = null;
+        ConnectedWorker? visibleAtPublication = null;
+        pool.BeforeAdoptedWorkerPublicationForTest = id =>
+        {
+            hookInvocations++;
+            Assert.Equal(workerId, id);
+            heldAtPublication = pipeline.IsRestoredActiveAttemptHold;
+            visibleAtPublication = pool.GetWorker(id);
+        };
+
+        var result = adopter.TryAdoptRestoredAttempt(
+            workerId, taskId, [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false);
+
+        Assert.Equal(1, hookInvocations);
+        Assert.True(heldAtPublication == false,
+            "at the instant of publication the hold must ALREADY have left — the adoption CAS precedes it");
+        Assert.Null(visibleAtPublication);
+
+        Assert.True(result.Adopted);
+        Assert.Same(result.Worker, pool.GetWorker(workerId));
+        Assert.False(pipeline.IsRestoredActiveAttemptHold);
+    }
+
+    // ═══════════════ (F7) THE STALE-EVIDENCE RACE — revalidated in ONE synchronized region ═══════════════
+
+    /// <summary>
+    /// THE STALE-EVIDENCE RACE, one vector per REAL invalidating writer. Every read-only precondition
+    /// has already held when the adoption is PARKED on its commit-window hook; the writer then runs
+    /// its real production transition; the adoption is released. The synchronized
+    /// validate-and-adopt region must see the invalidated LIVE evidence and REFUSE with
+    /// <c>AttemptNoLongerValid</c> — never <c>adopted = true</c>, never a published busy worker, never
+    /// an active entry — and the hold is left exactly as the writer left it (still Held: the
+    /// invalidation does not touch it, and the refusal mutates nothing).
+    /// <para>
+    /// THE WRITERS, each driven through its production transition:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description><c>cancel</c> — the lifecycle service's terminal
+    ///     <c>MarkGoalFailedAsync</c> (what <c>GoalDispatcher.CancelGoalAsync</c> runs), which
+    ///     advances the pipeline to Failed under the pipeline lock;</description></item>
+    ///   <item><description><c>admission</c> — <see cref="GoalPipeline.AdmitCompletion"/>, which
+    ///     CLAIMS the Pending slot;</description></item>
+    ///   <item><description><c>retire</c> — the stale-cleanup
+    ///     <see cref="GoalPipeline.RetireSlotAndClearIfCurrent"/>, which abandons the slot and clears
+    ///     the pointer;</description></item>
+    ///   <item><description><c>new-iteration</c> — the machine's <c>Fail</c> plus the paired
+    ///     <c>AdvanceTo</c> of a terminal failure: both the pipeline and the machine leave the slot's
+    ///     phase.</description></item>
+    /// </list>
+    /// <para>
+    /// REMOVAL-PROOFNESS (scratch-verified): replacing the synchronized region with the bare hold CAS
+    /// makes every case fail with <c>adopted = true</c> and a published busy worker.
+    /// </para>
+    /// </summary>
+    /// <param name="writer">Which invalidating writer lands inside the commit window.</param>
+    [Theory]
+    [InlineData("cancel")]
+    [InlineData("admission")]
+    [InlineData("retire")]
+    [InlineData("new-iteration")]
+    public async Task Register_InvalidatingTransitionInsideTheCommitWindow_RefusesWithAttemptNoLongerValid(string writer)
+    {
+        var goalId = $"adopt-stale-{writer}";
+        var workerId = $"worker-stale-{writer}";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        var harness = CreateRegisterHarness(manager, withAdopter: true);
+        var adopter = Assert.IsType<RestoredAttemptAdopter>(harness.Adopter);
+
+        // THE INVALIDATING WRITER, run inside the commit window — after every precondition read,
+        // before the synchronized region — through its real production transition.
+        var writerRan = false;
+        adopter.BeforeAdoptCommitForTest = () =>
+        {
+            writerRan = true;
+            switch (writer)
+            {
+                case "cancel":
+                    CancelLifecycle(pipeline)
+                        .MarkGoalFailedAsync(pipeline, "Cancelled by user", CancellationToken.None)
+                        .GetAwaiter().GetResult();
+                    Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+                    break;
+                case "admission":
+                    Assert.Equal(AdmissionOutcome.Admitted, pipeline.AdmitCompletion(taskId));
+                    break;
+                case "retire":
+                    Assert.Equal(SlotRetirementOutcome.Retired, pipeline.RetireSlotAndClearIfCurrent(taskId));
+                    Assert.Null(pipeline.ActiveTaskId);
+                    break;
+                case "new-iteration":
+                    pipeline.StateMachine.Fail();
+                    pipeline.AdvanceTo(GoalPhase.Failed);
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unhandled writer: {writer}");
+            }
+        };
+
+        var response = await RegisterAsync(harness, workerId, taskId);
+
+        Assert.True(writerRan, "the invalidating writer must have landed inside the commit window");
+        Assert.True(response.Accepted, "a lost race never fails the registration itself");
+        Assert.False(response.AdoptedTask, "an invalidated attempt must NEVER be reported adopted");
+
+        // ONE NAMED WARNING, and the worker is registered ordinarily and IDLE with no active entry:
+        // no busy worker was ever published for the invalidated attempt.
+        AssertSingleAdoptionRefusalWarning(harness, "AttemptNoLongerValid", workerId, taskId);
+        AssertDeclinedClaim(harness, pipeline, workerId, taskId, expectHeld: true);
+    }
+
+    /// <summary>
+    /// The REAL <see cref="GoalLifecycleService"/> <c>GoalDispatcher.CancelGoalAsync</c> drives, over a
+    /// real <see cref="GoalManager"/> whose goal source owns the pipeline's goal — so the terminal
+    /// <c>MarkGoalFailedAsync</c> runs its whole production path (phase advance AND status write).
+    /// </summary>
+    private static GoalLifecycleService CancelLifecycle(GoalPipeline pipeline)
+    {
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new InMemoryGoalSource(pipeline.Goal));
+        goalManager.GetNextGoalAsync(CancellationToken.None).GetAwaiter().GetResult();
+        return new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+    }
+
+    /// <summary>
+    /// THE SAME RACE WITH THE MANAGER REMOVAL: <c>CancelGoalAsync</c>'s terminal failure followed by
+    /// <see cref="GoalPipelineManager.RemovePipeline"/> lands inside the commit window. The removed
+    /// pipeline no longer owns the claimed task, so the adoption refuses with
+    /// <c>AttemptNoLongerValid</c> and publishes no busy worker.
+    /// </summary>
+    [Fact]
+    public async Task Register_PipelineRemovedInsideTheCommitWindow_RefusesWithAttemptNoLongerValid()
+    {
+        var goalId = "adopt-stale-removed";
+        var workerId = "worker-stale-removed";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        var harness = CreateRegisterHarness(manager, withAdopter: true);
+        var adopter = Assert.IsType<RestoredAttemptAdopter>(harness.Adopter);
+
+        adopter.BeforeAdoptCommitForTest = () =>
+        {
+            // THE PRODUCTION CANCEL SEQUENCE: terminal failure, then removal from the manager.
+            CancelLifecycle(pipeline)
+                .MarkGoalFailedAsync(pipeline, "Cancelled by user", CancellationToken.None)
+                .GetAwaiter().GetResult();
+            Assert.True(manager.RemovePipeline(goalId));
+            Assert.Null(manager.GetByTaskId(taskId));
+        };
+
+        var response = await RegisterAsync(harness, workerId, taskId);
+
+        Assert.True(response.Accepted);
+        Assert.False(response.AdoptedTask);
+        AssertSingleAdoptionRefusalWarning(harness, "AttemptNoLongerValid", workerId, taskId);
+        AssertDeclinedClaim(harness, pipeline, workerId, taskId, expectHeld: true);
+    }
+
+    /// <summary>
+    /// THE LINEARIZATION POINT ITSELF: an invalidating writer that tries to land INSIDE the
+    /// synchronized region blocks on the pipeline lock until the region's CAS has committed, so the
+    /// adoption wins and the writer then sees an ADOPTED attempt — the "after the CAS" half of the
+    /// contract. The writer is started from the region's own hook, proven BLOCKED while the region
+    /// holds the lock, and joined afterwards.
+    /// </summary>
+    [Fact]
+    public async Task Register_WriterContendingForTheCommitRegion_BlocksUntilTheCasCommits()
+    {
+        var goalId = "adopt-stale-contended";
+        var workerId = "worker-stale-contended";
+        var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
+        var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
+
+        var harness = CreateRegisterHarness(manager, withAdopter: true);
+
+        Task<AdmissionOutcome>? admission = null;
+        var writerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pipeline.InsideAdoptionCommitRegionForTest = () =>
+        {
+            admission = Task.Run(() =>
+            {
+                writerStarted.TrySetResult();
+                return pipeline.AdmitCompletion(taskId);
+            });
+
+            // The writer is running and contending — but it cannot enter while the region holds the
+            // pipeline lock, so it has NOT completed by the time the region proceeds to its CAS.
+            writerStarted.Task.Wait(CommitOrderWait);
+            Assert.False(admission.Wait(TimeSpan.FromMilliseconds(200)),
+                "a writer contending for the pipeline lock must block until the region's CAS commits");
+        };
+
+        var response = await RegisterAsync(harness, workerId, taskId);
+
+        Assert.True(response.AdoptedTask, "the region held the lock through its CAS, so the adoption wins");
+        Assert.NotNull(admission);
+        Assert.Equal(AdmissionOutcome.Admitted, await admission!.WaitAsync(CommitOrderWait, TestContext.Current.CancellationToken));
+        Assert.False(pipeline.IsRestoredActiveAttemptHold, "the writer landed AFTER the CAS: the hold is Adopted");
+    }
+
+    // ═══════════════ (F4) HONEST CLEANUP — a refused removal is REPORTED, never assumed away ═══════════════
+
+    /// <summary>
+    /// Replaces the active entry under <paramref name="taskId"/> with an equal-valued but DISTINCT
+    /// instance through the queue's own public API — exactly what a concurrent writer re-activating
+    /// the same task id does. The reference-checked <see cref="TaskQueue.TryRemoveOwned"/> then
+    /// GENUINELY refuses the adopted registration's own instance: no seam, no decorator.
+    /// </summary>
+    private static WorkTask ReplaceActiveEntryWithForeignInstance(TaskQueue queue, string taskId)
+    {
+        var ours = Assert.IsType<WorkTask>(queue.GetActiveTask(taskId));
+        var foreign = ours with { Metadata = new Dictionary<string, string>() };
+        queue.MarkComplete(taskId);
+        queue.Activate(foreign, "worker-foreign");
+        Assert.NotSame(ours, queue.GetActiveTask(taskId));
+        return foreign;
+    }
+
+    /// <summary>
+    /// THE LOST-RACE CLEANUP IS HONEST: a same-id registration lands at the publication point (so the
+    /// pool's <c>TryAdd</c> loses) while a concurrent writer has re-activated the task with a foreign
+    /// instance, so the reference-checked removal GENUINELY refuses. The call still returns
+    /// <c>DuplicateId</c>, but the refused cleanup is REPORTED — exactly once, naming the task and
+    /// worker — instead of being silently assumed away, and the foreign entry is left untouched.
+    /// <para>
+    /// REMOVAL-PROOFNESS: ignoring <c>TryRemoveOwned</c>'s result (the pre-fix code) emits no warning
+    /// and fails the single-warning assertion.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void RegisterAdoptedWorker_LostRaceWithRefusedRemoval_ReportsTheRefusedCleanup()
+    {
+        var logger = new AdoptionCapturingLogger<WorkerPool>();
+        var pool = new WorkerPool(logger);
+        var queue = new TaskQueue();
+        var task = BuildTask("task-residue-race");
+        WorkTask? foreign = null;
+
+        // THE LOST RACE, at the real publication point: the pool's activity lock is reentrant for this
+        // thread, so the competing same-id registration and the foreign re-activation complete here.
+        pool.BeforeAdoptedWorkerPublicationForTest = id =>
+        {
+            pool.RegisterWorker(id, []);
+            foreign = ReplaceActiveEntryWithForeignInstance(queue, task.TaskId);
+        };
+
+        var result = pool.RegisterAdoptedWorker(
+            "worker-residue-race", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false,
+            task, queue);
+
+        Assert.Equal(AdoptedRegistrationOutcome.DuplicateId, result.Outcome);
+        Assert.Null(result.Worker);
+
+        // THE FOREIGN ENTRY IS UNTOUCHED, and the refused cleanup is REPORTED exactly once.
+        Assert.Same(foreign, queue.GetActiveTask(task.TaskId));
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("stale-active-entry", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(task.TaskId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("worker-residue-race", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE EXCEPTION CLEANUP IS HONEST: a throw lands after the active entry was claimed (at the
+    /// publication point), and the reference-checked removal GENUINELY refuses because a concurrent
+    /// writer re-activated the task. The ORIGINAL exception is rethrown — never replaced — no worker
+    /// is published, and the refused cleanup is REPORTED rather than claimed clean.
+    /// </summary>
+    [Fact]
+    public void RegisterAdoptedWorker_ThrowWithRefusedRemoval_RethrowsTheOriginal_AndReportsTheCleanup()
+    {
+        var logger = new AdoptionCapturingLogger<WorkerPool>();
+        var pool = new WorkerPool(logger);
+        var queue = new TaskQueue();
+        var task = BuildTask("task-residue-throw");
+        var original = new InvalidOperationException("original-commit-failure");
+        WorkTask? foreign = null;
+
+        pool.BeforeAdoptedWorkerPublicationForTest = _ =>
+        {
+            foreign = ReplaceActiveEntryWithForeignInstance(queue, task.TaskId);
+            throw original;
+        };
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => pool.RegisterAdoptedWorker(
+            "worker-residue-throw", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false,
+            task, queue));
+
+        Assert.Same(original, thrown);
+        Assert.Null(pool.GetWorker("worker-residue-throw"));
+        Assert.Same(foreign, queue.GetActiveTask(task.TaskId));
+
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("stale-active-entry", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("worker-residue-throw", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("removal refused", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE CLEAN-CLEANUP CONTROL: with no concurrent writer the same throw unwinds the adopted
+    /// registration's own entry and emits NO warning — so the warnings above are the refused
+    /// removal's doing, not a blanket emission.
+    /// </summary>
+    [Fact]
+    public void RegisterAdoptedWorker_ThrowWithWorkingRemoval_UnwindsTheEntry_WithoutAWarning()
+    {
+        var logger = new AdoptionCapturingLogger<WorkerPool>();
+        var pool = new WorkerPool(logger);
+        var queue = new TaskQueue();
+        var task = BuildTask("task-residue-clean");
+        var original = new InvalidOperationException("original-commit-failure");
+
+        pool.BeforeAdoptedWorkerPublicationForTest = _ => throw original;
+
+        Assert.Same(original, Assert.Throws<InvalidOperationException>(() => pool.RegisterAdoptedWorker(
+            "worker-residue-clean", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false,
+            task, queue)));
+
+        Assert.Null(queue.GetActiveTask(task.TaskId));
+        Assert.Empty(logger.LogEntries);
+    }
+
     // ═══════════════ (a) THE ADOPTED COMPLETION, END TO END THROUGH THE REAL PATHS ═══════════════
 
     /// <summary>
@@ -1482,11 +1908,13 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// proves the real domain chain ran — not merely that a test handler fired.
     /// </para>
     /// <para>
-    /// THE ADVANCEMENT IS READ FROM THE PIPELINE, THE SLOT AND THE DURABLE ROW: with no Brain the
-    /// existing no-brain path is the production advancement — the completing slot is admitted
-    /// (Pending → Claimed, the A1a in-flight exemption the terminal abandon respects), the phase
-    /// reaches <see cref="GoalPhase.Done"/>, the goal row is marked Completed in its source, and the
-    /// persisted pipeline row agrees.
+    /// THE ADVANCEMENT IS READ FROM THE PIPELINE, THE SLOT AND THE DURABLE EVIDENCE: with no Brain
+    /// the existing no-brain path is the production advancement — the completing slot is admitted
+    /// (Pending → Claimed, the A1a in-flight exemption the terminal abandon respects), the IN-MEMORY
+    /// phase reaches <see cref="GoalPhase.Done"/>, the goal is marked Completed in its source, and the
+    /// completion receipt is durably retained. The persisted PIPELINE ROW is deliberately NOT read:
+    /// the no-brain terminal path returns BEFORE the drive's own <c>PersistFull</c>, so the row's
+    /// phase is not terminal and is not evidence of this completion.
     /// </para>
     /// <para>
     /// DETERMINISTIC SYNCHRONIZATION, NO SLEEPS: the downstream wait is a

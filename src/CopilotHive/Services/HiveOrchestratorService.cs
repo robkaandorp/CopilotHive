@@ -423,7 +423,9 @@ public sealed class HiveOrchestratorService(
                 });
 
             case RestoredAttemptAdoptionOutcome.Refused:
-                LogAdoptionRefused(workerId, claimedTaskId, adoption.Refusal.ToString());
+                // THE ONE WARNING for the whole path: the adopter logs nothing itself. A ReadFailed
+                // refusal carries its read failure, which is rendered (sanitized) into this line.
+                LogAdoptionRefused(workerId, claimedTaskId, adoption.Refusal.ToString(), adoption.ReadException);
                 return Task.FromResult(RegisterOrRejectDuplicate(workerId, request, requested, ackEnabled));
 
             case RestoredAttemptAdoptionOutcome.HoldAlreadyReleased:
@@ -544,8 +546,9 @@ public sealed class HiveOrchestratorService(
 
     /// <summary>
     /// THE GUARDED DECLINED-ADOPTION DIAGNOSTIC: the reconnecting worker's claim was NOT adopted, so
-    /// the worker is being registered ordinarily and idle. Exactly ONE line is emitted, and it names
-    /// the check that ACTUALLY refused.
+    /// the worker is being registered ordinarily and idle. Exactly ONE line is emitted for the WHOLE
+    /// production path — the adopter logs no refusal of its own — and it names the check that
+    /// ACTUALLY refused.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -553,6 +556,11 @@ public sealed class HiveOrchestratorService(
     /// may want to know that a surviving worker's attempt was not reclaimed, and the named check is
     /// what makes the disposition actionable. No success wording appears, because nothing was
     /// adopted.
+    /// </para>
+    /// <para>
+    /// A READ FAILURE KEEPS ITS CAUSE VISIBLE IN THIS SAME LINE: when <paramref name="cause"/> is
+    /// supplied (the <c>ReadFailed</c> refusal) its SANITIZED, bounded detail is appended — never
+    /// the exception object, whose raw message and stack a sink would render verbatim.
     /// </para>
     /// <para>
     /// GUARDED like every other refusal diagnostic: the whole log call sits inside its own no-throw
@@ -563,16 +571,31 @@ public sealed class HiveOrchestratorService(
     /// <param name="workerId">The registering worker's id.</param>
     /// <param name="taskId">The task id the worker claimed.</param>
     /// <param name="check">The name of the check that refused.</param>
-    private void LogAdoptionRefused(string workerId, string taskId, string check)
+    /// <param name="cause">The underlying read failure for <c>ReadFailed</c>, or <c>null</c>.</param>
+    private void LogAdoptionRefused(string workerId, string taskId, string check, Exception? cause = null)
     {
         try
         {
-            logger.LogWarning(
-                "Registration claim for task {TaskId} by worker {WorkerId} was not adopted " +
-                "(check={Check}); the worker is registered ordinarily and the attempt is unchanged",
-                taskId,
-                workerId,
-                check);
+            if (cause is null)
+            {
+                logger.LogWarning(
+                    "Registration claim for task {TaskId} by worker {WorkerId} was not adopted " +
+                    "(check={Check}); the worker is registered ordinarily and the attempt is unchanged",
+                    taskId,
+                    workerId,
+                    check);
+            }
+            else
+            {
+                logger.LogWarning(
+                    "Registration claim for task {TaskId} by worker {WorkerId} was not adopted " +
+                    "(check={Check}); the worker is registered ordinarily and the attempt is unchanged " +
+                    "— cause: {Detail}",
+                    taskId,
+                    workerId,
+                    check,
+                    SanitizedFailureDetail(cause));
+            }
         }
         catch
         {

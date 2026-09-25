@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using CopilotHive.Models;
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Services;
 
@@ -106,6 +108,23 @@ internal enum AdoptedRegistrationOutcome
 public sealed class WorkerPool : IWorkerPool
 {
     private readonly ConcurrentDictionary<string, ConnectedWorker> _workers = new();
+
+    /// <summary>
+    /// The pool's diagnostic sink, used ONLY for the guarded stale-active-entry residue warning of
+    /// <see cref="RegisterAdoptedWorker"/>. Defaults to a no-op logger, so every existing
+    /// parameterless construction is unchanged.
+    /// </summary>
+    private readonly ILogger<WorkerPool> _logger;
+
+    /// <summary>
+    /// Creates the pool. The logger is OPTIONAL: the container supplies it, and every other
+    /// construction site keeps compiling with the no-op default.
+    /// </summary>
+    /// <param name="logger">Logger for the guarded residue diagnostic; <c>null</c> means a no-op logger.</param>
+    public WorkerPool(ILogger<WorkerPool>? logger = null)
+    {
+        _logger = logger ?? NullLogger<WorkerPool>.Instance;
+    }
 
     /// <summary>
     /// Guards all reads and writes of mutable worker state: <see cref="ConnectedWorker.IsBusy"/>,
@@ -1199,16 +1218,30 @@ public sealed class WorkerPool : IWorkerPool
     /// <see cref="AdoptedRegistrationResult"/> so the caller can fall back to ordinary registration.
     /// </para>
     /// <para>
-    /// EXCEPTION CONTAINMENT. Anything thrown inside the span leaves nothing mutated: when this
-    /// call's own active entry had already been added it is removed with the same reference-checked
-    /// removal before the ORIGINAL exception is rethrown. That cleanup is best-effort — a failure
-    /// inside the removal itself can neither be reported nor allowed to replace the original
-    /// exception, which is the authoritative outcome.
+    /// HONEST CLEANUP. When this call's own active entry must be unwound — the lost
+    /// <c>TryAdd</c> race, or an exception after the entry was added — the reference-checked
+    /// <see cref="TaskQueue.TryRemoveOwned"/> result is CHECKED. A removal that is refused (or that
+    /// itself throws) leaves a STALE ACTIVE ENTRY behind, and that residue is reported through a
+    /// guarded warning naming the task and worker rather than being assumed away. The outcome is
+    /// unchanged by the residue: the lost race still returns
+    /// <see cref="AdoptedRegistrationOutcome.DuplicateId"/>, and a throw still rethrows the ORIGINAL
+    /// exception, which stays authoritative.
     /// </para>
     /// <para>
-    /// WHAT IT DOES NOT DO: no channel write, no notification, no database or session operation, no
-    /// logging and no <c>await</c> — only the worker's own fields, the pool dictionary and the
-    /// queue's active-entry insert.
+    /// LOCK ORDER, DOCUMENTED. This method holds <c>_activityLock</c> while the queue takes its own
+    /// <c>TaskQueue._activeLock</c> (inside <see cref="TaskQueue.TryActivateNew"/> and
+    /// <see cref="TaskQueue.TryRemoveOwned"/>), so the order is
+    /// <c>_activityLock</c> → <c>_activeLock</c>. The pre-existing <see cref="TryClaimAndActivate"/>
+    /// takes the same order (<see cref="TaskQueue.Activate"/> under <c>_activityLock</c>). No path
+    /// takes them the other way round: <see cref="TaskQueue"/> never calls back into the pool and
+    /// holds <c>_activeLock</c> only around its own dictionary operations, so the two monitors
+    /// cannot form a cycle.
+    /// </para>
+    /// <para>
+    /// WHAT IT DOES NOT DO: no channel write, no notification, no database or session operation and
+    /// no <c>await</c> — only the worker's own fields, the pool dictionary and the queue's
+    /// active-entry insert. The only log it can write is the guarded residue warning above, and only
+    /// when a cleanup genuinely failed.
     /// </para>
     /// </remarks>
     /// <param name="id">The worker id to register under.</param>
@@ -1261,12 +1294,18 @@ public sealed class WorkerPool : IWorkerPool
 
                 activeEntryAdded = true;
 
+                // THE PUBLICATION-BOUNDARY OBSERVATION: the last instant before the worker becomes
+                // visible through GetWorker. Null in production.
+                BeforeAdoptedWorkerPublicationForTest?.Invoke(id);
+
                 // 3. THE PUBLICATION. Losing this race is still a duplicate — and unwinds ONLY our
-                //    own entry, by reference.
+                //    own entry, by reference, with the removal's result checked.
                 if (!_workers.TryAdd(id, worker))
                 {
-                    queue.TryRemoveOwned(task.TaskId, task);
                     activeEntryAdded = false;
+                    if (!queue.TryRemoveOwned(task.TaskId, task))
+                        ReportStaleActiveEntry(task.TaskId, id, cleanupFailure: null);
+
                     return new AdoptedRegistrationResult { Outcome = AdoptedRegistrationOutcome.DuplicateId };
                 }
 
@@ -1278,22 +1317,66 @@ public sealed class WorkerPool : IWorkerPool
             }
             catch
             {
-                // NOTHING MUTATED ON A THROW. The removal is guarded so it can never replace the
-                // original exception, which stays the authoritative outcome.
+                // THE ORIGINAL EXCEPTION STAYS AUTHORITATIVE. When our own entry had been added it is
+                // unwound by reference; a refused or throwing removal is REPORTED as residue — never
+                // silently assumed away — and can never replace the original exception.
                 if (activeEntryAdded)
                 {
                     try
                     {
-                        queue.TryRemoveOwned(task.TaskId, task);
+                        if (!queue.TryRemoveOwned(task.TaskId, task))
+                            ReportStaleActiveEntry(task.TaskId, id, cleanupFailure: null);
                     }
-                    catch
+                    catch (Exception cleanupFailure)
                     {
-                        // Best-effort cleanup only: the original exception below is the outcome.
+                        ReportStaleActiveEntry(task.TaskId, id, cleanupFailure);
                     }
                 }
 
                 throw;
             }
+        }
+    }
+
+    /// <summary>
+    /// THE PUBLICATION-BOUNDARY SEAM — a test-only hook invoked inside
+    /// <see cref="RegisterAdoptedWorker"/>'s <c>_activityLock</c> span, after the active entry was
+    /// claimed and IMMEDIATELY BEFORE the worker is published to the pool dictionary. It receives
+    /// the worker id. <c>null</c> (the production default) means it is absent, so production is
+    /// byte-identical with or without it; it observes only and can neither publish nor refuse.
+    /// </summary>
+    /// <remarks>
+    /// It exists so a test can witness the COMMIT ORDER at the REAL publication point: when it runs,
+    /// the restored attempt's hold must already have left and the worker must still be invisible.
+    /// The hook runs while <c>_activityLock</c> is held; that lock is reentrant for the owning
+    /// thread, which is what lets a test simulate a same-id registration landing at exactly this
+    /// instant (the lost-race cleanup path).
+    /// </remarks>
+    internal Action<string>? BeforeAdoptedWorkerPublicationForTest { get; set; }
+
+    /// <summary>
+    /// Reports — through the guarded pool logger — that a cleanup left a STALE ACTIVE ENTRY behind.
+    /// A throwing logger is swallowed: the diagnostic can never replace the caller's outcome or
+    /// original exception.
+    /// </summary>
+    /// <param name="taskId">The task whose entry remains.</param>
+    /// <param name="workerId">The worker the entry was claimed for.</param>
+    /// <param name="cleanupFailure">The removal's own exception, or <c>null</c> for a refused removal.</param>
+    private void ReportStaleActiveEntry(string taskId, string workerId, Exception? cleanupFailure)
+    {
+        try
+        {
+            _logger.LogWarning(
+                "WorkerPool: stale-active-entry task={TaskId} worker={WorkerId} — the adopted registration's " +
+                "own active queue entry could NOT be removed during cleanup ({Cause}); it remains in the " +
+                "queue as residue",
+                taskId,
+                workerId,
+                cleanupFailure is null ? "removal refused" : cleanupFailure.GetType().Name);
+        }
+        catch
+        {
+            // Diagnostic failure only — the caller's outcome (or original exception) stands.
         }
     }
 }

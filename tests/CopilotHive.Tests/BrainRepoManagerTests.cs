@@ -1065,7 +1065,7 @@ public sealed class BrainRepoManagerGetHeadShaTests : IDisposable
 /// <summary>
 /// Test logger that captures log entries for verification.
 /// </summary>
-internal sealed class TestLogger<T> : ILogger<T>, RestoredAttemptAdoptionTests.ILogEntrySink
+internal sealed class TestLogger<T> : ILogger<T>
 {
     public List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; } = [];
 

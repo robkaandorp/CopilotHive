@@ -268,10 +268,11 @@ public sealed class GoalPipeline
     /// THE ADOPTION TRANSITION: Held → Adopted, atomically.
     /// </summary>
     /// <remarks>
-    /// The single caller is <see cref="RestoredAttemptAdopter"/>, which performs it FIRST — before
-    /// the worker becomes visible — so no observer can ever see an adopted worker whose attempt is
-    /// still reported as held. It is a compare-and-swap FROM Held, so it can never succeed after a
-    /// release: the two cannot both win.
+    /// The production adopter reaches it ONLY through
+    /// <see cref="TryAdoptRestoredActiveAttemptIfStillValid"/>, which performs it inside the
+    /// synchronized revalidation region FIRST — before the worker becomes visible — so no observer
+    /// can ever see an adopted worker whose attempt is still reported as held. It is a
+    /// compare-and-swap FROM Held, so it can never succeed after a release: the two cannot both win.
     /// </remarks>
     /// <returns>
     /// <c>true</c> when this call moved the state from Held to Adopted; <c>false</c> when the state
@@ -282,6 +283,102 @@ public sealed class GoalPipeline
             ref _restoredActiveAttemptState,
             (int)RestoredActiveAttemptState.Adopted,
             (int)RestoredActiveAttemptState.Held) == (int)RestoredActiveAttemptState.Held;
+
+    /// <summary>
+    /// THE COMMIT-REGION SEAM — a test-only hook invoked INSIDE
+    /// <see cref="TryAdoptRestoredActiveAttemptIfStillValid"/>'s <c>_lock</c> span, after the
+    /// live evidence has been revalidated and IMMEDIATELY BEFORE the Held → Adopted
+    /// compare-and-swap. <c>null</c> (the production default) means it is absent, so production is
+    /// byte-identical with or without it. It observes the linearization point; it can neither adopt
+    /// nor bypass any check.
+    /// </summary>
+    internal Action? InsideAdoptionCommitRegionForTest { get; set; }
+
+    /// <summary>
+    /// THE SYNCHRONIZED VALIDATE-AND-ADOPT REGION: revalidates the LIVE evidence a restored-attempt
+    /// adoption depends on and, only when all of it still holds, takes the hold Held → Adopted — as
+    /// ONE step inside a single <c>_lock</c> span.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. The adopter's read-only precondition chain reads the pointer, the registry slot
+    /// and the phase BEFORE the commit, without synchronization with their writers. A concurrent
+    /// cancellation, terminal failure, slot retirement or completion admission landing between those
+    /// reads and the commit would otherwise leave the hold Held — and a bare hold CAS would adopt a
+    /// canceled or invalidated attempt. This region closes that window.
+    /// </para>
+    /// <para>
+    /// THE LINEARIZATION, against every writer that can invalidate the attempt:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>PHASE — <see cref="AdvanceTo"/> (terminal Done/Failed, the NewIteration
+    ///     Planning window, cancellation's <c>MarkGoalFailedAsync</c>) mutates under <c>_lock</c>;</description></item>
+    ///   <item><description>POINTER — <see cref="SetActiveTask"/>, <see cref="TrySetActiveTask"/>,
+    ///     <see cref="ClearActiveTask"/>, <see cref="ClearActiveTaskIfCurrent"/> and
+    ///     <see cref="RetireSlotAndClearIfCurrent"/> all mutate under <c>_lock</c>;</description></item>
+    ///   <item><description>SLOT — completion admission (<see cref="AdmitCompletion"/>, Pending →
+    ///     Claimed), stale-cleanup retirement (<see cref="RetireSlotAndClearIfCurrent"/>) and every
+    ///     other registry transition mutate under <c>_lock</c>;</description></item>
+    ///   <item><description>STATE MACHINE — its terminal and NewIteration moves take the machine's OWN
+    ///     lock, which the lock-order prohibition forbids nesting inside <c>_lock</c>. The region
+    ///     therefore reads <see cref="PipelineStateMachine.Phase"/> RAW (a coherent single value, no
+    ///     lock taken). Every production machine move that invalidates the attempt is PAIRED with a
+    ///     <c>_lock</c>-taking <see cref="AdvanceTo"/> (Fail → Failed, NewIteration → Planning), so a
+    ///     machine move either lands before the raw read (→ refusal) or its paired
+    ///     <see cref="AdvanceTo"/> lands after the CAS (→ the hold is Adopted and the existing paths
+    ///     see the terminal phase).</description></item>
+    /// </list>
+    /// <para>
+    /// So an invalidating transition either happens BEFORE this region's validation (→
+    /// <see cref="RestoredAttemptCommitDecision.AttemptNoLongerValid"/>, nothing mutated, the hold
+    /// untouched) or AFTER its CAS (→ the hold is Adopted, and the existing completion/cancel paths
+    /// observe the terminal state exactly as they would for any busy worker). The hold's release is
+    /// a lock-free CAS FROM Held, so adopt/release mutual exclusion is unchanged.
+    /// </para>
+    /// <para>
+    /// No other lock is taken here, so this region cannot participate in a lock-order cycle.
+    /// </para>
+    /// </remarks>
+    /// <param name="expectedSlot">The RECORDED slot the adoption claims; must be non-null.</param>
+    /// <returns>The commit decision.</returns>
+    internal RestoredAttemptCommitDecision TryAdoptRestoredActiveAttemptIfStillValid(WorkSlot expectedSlot)
+    {
+        ArgumentNullException.ThrowIfNull(expectedSlot);
+
+        lock (_lock)
+        {
+            var expectedPhase = expectedSlot.Position.Phase;
+
+            // THE LIVE POINTER must still name the claimed task, ordinally.
+            if (!string.Equals(ActiveTaskId, expectedSlot.TaskId, StringComparison.Ordinal))
+                return RestoredAttemptCommitDecision.AttemptNoLongerValid;
+
+            // THE LIVE PHASE: the pipeline's own phase (written only under this lock) and the raw
+            // machine phase must both still be the slot's worker phase — never terminal or Planning.
+            if (Phase is GoalPhase.Planning or GoalPhase.Done or GoalPhase.Failed
+                || Phase != expectedPhase
+                || StateMachine.Phase != expectedPhase)
+            {
+                return RestoredAttemptCommitDecision.AttemptNoLongerValid;
+            }
+
+            // THE LIVE SLOT: still registered, still PENDING (not admitted, not retired), and still
+            // the exact recorded slot (task id, position and attempt).
+            if (!_slots.TryGetValue(expectedSlot.TaskId, out var entry)
+                || entry.State != WorkSlotState.Pending
+                || entry.Slot != expectedSlot)
+            {
+                return RestoredAttemptCommitDecision.AttemptNoLongerValid;
+            }
+
+            InsideAdoptionCommitRegionForTest?.Invoke();
+
+            // THE CAS, in the same span as the validation it depends on.
+            return TryAdoptRestoredActiveAttempt()
+                ? RestoredAttemptCommitDecision.Adopted
+                : RestoredAttemptCommitDecision.HoldAlreadyReleased;
+        }
+    }
 
     /// <summary>
     /// THE RELEASE TRANSITION: Held → Released, atomically. Used by the unclaimed-held-attempt
@@ -1968,6 +2065,29 @@ internal enum RestoredActiveAttemptState
     /// from <see cref="Released"/>.
     /// </summary>
     Adopted = 2,
+}
+
+/// <summary>
+/// The outcome of <see cref="GoalPipeline.TryAdoptRestoredActiveAttemptIfStillValid"/> — the
+/// synchronized validate-and-adopt region — exhaustively.
+/// </summary>
+internal enum RestoredAttemptCommitDecision
+{
+    /// <summary>The live evidence still held and the hold moved Held → Adopted.</summary>
+    Adopted,
+
+    /// <summary>
+    /// The live evidence still held but the hold was no longer Held (the release sweep won): nothing
+    /// was mutated.
+    /// </summary>
+    HoldAlreadyReleased,
+
+    /// <summary>
+    /// The live pointer, phase or slot no longer matches the recorded attempt (a cancellation,
+    /// terminal transition, retirement or completion admission landed first): nothing was mutated
+    /// and the hold is untouched.
+    /// </summary>
+    AttemptNoLongerValid,
 }
 
 /// <summary>
