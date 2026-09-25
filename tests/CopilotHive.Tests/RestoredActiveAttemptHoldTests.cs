@@ -1613,7 +1613,7 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
         // NOTHING mutated: the queue entry is retained, the pointer and the mapping survive, and
         // NO redispatch was enqueued.
         Assert.NotNull(queue.GetActiveTask(taskId));
-        Assert.Null(queue.TryDequeueAny() is { } notEnqueued ? null : queue.TryDequeueAny());
+        Assert.Null(queue.TryDequeueAny());
         Assert.Equal(taskId, held.ActiveTaskId);
         Assert.Same(held, restoreManager.GetByTaskId(taskId));
         Assert.Empty(QueuedRedispatches(dispatcher));
