@@ -15,9 +15,10 @@ namespace CopilotHive.Tests;
 /// Slice 1A1/2 Program.cs registration tests: a <see cref="HiveConfigFile"/> singleton is ALWAYS
 /// registered (even when <c>--config-repo</c> is empty), the no-repo fallback carries a NULL
 /// <see cref="OrchestratorConfig.Model"/> (never <see cref="Constants.DefaultWorkerModel"/>), and
-/// the Brain registration is config-driven (Slice 2): with the null fallback model the Brain is
-/// NOT registered at all — <c>BRAIN_MODEL</c> no longer gates or seeds it. The Composer stays
-/// resolver-only and registers as a disconnected shell.
+/// the Brain is MANDATORY (CopilotHive has no no-Brain operating mode): the null fallback model
+/// is not a "no Brain" state — this host supplies its own Brain explicitly, exactly as test hosts
+/// must, and <c>BRAIN_MODEL</c> neither gates nor seeds it. The Composer stays resolver-only and
+/// registers as a disconnected shell.
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class ConfigRegistrationTests : IDisposable
@@ -56,6 +57,12 @@ public sealed class ConfigRegistrationTests : IDisposable
     /// <summary>Boots the real application (no <c>--config-repo</c> argument) in Testing mode.</summary>
     private sealed class ConfigRegistrationFactory : WebApplicationFactory<Program>
     {
+        /// <summary>
+        /// The Brain this host registers for itself. Exposed so a test can prove the host resolved
+        /// THIS instance (identity), not a production Brain seeded from an environment variable.
+        /// </summary>
+        public NoOpDistributedBrain Brain { get; } = new();
+
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
@@ -65,7 +72,7 @@ public sealed class ConfigRegistrationTests : IDisposable
             // HiveConfigFile is the null-orchestrator.model fallback — it supplies a Brain
             // explicitly instead of relying on a configured model.
             builder.ConfigureServices(services =>
-                services.ReplaceDistributedBrain(new NoOpDistributedBrain()));
+                services.ReplaceDistributedBrain(Brain));
         }
     }
 
@@ -92,42 +99,37 @@ public sealed class ConfigRegistrationTests : IDisposable
     }
 
     [Fact]
-    public void NoConfigRepo_BrainNotRegistered_GetServiceReturnsNull_EnvHasNoEffect()
+    public void NoConfigRepo_BrainIsHostSuppliedInstance_EnvHasNoEffect()
     {
-        // BRAIN_MODEL is set (class ctor) — Slice 2: the env var no longer gates or seeds the
-        // Brain. With the no-config-repo fallback's EMPTY Orchestrator.Model the Brain must NOT
-        // be registered at all, so GetService<IDistributedBrain>() returns null.
+        // The Brain is MANDATORY: GetService<IDistributedBrain>() must never be null, even for the
+        // null-orchestrator.model no-config-repo fallback. This host supplies its own Brain
+        // explicitly (the test-host contract), and that EXACT instance is what the host resolves.
         var brain = _factory.Services.GetService<IDistributedBrain>();
 
-        Assert.Null(brain);
+        Assert.NotNull(brain);
+        Assert.Same(_factory.Brain, brain);
+
+        // BRAIN_MODEL is set (class ctor) and still has NO effect: had the env var seeded or gated
+        // the Brain, the resolved instance would be the production DistributedBrain (or the
+        // registration would have thrown on the null fallback model) — never this stub.
+        Assert.IsNotType<DistributedBrain>(brain);
+        Assert.Null(brain!.GetStats());
     }
 
     [Fact]
-    public void NoConfigRepo_NoBrain_ConsumersDegradeGracefully()
+    public void NoConfigRepo_StubBrainHost_StartupLog_NoBrainEnabledOrDisabledMessage()
     {
-        // With no Brain registered, consumers that take IDistributedBrain as an OPTIONAL
-        // constructor parameter resolve normally with a null Brain (no crash, no DI failure).
-        var dispatcher = _factory.Services.GetService<GoalDispatcher>();
-
-        Assert.NotNull(dispatcher);
-
-        var brainField = typeof(GoalDispatcher).GetField("_brain", BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_brain field not found on GoalDispatcher");
-        Assert.Null(brainField.GetValue(dispatcher));
-    }
-
-    [Fact]
-    public void NoConfigRepo_StartupLog_BrainDisabled_NoModelConfigured()
-    {
-        // Startup logging: with no config repo (empty model fallback) the Brain is disabled and
-        // Program.cs must log the config-driven disable message (no BRAIN_MODEL-based message).
+        // The "Brain enabled" line now comes from the PRODUCTION registration factory (which never
+        // runs when a host supplies its own Brain), and "Brain disabled" no longer exists at all:
+        // a stub-Brain host must log neither.
         var logs = _factory.Services.GetRequiredService<DashboardLogSink>()
             .GetRecent(int.MaxValue)
             .Select(e => e.Message)
             .ToList();
 
-        Assert.Contains(logs, m => m.Contains(
+        Assert.DoesNotContain(logs, m => m.Contains(
             "Brain disabled — no brain model configured in hive-config.yaml", StringComparison.Ordinal));
+        Assert.DoesNotContain(logs, m => m.Contains("Brain enabled", StringComparison.Ordinal));
         Assert.DoesNotContain(logs, m => m.Contains("BRAIN_MODEL", StringComparison.Ordinal));
     }
 
