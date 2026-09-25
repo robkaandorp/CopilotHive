@@ -1738,8 +1738,10 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     /// THE INTERLEAVING: every read-only precondition has passed, the adoption has ENTERED the
     /// synchronized region, and its live pointer/phase/slot revalidation has already SUCCEEDED
     /// (the commit-region hook fires only after it) — so any route check placed BEFORE the region
-    /// would already have passed too. The real <c>ClearGoalRetryState</c> runs at that instant; the
-    /// adoption is released. The route, proven inside the same span adjacent to the CAS, must fail
+    /// would already have passed too. A TCS gate parks the adoption at that boundary, with a real
+    /// Failed goal row and the held-Coding pipeline coexisting. The real
+    /// <c>ClearGoalRetryState</c> runs on another thread, then the adoption is released. The route,
+    /// proven inside the same span adjacent to the CAS, must fail
     /// closed: <c>RouteNoLongerValid</c>, <c>adopted_task = false</c> (NEVER true), no busy worker,
     /// no active entry, the hold untouched.
     /// </para>
@@ -1756,6 +1758,19 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         var (_, taskId, _) = SeedHeldAttempt(goalId, workerId);
         var (manager, pipeline) = RestoreHeldAttempt(goalId, taskId);
 
+        // The public retry path is enabled by a FAILED goal row. Keep it independent of the held
+        // Coding pipeline's snapshot, as in the startup conflict fixture: the row may say Failed
+        // while the restored pipeline still owns a Pending Coding attempt.
+        var goalStore = new GoalStore(new SharedCacheContextFactory(_connectionString),
+            NullLogger<GoalStore>.Instance);
+        var failedGoal = NewGoal(goalId);
+        failedGoal.Status = GoalStatus.Failed;
+        await goalStore.CreateGoalAsync(failedGoal, TestContext.Current.CancellationToken);
+        Assert.Equal(GoalStatus.Failed,
+            (await goalStore.GetGoalAsync(goalId, TestContext.Current.CancellationToken))!.Status);
+        Assert.True(pipeline.IsRestoredActiveAttemptHold);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+
         var harness = CreateRegisterHarness(manager, withAdopter: true);
 
         // THE REAL RETRY-CLEARING WRITER: the production dispatcher over the SAME manager. Its
@@ -1767,30 +1782,61 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
-        var regionReached = false;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         pipeline.InsideAdoptionCommitRegionForTest = () =>
         {
-            regionReached = true;
+            // Every read-only precondition AND the live pointer/slot/phase validation have passed.
+            // No route is removed here: the test drives the independent real retry writer while this
+            // invocation remains parked inside the actual production validation/CAS region.
+            entered.TrySetResult();
+            Assert.True(release.Task.Wait(CommitOrderWait), "the held commit region must be released");
+        };
 
-            // Precondition of the vector: the route was STILL valid when the region was entered, so
-            // a pre-region route check could not have refused.
+        var registration = Task.Run(() => RegisterAsync(harness, workerId, taskId));
+        Exception? primary = null;
+        try
+        {
+            await entered.Task.WaitAsync(CommitOrderWait, TestContext.Current.CancellationToken);
+            Assert.False(registration.IsCompleted);
+            // A separate removal with NO terminal transition: the pre-region route lookup passed,
+            // but this operation removes the mapping BEFORE the in-region route probe and CAS.
             Assert.Same(pipeline, manager.GetByTaskId(taskId));
-
             retryDispatcher.ClearGoalRetryState(goalId);
-
-            // The removal genuinely changed only the ROUTE — no terminal transition, the live
-            // evidence the region already validated is exactly as it was.
             Assert.Null(manager.GetByTaskId(taskId));
             Assert.Equal(GoalPhase.Coding, pipeline.Phase);
             Assert.Equal(taskId, pipeline.ActiveTaskId);
-        };
+            Assert.True(pipeline.IsRestoredActiveAttemptHold);
+        }
+        catch (Exception ex)
+        {
+            primary = ex;
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
 
-        var response = await RegisterAsync(harness, workerId, taskId);
+        // Join the producer even on an assertion failure in the window. Preserve that failure if
+        // both the stimulus and producer fail, rather than masking it with a teardown exception.
+        CopilotHive.Shared.Grpc.RegisterResponse? response = null;
+        try
+        {
+            response = await registration.WaitAsync(CommitOrderWait, TestContext.Current.CancellationToken);
+        }
+        catch when (primary is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw();
+            throw;
+        }
+        if (primary is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw();
 
-        Assert.True(regionReached, "the removal must land inside the synchronized region for this vector");
-        Assert.True(response.Accepted, "a lost route never fails the registration itself");
+        Assert.NotNull(response);
+        Assert.True(response!.Accepted, "a lost route never fails the registration itself");
         Assert.False(response.AdoptedTask, "a routeless attempt must NEVER be reported adopted");
-
+        Assert.Equal(GoalStatus.Failed,
+            (await goalStore.GetGoalAsync(goalId, TestContext.Current.CancellationToken))!.Status);
         AssertSingleAdoptionRefusalWarning(harness, "RouteNoLongerValid", workerId, taskId);
         AssertDeclinedClaim(harness, pipeline, workerId, taskId, expectHeld: true);
     }
@@ -2139,39 +2185,52 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     }
 
     /// <summary>
-    /// A capturing logger that also records whether the pool's <c>_activityLock</c> was held by the
-    /// emitting thread at the instant of EACH record — the M2 witness that the guarded warning is
-    /// emitted only AFTER the lock is released.
+    /// Observes the REAL pool API at warning emission rather than inspecting a private monitor.
+    /// A separate thread calls <see cref="WorkerPool.GetIdleWorker"/>, which must acquire the
+    /// activity lock. Its entry is signalled before that call; the logger waits for a POSITIVE
+    /// completed production read while the warning is being emitted. A logger invoked while the
+    /// caller still owns the activity lock cannot complete that read until it returns, and records
+    /// false (bounded failure). All spawned readers are joined before the test ends.
     /// </summary>
-    private sealed class LockAwarePoolLogger(WorkerPool pool) : ILogger<WorkerPool>
+    private sealed class PoolReadAtWarningLogger(WorkerPool pool) : ILogger<WorkerPool>
     {
-        private readonly Lock _activityLock = (Lock)(typeof(WorkerPool)
-            .GetField("_activityLock", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            ?.GetValue(pool)
-            ?? throw new InvalidOperationException("WorkerPool no longer has a private '_activityLock' field."));
-
-        public List<(LogLevel Level, string Message, bool LockHeld)> Entries { get; } = [];
-
+        private readonly List<Task<ConnectedWorker?>> _reads = [];
+        public List<(LogLevel Level, string Message, bool ReadFinishedAtEmission)> Entries { get; } = [];
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-
         public bool IsEnabled(LogLevel logLevel) => true;
 
-        public void Log<TState>(
-            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
-            Func<TState, Exception?, string> formatter) =>
-            Entries.Add((logLevel, formatter(state, exception), _activityLock.IsHeldByCurrentThread));
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var read = Task.Run(() =>
+            {
+                entered.TrySetResult();
+                return pool.GetIdleWorker();
+            });
+            _reads.Add(read);
+            Assert.True(entered.Task.Wait(CommitOrderWait),
+                "the independent pool reader must start while the warning is emitted");
+            Entries.Add((logLevel, formatter(state, exception), read.Wait(CommitOrderWait)));
+        }
+
+        public void AssertReadersJoined()
+        {
+            foreach (var read in _reads)
+                Assert.True(read.Wait(CommitOrderWait), "the warning's independent pool reader leaked");
+        }
     }
 
     /// <summary>
-    /// A WorkerPool whose logger is a <see cref="LockAwarePoolLogger"/> over that same pool (the
-    /// logger must reach the pool's own lock, so it is bound after construction).
+    /// The pool's logger observes GetIdleWorker from another thread at the actual warning sink.
+    /// A forwarder binds the logger to the same pool after construction.
     /// </summary>
-    private static (WorkerPool Pool, LockAwarePoolLogger Logger) CreateLockAwarePool()
+    private static (WorkerPool Pool, PoolReadAtWarningLogger Logger) CreatePoolWithWarningReadProbe()
     {
-        LockAwarePoolLogger? logger = null;
+        PoolReadAtWarningLogger? logger = null;
         var forwarding = new ForwardingPoolLogger(() => logger!);
         var pool = new WorkerPool(forwarding);
-        logger = new LockAwarePoolLogger(pool);
+        logger = new PoolReadAtWarningLogger(pool);
         return (pool, logger);
     }
 
@@ -2205,7 +2264,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     [Fact]
     public void RegisterAdoptedWorker_LostRaceWithThrowingRemoval_ReturnsDuplicateId_AndReportsTheCleanup()
     {
-        var (pool, logger) = CreateLockAwarePool();
+        var (pool, logger) = CreatePoolWithWarningReadProbe();
         var queue = new TaskQueue();
         var task = BuildTask("task-throwing-race");
 
@@ -2232,7 +2291,9 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         Assert.Contains("worker-throwing-race", warning.Message, StringComparison.Ordinal);
         Assert.Contains($"removal threw {nameof(ThreadInterruptedException)}", warning.Message, StringComparison.Ordinal);
         Assert.Contains("own entry remains in the queue as residue", warning.Message, StringComparison.Ordinal);
-        Assert.False(warning.LockHeld, "the warning must be emitted only AFTER _activityLock is released");
+        logger.AssertReadersJoined();
+        Assert.True(warning.ReadFinishedAtEmission,
+            "the independent GetIdleWorker read must FINISH while the warning is emitted, after the pool lock is released");
     }
 
     /// <summary>
@@ -2243,7 +2304,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     [Fact]
     public void RegisterAdoptedWorker_ThrowWithThrowingRemoval_RethrowsTheOriginal_AndReportsTheCleanup()
     {
-        var (pool, logger) = CreateLockAwarePool();
+        var (pool, logger) = CreatePoolWithWarningReadProbe();
         var queue = new TaskQueue();
         var task = BuildTask("task-throwing-throw");
         var original = new InvalidOperationException("original-commit-failure");
@@ -2269,7 +2330,9 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         Assert.Contains("worker-throwing-throw", warning.Message, StringComparison.Ordinal);
         Assert.Contains($"removal threw {nameof(ThreadInterruptedException)}", warning.Message, StringComparison.Ordinal);
         Assert.Contains("own entry remains in the queue as residue", warning.Message, StringComparison.Ordinal);
-        Assert.False(warning.LockHeld, "the warning must be emitted only AFTER _activityLock is released");
+        logger.AssertReadersJoined();
+        Assert.True(warning.ReadFinishedAtEmission,
+            "the independent GetIdleWorker read must FINISH while the warning is emitted, after the pool lock is released");
     }
 
     /// <summary>
@@ -2283,7 +2346,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
     [Fact]
     public void RegisterAdoptedWorker_LostRaceWithAlreadyAbsentEntry_DoesNotClaimResidue()
     {
-        var (pool, logger) = CreateLockAwarePool();
+        var (pool, logger) = CreatePoolWithWarningReadProbe();
         var queue = new TaskQueue();
         var task = BuildTask("task-absent-race");
 
@@ -2306,7 +2369,9 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
         Assert.Contains("already absent", warning.Message, StringComparison.Ordinal);
         Assert.Contains("no residue remains", warning.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("remains in the queue as residue", warning.Message, StringComparison.Ordinal);
-        Assert.False(warning.LockHeld, "the warning must be emitted only AFTER _activityLock is released");
+        logger.AssertReadersJoined();
+        Assert.True(warning.ReadFinishedAtEmission,
+            "the independent GetIdleWorker read must FINISH while the warning is emitted, after the pool lock is released");
     }
 
     // ═══════════════ (a) THE ADOPTED COMPLETION, END TO END THROUGH THE REAL PATHS ═══════════════
