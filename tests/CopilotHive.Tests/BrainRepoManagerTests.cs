@@ -196,6 +196,147 @@ public sealed class BrainRepoManagerTests : IDisposable
         Assert.Equal(BranchDeleteResult.NotFound, result);
     }
 
+    // ── Cancellation contract of DeleteRemoteBranchAsync ──────────────────────
+    //
+    // All four tests below drive the PRODUCTION classification code through the injected
+    // `_gitRunner` seam (no git process, no network). The clone directory exists and no
+    // configured-URL lookup is wired, so the credential refresh short-circuits and the ONLY
+    // commands the manager issues are the delete push and the best-effort `branch -D`.
+
+    /// <summary>
+    /// Builds a manager wired to the injected runner seam with a clone directory present and NO
+    /// credential lookups (the refresh short-circuits, so the runner records exactly the commands
+    /// under test). Returns the recorded command strings in issue order.
+    /// </summary>
+    private (BrainRepoManager Manager, List<string> Commands) CreateSeamManager(
+        Func<BrainGitRequest, BrainGitResult> respond)
+    {
+        var commands = new List<string>();
+        var manager = new BrainRepoManager(
+            _tempDir,
+            new TestLogger<BrainRepoManager>(),
+            request =>
+            {
+                commands.Add(string.Join(' ', request.Arguments));
+                return respond(request);
+            });
+
+        Directory.CreateDirectory(Path.Combine(manager.GetClonePath("seam-repo"), ".git"));
+        return (manager, commands);
+    }
+
+    /// <summary>
+    /// A caller cancellation DURING the delete push is not a git outcome: it propagates as
+    /// <see cref="OperationCanceledException"/> (carrying the caller's token) and the local
+    /// <c>branch -D</c> cleanup is not issued at all.
+    /// </summary>
+    /// <remarks>
+    /// The propagated exception is asserted to be the SEAM'S OWN sentinel instance, which is what
+    /// makes this removal-proof: if the cancellation filter were dropped, the OCE would be
+    /// classified as a git result and the method would go on to attempt the local cleanup — whose
+    /// pre-launch cancellation guard then throws a DIFFERENT (framework-created)
+    /// <see cref="OperationCanceledException"/>. A bare "an OCE was thrown" assertion would accept
+    /// that; the instance identity does not. The mutation that rethrows only AFTER the local cleanup
+    /// is killed by the <c>branch -D</c> absence assertion.
+    /// </remarks>
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_CancelledDuringPush_PropagatesAndSkipsLocalCleanup()
+    {
+        using var cts = new CancellationTokenSource();
+        var sentinel = new OperationCanceledException(
+            "DELIBERATE-PUSH-CANCELLATION-SENTINEL", cts.Token);
+        var (manager, commands) = CreateSeamManager(request =>
+        {
+            if (request.Arguments.Contains("--delete"))
+            {
+                cts.Cancel();
+                throw sentinel;
+            }
+
+            return new BrainGitResult(0, string.Empty, string.Empty);
+        });
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => manager.DeleteRemoteBranchAsync("seam-repo", "feature", cts.Token));
+
+        // The push's OWN cancellation propagated — not a later, unrelated cancellation.
+        Assert.Same(sentinel, ex);
+        Assert.Equal(cts.Token, ex.CancellationToken);
+
+        // Premise: the delete push really was attempted through this seam.
+        Assert.Contains(commands, c => c.StartsWith("push origin --delete", StringComparison.Ordinal));
+
+        // The cancelled push must not be followed by the local cleanup command.
+        Assert.DoesNotContain(commands, c => c.StartsWith("branch -D", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A caller cancellation DURING the best-effort local cleanup (after a successful push)
+    /// propagates instead of being swallowed into <see cref="BranchDeleteResult.Success"/>.
+    /// </summary>
+    /// <remarks>
+    /// Kills the mutation that restores a bare <c>catch { }</c> around the cleanup: the push
+    /// succeeds, so the method would return <see cref="BranchDeleteResult.Success"/> and the throw
+    /// assertion fails. The propagated exception is asserted to be the cleanup seam's OWN sentinel
+    /// instance, so a mutant that swallowed it and threw some unrelated cancellation cannot pass.
+    /// </remarks>
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_CancelledDuringLocalCleanup_PropagatesInsteadOfSuccess()
+    {
+        using var cts = new CancellationTokenSource();
+        var sentinel = new OperationCanceledException(
+            "DELIBERATE-CLEANUP-CANCELLATION-SENTINEL", cts.Token);
+        var (manager, commands) = CreateSeamManager(request =>
+        {
+            if (request.Arguments.Contains("-D"))
+            {
+                cts.Cancel();
+                throw sentinel;
+            }
+
+            return new BrainGitResult(0, string.Empty, string.Empty); // the push succeeds
+        });
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => manager.DeleteRemoteBranchAsync("seam-repo", "feature", cts.Token));
+
+        Assert.Same(sentinel, ex);
+        Assert.Equal(cts.Token, ex.CancellationToken);
+
+        // Both commands really ran — the failure is the cleanup's cancellation, not a missing push.
+        Assert.Contains(commands, c => c.StartsWith("push origin --delete", StringComparison.Ordinal));
+        Assert.Contains(commands, c => c.StartsWith("branch -D", StringComparison.Ordinal));
+    }
+
+    /// <summary>A NON-cancellation push failure is still a git result: <c>Failed</c>.</summary>
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_PushFails_StillReturnsFailed()
+    {
+        var (manager, _) = CreateSeamManager(request => request.Arguments.Contains("--delete")
+            ? new BrainGitResult(128, string.Empty, "fatal: unable to access the remote repository")
+            : new BrainGitResult(0, string.Empty, string.Empty));
+
+        var result = await manager.DeleteRemoteBranchAsync(
+            "seam-repo", "feature", TestContext.Current.CancellationToken);
+
+        Assert.Equal(BranchDeleteResult.Failed, result);
+    }
+
+    /// <summary>"remote ref does not exist" is still classified as <c>NotFound</c>.</summary>
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_RemoteRefDoesNotExist_StillReturnsNotFound()
+    {
+        var (manager, _) = CreateSeamManager(request => request.Arguments.Contains("--delete")
+            ? new BrainGitResult(
+                1, string.Empty, "error: unable to delete 'feature': remote ref does not exist")
+            : new BrainGitResult(0, string.Empty, string.Empty));
+
+        var result = await manager.DeleteRemoteBranchAsync(
+            "seam-repo", "feature", TestContext.Current.CancellationToken);
+
+        Assert.Equal(BranchDeleteResult.NotFound, result);
+    }
+
     [Fact]
     public async Task EnsureCloneAsync_CloneExistsEmptyRemote_SkipsCheckoutAndLogsWarning()
     {

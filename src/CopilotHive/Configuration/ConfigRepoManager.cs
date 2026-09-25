@@ -763,6 +763,17 @@ public class ConfigRepoManager
     /// Runs git and returns the raw result — a non-zero exit code is RETURNED, never thrown.
     /// Routes through <see cref="GitRunner"/> when the seam is set, otherwise launches the real
     /// <c>git</c> process with the <c>-c core.autocrlf=false</c> injection.
+    /// <para>
+    /// <b>Cancellation.</b> <c>ReadToEndAsync(ct)</c>/<c>WaitForExitAsync(ct)</c> observe the token
+    /// but do NOT terminate the child process, so a cancelled caller would otherwise return while
+    /// git is still mutating the clone (and would release the caller's lock on a repo that is still
+    /// being written). A caller cancellation (<see cref="OperationCanceledException"/> raised while
+    /// <paramref name="ct"/> is cancelled) therefore performs the SAME best-effort termination the
+    /// Brain's capture runner does — a guarded <c>Kill(entireProcessTree: true)</c> followed by a
+    /// bounded <c>WaitForExit(5000)</c> — and then always rethrows the ORIGINAL cancellation.
+    /// Nothing here can block indefinitely, and failing to confirm termination never suppresses the
+    /// cancellation.
+    /// </para>
     /// </summary>
     private async Task<GitRunResult> RunGitCoreAsync(string workingDir, string[] args, CancellationToken ct)
     {
@@ -791,11 +802,74 @@ public class ConfigRepoManager
         var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
         var stderrTask = process.StandardError.ReadToEndAsync(ct);
 
-        await Task.WhenAll(stdoutTask, stderrTask);
-        await process.WaitForExitAsync(ct);
+        try
+        {
+            await Task.WhenAll(stdoutTask, stderrTask);
+            await process.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller's token was canceled while the git process was still running. Terminate the
+            // whole process tree (bounded, best-effort — see the helper) BEFORE rethrowing so a
+            // cancelled config-repo operation never leaves a git process mutating the clone after
+            // the caller has been released.
+            TerminateProcessTreeBestEffort(process);
+
+            throw; // Always rethrow the OperationCanceledException.
+        }
 
         return new GitRunResult(process.ExitCode, stdoutTask.Result, stderrTask.Result);
     }
+
+    /// <summary>
+    /// Best-effort, BOUNDED termination of a cancelled git process tree — the same shape as
+    /// <c>BrainRepoManager.RunGitCaptureAsync</c>'s cancellation cleanup. <c>Kill</c> is guarded by
+    /// <see cref="Process.HasExited"/> (checked before and after) so post-cancellation cleanup does
+    /// not race a process that is exiting anyway, the confirming wait is bounded by 5s, and the
+    /// whole helper is wrapped so that NO cleanup failure — including an unconfirmable termination —
+    /// can ever prevent the caller's cancellation from propagating.
+    /// </summary>
+    private static void TerminateProcessTreeBestEffort(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException) when (process.HasExited)
+                {
+                    // Process already exited between the HasExited check and Kill — safe to proceed.
+                }
+                catch (Exception)
+                {
+                    // Kill failed for another reason. If the process has since exited we are safe;
+                    // otherwise there is nothing more we can do — proceed best-effort.
+                }
+
+                if (!process.HasExited)
+                {
+                    // Best-effort bounded wait. If this returns false the process may still be alive
+                    // after 5s; the cancellation is still rethrown by the caller.
+                    process.WaitForExit(5000);
+                }
+            }
+        }
+        catch
+        {
+            // Last-resort guard: never prevent the cancellation from propagating.
+        }
+    }
+
+    /// <summary>
+    /// Test-only entry point that drives the real core runner (the <see cref="GitRunner"/> seam is
+    /// left <c>null</c> by the caller) so cancellation and process termination can be observed
+    /// against a REAL git process.
+    /// </summary>
+    internal Task<GitRunResult> RunGitForTestAsync(string workingDir, string[] args, CancellationToken ct) =>
+        RunGitCoreAsync(workingDir, args, ct);
 
     /// <summary>
     /// Runs the core and applies the shared failure translation: a caller cancellation
