@@ -303,11 +303,12 @@ public sealed class LlmSessionRegistryIntegrationTests
             var blockingFork = brain.ForkSessionForGoalAsync("goal-blocker", TestContext.Current.CancellationToken);
             await gate.Entered.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // A second fork must queue behind the blocked mailbox.
+            // A second fork must queue behind the blocked mailbox. The gate holds the mailbox blocked
+            // until Release(), so it - not a delay - guarantees the queued state.
+            // GoalSessionExists must NOT be called while the mailbox is blocked: it queues on the same
+            // mailbox and only times out after 1 s, proving nothing.
             var forkTask = brain.ForkSessionForGoalAsync("goal-serialized-1", TestContext.Current.CancellationToken);
-            await Task.Delay(200, TestContext.Current.CancellationToken);
             Assert.False(forkTask.IsCompleted, "Fork must remain queued while the actor mailbox is blocked");
-            Assert.False(brain.GoalSessionExists("goal-serialized-1"));
 
             // Release the mailbox; both forks complete in order.
             gate.Release();
@@ -344,7 +345,8 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             var deleteTask = brain.DeleteGoalSessionAsync("goal-order-b", TestContext.Current.CancellationToken);
 
-            await Task.Delay(200, TestContext.Current.CancellationToken);
+            // The gate holds the mailbox blocked until Release(), so it - not a delay - guarantees
+            // the delete is queued; GoalSessionExists must not be probed while the mailbox is blocked.
             Assert.False(deleteTask.IsCompleted, "Delete must stay queued while the actor mailbox is blocked");
 
             gate.Release();
