@@ -505,6 +505,25 @@ public sealed class WorkerService(
     /// <param name="primaryFailure">The run failure already propagating, or <c>null</c>.</param>
     private void DetachProvisioner(Exception? primaryFailure)
     {
+        // ── THE FAIL-CLOSED INTERIM: NEVER DETACH WHILE AN ASSIGNMENT IS CARRIED ───────────────────
+        //
+        // The installed callback is the carrying assignment's ONLY lazy provisioning route, and the
+        // assignment outlives the run that owns it. Nulling it here would leave a Carried assignment
+        // with NO callback at all for the whole time it is carried — strictly worse than the interim
+        // state, in which the callback is the ORIGINAL connection's own checked entry point: that
+        // connection is retired, so a lazy call fails with the EXISTING disconnected error, the
+        // executor's normal error path produces a failure result, and the carried delivery delivers
+        // it. Retargeting the callback onto an adopted connection is a follow-up goal's job.
+        //
+        // So while an assignment is Carried the callback stays exactly as it was. An ADOPTED run
+        // never REPLACED it either (step 5 is skipped for an adopted run), so the interim callback
+        // survives the whole adopted run — including a successor assignment accepted on the same
+        // adopted stream after the carried assignment became Delivered. At the END of a run with no
+        // assignment left Carried, this detaches as today, and every later non-adopted run installs
+        // its own as today.
+        if (_activeAssignment is { State.IsCarried: true })
+            return;
+
         try
         {
             _agentRunner.SetConfigProvisioner(null);
@@ -518,6 +537,61 @@ public sealed class WorkerService(
             }
 
             ExceptionDispatchInfo.Capture(ex).Throw();
+        }
+    }
+
+    /// <summary>
+    /// PREPARES THE AGENT RUNNER — the existing <see cref="IAgentRunner.ConnectAsync"/> step,
+    /// factored into the ONE call site that may run it so a CARRIED assignment's run can DEFER it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The step itself is UNCHANGED: the same diagnostic and the same single
+    /// <c>await _agentRunner.ConnectAsync(ct)</c> with the PROCESS token, called at most once per
+    /// run. Only ITS POSITION became conditional — a run that claims a carried task must not
+    /// re-prepare the runner the carried assignment is still running on, so it defers the call until
+    /// it knows the claim was refused, and then runs it AFTER the carried drain and BEFORE the
+    /// stream, the initial Ready or any new assignment. Every other run calls it where it always ran.
+    /// </para>
+    /// <para>
+    /// A runner preparation that faults propagates UNCHANGED to <see cref="RunAsync"/>, exactly as
+    /// before: it is run setup, not cleanup, and nothing here captures, retries or reclassifies it.
+    /// </para>
+    /// </remarks>
+    /// <param name="ct">The PROCESS token.</param>
+    private async Task ConnectAgentRunnerAsync(CancellationToken ct)
+    {
+        // This creates NO LLM client: worker containers hold no LLM credentials of their own, so the
+        // client is created lazily on the first prompt, after the orchestrator has provisioned
+        // credentials.
+        _log.Info("Preparing SharpCoder agent engine...");
+        await _agentRunner.ConnectAsync(ct);
+    }
+
+    /// <summary>The static, secret-free warning for a registration that claims an adoption nobody asked for.</summary>
+    private const string AdoptionWithoutClaimWarning =
+        "Orchestrator reported an adopted task for a registration that claimed none — ignoring it.";
+
+    /// <summary>
+    /// THE ONE WARNING for the fail-closed anomaly: an ACCEPTED registration answered
+    /// <c>adopted_task == true</c> although THIS run sent an EMPTY <c>current_task_id</c> and has
+    /// nothing carried.
+    /// </summary>
+    /// <remarks>
+    /// The answer is IGNORED — the runner was prepared, this run installs its own provisioner, sends
+    /// the initial Ready and never publishes an adoption — and the warning is emitted exactly once,
+    /// GUARDED so a degraded diagnostic sink can never change the run's outcome. It carries no
+    /// provisioned value and no exception text.
+    /// </remarks>
+    private void LogAdoptionWithoutClaimWarning()
+    {
+        try
+        {
+            _log.Warn(AdoptionWithoutClaimWarning);
+        }
+        catch
+        {
+            // A diagnostic must never affect the run's outcome.
         }
     }
 
@@ -673,11 +747,20 @@ public sealed class WorkerService(
             _currentRole = null;
         }
 
-        // Prepare the agent runner. This creates NO LLM client: worker containers hold no LLM
-        // credentials of their own, so the client is created lazily on the first prompt, after
-        // the orchestrator has provisioned credentials.
-        _log.Info("Preparing SharpCoder agent engine...");
-        await _agentRunner.ConnectAsync(ct);
+        // THE CARRIED ASSIGNMENT, if the previous run left one: it is the ONE thing a reconnect
+        // exists to preserve, and it decides this whole run's shape — whether the registration
+        // claims a current task, whether the runner may be re-prepared at all, and (on an adopted
+        // answer) whether the initial Ready is replaced by an adoption publication.
+        var carried = _activeAssignment is { State.IsCarried: true } ? _activeAssignment : null;
+
+        // Prepare the agent runner — DEFERRED FOR A CARRIED ASSIGNMENT. Re-preparing the runner
+        // tears down and re-establishes state the carried assignment is still running on, so the
+        // preparation is SKIPPED here and performed later, exactly once, on the one path that turns
+        // out not to adopt: an `adopted_task == false` answer, where it runs AFTER the carried
+        // assignment is drained and BEFORE the stream opens. A run with nothing carried, and a
+        // rejected registration, never defer it.
+        if (carried is null)
+            await ConnectAgentRunnerAsync(ct);
 
         // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network).
         // A test seam may instead supply the call invoker, so the REAL lifecycle can be driven
@@ -713,6 +796,16 @@ public sealed class WorkerService(
             // orchestrator simply ignores the field and answers with the default (disabled).
             RequestCompletionReceiptAck = true,
         };
+
+        // THE CARRIED CLAIM. Only a run that actually retained a CARRIED assignment names one, and
+        // it names that assignment's OWN task id. This is deliberately NOT authentication and NOT a
+        // proof of ownership: it is the caller's statement of what it is still working on, which the
+        // orchestrator checks against its OWN recorded evidence before answering
+        // <see cref="RegisterResponse.AdoptedTask"/>. A run with nothing carried sends the field's
+        // EMPTY default, which is exactly today's registration.
+        if (carried is not null)
+            registerRequest.CurrentTaskId = carried.TaskId;
+
         registerRequest.Capabilities.AddRange(capabilities);
 
         var registerResponse = await client.RegisterAsync(registerRequest, cancellationToken: ct);
@@ -723,6 +816,14 @@ public sealed class WorkerService(
             // ever be observed by another operation. The returned outcome is the ONLY thing this
             // branch produces — no stream is opened, no connection is constructed, and the
             // registration RPC's own failure (had there been one) would have propagated instead.
+            //
+            // A CARRIED assignment can never be adopted by a rejected registration, so it is
+            // cancelled and drained here — BEFORE any stream exists, with NO Complete — and the
+            // outcome this branch returns is unchanged. Nothing is delivered, because there is no
+            // connection to deliver it on; the process (or the next run) starts fresh.
+            if (carried is not null)
+                await DrainCarriedAssignmentAsync();
+
             _log.Error("Registration rejected by orchestrator.");
             return WorkerRunOutcome.RegistrationRejected;
         }
@@ -732,6 +833,39 @@ public sealed class WorkerService(
             : registerResponse.AssignedWorkerId;
 
         _log.Info($"Registered as {assignedId} (orchestrator v{registerResponse.OrchestratorVersion})");
+
+        // THE ADOPTION DECISION — one boolean, taken ONCE from the ACCEPTED response's OWN explicit
+        // field together with whether THIS run actually claimed a carried task. It is never derived
+        // from the version, the capabilities, a task's model, or the mere presence of a retained
+        // assignment: an answer of "adopted" for a run that sent NO current task id is a protocol
+        // anomaly and is IGNORED (fail-closed) — such a registration would otherwise be treated as an
+        // adoption it cannot be.
+        var adopted = carried is not null && registerResponse.AdoptedTask;
+
+        if (carried is not null && !adopted)
+        {
+            // ── NOT ADOPTED: THE ORCHESTRATOR DID NOT TAKE THE CARRIED TASK ────────────────────────
+            //
+            // The claim was refused, so the retained assignment has no delivery target and must not
+            // outlive this registration: it is cancelled and drained — including its carried
+            // delivery, and with NO Complete — BEFORE the stream is opened, and the ownership slot is
+            // cleared by that drain. Only THEN is the deferred runner preparation performed: the
+            // preparation is deliberately AFTER the drain (so the runner is never re-prepared while
+            // the carried work is still unwinding) and BEFORE the stream, the initial Ready and any
+            // new assignment (so this run continues exactly as an ordinary one).
+            await DrainCarriedAssignmentAsync();
+            await ConnectAgentRunnerAsync(ct);
+        }
+        else if (carried is null && registerResponse.AdoptedTask)
+        {
+            // ── THE FAIL-CLOSED ANOMALY ────────────────────────────────────────────────────────────
+            //
+            // This run claimed NO current task, so there is nothing to adopt — yet the answer says
+            // it adopted one. The answer is IGNORED: the runner was prepared as usual, this run
+            // installs its own provisioner, sends the initial Ready and never publishes an adoption.
+            // Exactly ONE warning marks the anomaly; nothing else about the run changes.
+            LogAdoptionWithoutClaimWarning();
+        }
 
         // 2. Open the bidirectional work stream. LEXICAL ownership stays here (the `using`), while
         //    the connection owns CHECKED ACCESS to it — one disposal, never two.
@@ -789,7 +923,17 @@ public sealed class WorkerService(
             //    point, so the eager per-assignment site and this lazy site share one provisioner
             //    instance AND one retirement contract — including when a TestProvisioner replaced
             //    the connection's provisioner.
-            _agentRunner.SetConfigProvisioner(connection.CreateProvisioningCallback());
+            //
+            //    SKIPPED FOR AN ADOPTED RUN, deliberately and exactly as the runner preparation is:
+            //    an adopted run must NOT replace the callback that belongs to the assignment it
+            //    adopted. Leaving it installed is the FAIL-CLOSED interim: the callback is the
+            //    ORIGINAL connection's own checked entry point, that connection is retired, so a
+            //    lazy provisioning call fails with the EXISTING disconnected error — the executor's
+            //    normal error path produces a failure result, which the carried delivery delivers.
+            //    Retargeting the callback onto the adopted connection is a follow-up goal's job, and
+            //    NO mid-run install is performed here.
+            if (!adopted)
+                _agentRunner.SetConfigProvisioner(connection.CreateProvisioningCallback());
 
             // 6. Start heartbeat background task. The launch point is UNCHANGED: with no seam
             //    supplied this is the production loop over its own 30-second PeriodicTimer; a
@@ -800,8 +944,28 @@ public sealed class WorkerService(
                 ? RunHeartbeatAsync(connection, heartbeatCts.Token)
                 : HeartbeatTaskFactory(connection, heartbeatCts);
 
-            // 7. Send WorkerReady
-            await SendWorkerReady(connection, ct);
+            if (adopted)
+            {
+                // 7a. ADOPTED — PUBLISH THE ADOPTION INSTEAD OF SENDING AN INITIAL READY.
+                //
+                // The orchestrator already took this worker's carried task, so an initial Ready
+                // would invite a NEW assignment for a worker that is not idle; what the adopted
+                // assignment needs is exactly this publication: "the retained result may now be
+                // delivered on THIS connection, written with THIS run's stream token". It is the LAST
+                // step before the message loop, so every earlier step (stream open, connection
+                // construction, publication, heartbeat start) has already succeeded.
+                //
+                // Nothing before this point publishes an adoption: if ANY of those steps throws, the
+                // assignment stays Carried, the `finally` below retires and unpublishes the
+                // connection, the carried delivery keeps waiting for a later one, and the exception
+                // propagates exactly as today.
+                PublishAdoption(connection, ct);
+            }
+            else
+            {
+                // 7b. Send WorkerReady — today's initial readiness for every non-adopted run.
+                await SendWorkerReady(connection, ct);
+            }
 
             // 8. Main message loop
             await ProcessMessagesAsync(connection, ct);
