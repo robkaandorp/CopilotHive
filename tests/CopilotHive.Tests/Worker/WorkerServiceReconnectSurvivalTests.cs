@@ -886,6 +886,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
         Task? execution = null;
         Task? reporting = null;
         Task? carriedDelivery = null;
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             responses.Push(ResultAssignment("task-A"));
@@ -904,7 +905,6 @@ public sealed class WorkerServiceReconnectSurvivalTests
             CancellationToken? observedToken = null;
             var completesAtHook = -1;
             var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             service.CarriedBeforeCompleteSendHook = token =>
             {
                 completesAtHook = adoptedRequests.Completes.Count;
@@ -937,6 +937,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
         }
         finally
         {
+            hookRelease.TrySetResult();
             service.CarriedBeforeCompleteSendHook = null;
             await CarryHarness.TeardownAsync(harness, execution, reporting, carriedDelivery);
         }
@@ -958,6 +959,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
         Task? execution = null;
         Task? reporting = null;
         Task? carriedDelivery = null;
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             responses.Push(ResultAssignment("task-A"));
@@ -976,7 +978,6 @@ public sealed class WorkerServiceReconnectSurvivalTests
             var readiesAtHook = -1;
             var claimStateAtHook = -1;
             var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             service.CarriedBeforeReadyClaimHook = () =>
             {
                 completesAtHook = adoptedRequests.Completes.Count;
@@ -1005,6 +1006,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
         }
         finally
         {
+            hookRelease.TrySetResult();
             service.CarriedBeforeReadyClaimHook = null;
             await CarryHarness.TeardownAsync(harness, execution, reporting, carriedDelivery);
         }
@@ -1234,16 +1236,25 @@ public sealed class WorkerServiceReconnectSurvivalTests
             Task? reporting,
             Task? carriedDelivery)
         {
+            harness.ReleaseDisposeHold();
             harness.Responses.TryComplete();
             harness.Requests.ReleaseAll();
             harness.Runner.ReleaseAll();
-            await harness.Service.DrainCarriedAssignmentAsync();
-            await JoinAllForTeardownAsync(
-                ("assignment execution", execution),
-                ("assignment reporting", reporting),
-                ("carried delivery", carriedDelivery),
-                ("run", harness.Run));
-            TryDispose(harness.Service);
+            Exception? primary = null;
+            try { await harness.Service.DrainCarriedAssignmentAsync(); }
+            catch (Exception ex) { primary = ex; }
+            try
+            {
+                await JoinAllForTeardownAsync(
+                    ("assignment execution", execution),
+                    ("assignment reporting", reporting),
+                    ("carried delivery", carriedDelivery),
+                    ("run", harness.Run));
+            }
+            catch (Exception ex) { primary ??= ex; }
+            finally { TryDispose(harness.Service); }
+            if (primary is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw();
         }
     }
 
@@ -1317,6 +1328,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
     {
         var active = GetActiveAssignment(service);
         return (Task)active.GetType().GetProperty("Reporting")!.GetValue(active)!;
+    }
+
+    private static TaskResult? GetRetainedResult(WorkerService service)
+    {
+        var active = GetActiveAssignment(service);
+        var holder = active.GetType().GetProperty("TerminalResult")!.GetValue(active)!;
+        return (TaskResult?)holder.GetType().GetProperty("Result")!.GetValue(holder);
     }
 
     private static CancellationTokenSource GetOwnerCts(WorkerService service)
@@ -1556,7 +1574,9 @@ public sealed class WorkerServiceReconnectSurvivalTests
         private readonly Dictionary<int, TaskCompletionSource> _readyEntered = [];
         private readonly Dictionary<int, TaskCompletionSource> _readyRelease = [];
         private readonly Dictionary<int, TaskCompletionSource> _writeCountWaiters = [];
+        private readonly Dictionary<int, TaskCompletionSource> _readyCountWaiters = [];
         private bool _releaseImmediately;
+        private bool _disposed;
         private int _holdCompletesFrom = int.MaxValue;
         private int _holdReadiesFrom = int.MaxValue;
         private Exception? _failNextCompleteWrite;
@@ -1648,9 +1668,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
         {
             lock (_gate)
             {
-                if (_readies.Count >= count + 1)
+                var threshold = count + (CountsFirstReadyAsInitial ? 1 : 0);
+                if (_readies.Count >= threshold)
                     return Task.CompletedTask;
-                return WriteCountWaiterLocked(count + 1).Task;
+                if (!_readyCountWaiters.TryGetValue(threshold, out var waiter))
+                    _readyCountWaiters[threshold] = waiter =
+                        new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                return waiter.Task;
             }
         }
 
@@ -1677,7 +1701,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
         internal Task AssignmentReadyEntered(int ordinal)
         {
             lock (_gate)
-                return _readies.Count > ordinal + 1
+                return _readies.Count > ordinal + (CountsFirstReadyAsInitial ? 1 : 0)
                     ? Task.CompletedTask
                     : Slot(_readyEntered, ordinal).Task;
         }
@@ -1712,7 +1736,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
         {
             lock (_gate)
             {
-                _releaseImmediately = true;
+                _disposed = true;
                 foreach (var source in _completeRelease.Values) source.TrySetCanceled();
                 foreach (var source in _readyRelease.Values) source.TrySetCanceled();
             }
@@ -1737,8 +1761,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
                     _completes.Add(message);
                     _writes.Add(message);
                     release = index >= _holdCompletesFrom ? Slot(_completeRelease, index) : null;
-                    if (_releaseImmediately && release is not null)
-                        release.TrySetResult();
+                    if (_disposed && release is not null) release.TrySetCanceled();
+                    else if (_releaseImmediately && release is not null) release.TrySetResult();
                     SignalWriteCountLocked();
                 }
 
@@ -1773,17 +1797,21 @@ public sealed class WorkerServiceReconnectSurvivalTests
             TaskCompletionSource? readyRelease;
             lock (_gate)
             {
-                ordinal = _readies.Count - 1;
+                ordinal = _readies.Count - (CountsFirstReadyAsInitial ? 1 : 0);
                 _readies.Add(message);
                 _writes.Add(message);
                 readyRelease = ordinal >= _holdReadiesFrom ? Slot(_readyRelease, ordinal) : null;
-                if (_releaseImmediately && readyRelease is not null)
-                    readyRelease.TrySetResult();
+                if (_disposed && readyRelease is not null) readyRelease.TrySetCanceled();
+                else if (_releaseImmediately && readyRelease is not null) readyRelease.TrySetResult();
                 SignalWriteCountLocked();
+                foreach (var (threshold, waiter) in _readyCountWaiters.ToArray())
+                    if (_readies.Count >= threshold)
+                    {
+                        _readyCountWaiters.Remove(threshold);
+                        waiter.TrySetResult();
+                    }
+                if (ordinal >= 0) Slot(_readyEntered, ordinal).TrySetResult();
             }
-
-            if (ordinal >= 0)
-                Slot(_readyEntered, ordinal).TrySetResult();
 
             if (readyRelease is not null)
             {
@@ -1815,8 +1843,9 @@ public sealed class WorkerServiceReconnectSurvivalTests
                     ready.Add(waiter);
             }
 
-            foreach (var waiter in ready)
-                _writeCountWaiters.Remove(waiter.Task.Id);
+            foreach (var (threshold, waiter) in _writeCountWaiters.ToArray())
+                if (_writes.Count >= threshold)
+                    _writeCountWaiters.Remove(threshold);
 
             foreach (var waiter in ready)
                 waiter.TrySetResult();
@@ -2045,31 +2074,24 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// <c>current_task_id</c>, gets <c>adopted=true</c>, does NOT call
     /// <c>ConnectAsync</c>, and sends no initial Ready. The retained result is delivered
     /// exactly once on the SECOND stream (one Complete then one Ready), and the first stream
-    /// never moved again after the tolerated pre-loss Complete.
-    /// <para>
-    /// THE EOF VECTOR uses the reporter-parked-in-held-write pattern (the fixture's proven
-    /// finding): the body is released and the reporter PARKS in its old-connection Complete
-    /// write; the EOF then carries the assignment WITH the retained result.
-    /// </para>
+    /// has no Complete or assignment Ready. The executor is held at its prompt by a TCS until
+    /// AFTER the second run's adoption publication; EOF therefore precedes its terminal result.
     /// </summary>
     [Fact]
     public async Task Acceptance_a_RunningTaskSurvivesEof_SecondRunAdoptsAndDeliversOnSecondStream()
     {
-        var plan = ReconnectPlan.StartAsync(
-            "task-A", register2Adopted: true, holdReportComplete: true);
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
         try
         {
-            // RUN 1: the body finishes; the reporter PARKS in its old-connection Complete
-            // write; the EOF then carries the assignment WITH the retained result.
-            await plan.PushAssignmentAsync("task-A");
-            plan.Runner.Release("task-A");
-            await plan.CurrentRequests.AssignmentCompleteEntered(0)
-                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            // The executor has entered its gated prompt and is STILL RUNNING at EOF.
+            var execution = await plan.PushAssignmentAsync("task-A");
+            Assert.False(execution.IsCompleted);
             plan.CompleteStream();
-            // THE STREAM LOSS: the assignment is carried; the run ends cleanly.
             await plan.JoinRunAsync();
             var owner = GetActiveAssignment(plan.Service);
             Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+            Assert.False(execution.IsCompleted);
+            Assert.False(plan.Runner.WasCancelled("task-A"));
             await WaitForCarriedDeliveryAsync(plan.Service, "The carry claim must start a CarriedDelivery.");
             Assert.Equal("task-A", GetHeartbeatTaskId(plan.Service));
             Assert.Equal("coder", GetHeartbeatRole(plan.Service));
@@ -2084,10 +2106,12 @@ public sealed class WorkerServiceReconnectSurvivalTests
             // NO RUNNER PREPARATION: the adopted run defers ConnectAsync - the count stays at
             // run 1's single call.
             Assert.Equal(1, plan.Runner.ConnectCount);
+            Assert.Same(plan.CurrentConnection, GetAdoptedConnection(plan.Service));
+            Assert.Empty(plan.CurrentRequests.Writes); // adoption replaced the initial Ready
 
-            // THE RETAINED RESULT IS DELIVERED: the adoption was published for the SECOND run's
-            // connection (in place of the initial Ready), and the delivery writes exactly ONE
-            // Complete then ONE Ready on the SECOND stream.
+            // Only AFTER adoption do we allow the original executor to finish.
+            plan.Runner.Release("task-A");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
             await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
@@ -2105,12 +2129,11 @@ public sealed class WorkerServiceReconnectSurvivalTests
             Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
             Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
 
-            // THE OLD STREAM NEVER MOVED AGAIN: the tolerated PRE-LOSS Complete (the write that
-            // was already past the usability check when the loss hit) is the ONLY Complete on
-            // stream 1, and no assignment Ready was ever written there.
-            var oldComplete = Assert.Single(plan.Requests[0].Completes);
-            Assert.Equal("task-A", oldComplete.Complete.TaskId);
+            // The original stream saw only run 1's initial Ready; nothing else was initiated
+            // after the early retirement (no Complete and no assignment Ready).
+            Assert.Empty(plan.Requests[0].Completes);
             Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+            Assert.Single(plan.Requests[0].Writes);
 
             // END RUN 2: the exit re-check clears the Delivered assignment before RunAsync returns.
             plan.CompleteStream();
@@ -2126,46 +2149,45 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     /// <summary>
-    /// (b) THE TASK FINISHES WITH A RESULT BETWEEN EOF AND RECONNECT: the heartbeat task id is
-    /// still set at the moment the carried teardown and the reporter's finally have both run,
-    /// and the Complete goes ONLY on the adopting second stream.
+    /// (b) The executor is held at its prompt by a TCS through EOF, then released after run 1
+    /// returns but BEFORE run 2 starts. The result is retained, reporting's finally restores
+    /// the busy heartbeat, and Complete goes only on the adopting second stream.
     /// </summary>
     [Fact]
     public async Task Acceptance_b_ResultBetweenEofAndReconnect_HeartbeatIdStillSet_CompleteOnAdoptingStreamOnly()
     {
-        var plan = ReconnectPlan.StartAsync(
-            "task-A", register2Adopted: true, holdReportComplete: true);
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
         try
         {
-            await plan.PushAssignmentAsync("task-A");
-            plan.Runner.Release("task-A");
-
-            // The reporter PARKS in its Complete write, then the EOF carries the assignment
-            // while the reporter is held.
-            await plan.CurrentRequests.AssignmentCompleteEntered(0)
-                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var execution = await plan.PushAssignmentAsync("task-A");
             plan.CompleteStream();
             await plan.JoinRunAsync();
-
-            // (b) FIRST CLAUSE: the heartbeat state is still set from the carried assignment.
+            Assert.False(execution.IsCompleted);
             var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            // The result arises strictly AFTER EOF but BEFORE the second registration.
+            plan.Runner.Release("task-A");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await GetActiveReporting(plan.Service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.NotNull(GetRetainedResult(plan.Service));
+            // Reporting's finally must restore the heartbeat state for the carried task.
             Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
             Assert.Equal("task-A", GetHeartbeatTaskId(plan.Service));
             Assert.Equal("coder", GetHeartbeatRole(plan.Service));
 
-            // The reconnect claims and adopts; the delivery observes the (released) reporter and
-            // delivers the retained result on the adopting SECOND stream only.
+            // No result was sent on the original retired stream. Reconnect only NOW.
+            Assert.Empty(plan.Requests[0].Completes);
             plan.StartSecondRun(RegisterResponseFor(adopted: true));
-            plan.Requests[0].ReleaseAll();
+            Assert.Equal("task-A", Assert.Single(plan.Invokers[1].Registers).CurrentTaskId);
             var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
             await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             var complete = Assert.Single(plan.CurrentRequests.Completes);
             Assert.Equal("task-A", complete.Complete.TaskId);
             Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
-            // Stream 1 carries ONLY the tolerated pre-loss write (the Complete the reporter had
-            // already past the usability check when the loss hit); the delivery did NOT resend.
-            Assert.Single(plan.Requests[0].Completes);
+            // Stream 1 never saw the completion or an assignment Ready.
+            Assert.Empty(plan.Requests[0].Completes);
             Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
             Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
 
@@ -2321,14 +2343,20 @@ public sealed class WorkerServiceReconnectSurvivalTests
             await plan.CurrentRequests.AssignmentCompleteEntered(0)
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // THE STREAM ENDS under the delivery's Complete write: the parked write is faulted
-            // on the disposal and the delivery RETURNS TO THE WAIT (a non-cancellation
-            // failure). The run ends with the assignment still Carried.
-            plan.CurrentRequests.FailNextCompleteWrite = new InvalidOperationException("stream 2 ended");
-            plan.CurrentRequests.ReleaseAll();
+            // The write is still parked with a LIVE assignment token. Only disposing the
+            // transport faults it: the fake's TrySetCanceled gives the pending write an OCE
+            // with an empty token, not the assignment token. The delivery must treat this as
+            // a transport failure and wait for a DIFFERENT adopted connection.
+            var retainedOwner = GetActiveAssignment(plan.Service);
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.False(ownerCts.IsCancellationRequested);
+            Assert.False(delivery.IsCompleted);
             plan.CompleteStream();
             await plan.JoinRunAsync();
-            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.Same(retainedOwner, GetActiveAssignment(plan.Service));
+            Assert.False(ownerCts.IsCancellationRequested);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(retainedOwner));
+            Assert.False(delivery.IsCompleted);
             Assert.Single(plan.CurrentRequests.Completes);
             Assert.Equal(0, plan.Requests[1].AssignmentReadyCount);
 
@@ -2336,6 +2364,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
             // lands on the adopting THIRD stream.
             plan.StartThirdRun(RegisterResponseFor(adopted: true));
             var delivery2 = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must still run.");
+            Assert.Same(delivery, delivery2);
             await delivery2.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await plan.CurrentRequests.AssignmentCompleteEntered(0)
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2518,6 +2547,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
     {
         var plan = ReconnectPlan.StartAsync(
             "task-A", register2Adopted: false, holdReportComplete: true);
+        var connectEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowConnect = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             await plan.PushAssignmentAsync("task-A");
@@ -2527,19 +2558,36 @@ public sealed class WorkerServiceReconnectSurvivalTests
             plan.CompleteStream();
             await plan.JoinRunAsync();
 
-            // ADOPTED == false: the drain and the runner preparation are ordered, and the
-            // initial Ready follows them. The runner fake records the exact order.
+            // Arm a gate AT the real runner preparation call: the drain must have already
+            // cancelled and joined the exact owner, cleared the slot and heartbeat, and must
+            // precede even the stream factory invocation. A reversed order fails HERE.
+            var ownerCts = GetOwnerCts(plan.Service);
+            var retainedDelivery = await WaitForCarriedDeliveryAsync(plan.Service, "Expected carried delivery.");
+            bool cancelledAtConnect = false, drainedAtConnect = false, joinedAtConnect = false;
+            string? taskAtConnect = "not sampled";
+            int opensAtConnect = -1;
+            plan.Runner.ConnectEnteredHook = async _ =>
+            {
+                cancelledAtConnect = ownerCts.IsCancellationRequested;
+                drainedAtConnect = GetActiveAssignmentOrNull(plan.Service) is null;
+                joinedAtConnect = retainedDelivery.IsCompleted;
+                taskAtConnect = GetHeartbeatTaskId(plan.Service);
+                opensAtConnect = plan.StreamOpenCount;
+                connectEntered.TrySetResult();
+                await allowConnect.Task;
+            };
             plan.StartSecondRun(RegisterResponseFor(adopted: false));
-            Assert.Equal("task-A", plan.Invokers[1].Registers[0].CurrentTaskId);
+            await connectEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal("task-A", Assert.Single(plan.Invokers[1].Registers).CurrentTaskId);
+            Assert.True(cancelledAtConnect);
+            Assert.True(drainedAtConnect);
+            Assert.True(joinedAtConnect);
+            Assert.Null(taskAtConnect);
+            Assert.Equal(1, opensAtConnect); // only run 1's stream exists while held
+            Assert.Empty(plan.CurrentRequests.Writes);
+            allowConnect.TrySetResult();
             await plan.CurrentRequests.WaitForWriteCountAsync(1)
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
-            // THE ORDER, observed through the production sequence's effects: production runs
-            // DrainCarriedAssignmentAsync BEFORE ConnectAgentRunnerAsync, and the initial Ready
-            // is the stream's FIRST write (strictly after both). The observable at the moment
-            // the initial Ready has landed: exactly TWO connects (run 1 + this run), the slot is
-            // EMPTY (the drain cleared it before the connect could run), and the heartbeat state
-            // is cleared — which together prove the drain preceded the connect.
             Assert.Equal(2, plan.Runner.ConnectCount);
             Assert.Equal(
                 WorkerMessage.PayloadOneofCase.Ready,
@@ -2563,6 +2611,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         }
         finally
         {
+            allowConnect.TrySetResult();
+            plan.Runner.ConnectEnteredHook = null;
             await plan.TeardownAsync();
         }
     }
@@ -2698,38 +2748,32 @@ public sealed class WorkerServiceReconnectSurvivalTests
             await plan.JoinRunAsync();
             Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
 
-            // THE HEARTBEAT SEAM THROWS after the CONNECTION publication (step 6 follows
-            // step 4): the faulting seam task is the run's OWN heartbeat task, so its failure
-            // is joined at the run's teardown and propagates from RunAsync (error precedence:
-            // without a primary, the heartbeat-join failure wins). The adopted run claims the
-            // carried task through current_task_id, publishes the adoption (in place of the
-            // initial Ready) and runs its message loop; the run's OWN carried assignment is
-            // delivered on this adopted stream.
-            plan.StartThirdRun(
-                RegisterResponseFor(adopted: true),
-                heartbeatFailure: new InvalidOperationException("heartbeat seam failed"));
-            Assert.Equal("task-A", plan.Invokers[^1].Registers[0].CurrentTaskId);
-
-            // NOTHING was written on that connection BEFORE the delivery (the adopted run
-            // replaces the initial Ready with the adoption publication), and ConnectAsync was
-            // not called (the count stays at run 1's call).
+            // The heartbeat FACTORY throws synchronously after connection publication but
+            // before the adoption can be published or a message can be written.
+            var heartbeatFailure = new InvalidOperationException("heartbeat seam failed");
+            plan.StartSecondRun(RegisterResponseFor(adopted: true), heartbeatFailure);
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => plan.Run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(heartbeatFailure, thrown);
+            var failedConnection = Assert.IsType<WorkerConnection>(plan.FailedHeartbeatConnection);
+            Assert.True(failedConnection.IsRetired);
+            Assert.Null(GetPublishedConnection(plan.Service));
+            Assert.Null(GetAdoptedConnectionOrNull(plan.Service));
+            Assert.Empty(plan.CurrentRequests.Writes);
+            Assert.Equal("task-A", Assert.Single(plan.Invokers[1].Registers).CurrentTaskId);
             Assert.Equal(1, plan.Runner.ConnectCount);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
 
-            // The carried delivery runs on the adopted stream (exactly one Complete then one
-            // Ready).
+            // A LATER adopted registration on the SAME service finally publishes adoption.
+            plan.StartThirdRun(RegisterResponseFor(adopted: true));
+            Assert.Equal("task-A", Assert.Single(plan.Invokers[2].Registers).CurrentTaskId);
             var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
-            plan.Requests[0].ReleaseAll();
             await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Single(plan.CurrentRequests.Completes);
             Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
-            Assert.Equal(CarryStates.Delivered, GetAssignmentState(GetActiveAssignment(plan.Service)));
-
-            // THE RUN ENDS (the stream loss): the heartbeat-join failure surfaces from RunAsync
-            // (no primary in flight - the joined seam fault wins).
+            Assert.Equal(1, plan.Runner.ConnectCount);
             plan.CompleteStream();
-            await Assert.ThrowsAsync<InvalidOperationException>(
-                () => plan.Run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+            await plan.JoinRunAsync();
 
         }
         finally
@@ -2796,91 +2840,76 @@ public sealed class WorkerServiceReconnectSurvivalTests
     [Fact]
     public async Task Acceptance_n_ReconnectLoopDecisions_DrainBeforeFinalDispose()
     {
-        var plan = ReconnectPlan.StartAsync(
-            "task-A", register2Adopted: true, holdReportComplete: true);
+        // These are the decisions Program.cs actually consumes (no source-text mirror).
+        Assert.Equal(WorkerOutcomeAction.Reconnect,
+            WorkerProgramDecisions.DecideOutcome(WorkerRunOutcome.WorkStreamEnded));
+        Assert.Equal(WorkerOutcomeAction.Stop,
+            WorkerProgramDecisions.DecideOutcome(WorkerRunOutcome.RegistrationRejected));
+        Assert.Equal(WorkerOutcomeAction.Fatal,
+            WorkerProgramDecisions.DecideOutcome((WorkerRunOutcome)int.MaxValue));
+
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: false);
         try
         {
-            // THE OUTCOMES THE LOOP CONSUMES.
-            await plan.PushAssignmentAsync("task-A");
-            plan.Runner.Release("task-A");
-            await plan.CurrentRequests.AssignmentCompleteEntered(0)
-                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var execution = await plan.PushAssignmentAsync("task-A");
             plan.CompleteStream();
-            await plan.JoinRunAsync();
+            Assert.Equal(WorkerRunOutcome.WorkStreamEnded, await plan.JoinRunAsync());
+            Assert.False(execution.IsCompleted);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
 
-            // WORKSTREAMENDED RECONNECTS: the SECOND run runs on the SAME service (the run
-            // guard admitted it) and re-claims the carried task through current_task_id.
-            plan.StartSecondRun(RegisterResponseFor(adopted: true));
-            Assert.Equal("task-A", plan.Invokers[1].Registers[0].CurrentTaskId);
-            Assert.Equal(2, plan.Invokers.Count);
-
-            // The carried assignment is delivered on the adopted stream; the run then ends.
-            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
-            plan.Requests[0].ReleaseAll();
-            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            plan.CompleteStream();
-            await plan.JoinRunAsync();
-            Assert.Equal(0, GetSlotOccupancy(plan.Service));
-
-            // REGISTRATIONREJECTED ENDS THE LOOP: a REJECTED registration can never adopt the
-            // carried task, so the service drains it BEFORE any stream exists (no Complete) and
-            // returns the outcome Program treats as terminal. The carried assignment from the
-            // FIRST stream loss is still retained at this point, so the vector is driven by the
-            // SAME carried assignment.
-            plan.StartNextRun(RegisterResponseFor(adopted: false, rejected: true));
-            Assert.Equal(
-                WorkerRunOutcome.RegistrationRejected,
+            // The rejection really names the STILL-CARRIED task, not a task previously
+            // delivered and cleared. Rejection drains it before opening any work stream.
+            plan.StartSecondRun(RegisterResponseFor(adopted: false, rejected: true));
+            Assert.Equal("task-A", Assert.Single(plan.Invokers[1].Registers).CurrentTaskId);
+            Assert.Equal(WorkerRunOutcome.RegistrationRejected,
                 await plan.Run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
             Assert.Equal(0, GetSlotOccupancy(plan.Service));
             Assert.Null(GetPublishedConnection(plan.Service));
             Assert.Empty(plan.CurrentRequests.Writes);
-
-            // DRAIN BEFORE THE FINAL DISPOSE, WITH A THROWING DRAIN: Program's final cleanup
-            // calls DrainCarriedAssignmentAsync FIRST and the ONE Dispose SECOND, each in its
-            // own guarded block, with the exit code decided after both. A THROWING drain must
-            // still be followed by the disposal, exactly once.
-            var failingDrainService = new WorkerService(
-                "http://localhost:9999", "worker-reconnect", ["coder"], "/config-repo");
-            var disposals = 0;
-            var exitCode = 0;
-            try
-            {
-                typeof(WorkerService)
-                    .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!
-                    .SetValue(failingDrainService, new ObservingRunner());
-
-                // THE PROGRAM SHAPE, mirrored exactly (Program.cs exposes no seam).
-                try
-                {
-                    await failingDrainService.DrainCarriedAssignmentAsync();
-                }
-                catch (Exception)
-                {
-                    exitCode = 1;
-                }
-
-                try
-                {
-                    disposals++;
-                    failingDrainService.Dispose();
-                }
-                catch (Exception)
-                {
-                    exitCode = 1;
-                }
-
-                // THE DISPOSAL RAN EXACTLY ONCE, AFTER THE DRAIN.
-                Assert.Equal(1, disposals);
-                Assert.Equal(0, exitCode);
-            }
-            finally
-            {
-                TryDispose(failingDrainService);
-            }
         }
         finally
         {
             await plan.TeardownAsync();
+        }
+
+        // The extracted final-cleanup decision is driven with an ACTUALLY THROWING drain.
+        // Program.cs then runs its one final Dispose irrespective of the decision.
+        var events = new List<string>();
+        var failure = new InvalidOperationException("sensitive marker from carried drain");
+        var runner = new ObservingRunner();
+        var service = new WorkerService("http://localhost:9999", "worker-1", ["coder"], "/config-repo");
+        InstallRunner(service, runner);
+        var attempts = 0;
+        var disposalAttempts = 0;
+        try
+        {
+            var drainFailed = await WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync(() =>
+            {
+                attempts++;
+                events.Add("drain");
+                throw failure; // truly throwing delegate, not an empty-service no-op
+            });
+            var exitCode = drainFailed ? 1 : 0;
+            try
+            {
+                disposalAttempts++;
+                service.Dispose();
+                events.Add("dispose");
+            }
+            catch (Exception)
+            {
+                exitCode = 1;
+            }
+            Assert.True(drainFailed);
+            Assert.Equal(1, attempts);
+            Assert.Equal(1, disposalAttempts);
+            Assert.Equal(1, runner.DisposeCount);
+            Assert.Equal(["drain", "dispose"], events);
+            Assert.Equal(1, exitCode);
+        }
+        finally
+        {
+            if (disposalAttempts == 0) service.Dispose();
         }
     }
 
@@ -2926,6 +2955,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
         internal List<CarryRequestStream> Requests { get; } = [];
         internal List<ChannelResponseReader> Readers { get; } = [];
         internal List<WorkerConnection> Connections { get; } = [];
+        internal List<Task<WorkerConnection>> PublishedConnections { get; } = [];
+        internal WorkerConnection? FailedHeartbeatConnection { get; private set; }
+        private int _streamOpenCount;
+        internal int StreamOpenCount => Volatile.Read(ref _streamOpenCount);
         internal List<Task<WorkerRunOutcome>> Runs { get; } = [];
         internal Task<WorkerRunOutcome> Run => Runs[^1];
         internal CarryRequestStream CurrentRequests => Requests[^1];
@@ -3044,32 +3077,39 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 if (openFailure is { } failure)
                     throw failure;
 
+                Interlocked.Increment(ref _streamOpenCount);
                 streamToken = ct;
                 var stream = BuildFaultingStream(requests, responses);
                 CurrentStreamToken = ct;
                 HandedReader = responses;
                 return stream;
             };
-            Service.HeartbeatTaskFactory = (_, _) => heartbeatFailure is { } hf
-                ? Task.FromException(hf)
-                : Task.CompletedTask;
+            var published = new TaskCompletionSource<WorkerConnection>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Service.HeartbeatTaskFactory = (connection, _) =>
+            {
+                // Production enters the heartbeat factory AFTER publishing the connection.
+                // Register the waiter at construction rather than polling for publication.
+                Connections.Add(connection);
+                published.TrySetResult(connection);
+                if (heartbeatFailure is { } failure)
+                {
+                    FailedHeartbeatConnection = connection;
+                    throw failure; // BEFORE adoption publication, not a faulted heartbeat task
+                }
+                return Task.CompletedTask;
+            };
 
             Invokers.Add(invoker);
             Requests.Add(requests);
             Readers.Add(responses);
-
-            var run = Service.RunAsync(TestContext.Current.CancellationToken);
-            Runs.Add(run);
-
-            // The connection becomes observable once it is published (or the run has already
-            // faulted, in which case the caller observes that instead).
-            var published = WaitForPublishedConnectionOrNull();
-            if (published is not null)
-                Connections.Add(published);
+            PublishedConnections.Add(published.Task);
+            Runs.Add(Service.RunAsync(TestContext.Current.CancellationToken));
         }
 
         /// <summary>Wires the SECOND run (the first reconnect).</summary>
-        internal void StartSecondRun(RegisterResponse response) => StartNextRun(response);
+        internal void StartSecondRun(RegisterResponse response, Exception? heartbeatFailure = null) =>
+            StartNextRun(response, heartbeatFailure: heartbeatFailure);
 
         /// <summary>Wires the THIRD run, with optional one-shot wiring for the reconnect vector.</summary>
         internal void StartThirdRun(
@@ -3084,28 +3124,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// <summary>The reader instance the CURRENT run's factory handed into its stream.</summary>
         internal ChannelResponseReader? HandedReader { get; private set; }
 
-        /// <summary>
-        /// Waits, bounded, for the current run's published connection (or none - a rejected
-        /// registration or a still-faulting open never publishes one).
-        /// </summary>
-        private WorkerConnection? WaitForPublishedConnectionOrNull()
-        {
-            var stopwatch = Stopwatch.StartNew();
-            while (stopwatch.Elapsed < Failsafe)
-            {
-                var connection = GetPublishedConnection(Service);
-                if (connection is not null)
-                    return connection;
-
-                TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
-
-                // Observation-only cooperative yield: the run's continuations need a chance to
-                // run while no connection is published yet. The bound is a FAILURE GUARD only.
-                Task.Delay(1, TestContext.Current.CancellationToken).GetAwaiter().GetResult();
-            }
-
-            return null;
-        }
+        internal Task<WorkerConnection> WaitForPublishedConnectionAsync() =>
+            PublishedConnections[^1].WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         /// <summary>
         /// Pushes a genuine assignment on the CURRENT run's stream and returns its execution
@@ -3142,22 +3162,26 @@ public sealed class WorkerServiceReconnectSurvivalTests
             foreach (var requests in Requests)
                 requests.ReleaseAll();
             Runner.ReleaseAll();
-            await Service.DrainCarriedAssignmentAsync();
-            foreach (var run in Runs)
+            Exception? primary = null;
+            try { await Service.DrainCarriedAssignmentAsync(); }
+            catch (Exception ex) { primary = ex; }
+            try
             {
-                try
+                await JoinAllForTeardownAsync(
+                    [.. Runs.Select((run, index) => ($"run {index}", (Task?)run))]);
+            }
+            catch (Exception ex) { primary ??= ex; }
+            finally
+            {
+                try { TryDispose(Service); }
+                finally
                 {
-                    await run.WaitAsync(Failsafe, CancellationToken.None);
-                }
-                catch (Exception)
-                {
-                    // Terminal fault/cancellation: the run is quiescent, which is all teardown
-                    // needs.
+                    try { _gitRestore.Dispose(); }
+                    catch (Exception ex) { primary ??= ex; }
                 }
             }
-
-            TryDispose(Service);
-            _gitRestore.Dispose();
+            if (primary is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw();
         }
     }
 
@@ -3180,6 +3204,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         private string? _taskId;
 
         internal int ConnectCount => Volatile.Read(ref _connectCount);
+        private int _disposeCount;
+        internal int DisposeCount => Volatile.Read(ref _disposeCount);
 
         internal IReadOnlyList<string> EventLog
         {
@@ -3273,11 +3299,14 @@ public sealed class WorkerServiceReconnectSurvivalTests
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
 
+        internal Func<CancellationToken, Task>? ConnectEnteredHook { get; set; }
+
         public async Task ConnectAsync(CancellationToken ct = default)
         {
             RecordEvent("connect");
             Interlocked.Increment(ref _connectCount);
-            await Task.CompletedTask;
+            if (ConnectEnteredHook is { } hook)
+                await hook(ct);
         }
 
         public Task ResetSessionAsync(
@@ -3288,6 +3317,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
             return Task.CompletedTask;
         }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref _disposeCount);
+            return ValueTask.CompletedTask;
+        }
     }
 }

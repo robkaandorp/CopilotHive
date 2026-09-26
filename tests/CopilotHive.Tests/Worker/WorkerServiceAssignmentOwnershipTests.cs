@@ -2135,6 +2135,55 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
+    /// A non-carry EOF with a LIVE process token and an ordinary Ready already started:
+    /// teardown itself cancels the owner's CTS. Its captured callback failure must propagate
+    /// from the LOOP after joining the body and clearing the slot, with no cancelled-read
+    /// primary to mask it. Dropping deferred callback evidence fails this test by identity.
+    /// </summary>
+    [Fact]
+    public async Task EofAfterReadyStarted_ThrowingCallbackPropagatesFromLoopAfterCleanup()
+    {
+        var runner = new GatedPromptRunner();
+        var service = BuildService(runner);
+        var responses = new ChannelResponseReader();
+        var requests = new RecordingRequestStream();
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(requests, responses), service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+        ArmedCancellationCallback? armed = null;
+        Task? execution = null;
+        try
+        {
+            responses.Push(Assignment("task-A"));
+            await runner.PromptStarted("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            execution = GetActiveExecution(service);
+            runner.Release("task-A");
+            await requests.WaitForReadyCountAsync(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            armed = ArmThrowingCancellationCallback(service);
+            var source = armed.Source;
+            Assert.False(source.IsCancellationRequested);
+
+            responses.TryComplete();
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Contains(armed.CallbackFailure, Flatten(surfaced));
+            Assert.True(armed.CallbackInvoked);
+            Assert.True(execution.IsCompleted);
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.True(connection.IsRetired);
+            Assert.Throws<ObjectDisposedException>(() => _ = source.Token);
+            Assert.Equal(1, armed.InvocationCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            responses.TryComplete();
+            armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service, ("assignment body", execution), ("loop", loop));
+        }
+    }
+
+    /// <summary>
     /// ERROR PRECEDENCE AT THE MESSAGE LOOP: a PRIMARY reader fault is preserved when the teardown's
     /// cancellation cleanup ALSO fails. The reader's ORIGINAL exception identity surfaces from the
     /// loop, the join of the retained body still happens, and the secondary cancellation failure is

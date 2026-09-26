@@ -2543,6 +2543,61 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     /// <summary>
+    /// Non-carry EOF with a LIVE process token: ACK tracking is enabled but ordinary Ready is
+    /// ungated, so ReadyStarted wins before EOF despite NO receipt ACK. The loop itself must
+    /// propagate the deferred cancellation-callback failure AFTER joining the held Ready and
+    /// clearing ownership; dropping the deferred failure cannot pass this vector.
+    /// </summary>
+    [Fact]
+    public async Task AckOnlyMode_EofAfterReadyStarted_ThrowingCallbackPropagatesFromLoopWithoutPrimary()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: false);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+        CancellationTokenRegistration callbackRegistration = default;
+        Task? execution = null;
+        Task? reporting = null;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            var ownerCts = GetOwnerCts(service);
+            var failure = new GateDeferredCancellationException("callback must propagate from loop");
+            callbackRegistration = ownerCts.Token.Register(() => throw failure);
+            Assert.Equal(1, writer.ReadyCount);
+            Assert.False(ownerCts.IsCancellationRequested);
+
+            // This is EOF with a LIVE process token and an actual started ordinary Ready.
+            reader.TryComplete();
+            writer.ReleaseReady(0);
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Contains(failure, Flatten(surfaced));
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.True(connection.IsRetired);
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+        }
+        finally
+        {
+            callbackRegistration.Dispose();
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution), ("assignment reporting", reporting), ("loop", loop));
+        }
+    }
+
+    /// <summary>
     /// EOF TEARDOWN UNDER PROCESS-TOKEN CANCELLATION WITH A THROWING CANCELLATION CALLBACK (an EOF
     /// with a LIVE token now CARRIES, so this variant is the one that still drains): the drain clears
     /// WITHOUT any ACK wait (the ACK is permanently absent), emits NO ordinary Ready, and the
