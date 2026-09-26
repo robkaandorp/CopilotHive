@@ -1,5 +1,6 @@
 using CopilotHive.Worker;
 using CopilotHive.Workers;
+using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
 
@@ -17,7 +18,8 @@ namespace CopilotHive.Tests.Worker;
 /// so the provider's failure text became the turn's normal output and <c>TaskExecutor</c> reported a
 /// completed phase. The runner must instead throw <see cref="AgentTurnFailedException"/>, whose
 /// message carries no provider text (provider text can echo a provisioned secret; see
-/// <see cref="SafeExceptionLog"/>).
+/// <see cref="SafeExceptionLog"/>), so the existing <c>TaskExecutor</c> catch reports
+/// <c>TaskOutcome.Failed</c> with a <c>FAIL</c> verdict.
 /// </para>
 /// <para>
 /// The provider-failure shape is produced by a streaming fake whose
@@ -106,7 +108,7 @@ public sealed class SharpCoderRunnerErrorResultTests
             await Assert.ThrowsAsync<AgentTurnFailedException>(
                 () => runner.SendPromptAsync("work", workDir, TestContext.Current.CancellationToken));
 
-            // The agent loop does NOT own the client: nothing has disposed it yet.
+            // The turn does not own the client: nothing has disposed it yet.
             Assert.Equal(0, client.DisposeCount);
 
             var reset = runner.ResetSessionAsync("next-model", null, TestContext.Current.CancellationToken);
@@ -154,8 +156,7 @@ public sealed class SharpCoderRunnerErrorResultTests
     /// <c>MaxStepsReached</c> result is NOT a provider failure, so the turn must still RETURN the
     /// agent's accumulated partial text instead of throwing. The status is read from the runner's own
     /// closing log line so the control is anchored to the ACTUAL status value — without it, a mutant
-    /// that throws for every non-success status (or that changed MaxStepsReached into a Success) could
-    /// still satisfy the assertions below.
+    /// that throws for every non-success status could still satisfy the assertions below.
     /// </summary>
     [Fact]
     public async Task SendPromptAsync_MaxStepsReachedStatus_ReturnsPartialTextWithoutThrowing()
@@ -187,6 +188,65 @@ public sealed class SharpCoderRunnerErrorResultTests
         finally
         {
             Console.SetOut(originalOut);
+            await runner.DisposeAsync();
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// THE ACCEPTANCE CRITERION, end to end through the REAL production seams: the real
+    /// <see cref="SharpCoderRunner"/> (its provider failure faked at the <c>IChatClient</c> boundary)
+    /// driven by the real <see cref="TaskExecutor"/>. An Error turn must come back as
+    /// <see cref="TaskOutcome.Failed"/> with a <c>FAIL</c> verdict — never as a completed phase whose
+    /// narrative is the provider's error text — and neither the result nor its issues may carry that
+    /// text. On the rejected revision the same flow returns <c>TaskOutcome.Completed</c> and the
+    /// provider text appears in the output, so this test fails on the old code twice over.
+    /// </summary>
+    [Fact]
+    public async Task RealRunnerErrorTurn_ThroughTaskExecutor_ReportsFailedWithFailVerdictAndNoProviderText()
+    {
+        var workDir = CreateWorkDir();
+        var runner = new SharpCoderRunner();
+        var client = new ThrowBeforeFirstYieldChatClient(new InvalidOperationException(ProviderFailureText));
+        var git = new NoOpGitOperations();
+
+        try
+        {
+            runner.ClientCreationSeam = _ => client;
+            runner.SetCustomAgent(WorkerRole.Coder, "coder");
+
+            var executor = new TaskExecutor(runner, gitOperations: git, sessionClient: null);
+            var task = new WorkTask
+            {
+                TaskId = "task-error-result",
+                GoalId = "goal-error-result",
+                GoalDescription = "Error-result handling",
+                Prompt = "do the thing",
+                Role = WorkerRole.Coder,
+                Repositories = [],
+            };
+
+            var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+            // FAILED, with a FAIL verdict — not a completed phase.
+            Assert.Equal(TaskOutcome.Failed, result.Status);
+            Assert.Equal("FAIL", result.Metrics!.Verdict);
+
+            // The sanitized classification of THIS exception type is what travels onward...
+            Assert.Contains("AgentTurnFailedException", result.Output, StringComparison.Ordinal);
+            Assert.Contains(result.Metrics.Issues, i => i.Contains("AgentTurnFailedException", StringComparison.Ordinal));
+
+            // ...and the provider's failure text is nowhere in the result that reaches the orchestrator.
+            Assert.DoesNotContain("SECRET-TOKEN-123", result.Output, StringComparison.Ordinal);
+            Assert.DoesNotContain("provider failure", result.Output, StringComparison.Ordinal);
+            foreach (var issue in result.Metrics.Issues)
+                Assert.DoesNotContain("SECRET-TOKEN-123", issue, StringComparison.Ordinal);
+
+            // A failed turn is never a phase narrative, and the auto-commit follow-up never ran.
+            Assert.False(git.PushWasCalled, "A failed turn must not have produced a pushed branch.");
+        }
+        finally
+        {
             await runner.DisposeAsync();
             Directory.Delete(workDir, recursive: true);
         }
@@ -316,4 +376,37 @@ file sealed class AlwaysToolCallChatClient : IChatClient
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
 
     public void Dispose() { }
+}
+
+/// <summary>Minimal no-op git operations so the executor reaches the prompt call.</summary>
+file sealed class NoOpGitOperations : IGitOperations
+{
+    public bool PushWasCalled { get; private set; }
+
+    public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct) => Task.CompletedTask;
+
+    public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+
+    public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct)
+        => Task.CompletedTask;
+
+    public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct)
+    {
+        PushWasCalled = true;
+        return Task.CompletedTask;
+    }
+
+    public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+        => Task.FromResult(new GitChangeSummary());
+
+    public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct) => Task.FromResult(false);
+
+    public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+        => Task.FromResult<string?>(null);
+
+    public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
+        string workDir, string args, CancellationToken ct)
+        => Task.FromResult((0, "", ""));
+
+    public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
 }
