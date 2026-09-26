@@ -458,12 +458,6 @@ public class DistributedBrainShadowTests
     private static LlmSessionInfo? FindSession(LlmSessionRegistry registry, string sessionId) =>
         registry.GetAll().FirstOrDefault(s => s.SessionId == sessionId);
 
-    private static bool IsResetting(DistributedBrain brain) =>
-        (bool)typeof(DistributedBrain).GetField("_resetting", NonPublicInstance)!.GetValue(brain)!;
-
-    private static void SetResetting(DistributedBrain brain, bool value) =>
-        typeof(DistributedBrain).GetField("_resetting", NonPublicInstance)!.SetValue(brain, value);
-
     private static bool IsConnected(DistributedBrain brain) =>
         (bool)typeof(DistributedBrain).GetField("_connected", NonPublicInstance)!.GetValue(brain)!;
 
@@ -1193,11 +1187,16 @@ public class DistributedBrainShadowTests
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Criteria 16-22: reset durability
+    // Criteria 16-22: master-only reset — only the master session is rewritten
     // ════════════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// A reset rewrites ONLY the actor's master session — to an empty history — while the actor-dir
+    /// goal session, the legacy state-dir files and the <c>.migrated</c> marker keep their exact
+    /// content, and the SAME actor instance keeps serving.
+    /// </summary>
     [Fact]
-    public async Task ResetSessionAsync_DeletesAllSessionFilesAndRestartsWithEmptyHistory()
+    public async Task ResetSessionAsync_RewritesMasterOnly_KeepsGoalSessionsAndMarker()
     {
         var dir = NewTempDir();
         try
@@ -1208,258 +1207,130 @@ public class DistributedBrainShadowTests
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
                 await brain.ForkSessionForGoalAsync("reset-goal", TestContext.Current.CancellationToken);
 
-                // Simulate leftover legacy state-dir session files from a pre-actor run: reset must
-                // clear those too, not just the actor's own files.
-                File.WriteAllText(Path.Combine(dir, "brain-master.json"), "{}");
-                File.WriteAllText(Path.Combine(dir, "brain-goal-reset-goal.json"), "{}");
+                var actorBefore = (BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actorBefore);
 
-                Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")));
-                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-reset-goal.json")));
-                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-master.json")));
-                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-goal-reset-goal.json")));
-                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")));
+                // Seed the MASTER with history and force it to disk: the master is the ONLY state a
+                // reset may rewrite, so the rewrite must be observable.
+                var seed = BrainActorMessages.CreateMergeSummaryMessage("seed-goal", "MASTER_RESET_SEED");
+                Assert.True(actorBefore!.Tell(seed));
+                await seed.Reply.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
-                await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+                var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+                Assert.Contains("MASTER_RESET_SEED",
+                    await File.ReadAllTextAsync(actorMasterPath, TestContext.Current.CancellationToken));
 
-                Assert.False(File.Exists(Path.Combine(dir, "brain-master.json")), "stateDir master should be deleted.");
-                Assert.False(File.Exists(Path.Combine(dir, "brain-goal-reset-goal.json")), "stateDir goal should be deleted.");
-                Assert.False(File.Exists(Path.Combine(dir, "actors", "brain-goal-reset-goal.json")), "actor goal should be deleted.");
+                // Leftover legacy state-dir files from a pre-actor run are NOT part of any reset.
+                var legacyMasterPath = Path.Combine(dir, "brain-master.json");
+                var legacyGoalPath = Path.Combine(dir, "brain-goal-reset-goal.json");
+                await File.WriteAllTextAsync(legacyMasterPath, "legacy-master-content", TestContext.Current.CancellationToken);
+                await File.WriteAllTextAsync(legacyGoalPath, "legacy-goal-content", TestContext.Current.CancellationToken);
 
-                var freshActorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
-                Assert.True(File.Exists(freshActorMasterPath), "New actor master should be created after restart.");
-
-                var freshMaster = await AgentSession.LoadAsync(freshActorMasterPath, TestContext.Current.CancellationToken);
-                Assert.Empty(freshMaster.MessageHistory);
-
-                var stats = ((BrainActor?)GetBrainActor(brain))?.Tell(BrainActorMessages.CreateGetStatsMessage()) ?? false;
-                Assert.True(stats, "Recreated actor should be live.");
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task ResetSessionAsync_DeletionFailure_ActorsMaster_Throws()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewShadowBrain(dir);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("del-fail", TestContext.Current.CancellationToken);
-
-                brain._fileDeleter = path =>
-                {
-                    if (path.Contains(Path.Combine(dir, "actors")) && path.Contains("brain-master"))
-                        throw new IOException("simulated actors master delete failure");
-                    File.Delete(path);
-                };
-
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-                Assert.Contains("Failed to clear session state during reset", ex.Message);
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task ResetSessionAsync_DeletionFailure_StateDirMaster_Throws()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewShadowBrain(dir);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("state-fail", TestContext.Current.CancellationToken);
-
-                // Leftover legacy state-dir master file whose deletion will be made to fail.
-                File.WriteAllText(Path.Combine(dir, "brain-master.json"), "{}");
-
-                brain._fileDeleter = path =>
-                {
-                    if (path.StartsWith(dir) && !path.Contains("actors") && path.Contains("brain-master"))
-                        throw new IOException("simulated state dir master delete failure");
-                    File.Delete(path);
-                };
-
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-                Assert.Contains("Failed to clear session state during reset", ex.Message);
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task ResetSessionAsync_DeletionFailure_ActorsGoal_Throws()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewShadowBrain(dir);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("goal-fail", TestContext.Current.CancellationToken);
-
-                brain._fileDeleter = path =>
-                {
-                    if (path.Contains(Path.Combine(dir, "actors")) && path.Contains("brain-goal-goal-fail"))
-                        throw new IOException("simulated actors goal delete failure");
-                    File.Delete(path);
-                };
-
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-                Assert.Contains("Failed to clear session state during reset", ex.Message);
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task ResetSessionAsync_DeletesMigratedMarker()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewShadowBrain(dir);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                var actorGoalPath = Path.Combine(dir, "actors", "brain-goal-reset-goal.json");
                 var markerPath = Path.Combine(dir, "actors", ".migrated");
+                Assert.True(File.Exists(actorGoalPath));
                 Assert.True(File.Exists(markerPath));
 
-                // Track whether the deleter was invoked for the .migrated marker.
-                var markerDeleted = false;
-                brain._fileDeleter = path =>
-                {
-                    if (path == markerPath)
-                        markerDeleted = true;
-                    File.Delete(path);
-                };
+                var actorGoalBefore = await File.ReadAllTextAsync(actorGoalPath, TestContext.Current.CancellationToken);
+                var legacyMasterBefore = await File.ReadAllTextAsync(legacyMasterPath, TestContext.Current.CancellationToken);
+                var legacyGoalBefore = await File.ReadAllTextAsync(legacyGoalPath, TestContext.Current.CancellationToken);
 
                 await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
-                Assert.True(markerDeleted, "Reset must delete the .migrated marker via _fileDeleter.");
-                // MigrateSessionFiles is suppressed while _resetting is set, so the restarting actor
-                // must NOT re-import the legacy session files the reset just deleted — and therefore
-                // must not recreate the marker either.
-                Assert.False(File.Exists(markerPath),
-                    "Marker must not be recreated: migration is suppressed during a reset.");
+                // The master was rewritten in place and now holds an EMPTY history.
+                var freshMaster = await AgentSession.LoadAsync(actorMasterPath, TestContext.Current.CancellationToken);
+                Assert.Empty(freshMaster.MessageHistory);
+                Assert.DoesNotContain("MASTER_RESET_SEED",
+                    await File.ReadAllTextAsync(actorMasterPath, TestContext.Current.CancellationToken));
+
+                // Every goal-scoped artefact survives with unchanged content.
+                Assert.Equal(actorGoalBefore,
+                    await File.ReadAllTextAsync(actorGoalPath, TestContext.Current.CancellationToken));
+                Assert.True(File.Exists(legacyMasterPath), "The legacy state-dir master must survive a reset.");
+                Assert.Equal(legacyMasterBefore,
+                    await File.ReadAllTextAsync(legacyMasterPath, TestContext.Current.CancellationToken));
+                Assert.True(File.Exists(legacyGoalPath), "The legacy state-dir goal session must survive a reset.");
+                Assert.Equal(legacyGoalBefore,
+                    await File.ReadAllTextAsync(legacyGoalPath, TestContext.Current.CancellationToken));
+                Assert.True(File.Exists(markerPath), "The .migrated marker must survive a reset.");
+
+                // The SAME actor instance is still live and serving.
+                Assert.Same(actorBefore, GetBrainActor(brain));
+                Assert.False(actorBefore.IsCompleted, "A reset must not dispose the actor.");
+                var statsMsg = BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(actorBefore.Tell(statsMsg));
+                var stats = await statsMsg.Reply.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+                Assert.NotNull(stats);
+                Assert.True(stats!.IsConnected);
             }
         }
         finally { DeleteDir(dir); }
     }
 
+    /// <summary>
+    /// When the master save fails, the failure surfaces to the caller while the old in-memory
+    /// master, the connection, the master registry entry, the same actor and every goal session
+    /// stay intact and usable.
+    /// </summary>
     [Fact]
-    public async Task ResetSessionAsync_RestartFailure_RollsbackAndRecovers()
+    public async Task ResetSessionAsync_MasterSaveFailure_SurfacesErrorAndKeepsGoals()
     {
         var dir = NewTempDir();
         var registry = new LlmSessionRegistry();
         try
         {
-            var brain = NewShadowBrain(dir, sessionRegistry: registry);
+            var brain = NewShadowBrain(dir, sessionRegistry: registry,
+                factoryChatClientFactory: _ => new SequencedPlanStubClient(["coding", "testing", "review", "merging"]));
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("save-fail-goal", TestContext.Current.CancellationToken);
+
+                var actor = (BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
                 Assert.NotNull(FindSession(registry, "brain-master"));
 
-                SetActorFactory(brain, _ => throw new InvalidOperationException("restart factory boom"));
+                var actorGoalPath = Path.Combine(dir, "actors", "brain-goal-save-fail-goal.json");
+                var actorGoalBefore = await File.ReadAllTextAsync(actorGoalPath, TestContext.Current.CancellationToken);
 
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                // Make the master save throw deterministically: replace the master FILE with a
+                // DIRECTORY of the same name, so no write to that path can succeed.
+                var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+                File.Delete(actorMasterPath);
+                Directory.CreateDirectory(actorMasterPath);
+
+                var ex = await Assert.ThrowsAnyAsync<Exception>(
                     () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-                Assert.Contains("restart factory boom", ex.Message, StringComparison.Ordinal);
 
-                // The actor is the only execution path, so a failed restart must leave the brain
-                // fully rolled back: disconnected, unregistered, and no longer flagged as resetting.
-                Assert.False(IsConnected(brain), "Brain must not report itself connected without an actor.");
-                Assert.Null(GetBrainActor(brain));
-                Assert.Null(FindSession(registry, "brain-master"));
-                Assert.False(IsResetting(brain), "_resetting must be cleared in the finally block.");
+                // The actor's own save failure surfaced — not the facade's AskActorAsync timeout and
+                // not a cancellation — so the failed save really was attempted and reported.
+                Assert.IsNotType<TimeoutException>(ex);
+                Assert.IsNotType<OperationCanceledException>(ex);
 
-                // Recovery: a working factory plus ConnectAsync restores a usable brain.
-                SetActorFactory(brain, stateDir =>
-                    new BrainActor("copilot/test-model", 100_000, stateDir, NullLogger.Instance,
-                        chatClientFactory: _ => new TrackingChatClient(),
-                        workDirectory: dir));
-
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                // Nothing was rolled back: same actor, still connected, master still registered,
+                // goal file untouched.
+                Assert.Same(actor, GetBrainActor(brain));
                 Assert.True(IsConnected(brain));
-                Assert.NotNull(GetBrainActor(brain));
                 Assert.NotNull(FindSession(registry, "brain-master"));
+                Assert.Equal(actorGoalBefore,
+                    await File.ReadAllTextAsync(actorGoalPath, TestContext.Current.CancellationToken));
+
+                // The pre-existing goal still plans on its surviving child…
+                var plan = await brain.PlanIterationAsync(
+                    CreatePipeline("save-fail-goal"), null, TestContext.Current.CancellationToken);
+                Assert.False(plan.IsFailed);
+
+                // …and a brand-new fork still works.
+                await brain.ForkSessionForGoalAsync("after-fail-goal", TestContext.Current.CancellationToken);
+                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-goal-after-fail-goal.json")));
             }
         }
         finally { DeleteDir(dir); }
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Criteria 22/23/26: concurrency contracts around reset and dispose
+    // Criteria 15/26: actor-detach and dispose contracts
     // ════════════════════════════════════════════════════════════════════════
-
-    [Fact]
-    public async Task ForkSessionForGoalAsync_DuringActiveReset_Throws()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewShadowBrain(dir);
-
-            // The first factory call satisfies ConnectAsync; the second (the reset's restart) blocks
-            // until the test releases it, so the reset genuinely stays in-flight while we fork.
-            var restartEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var releaseRestart = new ManualResetEventSlim(false);
-            var firstCall = true;
-            SetActorFactory(brain, stateDir =>
-            {
-                if (firstCall)
-                {
-                    firstCall = false;
-                    return new BrainActor("copilot/test-model", 100_000, stateDir, NullLogger.Instance,
-                        chatClientFactory: _ => new TrackingChatClient(),
-                        workDirectory: dir);
-                }
-
-                restartEntered.TrySetResult(true);
-                releaseRestart.Wait(TimeSpan.FromSeconds(30));
-                throw new InvalidOperationException("restart fails");
-            });
-
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-                // Reset runs on a background thread. It flips _resetting, detaches the old actor and
-                // then parks inside the restart factory while still holding _sessionLock.
-                var resetTask = Task.Run(
-                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken),
-                    TestContext.Current.CancellationToken);
-                await restartEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-
-                // A fork issued while that reset is genuinely in flight must fail fast. This only
-                // passes because ForkSessionForGoalAsync checks _resetting BEFORE touching the
-                // actor — a lock-first implementation would deadlock behind the reset instead.
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken)
-                        .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
-                Assert.Contains("reset", ex.Message, StringComparison.OrdinalIgnoreCase);
-
-                releaseRestart.Set();
-                await Assert.ThrowsAsync<InvalidOperationException>(() => resetTask);
-
-                // The failed reset rolled the brain back rather than leaving it half-reset.
-                Assert.False(IsResetting(brain), "_resetting must be cleared once the reset unwinds.");
-                Assert.False(IsConnected(brain));
-                Assert.Null(GetBrainActor(brain));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
 
     [Fact]
     public async Task GetStats_WhenActorDetached_ReturnsNull()
@@ -1473,20 +1344,14 @@ public class DistributedBrainShadowTests
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
                 Assert.NotNull(brain.GetStats());
 
-                // A reset detaches the actor. GetStats must report null because the actor is gone,
-                // NOT because it inspects the _resetting flag (which it deliberately never reads).
+                // A reset no longer detaches anything — it is handled inside the live actor — so the
+                // detached-actor answer below comes solely from GetStats' null-actor guard.
                 var actor = (BrainActor?)GetBrainActor(brain);
                 typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, null);
                 if (actor is not null)
                     await actor.DisposeAsync();
 
                 Assert.Null(brain.GetStats());
-
-                // Proof that _resetting plays no part: with the actor detached the answer is null
-                // regardless of the flag's value.
-                SetResetting(brain, true);
-                try { Assert.Null(brain.GetStats()); }
-                finally { SetResetting(brain, false); }
             }
         }
         finally { DeleteDir(dir); }

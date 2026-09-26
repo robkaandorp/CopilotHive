@@ -64,9 +64,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Test seam for constructing the actor from a state directory.</summary>
     internal Func<string, BrainActor>? _actorFactory;
 
-    /// <summary>Test seam for deleting a file. Default is File.Delete.</summary>
-    internal Action<string> _fileDeleter = File.Delete;
-
     /// <summary>Test seam: copies a file during migration. Returns true on success, false on failure.</summary>
     internal Func<string, string, bool> _fileCopier = (src, dst) => { try { File.Copy(src, dst); return true; } catch { return false; } };
 

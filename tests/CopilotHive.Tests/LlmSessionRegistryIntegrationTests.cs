@@ -948,15 +948,15 @@ public sealed class LlmSessionRegistryIntegrationTests
     }
 
     [Fact]
-    public async Task ResetSessionAsync_ClearsAllGoalSessionsAndUnregistersThem()
+    public async Task ResetSessionAsync_PreservesAllGoalSessionsAndRefreshesMaster()
     {
         var tempDir = CreateTempDir();
         try
         {
             var registry = new LlmSessionRegistry();
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient(), sessionRegistry: registry,
-                chatClientFactory: _ => new FakeChatClient());
+                stateDir: tempDir, chatClient: new AlwaysPlanChatClient(), sessionRegistry: registry,
+                chatClientFactory: _ => new AlwaysPlanChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-reset-1", TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-reset-2", TestContext.Current.CancellationToken);
@@ -974,18 +974,28 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
-            // Every goal session is torn down and unregistered from the registry.
-            Assert.Null(FindSession(registry, "brain-goal-goal-reset-1"));
-            Assert.Null(FindSession(registry, "brain-goal-goal-reset-2"));
-            Assert.Null(FindSession(registry, "brain-goal-goal-reset-3"));
+            // PRESERVATION: a reset touches only the master, so every goal entry stays registered.
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-reset-1"));
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-reset-2"));
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-reset-3"));
+
+            // The goal session files and child actors are intact, so the sessions still exist.
+            Assert.True(brain.GoalSessionExists("goal-reset-1"), "Goal session file must survive a reset.");
+            Assert.True(brain.GoalSessionExists("goal-reset-2"), "Goal session file must survive a reset.");
+            Assert.True(brain.GoalSessionExists("goal-reset-3"), "Goal session file must survive a reset.");
 
             // The master session was rebuilt fresh and re-registered with zero tokens.
             var master = FindSession(registry, "brain-master");
             Assert.NotNull(master);
             Assert.Equal(0, master!.CurrentTokens);
 
-            // The goal sessions are gone from the actor as well, so a fresh fork is required.
-            Assert.False(brain.GoalSessionExists("goal-reset-1"));
+            // Every goal can still plan after the reset — their child actors were never disposed.
+            foreach (var id in new[] { "goal-reset-1", "goal-reset-2", "goal-reset-3" })
+            {
+                var plan = await brain.PlanIterationAsync(
+                    CreatePipeline(id, "Reset goal"), null, TestContext.Current.CancellationToken);
+                Assert.False(plan.IsFailed, $"Goal {id} must still plan after a master reset: {plan.FailureReason}");
+            }
         }
         finally
         {
@@ -2141,4 +2151,54 @@ file sealed class RegisterTrackingBrain(bool sessionExists) : IDistributedBrain
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
     public BrainStats? GetStats() => null;
+}
+
+/// <summary>
+/// IChatClient that always answers a planning request with a valid <c>report_iteration_plan</c>
+/// tool call, and the post-tool follow-up with plain text so the agent loop terminates. Used by
+/// the master-only-reset preservation test, where every goal must be able to plan again after the
+/// reset; an empty-response client would silently turn a preserved goal into a planning failure.
+/// </summary>
+file sealed class AlwaysPlanChatClient : IChatClient
+{
+    public ChatClientMetadata Metadata => new("always-plan", null, "always-plan-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var all = messages.ToList();
+        var last = all.Count > 0 ? all[^1] : null;
+
+        if (last is not null && last.Role == ChatRole.Tool)
+        {
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Plan reported."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+        }
+
+        var toolCall = new FunctionCallContent("always-plan-call", "report_iteration_plan", new Dictionary<string, object?>
+        {
+            ["phases"] = new[] { "coding", "testing", "review", "merging" },
+            ["phase_instructions"] = "{}",
+            ["reason"] = "always-plan stub plan",
+            ["model_tiers"] = null,
+        });
+        return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCall]))
+        {
+            FinishReason = ChatFinishReason.ToolCalls,
+        });
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming not used in always-plan client.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
 }
