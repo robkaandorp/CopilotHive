@@ -3287,6 +3287,18 @@ public sealed class DistributedBrainTests
                 var originalActor = (CopilotHive.Actors.BrainActor)original!;
                 var goalFileBefore = await File.ReadAllTextAsync(ActorGoalFile(dir, "g7"), TestContext.Current.CancellationToken);
 
+                // Seed the MASTER with history so the post-reset "empty master" assertion is
+                // non-vacuous: without this, MessageCount would be 0 either way.
+                var seed = CopilotHive.Actors.BrainActorMessages.CreateMergeSummaryMessage("seed-goal", "MASTER_SEED_BEFORE_RESET");
+                Assert.True(originalActor.Tell(seed));
+                await seed.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                var seededStats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(originalActor.Tell(seededStats));
+                var seededReply = await seededStats.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                Assert.Equal(2, seededReply!.MessageCount);
+
+                var childBefore = ReadChildActors(originalActor)["g7"];
+
                 await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
                 // The SAME actor instance survives: a reset is one message handled by the live actor,
@@ -3296,13 +3308,12 @@ public sealed class DistributedBrainTests
                 Assert.Same(original, afterReset);
                 Assert.False(originalActor.IsCompleted, "A reset must not dispose the actor.");
 
-                // The goal's session file AND its child actor survive untouched.
+                // The goal's session file AND the SAME child instance survive untouched.
                 Assert.True(File.Exists(ActorGoalFile(dir, "g7")),
                     "A goal session file must survive a master-only reset.");
                 Assert.Equal(goalFileBefore,
                     await File.ReadAllTextAsync(ActorGoalFile(dir, "g7"), TestContext.Current.CancellationToken));
-                Assert.True(ReadChildActors(originalActor).ContainsKey("g7"),
-                    "The goal's child actor must survive a master-only reset.");
+                Assert.Same(childBefore, ReadChildActors(originalActor)["g7"]);
 
                 // The still-live actor is connected and reports the fresh, empty master.
                 var stats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
@@ -3384,16 +3395,24 @@ public sealed class DistributedBrainTests
                 var historyCountBefore = childA.Session.MessageHistory.Count;
                 Assert.True(historyCountBefore > 0, "Goal A must have accumulated history before the reset.");
 
+                // Snapshot the EXACT pre-reset history texts, so survival can be asserted message by
+                // message. A count-only check would accept a rewritten session that happened to be
+                // the same length.
+                var historyBefore = childA.Session.MessageHistory.Select(m => m.Text).ToList();
+
                 // AWAITED reset to completion — exactly the production scenario.
                 await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
-                // Goal A's child, session file, history and planning all survive.
+                // The SAME actor and the SAME child instance survive, along with the goal's file.
                 Assert.Same(actor, GetBrainActor(brain));
-                Assert.True(ReadChildActors(actor!).ContainsKey("goal-a"),
-                    "Goal A's child actor must survive the reset.");
+                Assert.Same(childA, ReadChildActors(actor!)["goal-a"]);
                 Assert.True(File.Exists(ActorGoalFile(dir, "goal-a")));
-                Assert.Contains(childA.Session.MessageHistory,
-                    m => m.Text.Contains("In-progress goal A", StringComparison.Ordinal));
+
+                // Every pre-reset history entry is still present, in order.
+                var historyAfter = childA.Session.MessageHistory.Select(m => m.Text).ToList();
+                Assert.True(historyAfter.Count >= historyCountBefore,
+                    "Goal A must keep its pre-reset message history.");
+                Assert.Equal(historyBefore, historyAfter.Take(historyCountBefore));
 
                 // CraftPromptAsync must return the ACTOR-generated prompt — the fallback would not
                 // contain the stub's marker, so this asserts real actor routing, not a silent fallback.
@@ -3405,10 +3424,6 @@ public sealed class DistributedBrainTests
                 // Goal A's next planning call still succeeds on its own surviving child.
                 var planAfter = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
                 Assert.False(planAfter.IsFailed, $"Goal A must still plan after a reset: {planAfter.FailureReason}");
-
-                // Goal A's pre-reset history is still there (the goal session was not rewritten).
-                Assert.True(childA.Session.MessageHistory.Count >= historyCountBefore,
-                    "Goal A must keep its pre-reset message history.");
 
                 // Goal B, forked AFTER the reset, starts from the NEW empty master…
                 await brain.ForkSessionForGoalAsync("goal-b", TestContext.Current.CancellationToken);

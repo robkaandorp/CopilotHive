@@ -1302,10 +1302,11 @@ public class DistributedBrainShadowTests
                 var ex = await Assert.ThrowsAnyAsync<Exception>(
                     () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
 
-                // The actor's own save failure surfaced — not the facade's AskActorAsync timeout and
-                // not a cancellation — so the failed save really was attempted and reported.
-                Assert.IsNotType<TimeoutException>(ex);
-                Assert.IsNotType<OperationCanceledException>(ex);
+                // The actor's own SAVE failure surfaced — not the facade's AskActorAsync timeout and
+                // not a cancellation — so the failed save really was attempted and reported. Writing
+                // a file path that is a directory fails with UnauthorizedAccessException (verified
+                // independently), which is the exception the actor's failing SaveSessionAsync throws.
+                Assert.IsType<UnauthorizedAccessException>(ex);
 
                 // Nothing was rolled back: same actor, still connected, master still registered,
                 // goal file untouched.
