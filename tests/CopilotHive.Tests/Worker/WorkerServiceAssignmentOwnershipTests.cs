@@ -118,30 +118,40 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
     /// <summary>
     /// EOF held at the unwind: with the body parked inside the prompt, the reader stream is
-    /// COMPLETED (EOF), so the loop exits its iteration, cancels and drains the RETAINED,
-    /// STILL-RUNNING assignment, and CANNOT finish while the body is held in the unwind gate.
-    /// Only when the unwind is released does the drain complete and the loop join. The
-    /// ownership slot is then empty and the heartbeat state cleared.
+    /// COMPLETED (EOF), so the loop exits its iteration and CANNOT finish while the body is held
+    /// in the unwind gate.
+    /// <para>
+    /// THIS IS THE PROCESS-TOKEN SHAPE. Under a LIVE process token an EOF is no longer a cancel
+    /// signal at all — it CARRIES the assignment (the stream-loss contract), so the loop's teardown
+    /// does no cancel and no drain and the body keeps running inside its prompt. Today's
+    /// cancel-then-join ordering is still exercised, on the token that still expresses it: the loop
+    /// token is cancelled BEFORE the EOF, so the read observes cancellation, the teardown takes the
+    /// existing cancel-and-drain path, the body observes that cancellation, and the loop cannot
+    /// finish until the unwind gate is released.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task EofWhileBodyDraining_LoopCannotFinishUntilUnwindReleases()
     {
         var runner = new GatedPromptRunner();
         var service = BuildService(runner);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
         var stream = BuildStream(requests, responses);
 
-        var loop = InvokeProcessMessages(service, stream, "worker-1", TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessages(service, stream, "worker-1", loopCts.Token);
         try
         {
             // Assign A and park its body inside the prompt: a RETAINED, running assignment.
             responses.Push(Assignment("task-A"));
             await runner.PromptStarted("task-A");
 
-            // EOF: complete the reader stream while the body is still running.
-            responses.TryComplete();
+            // CANCEL THE PROCESS/LOOP TOKEN FIRST, then complete the reader (EOF). Cancellation is
+            // what ends a run's assignment; the EOF that follows is not itself a carry trigger,
+            // because stream loss is only recognized while the process token is still live.
+            await loopCts.CancelAsync();
 
             // The loop's finally cancels the retained assignment; the body observes it.
             await runner.CancelObserved("task-A");
@@ -150,16 +160,88 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // the loop CANNOT be complete — deterministic, since the drain awaits the body.
             Assert.False(loop.IsCompleted, "The loop must not finish while the retained body is still unwinding.");
 
-            // Release the unwind: the drain completes, the loop joins.
+            // Release the unwind: the drain completes, the loop joins (the cancelled read surfaces
+            // the operation-cancellation the token expresses).
             runner.ReleaseUnwind();
-            await loop;
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => loop);
 
-            // Ownership slot empty after loop cleanup and heartbeat state cleared. Exactly ONE
-            // Ready: the stream token is still live under EOF, so the drained body's
-            // single-flight claim emits its own Ready during unwind (teardown never claims).
+            // Ownership slot empty after loop cleanup and heartbeat state cleared. The body's Ready
+            // was written with the (now cancelled) loop token, so no Ready is observable.
             Assert.Equal(0, GetSlotOccupancy(service));
             Assert.Null(GetHeartbeatTaskId(service));
-            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(0, requests.ReadyCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// EOF WITH A LIVE PROCESS TOKEN AND A RUNNING ASSIGNMENT IS NOW THE CARRY CASE: the loop
+    /// finishes and retires the connection WITHOUT waiting for the retained body (no cancel, no
+    /// drain), the assignment stays retained in the Carried state with the heartbeat state
+    /// restored, and NO Ready is written to that stream after the stream loss.
+    /// <para>
+    /// REMOVAL PROOF. The body is parked in its prompt with a LIVE token, so a teardown that still
+    /// cancelled or drained would either never complete (holding the run) or observe the body's
+    /// cancellation — both fail by name here, and the retention/state assertions reject a teardown
+    /// that cleared the slot.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task EofWhileBodyDraining_WithLiveToken_CarriesInsteadOfCancellingAndDraining()
+    {
+        var runner = new GatedPromptRunner();
+        var service = BuildService(runner);
+
+        var responses = new ChannelResponseReader();
+        var requests = new RecordingRequestStream();
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", stream, service.TestProvisioner);
+
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+        try
+        {
+            // Assign A and park its body inside the prompt: a RETAINED, running assignment.
+            responses.Push(Assignment("task-A"));
+            await runner.PromptStarted("task-A");
+
+            // EOF with the process token LIVE: the stream loss carries the assignment.
+            responses.TryComplete();
+
+            // THE LOOP RETURNS WITHOUT WAITING FOR THE BODY — no drain is part of this path.
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // NO CANCEL: the body never observed a cancellation and is still running.
+            Assert.False(runner.CancelObserved("task-A").IsCompleted,
+                "A stream loss must not cancel the retained body.");
+
+            // THE ASSIGNMENT IS RETAINED IN THE CARRIED STATE, with the heartbeat state restored
+            // from the assignment so the orchestrator keeps seeing this worker as busy.
+            var retained = GetActiveAssignment(service);
+            Assert.NotNull(retained);
+            Assert.Equal(CarriedState, GetAssignmentStateOf(retained));
+            Assert.Equal("task-A", GetHeartbeatTaskId(service));
+
+            // THE CONNECTION IS RETIRED and NO Ready was written to that stream after stream loss:
+            // a carried assignment claims no ordinary Ready on its retired original connection.
+            Assert.True(connection.IsRetired);
+            Assert.Equal(0, requests.ReadyCount);
+
+            // The retained assignment is released by the process-level drain, which IS the
+            // cancellation path for a carried assignment: the drain cancels the assignment token,
+            // the body observes it and parks in its unwind gate, so the gate is released here —
+            // AFTER the drain has been entered — and only then is the drain awaited.
+            var drain = service.DrainCarriedAssignmentAsync();
+            runner.ReleaseUnwind();
+            await drain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
         }
         finally
         {
@@ -771,27 +853,23 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// HELD REPORT AT EOF — the regression this split must not introduce. With the assignment's
-    /// EXECUTION already terminal and its CONNECTION-BOUND REPORTING held inside a gated Complete
-    /// write, the reader reaches EOF: the loop CANNOT finish and CANNOT retire the connection while
-    /// that report is still outstanding, because its teardown drain joins BOTH original tasks.
-    /// Releasing the gates lets the report finish, the drain settle and join the readiness write,
-    /// ownership clear and the connection retire.
+    /// HELD REPORT AT EOF, LIVE PROCESS TOKEN — the CARRY case. With the assignment's EXECUTION
+    /// already terminal and its CONNECTION-BOUND REPORTING held inside a gated Complete write, the
+    /// reader reaches EOF: the stream loss CARRIES the assignment, so the loop finishes and RETIRES
+    /// the connection WITHOUT waiting for that report, and NO Ready is written to the retired stream
+    /// afterwards. The report, the retained result and the ownership slot all outlive the loop; the
+    /// PROCESS-LEVEL drain is what finally releases them.
     /// <para>
-    /// REMOVAL PROOF — deterministic, not schedule-dependent. A teardown that joined only the
-    /// execution would find it already terminal and run straight through, RETIRING the connection
-    /// while the report is still parked in its Complete write. The report's published eligibility
-    /// could then never produce a readiness write that ENTERS the writer at all, so the awaited
-    /// <c>ReadyEntered(0)</c> below never completes and the single-Ready assertion fails by name.
-    /// That consequence is caused by production ordering, not by test scheduling. The SAME
-    /// discriminator covers the readiness-write join: a drain that skipped it would retire the
-    /// connection while the write is still in flight.
+    /// REMOVAL PROOF — deterministic, not schedule-dependent. A teardown that still drained would be
+    /// parked on the held report, so the bounded loop join fails by name; a teardown that emitted an
+    /// ordinary Ready would show up in the Ready count; a teardown that CLEARED the slot or cancelled
+    /// the assignment fails the retention and non-cancellation assertions.
     /// </para>
     /// </summary>
     [Fact]
-    public async Task EofWhileReportHeld_LoopCannotFinishOrRetireUntilReportingReleases()
+    public async Task EofWhileReportHeld_WithLiveToken_CarriesWithoutWaitingForReporting()
     {
-        const string taskId = "task-held-report";
+        const string taskId = "task-held-report-carry";
         var runner = new RetentionRunner(LongOutput);
         var requests = new RetentionRequestStream();
         var responses = new ChannelResponseReader();
@@ -804,10 +882,110 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
 
-        // Hoisted so the finally joins EVERY original task it started, even after a failure.
         Task? execution = null;
         Task? reporting = null;
-        Task? readinessWrite = null;
+        try
+        {
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+
+            // Let the executor finish; the report then parks inside the gated Complete write.
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            Assert.False(reporting.IsCompleted, "The report must be held inside its Complete write.");
+
+            // EOF with the PROCESS TOKEN LIVE: the stream loss carries the assignment.
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE LOOP FINISHED AND RETIRED WITHOUT WAITING FOR THE REPORT, and the report is
+            // still parked in its Complete write on the (now retired) original connection.
+            Assert.False(reporting.IsCompleted, "The carry teardown must not join the report.");
+            Assert.True(connection.IsRetired, "The loop retires the connection without draining.");
+
+            // THE ASSIGNMENT IS STILL RETAINED, in the Carried state, with its exact result intact —
+            // nothing was cancelled, cleared or replaced by the carry teardown.
+            var owner = GetActiveAssignment(service);
+            Assert.NotNull(owner);
+            Assert.Equal(CarriedState, GetAssignmentStateOf(owner));
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.False(GetOwnerCts(service).IsCancellationRequested, "The carried assignment is not cancelled.");
+
+            // NO Ready was written to that stream after the stream loss: a carried assignment claims
+            // no ordinary Ready on its retired original connection.
+            Assert.Equal(0, requests.ReadyCount);
+
+            // THE PROCESS-LEVEL DRAIN releases the retained assignment: release the held Complete
+            // first (the report is parked on the gate, not on the assignment token), then drain —
+            // which cancels the assignment's token, joins the report and clears the slot.
+            requests.ReleaseComplete(0);
+            await service.DrainCarriedAssignmentAsync()
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.Single(requests.Completes);
+            Assert.Equal(0, requests.ReadyCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// HELD REPORT UNDER PROCESS-TOKEN CANCELLATION — today's cancel-and-drain ordering, asserted on
+    /// the token that still expresses it. With the EXECUTION already terminal and the REPORTING held
+    /// inside a gated Complete write, the loop token is cancelled: the loop CANNOT finish and CANNOT
+    /// retire the connection while that report is still outstanding, because its teardown drain joins
+    /// BOTH original tasks. Releasing the gate lets the report terminate, the drain settle ownership
+    /// and the connection retire.
+    /// <para>
+    /// REMOVAL PROOF — deterministic, not schedule-dependent. A teardown that joined only the
+    /// execution would find it already terminal and run straight through, clearing the slot and
+    /// RETIRING the connection while the report is still parked in its Complete write, so the
+    /// in-flight assertions below fail by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ProcessTokenCancellationWhileReportHeld_LoopCannotFinishOrRetireUntilReportingReleases()
+    {
+        const string taskId = "task-held-report-cancel";
+        var runner = new RetentionRunner(LongOutput);
+
+        // THE HOLD IS TOKEN-IMMUNE. A real transport would cancel a parked write when the call is
+        // disposed; this vector needs the write to stay genuinely in flight while the loop token is
+        // cancelled, so the hold is expressed on the gate ALONE. The token semantics themselves are
+        // covered by the other vectors in this file.
+        var requests = new RetentionRequestStream(holdCompleteDespiteCancellation: true);
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, loopCts.Token);
+
+        Task? execution = null;
+        Task? reporting = null;
         var teardownEnteredRegistration = default(CancellationTokenRegistration);
         try
         {
@@ -820,8 +998,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             reporting = GetActiveReporting(service);
 
             // A BENIGN rendezvous on the owner's OWN source: the teardown drain's cancellation
-            // request is the first thing it does, so this fires once teardown has entered the
-            // drain. It changes no outcome — it only records.
+            // request is the first thing it does, so this fires once teardown has entered the drain.
             var teardownEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             teardownEnteredRegistration = GetOwnerCts(service).Token.Register(
                 () => teardownEntered.TrySetResult());
@@ -833,8 +1010,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
 
-            // EOF while the REPORT — and only the report — is still outstanding.
-            responses.TryComplete();
+            // PROCESS-TOKEN CANCELLATION while the REPORT — and only the report — is outstanding.
+            await loopCts.CancelAsync();
             await teardownEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // The teardown drain is parked on the reporting join, so nothing may be finished,
@@ -846,46 +1023,23 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.False(connection.IsRetired, "Retirement must follow the drain of BOTH original tasks.");
             Assert.Same(retained, GetRetainedResult(service));
 
-            // THE DETERMINISTIC DISCRIMINATOR. Release the Complete write: the report PUBLISHES the
-            // ordinary-Ready eligibility and terminates, and the drain's settlement then starts the
-            // assignment's single readiness write — which can only ENTER the writer while the
-            // connection is still usable, i.e. only if teardown really is waiting on this assignment.
+            // Release the Complete write: the report publishes the ordinary-Ready eligibility and
+            // terminates, letting the drain proceed to its ownership clear and retirement. The
+            // readiness write the drain settles is started with the CANCELLED loop token, so it
+            // writes nothing — the cancellation contract the token expresses. The loop itself joins
+            // by surfacing the cancelled read, exactly as the sibling token-cancellation vector does.
             requests.ReleaseComplete(0);
-            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            readinessWrite = CaptureReadinessWrite(
-                service,
-                "Teardown must settle and start the assignment's readiness write.");
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.True(
                 reporting.IsCompletedSuccessfully,
                 "The report must terminate independently of the readiness write.");
-            Assert.NotSame(reporting, readinessWrite);
-
-            // PRE-RELEASE, WITH THE READINESS WRITE STILL HELD. This is what makes the readiness
-            // JOIN removal-proof rather than incidental: teardown may not have finished, may not
-            // have cleared the ownership slot and may not have retired the connection while the
-            // write it started is outstanding. A drain that skipped the readiness join would already
-            // have completed all three by now, failing these BY NAME.
-            Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
-            Assert.False(
-                loop.IsCompleted,
-                "The loop must not finish while the readiness write its teardown started is held.");
-            Assert.NotNull(GetActiveAssignment(service));
-            Assert.Equal(1, GetSlotOccupancy(service));
-            Assert.False(
-                connection.IsRetired,
-                "Retirement must follow the drain that joins the readiness write.");
-
-            requests.ReleaseReady(0);
-
-            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
 
             Assert.Equal(0, GetSlotOccupancy(service));
             Assert.Null(GetHeartbeatTaskId(service));
             Assert.True(connection.IsRetired);
             Assert.Single(requests.Completes);
-            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(0, requests.ReadyCount);
         }
         finally
         {
@@ -896,7 +1050,6 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await JoinAllForTeardownAsync(service,
                 ("assignment execution", execution),
                 ("assignment reporting", reporting),
-                ("assignment readiness write", readinessWrite),
                 ("loop", loop));
             TryDelete(root);
         }
@@ -1890,23 +2043,31 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// The same discipline at LOOP TEARDOWN (EOF with the body still draining): a throwing
-    /// cancellation callback cannot skip awaiting the original body, cannot skip the CTS disposal,
-    /// and cannot close the connection's access early. The deferred failure surfaces after cleanup
-    /// — it does not become a fabricated successful teardown.
+    /// The same discipline at LOOP TEARDOWN under PROCESS-TOKEN CANCELLATION — the token that still
+    /// expresses the cancel-and-drain teardown (an EOF with a live token now CARRIES instead, so it
+    /// performs no cancellation request at all): a throwing cancellation callback cannot skip
+    /// awaiting the original body, cannot skip the CTS disposal, and cannot close the connection's
+    /// access early.
+    /// <para>
+    /// ERROR PRECEDENCE. The throwing callback fires on the CANCELLATION REQUEST itself (the loop
+    /// token's <c>CancelAsync</c>), which is where that failure is observed; the loop's own teardown
+    /// then reaches quiescence and its cancelled read is what it surfaces — never a fabricated
+    /// success, and never a skipped join, disposal, clear or retirement.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task EofWithThrowingCallback_JoinsBodyThenClearsAndSurfacesError()
     {
         var runner = new GatedPromptRunner();
         var service = BuildService(runner);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
         var stream = BuildStream(requests, responses);
 
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
-        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessagesWith(service, connection, loopCts.Token);
         ArmedCancellationCallback? armed = null;
 
         // Hoisted so the finally joins EVERY original task it started, even after a failure.
@@ -1923,10 +2084,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
 
-            // EOF while the body is still running: the loop's finally cancels the retained
-            // assignment. The body's own cancellation-observed signal is the deterministic
-            // boundary; no Task internals or polling are used.
-            responses.TryComplete();
+            // CANCEL THE PROCESS/LOOP TOKEN while the body is still running: the loop's finally
+            // cancels the retained assignment. The body's own cancellation-observed signal is the
+            // deterministic boundary; no Task internals or polling are used. The armed callback is
+            // THROWING, so the CANCELLATION REQUEST is where its failure surfaces — it is captured
+            // here with its original evidence.
+            var cancellationFailure = await Record.ExceptionAsync(() => loopCts.CancelAsync());
+            Assert.NotNull(cancellationFailure);
+            Assert.Contains(armed.CallbackFailure, Flatten(cancellationFailure!));
             await runner.CancelObserved("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // Parked in the drain on the ORIGINAL body: nothing cleared, nothing disposed, and the
@@ -1942,9 +2107,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             runner.ReleaseUnwind();
 
-            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+            // With the reader CANCELLED rather than faulted, the CANCELLED READ is the loop's
+            // primary (it surfaces with its own identity, exactly as the sibling token-cancellation
+            // vector expects), and the throwing callback's failure is REPORTED beside it through the
+            // EXISTING guarded sanitized log rather than replacing it.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
                 () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-            Assert.Contains(armed.CallbackFailure, Flatten(surfaced));
 
             Assert.Equal(0, GetSlotOccupancy(service));
             Assert.Null(GetHeartbeatTaskId(service));
@@ -4044,6 +4212,23 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         (bool)slot.GetType().GetProperty("IsSettled")!.GetValue(slot)!;
 
     /// <summary>
+    /// THE ASSIGNMENT STATE CELL'S CARRIED VALUE, mirrored for readable assertions. The production
+    /// constants are private, so the numeric value of <c>AssignmentState.Carried</c> is restated here
+    /// — exactly as the assignment-ownership fixture restates other private protocol values.
+    /// </summary>
+    private const int CarriedState = 2;
+
+    /// <summary>
+    /// The retained <c>AssignmentState.Value</c> of an assignment owner: the ONE atomic int the
+    /// carry and Ready transitions are decided by, read through its public <c>Value</c> member.
+    /// </summary>
+    private static int GetAssignmentStateOf(object assignment)
+    {
+        var state = assignment.GetType().GetProperty("State")!.GetValue(assignment)!;
+        return (int)state.GetType().GetProperty("Value")!.GetValue(state)!;
+    }
+
+    /// <summary>
     /// Constructs the production ordinary-readiness slot the assignment handler itself creates, for
     /// the vectors that invoke reporting directly instead of running the loop.
     /// </summary>
@@ -4312,9 +4497,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// write really was issued and is NEVER retried. Models a Ready write that fails on the
     /// REPORTING task's own single attempt.
     /// </param>
+    /// <param name="holdCompleteDespiteCancellation">
+    /// When set, a parked Complete write ignores its forwarded token and is released ONLY by the
+    /// test's gate. The default (<c>false</c>) is the faithful transport behavior — a write parked
+    /// when its call is disposed unwinds with <see cref="OperationCanceledException"/> — and every
+    /// existing vector keeps it; the token-immune hold exists for the one vector that must observe a
+    /// genuinely in-flight write WHILE the loop token is cancelled.
+    /// </param>
     private sealed class RetentionRequestStream(
         Func<int, Exception?>? completeTermination = null,
-        Func<int, Exception?>? readyTermination = null)
+        Func<int, Exception?>? readyTermination = null,
+        bool holdCompleteDespiteCancellation = false)
         : IClientStreamWriter<WorkerMessage>
     {
         private readonly object _gate = new();
@@ -4361,7 +4554,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                     if (_releaseImmediately) release.TrySetResult();
                 }
                 entered.TrySetResult();
-                await release.Task.WaitAsync(ct);
+                await (holdCompleteDespiteCancellation
+                    ? release.Task
+                    : release.Task.WaitAsync(ct));
                 if (completeTermination?.Invoke(index) is { } error)
                     throw error;
                 return;

@@ -1218,14 +1218,18 @@ public sealed class WorkerServiceReadinessOwnershipTests
 
     /// <summary>
     /// EOF WITH A LIVE TOKEN still permits the draining assignment's single Ready, and the TEARDOWN
-    /// drain must JOIN that write before it clears ownership and retires the connection.
+    /// drain must JOIN that write before it clears ownership. RETIREMENT ORDER IS CHANGED BY DESIGN:
+    /// the stream-loss path retires the connection at the read-await site as its VERY FIRST action,
+    /// so the connection is already retired while the drain joins the write (the drain's own
+    /// settlement is unaffected — this assignment had already claimed its ordinary Ready, so it is
+    /// NOT carried and today's cancel-and-drain path runs exactly as before).
     /// <para>
     /// THE JOIN PROOF IS TAKEN FROM INSIDE THE HELD WRITE. Before releasing it the test asserts the
-    /// loop is still incomplete, the owner is still installed and the connection is NOT retired;
-    /// then the write's own release callback re-records those same facts on the joiner's stack, at
-    /// the last instant the write is provably alive. A teardown that started the write without
-    /// joining it would already have cleared and retired by then, so it can never produce that
-    /// capture — and the loop would be complete while a readiness write was still in flight.
+    /// loop is still incomplete and the owner is still installed; then the write's own release
+    /// callback re-records those same facts on the joiner's stack, at the last instant the write is
+    /// provably alive. A teardown that started the write without joining it would already have
+    /// cleared by then, so it can never produce that capture — and the loop would be complete while a
+    /// readiness write was still in flight.
     /// </para>
     /// </summary>
     [Fact]
@@ -1284,16 +1288,13 @@ public sealed class WorkerServiceReadinessOwnershipTests
             Assert.IsNotType<TimeoutException>(responseClosure);
 
             // PRE-RELEASE, with the write still HELD and EOF positively inside teardown: teardown may
-            // not have finished, cleared
-            // ownership or retired the connection.
+            // not have finished or cleared ownership. The connection, however, is ALREADY RETIRED —
+            // the stream-loss path retires it FIRST, before the drain, by design.
             Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
             Assert.False(
                 loop.IsCompleted,
                 "The loop must not finish while the readiness write its teardown started is held.");
             Assert.Same(owner, GetActiveAssignment(service));
-            Assert.False(
-                connection.IsRetired,
-                "Retirement must follow the drain that joins the readiness write.");
 
             writer.ReleaseReady(0);
 
@@ -1301,19 +1302,20 @@ public sealed class WorkerServiceReadinessOwnershipTests
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // THE JOIN PROOF: the capture saw the exact original owner installed, the loop running
-            // and the connection unretired, all while the write was still alive.
+            // THE JOIN PROOF: the capture saw the exact original owner installed and the loop running
+            // while the write was still alive. The connection is retired from the START of this
+            // teardown (the early retire), so the capture records THAT fact rather than its absence.
             Assert.Same(owner, ownerAtWriteRelease);
             Assert.True(
                 loopAliveAtWriteRelease,
                 "Teardown must still have been running while the readiness write it started was alive.");
-            Assert.False(
+            Assert.True(
                 retiredAtWriteRelease,
-                "The connection must not have been retired while the readiness write was still alive.");
+                "The stream-loss path retires the connection BEFORE the drain, by design.");
 
             Assert.Equal(1, writer.ReadyCount);
             Assert.Single(writer.Completes);
-            Assert.True(connection.IsRetired, "Retirement must follow the join of the readiness write.");
+            Assert.True(connection.IsRetired);
             Assert.Equal(0, GetSlotOccupancy(service));
         }
         finally
@@ -1910,15 +1912,18 @@ public sealed class WorkerServiceReadinessOwnershipTests
             await drainEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // PRE-RELEASE, with the write still HELD and teardown POSITIVELY inside its drain:
-            // teardown may not finish, clear ownership or
-            // retire while the readiness write it started is outstanding — not even when it is
-            // already carrying a deferred cancellation-callback failure.
+            // teardown may not finish or clear ownership while the readiness write it started is
+            // outstanding — not even when it is already carrying a deferred cancellation-callback
+            // failure. The connection, however, is ALREADY RETIRED: the stream-loss path retires it
+            // FIRST, before the drain, by design.
             Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
             Assert.False(
                 loop.IsCompleted,
                 "Teardown must not finish while the readiness write it started is held.");
             Assert.Same(owner, GetActiveAssignment(service));
-            Assert.False(connection.IsRetired, "Retirement must follow the readiness-write join.");
+            Assert.True(
+                connection.IsRetired,
+                "The stream-loss path retires the connection BEFORE the drain, by design.");
 
             writer.ReleaseReady(0);
 
@@ -1933,9 +1938,9 @@ public sealed class WorkerServiceReadinessOwnershipTests
             Assert.True(
                 loopAliveAtWriteRelease,
                 "Teardown must still have been running while the readiness write it started was alive.");
-            Assert.False(
+            Assert.True(
                 retiredAtWriteRelease,
-                "The connection must not have been retired while the readiness write was still alive.");
+                "The stream-loss path retires the connection BEFORE the drain, by design.");
 
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);

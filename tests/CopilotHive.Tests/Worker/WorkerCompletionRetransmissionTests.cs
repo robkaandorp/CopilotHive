@@ -1230,9 +1230,11 @@ public sealed class WorkerCompletionRetransmissionTests
     }
 
     /// <summary>
-    /// MID-DELAY TEARDOWN: an EOF with the receipt permanently unconfirmed cancels the retry's
-    /// parked five-second delay and joins it, emitting NO ordinary Ready — and the NEVER-ADVANCED
-    /// clock is the positive witness that the retry really was parked.
+    /// MID-DELAY TEARDOWN: cancelling the PROCESS/LOOP token (the token that still expresses the
+    /// cancel-and-drain teardown; an EOF with a LIVE token now CARRIES the assignment, so no drain —
+    /// and no retry join — would run at all) with the receipt permanently unconfirmed cancels the
+    /// retry's parked five-second delay and joins it, emitting NO ordinary Ready — and the
+    /// NEVER-ADVANCED clock is the positive witness that the retry really was parked.
     /// </summary>
     [Fact]
     public async Task EofDuringPendingRetryDelay_ClosesCancelsAndJoinsWithoutReady()
@@ -1247,14 +1249,14 @@ public sealed class WorkerCompletionRetransmissionTests
             // The retry is PROVABLY parked (its delay exists); the clock is NEVER advanced.
             await harness.RetryParkedInDelayAsync(1);
 
-            // THE CONCRETE retry task, captured BEFORE the EOF can clear the ownership slot. A
+            // THE CONCRETE retry task, captured BEFORE the teardown can clear the ownership slot. A
             // post-drain lookup would read null, which is also what an implementation that
             // cancelled and then ABANDONED the unwind produces — so it could never discriminate.
             var retry = harness.Retry;
             Assert.False(retry.IsCompleted);
 
-            harness.CompleteStream();
-            await harness.JoinAsync();
+            harness.CancelLoopToken();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.JoinAsync());
 
             // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop returned: the drain
             // JOINED the retry, so by the time the loop completed the EXACT retained task had
@@ -1277,8 +1279,8 @@ public sealed class WorkerCompletionRetransmissionTests
 
     /// <summary>
     /// QUEUED-ON-THE-GATE TEARDOWN: with the production permit held and the retry PARKED ON THE
-    /// PERMIT QUEUE, an EOF cancels the permit acquisition (never a transport write) and joins the
-    /// retry before the ownership clear.
+    /// PERMIT QUEUE, cancelling the PROCESS/LOOP token cancels the permit acquisition (never a
+    /// transport write) and joins the retry before the ownership clear.
     /// </summary>
     [Fact]
     public async Task EofWhileRetryIsQueuedOnTheGate_CancelsThePermitWaitAndJoins()
@@ -1291,7 +1293,7 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.CompleteEnteredAsync(0);
             await harness.RetryParkedInDelayAsync(1);
 
-            // THE CONCRETE retry task, captured BEFORE the EOF clears the ownership slot.
+            // THE CONCRETE retry task, captured BEFORE the teardown clears the ownership slot.
             var retry = harness.Retry;
 
             await harness.HoldSendGateAsync();
@@ -1299,9 +1301,9 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.RetryQueuedOnSendGateAsync();
             Assert.False(retry.IsCompleted, "the retry must be parked on the permit queue.");
 
-            // EOF while the retry is queued: teardown must still converge.
-            harness.CompleteStream();
-            await harness.JoinAsync();
+            // The run cancellation while the retry is queued: teardown must still converge.
+            harness.CancelLoopToken();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.JoinAsync());
 
             // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop returned: the permit
             // wait was cancelled AND JOINED, never abandoned.
@@ -1322,14 +1324,20 @@ public sealed class WorkerCompletionRetransmissionTests
     }
 
     /// <summary>
-    /// ADMITTED-WRITE TEARDOWN: with the retry's own transport write HELD, an EOF genuinely JOINS it
-    /// under the EXISTING stream token — the drain awaits the admitted write exactly as the original
-    /// Complete/Ready writes are awaited today — and only then clears ownership.
+    /// ADMITTED-WRITE TEARDOWN: with the retry's own transport write HELD, cancelling the
+    /// PROCESS/LOOP token genuinely JOINS it — the drain awaits the admitted write exactly as the
+    /// original Complete/Ready writes are awaited today — and only then clears ownership. (An EOF
+    /// with a LIVE token now CARRIES the assignment, so it performs no drain at all and could never
+    /// join the admitted write.)
+    /// <para>
+    /// The admitted write's cancellation unwind is held, so the join is observable as a REAL
+    /// in-flight write rather than a token-only assertion.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task EofDuringAdmittedHeldRetry_JoinsTheAdmittedWriteBeforeClearing()
     {
-        var harness = new RetryHarness { HoldRetries = true };
+        var harness = new RetryHarness { HoldRetries = true, HoldRetryCancellationUnwind = true };
         try
         {
             await harness.StartAsync();
@@ -1340,24 +1348,32 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.AdvanceOneIntervalAsync();
             await harness.CompleteEnteredAsync(1);
 
-            // EOF while the admitted write is HELD: the loop must NOT finish yet.
-            harness.CompleteStream();
+            // THE RUN CANCELLATION while the admitted write is HELD: the writer observes the stream
+            // token and parks in its own deterministic cancellation-unwind barrier before rethrowing.
+            var retry = harness.Retry;
+            harness.CancelLoopToken();
+            await harness.RetryCancellationObservedAsync();
+            Assert.False(harness.RetryWriteCompleted(1));
+            Assert.False(retry.IsCompleted, "the retry must still be unwinding in the writer.");
+
+            // IN-WINDOW JOIN PROOF: the drain may not clear ownership while that write is unwinding.
             var premature = await Record.ExceptionAsync(() =>
                 harness.Loop.WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
             Assert.IsType<TimeoutException>(premature);
-            Assert.False(harness.RetryWriteCompleted(1));
             Assert.Equal(1, harness.SlotOccupancy);
 
             // RELEASE: the join observes the write's own termination, then the clear happens.
-            harness.ReleaseComplete(1);
+            harness.ReleaseRetryCancellationUnwind();
             await harness.JoinedRetryAsync();
-            await harness.JoinAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.JoinAsync());
 
+            Assert.True(retry.IsCompleted, "the drain must join the admitted write's retry task.");
             Assert.Equal(0, harness.SlotOccupancy);
             Assert.Equal(2, harness.Completes.Count);
         }
         finally
         {
+            harness.ReleaseRetryCancellationUnwind();
             await harness.TeardownAsync();
         }
     }
@@ -1740,9 +1756,11 @@ public sealed class WorkerCompletionRetransmissionTests
             Assert.Equal(1, delaysAfterRun1);
             Assert.Single(harness.CompletesOnWriter(0));
 
-            // Run 1 ends: EOF drains, joins the retry and clears ownership.
-            harness.CompleteStream();
-            await harness.JoinAsync();
+            // Run 1 ends under PROCESS-TOKEN CANCELLATION (the token that still expresses the
+            // cancel-and-drain teardown): it drains, joins the retry and clears ownership. An EOF
+            // with a LIVE token would CARRY the assignment instead and leave it retained.
+            harness.CancelLoopToken();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.JoinAsync());
             await retry1.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(0, harness.SlotOccupancy);
             Assert.Equal(0, harness.ReadyCount);
@@ -1781,8 +1799,9 @@ public sealed class WorkerCompletionRetransmissionTests
             Assert.Equal(writesOnOldStreamAtRun1End, harness.CompletesOnWriter(0).Count);
             Assert.Equal(TaskA, harness.CompletesOnWriter(0)[0].Complete.TaskId);
 
-            harness.CompleteStream();
-            await harness.JoinAsync();
+            // Run 2 ends the same way, and the old stream still receives nothing.
+            harness.CancelLoopToken();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.JoinAsync());
             Assert.Equal(writesOnOldStreamAtRun1End, harness.CompletesOnWriter(0).Count);
         }
         finally

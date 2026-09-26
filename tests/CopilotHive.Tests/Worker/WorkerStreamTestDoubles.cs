@@ -344,15 +344,48 @@ internal sealed class GatedOverlapDetectingRequestStream : FakeClientStreamWrite
         {
             // The write is abandoning (injected failure or cancellation): free the slot and
             // remove the now-stale release waiter so later sends remain individually releasable.
+            TaskCompletionSource<bool>? unwind;
             lock (_gate)
             {
                 _writeInProgress = false;
                 _releaseWaiters.Remove(release);
+
+                // THE CANCELLATION UNWIND HOLD. When armed, the write parks HERE — after its slot
+                // is freed — before rethrowing, so a test can observe that a CANCELLED write is
+                // still ALIVE and prove its joiner (a drain) is genuinely waiting on it. It is a
+                // positive rendezvous signalled under the same lock and it can never strand a
+                // producer: the teardown sweep releases it.
+                unwind = CancellationUnwind;
+                if (unwind is not null)
+                    _cancellationUnwindHolds.Add(unwind);
+                _cancellationEntered.TrySetResult(true);
             }
+
+            if (unwind is not null)
+                await unwind.Task;
 
             throw;
         }
     }
+
+    /// <summary>
+    /// OPTIONAL UNWIND HOLD for a write whose forwarded token cancelled: see the catch above.
+    /// <c>null</c> (the default) keeps the faithful immediate unwind every other vector expects.
+    /// </summary>
+    internal TaskCompletionSource<bool>? CancellationUnwind { get; set; }
+
+    private readonly TaskCompletionSource<bool> _cancellationEntered =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly List<TaskCompletionSource<bool>> _cancellationUnwindHolds = [];
+
+    /// <summary>
+    /// POSITIVE RENDEZVOUS: completes once a write has observed its forwarded token as cancelled
+    /// and reached the cancellation-unwind hold. Created EAGERLY, so a cancellation that lands
+    /// before a test registers its waiter is still observed rather than lost. The bound is a
+    /// FAILURE GUARD only — it never orders anything.
+    /// </summary>
+    internal Task WaitForCancellationEnteredAsync(TimeSpan bound, CancellationToken ct) =>
+        _cancellationEntered.Task.WaitAsync(bound, ct);
 
     /// <summary>
     /// Releases the OLDEST currently parked write. Deterministic tests call this only after
@@ -424,6 +457,11 @@ internal sealed class GatedOverlapDetectingRequestStream : FakeClientStreamWrite
             foreach (var waiter in _releaseWaiters)
                 waiter.TrySetResult(true);
             _releaseWaiters.Clear();
+
+            // A write parked in the CANCELLATION UNWIND HOLD left the release list already, so it
+            // is released here too: the sweep must never leave a producer alive.
+            _cancellationUnwindHolds.ForEach(hold => hold.TrySetResult(true));
+            _cancellationUnwindHolds.Clear();
         }
     }
 

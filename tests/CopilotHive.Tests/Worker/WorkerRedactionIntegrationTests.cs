@@ -645,13 +645,16 @@ public sealed class WorkerRedactionIntegrationTests
         const string NullOutcomeContinues = "if (completedOutcome is not { } outcome)\n        continue;";
         // Both diagnostics the returned-outcome path emits are guarded writes, never raw Console.
         const string WorkStreamEndedDiagnostic =
-            "WriteBestEffort(Console.Out, \"[Worker] Work stream ended; the worker is exiting.\");";
+            "WriteBestEffort(\n            Console.Out,\n"
+            + "            $\"[Worker] Work stream ended; reconnecting in {delay.TotalSeconds}s...\");";
+        const string CarriedDrainCall = "await service.DrainCarriedAssignmentAsync();";
         const string BestEffortHelper = "static void WriteBestEffort(TextWriter writer, string message)";
 
         foreach (var fragment in new[]
                  {
                      ServiceConstruction, AttemptRun, DisposalCall, ExitCodeInitialization,
-                     ExitDecision, NullOutcomeContinues, WorkStreamEndedDiagnostic, BestEffortHelper,
+                     ExitDecision, NullOutcomeContinues, WorkStreamEndedDiagnostic, CarriedDrainCall,
+                     BestEffortHelper,
                  })
         {
             Assert.True(
