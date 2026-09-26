@@ -384,10 +384,20 @@ public sealed class WorkerServiceReconnectSurvivalTests
         }
         finally
         {
-            responses.TryComplete();
-            harness.Runner.ReleaseAll();
-            await JoinAllForTeardownAsync(("run", harness.Run));
-            TryDispose(service);
+            try
+            {
+                responses.TryComplete();
+                harness.Runner.ReleaseAll();
+                await JoinAllForTeardownAsync(("run", harness.Run));
+                TryDispose(service);
+            }
+            finally
+            {
+                // This test has its OWN teardown and never calls CarryHarness.TeardownAsync, so
+                // the hermetic config-repo seam's restore handle is released HERE — even when the
+                // join or the dispose above throws.
+                harness.DisposeGitRestore();
+            }
         }
     }
 
@@ -1028,11 +1038,57 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     /// <summary>
+    /// THE SHARED HERMETIC CONFIG-REPO SEAM for every fixture that runs a REAL assignment
+    /// through the production provisioner path (the <see cref="CarryHarness"/> runs and the
+    /// <see cref="ReconnectPlan"/> runs): a unique temp directory plus a healthy
+    /// <see cref="FakeGitLauncher"/> installed through
+    /// <see cref="WorkerServiceConfigRepoHarness.InstallProcessRunner"/>.
+    /// </summary>
+    /// <remarks>
+    /// The per-assignment preparation (<c>WorkerService.PrepareConfigRepoAsync</c>) probes the
+    /// config repo with real git and then creates <c>&lt;dir&gt;/agents</c>, so a fixture that
+    /// hands the service an AMBIENT directory such as <c>/config-repo</c> depends on the host
+    /// filesystem (that path does not exist on the CI runner) and on the real git binary. The
+    /// temp directory exists and is writable everywhere, and the launcher answers the probe
+    /// deterministically: worktree root = the temp directory, origin = the configured URL, and
+    /// an empty successful result for every other command.
+    /// </remarks>
+    /// <param name="configRepoUrl">The origin URL the config-repo probe must observe.</param>
+    /// <returns>
+    /// The temp config-repo directory, plus the restore handle for the static
+    /// <see cref="GitOperations.ProcessRunner"/> override the helper installed — the CALLER owns
+    /// that handle and must dispose it on every exit path.
+    /// </returns>
+    private static (string ConfigRepoDir, IDisposable GitRestore) CreateHermeticConfigRepo(
+        string configRepoUrl)
+    {
+        var configRepoDir = Path.Combine(
+            Path.GetTempPath(), "reconnect-config-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(configRepoDir);
+        var launcher = new FakeGitLauncher(tokens =>
+        {
+            var command = string.Join(' ', tokens);
+            if (command.Contains("rev-parse --is-inside-work-tree", StringComparison.Ordinal))
+                return new GitProcessResult(0, "true\n", string.Empty);
+            if (command.Contains("rev-parse --show-toplevel", StringComparison.Ordinal))
+                return new GitProcessResult(0, configRepoDir + "\n", string.Empty);
+            if (command.Contains("remote get-url origin", StringComparison.Ordinal))
+                return new GitProcessResult(0, configRepoUrl + "\n", string.Empty);
+            return new GitProcessResult(0, string.Empty, string.Empty);
+        });
+        return (configRepoDir, WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher));
+    }
+
+    /// <summary>
     /// THE CARRY HARNESS: one service, one REAL sequential run, a fake duplex stream whose
     /// pending writes fault on dispose and honor write tokens, and the reflection observers the
     /// focused tests share. The run starts in <see cref="Create"/>, so every test observes the
     /// real <see cref="WorkerService.RunAsync"/> lifecycle (registration, publication, heartbeat
-    /// seam, initial Ready) rather than a synthetic publication.
+    /// seam, initial Ready) rather than a synthetic publication. The service is built over the
+    /// SHARED hermetic config-repo directory (<see cref="CreateHermeticConfigRepo"/>), so the
+    /// production per-assignment preparation never touches the ambient filesystem; the harness
+    /// owns that seam's restore handle and releases it through
+    /// <see cref="DisposeGitRestore"/>.
     /// </summary>
     private sealed class CarryHarness
     {
@@ -1050,7 +1106,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
             CancellationToken streamToken,
             Task<WorkerRunOutcome> run,
             TaskCompletionSource disposeHold,
-            int[] disposeHoldArmed)
+            int[] disposeHoldArmed,
+            IDisposable gitRestore)
         {
             Service = service;
             Requests = requests;
@@ -1062,6 +1119,31 @@ public sealed class WorkerServiceReconnectSurvivalTests
             Run = run;
             _disposeHold = disposeHold;
             _disposeHoldArmed = disposeHoldArmed;
+            _gitRestore = gitRestore;
+        }
+
+        /// <summary>
+        /// THE HERMETIC SEAM'S RESTORE HANDLE: the static
+        /// <see cref="GitOperations.ProcessRunner"/> override
+        /// <see cref="CreateHermeticConfigRepo"/> installed for THIS harness's service.
+        /// </summary>
+        private readonly IDisposable _gitRestore;
+
+        /// <summary>0 = not yet disposed; 1 = disposed. Guarded by <see cref="Interlocked"/>.</summary>
+        private int _gitRestoreDisposed;
+
+        /// <summary>
+        /// Releases the hermetic config-repo seam's <see cref="GitOperations.ProcessRunner"/>
+        /// override. IDEMPOTENT: a second (or later) call is a harmless no-op, so a harness can
+        /// be released by both a test's own teardown wrapper and <see cref="TeardownAsync"/>
+        /// without a double dispose reaching the restore closure.
+        /// </summary>
+        internal void DisposeGitRestore()
+        {
+            if (Interlocked.Exchange(ref _gitRestoreDisposed, 1) != 0)
+                return;
+
+            _gitRestore.Dispose();
         }
 
         internal WorkerService Service { get; }
@@ -1087,71 +1169,116 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// <see cref="WorkerService.RunAsync"/>. The initial Ready is EXPECTED and is awaited
         /// here, so a test's write assertions never count it.
         /// </summary>
+        /// <remarks>
+        /// The service runs over the SHARED HERMETIC CONFIG-REPO SEAM
+        /// (<see cref="CreateHermeticConfigRepo"/>), so the production per-assignment preparation
+        /// never touches the ambient filesystem or the real git binary. The returned harness OWNS
+        /// that seam's restore handle — released through <see cref="DisposeGitRestore"/> — and
+        /// every failure path below releases it in the outer <c>finally</c>, after unwinding a run
+        /// that had already started: no live producer and no leaked
+        /// <see cref="GitOperations.ProcessRunner"/> override survives a failed
+        /// <see cref="Create"/>.
+        /// </remarks>
         internal static CarryHarness Create()
         {
-            var service = new WorkerService(
-                "http://localhost:9999", WorkerId, ["coder"], "/config-repo");
-            var runner = new CarryPromptRunner();
-            InstallRunner(service, runner);
+            var (configRepoDir, gitRestore) = CreateHermeticConfigRepo(ConfigRepoUrl);
 
-            var requests = new CarryRequestStream();
-            var responses = new ChannelResponseReader();
-            var disposeHold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var disposeHoldArmed = new int[1];
-            var stream = BuildFaultingStream(requests, responses, () =>
-            {
-                // THE STREAM-DISPOSAL HOLD. A test that arms it parks the run exactly between
-                // the loop's carry teardown and RunAsync's exit re-check — the deterministic
-                // window in which the delivery can complete BEFORE the re-check runs. A test
-                // that never arms it gets today's immediate disposal.
-                if (Volatile.Read(ref disposeHoldArmed[0]) != 0)
-                    disposeHold.Task.GetAwaiter().GetResult();
-            });
-            var invoker = new ScriptedInvoker(RegisterFor(AssignedId));
-            service.CallInvokerFactory = () => invoker;
+            // Set ONLY once the fully built harness is on its way to the caller: the outer
+            // finally reads it as the ONE fact deciding whether the hermetic seam travels with
+            // the returned harness or is restored here.
+            var ownershipTransferred = false;
 
-            var streamToken = CancellationToken.None;
-            service.WorkStreamFactory = (_, ct) =>
-            {
-                streamToken = ct;
-                return stream;
-            };
-            service.HeartbeatTaskFactory = (_, _) => Task.CompletedTask;
-
-            var run = service.RunAsync(TestContext.Current.CancellationToken);
-
-            // The initial Ready is EXPECTED and is awaited here, so every later write assertion
-            // is about the ASSIGNMENT's own writes only.
+            // EVERYTHING after the helper call lives in this ONE try: service construction, the
+            // runner install, the run start, the initial-Ready wait and the published-connection
+            // assertion. The locals are null until their step runs, so the catch knows whether
+            // there is a run to unwind and the finally always releases the hermetic seam.
+            WorkerService? service = null;
+            CarryRequestStream? requests = null;
+            ChannelResponseReader? responses = null;
+            CarryPromptRunner? runner = null;
+            Task<WorkerRunOutcome>? run = null;
             try
             {
+                service = new WorkerService(
+                    "http://localhost:9999", WorkerId, ["coder"], configRepoDir);
+                runner = new CarryPromptRunner();
+                InstallRunner(service, runner);
+
+                requests = new CarryRequestStream();
+                responses = new ChannelResponseReader();
+                var disposeHold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var disposeHoldArmed = new int[1];
+                var stream = BuildFaultingStream(requests, responses, () =>
+                {
+                    // THE STREAM-DISPOSAL HOLD. A test that arms it parks the run exactly between
+                    // the loop's carry teardown and RunAsync's exit re-check — the deterministic
+                    // window in which the delivery can complete BEFORE the re-check runs. A test
+                    // that never arms it gets today's immediate disposal.
+                    if (Volatile.Read(ref disposeHoldArmed[0]) != 0)
+                        disposeHold.Task.GetAwaiter().GetResult();
+                });
+                var invoker = new ScriptedInvoker(RegisterFor(AssignedId));
+                service.CallInvokerFactory = () => invoker;
+
+                var streamToken = CancellationToken.None;
+                service.WorkStreamFactory = (_, ct) =>
+                {
+                    streamToken = ct;
+                    return stream;
+                };
+                service.HeartbeatTaskFactory = (_, _) => Task.CompletedTask;
+
+                run = service.RunAsync(TestContext.Current.CancellationToken);
+
+                // The initial Ready is EXPECTED and is awaited here, so every later write
+                // assertion is about the ASSIGNMENT's own writes only.
                 requests.WaitForWriteCountAsync(1)
                     .WaitAsync(Failsafe, TestContext.Current.CancellationToken)
                     .GetAwaiter().GetResult();
+
+                var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                var created = new CarryHarness(
+                    service, requests, responses, runner, connection, invoker, streamToken, run,
+                    disposeHold, disposeHoldArmed, gitRestore);
+
+                // TRANSFER: the harness now owns the restore handle, so the finally below must
+                // leave it installed for the run's own assignments.
+                ownershipTransferred = true;
+                return created;
             }
             catch (Exception)
             {
                 // A harness failure must never strand the run: unwind through the same teardown
-                // shape the tests use, so no live producer survives a failed Create().
-                responses.TryComplete();
-                requests.ReleaseAll();
-                runner.ReleaseAll();
-                try
+                // shape the tests use, so no live producer survives a failed Create(). A failure
+                // BEFORE the run started (service construction, runner install) has nothing to
+                // unwind.
+                if (run is not null)
                 {
-                    run.WaitAsync(Failsafe, CancellationToken.None).GetAwaiter().GetResult();
-                }
-                catch
-                {
-                    // The run's own outcome is not the fixture's concern here.
+                    responses!.TryComplete();
+                    requests!.ReleaseAll();
+                    runner!.ReleaseAll();
+                    try
+                    {
+                        run.WaitAsync(Failsafe, CancellationToken.None).GetAwaiter().GetResult();
+                    }
+                    catch
+                    {
+                        // The run's own outcome is not the fixture's concern here.
+                    }
+
+                    TryDispose(service!);
                 }
 
-                TryDispose(service);
                 throw;
             }
-
-            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
-            return new CarryHarness(
-                service, requests, responses, runner, connection, invoker, streamToken, run,
-                disposeHold, disposeHoldArmed);
+            finally
+            {
+                // EVERY failure path releases the hermetic seam here, including a failure that
+                // never started the run. The success path transferred the handle to the returned
+                // harness instead.
+                if (!ownershipTransferred)
+                    gitRestore.Dispose();
+            }
         }
 
         /// <summary>
@@ -1230,7 +1357,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// <summary>
         /// TEARDOWN: release every gate, end the reader, drain any retained assignment (the
         /// process cleanup shape) and join every producer under the bounded failsafe — even when
-        /// an assertion failed.
+        /// an assertion failed. The hermetic config-repo seam's restore handle is released in a
+        /// <c>finally</c> AFTER the service is disposed, so a failing dispose can never keep the
+        /// fake launcher installed; its own exception is recorded the same way the other teardown
+        /// failures are and rethrown after the joins.
         /// </summary>
         internal static async Task TeardownAsync(
             CarryHarness harness,
@@ -1254,7 +1384,16 @@ public sealed class WorkerServiceReconnectSurvivalTests
                     ("run", harness.Run));
             }
             catch (Exception ex) { primary ??= ex; }
-            finally { TryDispose(harness.Service); }
+            finally
+            {
+                try { TryDispose(harness.Service); }
+                finally
+                {
+                    try { harness.DisposeGitRestore(); }
+                    catch (Exception ex) { primary ??= ex; }
+                }
+            }
+
             if (primary is not null)
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw();
         }
@@ -2981,23 +3120,9 @@ public sealed class WorkerServiceReconnectSurvivalTests
         {
             // THE CONFIG-REPO SEAM: the reconnect plan runs REAL assignment bodies on
             // connections whose production provisioner is live, so the config-repo
-            // preparation reaches the git layer - a healthy fake launcher keeps that
+            // preparation reaches the git layer - the SHARED hermetic seam keeps that
             // deterministic and off the real filesystem.
-            var configRepoDir = Path.Combine(
-                Path.GetTempPath(), "reconnect-config-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(configRepoDir);
-            var launcher = new FakeGitLauncher(tokens =>
-            {
-                var command = string.Join(' ', tokens);
-                if (command.Contains("rev-parse --is-inside-work-tree", StringComparison.Ordinal))
-                    return new GitProcessResult(0, "true\n", string.Empty);
-                if (command.Contains("rev-parse --show-toplevel", StringComparison.Ordinal))
-                    return new GitProcessResult(0, configRepoDir + "\n", string.Empty);
-                if (command.Contains("remote get-url origin", StringComparison.Ordinal))
-                    return new GitProcessResult(0, ConfigRepoUrl + "\n", string.Empty);
-                return new GitProcessResult(0, string.Empty, string.Empty);
-            });
-            var gitRestore = WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher);
+            var (configRepoDir, gitRestore) = CreateHermeticConfigRepo(ConfigRepoUrl);
 
             var service = new WorkerService(
                 "http://localhost:9999", WorkerId, ["coder"], configRepoDir);
