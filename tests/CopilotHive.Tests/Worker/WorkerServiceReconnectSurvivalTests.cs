@@ -899,20 +899,21 @@ public sealed class WorkerServiceReconnectSurvivalTests
             carriedDelivery = await WaitForCarriedDeliveryAsync(
                 service, "The assignment must be carried.");
             var ownerCts = GetOwnerCts(service);
-            var adoptedRequests = harness.AdoptConnection() is { } adopted ? harness.AdoptedRequests! : throw new Xunit.Sdk.XunitException("Adoption failed.");
-            harness.Runner.Release("task-A");
-
             CancellationToken? observedToken = null;
             var completesAtHook = -1;
             var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Arm the hook while execution is STILL HELD: adoption and release can now never
+            // advance the reporter/delivery past this exact pre-Complete instant first.
             service.CarriedBeforeCompleteSendHook = token =>
             {
-                completesAtHook = adoptedRequests.Completes.Count;
+                completesAtHook = harness.AdoptedRequests!.Completes.Count;
                 observedToken = token;
                 hookEntered.TrySetResult();
                 return hookRelease.Task;
             };
 
+            var adoptedRequests = harness.AdoptConnection() is { } adopted ? harness.AdoptedRequests! : throw new Xunit.Sdk.XunitException("Adoption failed.");
+            harness.Runner.Release("task-A");
             await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // THE HOOK'S EXACT CONTRACT: NO Complete has been written yet, the token observed is
@@ -971,22 +972,23 @@ public sealed class WorkerServiceReconnectSurvivalTests
             carriedDelivery = await WaitForCarriedDeliveryAsync(
                 service, "The assignment must be carried.");
             var owner = GetActiveAssignment(service);
-            var adoptedRequests = harness.AdoptConnection() is { } adopted ? harness.AdoptedRequests! : throw new Xunit.Sdk.XunitException("Adoption failed.");
-            harness.Runner.Release("task-A");
-
             var completesAtHook = -1;
             var readiesAtHook = -1;
             var claimStateAtHook = -1;
             var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Arm the hook while execution is STILL HELD: no adopted Complete/Ready claim can
+            // race past this observation point before the delivery has a target.
             service.CarriedBeforeReadyClaimHook = () =>
             {
-                completesAtHook = adoptedRequests.Completes.Count;
-                readiesAtHook = adoptedRequests.AssignmentReadyCount;
+                completesAtHook = harness.AdoptedRequests!.Completes.Count;
+                readiesAtHook = harness.AdoptedRequests.AssignmentReadyCount;
                 claimStateAtHook = GetReadyClaimState(GetOwnerReadyClaim(owner));
                 hookEntered.TrySetResult();
                 return hookRelease.Task;
             };
 
+            var adoptedRequests = harness.AdoptConnection() is { } adopted ? harness.AdoptedRequests! : throw new Xunit.Sdk.XunitException("Adoption failed.");
+            harness.Runner.Release("task-A");
             await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // THE HOOK'S EXACT CONTRACT: the Complete is ALREADY WRITTEN, no assignment Ready has
@@ -2821,20 +2823,17 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// <summary>
     /// (n) THE PROGRAM-LEVEL DECISIONS, through the production paths Program.cs consumes.
     /// <para>
-    /// LIMITATION, DISCLOSED: Program.cs is top-level statements whose attempt loop captures
-    /// locals (cts, service, delay, exitCode) and exposes NO extracted loop/cleanup decision
-    /// helper or test seam (verified against the actual source; production is frozen this
-    /// round), so the loop's control flow itself cannot be driven in-process. The repo's
-    /// existing Program-level coverage covers the loop shape two ways - the structural
-    /// source-shape test (WorkerRedactionIntegrationTests.WorkerProgram_ProcessLifetimeContract)
-    /// and the real-process fatal-path test - which cover the loop's retry/fatal control flow
-    /// and the final-disposal policy. THIS test proves the DECISIONS the loop consumes, through
-    /// the REAL service: a returned WorkStreamEnded outcome reconnects (the run guard admits
-    /// the re-entry on the SAME service), a RegistrationRejected outcome is terminal, and the
-    /// final cleanup runs DrainCarriedAssignmentAsync BEFORE the ONE Dispose (mirrored exactly,
-    /// because the disposal must run even when the drain threw, with the exit code decided
-    /// after both - the policy shape the existing ProgramFinalDisposal_ThrowingDisposal_*
-    /// mirrors cover).
+    /// <see cref="WorkerProgramDecisions.DecideOutcome"/> and
+    /// <see cref="WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync"/> ARE extracted
+    /// production decisions and are exercised directly here: WorkStreamEnded reconnects on the
+    /// SAME service, RegistrationRejected stops, and a genuinely throwing drain is reported
+    /// once before exactly one Dispose, with exit code 1. Program.cs still owns its top-level
+    /// loop, backoff and final disposal; those effects cannot be driven in-process through the
+    /// decision helpers alone. The Program-level structural check in
+    /// WorkerRedactionIntegrationTests binds Program's ACTUAL drain-helper invocation (whose
+    /// delegate invokes the service drain) AFTER the attempt loop and BEFORE final Dispose;
+    /// the real-process fatal-path test checks top-level error handling. Together they cover
+    /// the call-site wiring that this decision test's mirror cannot establish by itself.
     /// </para>
     /// </summary>
     [Fact]

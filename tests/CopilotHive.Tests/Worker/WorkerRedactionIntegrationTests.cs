@@ -702,6 +702,28 @@ public sealed class WorkerRedactionIntegrationTests
             "The exit code must be decided AFTER the final service disposal: an early return would "
             + "freeze the outcome before teardown could fail it.");
 
+        // ── THE CARRIED DRAIN MUST PRECEDE THE ONE FINAL DISPOSAL ─────────────
+        // Bind the REAL Program.cs cleanup invocation (not a comment or a test-local mirror) to
+        // its service drain delegate, and require that invocation AFTER the attempt loop and
+        // BEFORE the one final Dispose. Swapping those operations must fail even if each still
+        // appears exactly once and the existing Run → Dispose → return ordering remains intact.
+        const string DrainHelperCall =
+            "if (await WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync(async () =>";
+        var executableProgram = StripLineComments(source);
+        Assert.Equal(1, CountOccurrences(executableProgram, DrainHelperCall));
+        var drainBody = ExtractBracedBlock(source, DrainHelperCall);
+        Assert.NotNull(drainBody);
+        Assert.Equal(1, CountOccurrences(StripLineComments(drainBody!), CarriedDrainCall));
+        var loopStartIndex = source.IndexOf(loopBlock!, StringComparison.Ordinal);
+        var drainIndex = source.IndexOf(DrainHelperCall, StringComparison.Ordinal);
+        var executableDrainIndex = executableProgram.IndexOf(DrainHelperCall, StringComparison.Ordinal);
+        var executableDisposalIndex = executableProgram.IndexOf(DisposalCall, StringComparison.Ordinal);
+        Assert.True(
+            0 <= loopStartIndex && loopStartIndex + loopBlock!.Length < drainIndex
+            && 0 <= executableDrainIndex && executableDrainIndex < executableDisposalIndex,
+            "Program must invoke its carried-assignment drain helper AFTER the attempt loop and "
+            + "BEFORE its single final Dispose; disposing first would abandon carried work.");
+
         // ── THE FINAL DISPOSAL IS NEVER RETRIED, AND NEVER SILENTLY IGNORED ───
         // The REGION between the final disposal and the exit decision IS the final disposal handling:
         // it must record the failure as a fatal exit code and must contain NO retry classification
