@@ -205,7 +205,8 @@ public sealed class DashboardStateService : IDisposable
     public BrainStats? GetComposerStats() => _composer?.GetStats();
 
     /// <summary>
-    /// Resets the Brain's conversation session, clearing all history and deleting the session file.
+    /// Resets the master Brain conversation session, clearing its history and reloading the
+    /// orchestrator instructions. Per-goal sessions of goals already in progress are preserved.
     /// Does nothing if the Brain is not configured.
     /// </summary>
     public async Task ResetBrainSessionAsync(CancellationToken ct = default)

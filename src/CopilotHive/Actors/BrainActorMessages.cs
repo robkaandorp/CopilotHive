@@ -10,6 +10,13 @@ internal interface IBrainMessage { }
 /// <summary>Loads or creates the master Brain session.</summary>
 internal sealed record ConnectMessage(TaskCompletionSource<bool> Reply) : IBrainMessage;
 
+/// <summary>
+/// Replaces the master Brain session with a fresh, empty one and switches the orchestrator
+/// instructions to <see cref="SystemPrompt"/>. Per-goal sessions, their child actors and their
+/// files are never touched.
+/// </summary>
+internal sealed record ResetMasterSessionMessage(string SystemPrompt, TaskCompletionSource<bool> Reply) : IBrainMessage;
+
 /// <summary>Forks the master session for a goal.</summary>
 internal sealed record ForkSessionMessage(string GoalId, TaskCompletionSource<bool> Reply) : IBrainMessage;
 
@@ -83,6 +90,10 @@ internal static class BrainActorMessages
 
     /// <summary>Creates a fork-session message with an asynchronous reply source.</summary>
     internal static ForkSessionMessage CreateForkSessionMessage(string goalId) => new(goalId, NewReply<bool>());
+
+    /// <summary>Creates a reset-master-session message with an asynchronous reply source.</summary>
+    internal static ResetMasterSessionMessage CreateResetMasterSessionMessage(string systemPrompt) =>
+        new(systemPrompt, NewReply<bool>());
 
     /// <summary>Creates a delete-session message with an asynchronous reply source.</summary>
     internal static DeleteSessionMessage CreateDeleteSessionMessage(string goalId) => new(goalId, NewReply<bool>());

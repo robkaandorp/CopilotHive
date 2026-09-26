@@ -289,10 +289,11 @@ public class LlmSessionRegistryTests
                 $"{relativePath}: expected at least {minReasoning} 'ReasoningEffort =' occurrences, found {reasoningCount}");
         }
 
-        // Exactly 9 LlmSessionInfo constructions across the 6 production files.
-        Assert.Equal(9, totalInitializers);
-        Assert.True(totalReasoningAssignments >= 9,
-            $"Expected at least 9 'ReasoningEffort =' assignments across all files, found {totalReasoningAssignments}");
+        // Exactly 10 LlmSessionInfo constructions across the 6 production files — the master-only
+        // reset added one in DistributedBrain.ResetSessionAsync, and it carries ReasoningEffort.
+        Assert.Equal(10, totalInitializers);
+        Assert.True(totalReasoningAssignments >= 10,
+            $"Expected at least 10 'ReasoningEffort =' assignments across all files, found {totalReasoningAssignments}");
     }
 
     private static int CountOccurrences(string text, string search)

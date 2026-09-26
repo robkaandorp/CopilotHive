@@ -371,7 +371,7 @@ else
     private async Task ResetBrainSessionAsync()
     {
         var confirmed = await JS.InvokeAsync<bool>("confirm",
-            "Are you sure you want to reset the Brain session? This will clear all conversation history and start a fresh session. The system prompt will be rebuilt with the current orchestrator.agents.md content reloaded from disk.");
+            "Are you sure you want to reset the Brain session? This clears the master Brain conversation and reloads the system prompt from the current orchestrator.agents.md content. Goals already in progress keep their own sessions and are not affected — the reset applies to goals started afterwards.");
         if (!confirmed)
             return;
 

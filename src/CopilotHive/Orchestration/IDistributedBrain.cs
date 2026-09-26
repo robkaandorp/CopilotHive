@@ -232,9 +232,11 @@ public interface IDistributedBrain
     bool GoalSessionExists(string goalId);
 
     /// <summary>
-    /// Resets the Brain session by reloading orchestrator instructions from disk,
-    /// clearing message history, and creating a fresh <see cref="SharpCoder.AgentSession"/>.
-    /// Also deletes the persisted session file. Thread-safe via the Brain call gate.
+    /// Resets ONLY the master Brain session: the master conversation history is cleared, a fresh
+    /// <see cref="SharpCoder.AgentSession"/> is persisted, and the orchestrator instructions are
+    /// reloaded from disk. Per-goal sessions, their child actors and their session files are left
+    /// completely untouched, so goals already in progress keep working; the reset applies to goals
+    /// whose session is forked afterwards. Thread-safe via the Brain call gate.
     /// </summary>
     Task ResetSessionAsync(CancellationToken ct = default);
 }

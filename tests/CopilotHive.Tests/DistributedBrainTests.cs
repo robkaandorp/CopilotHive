@@ -3244,6 +3244,12 @@ public sealed class DistributedBrainTests
     private static string ActorGoalFile(string dir, string goalId) =>
         Path.Combine(dir, "actors", $"brain-goal-{goalId}.json");
 
+    /// <summary>Reads the live child-actor map off a <see cref="CopilotHive.Actors.BrainActor"/>.</summary>
+    private static Dictionary<string, CopilotHive.Actors.GoalBrainActor> ReadChildActors(
+        CopilotHive.Actors.BrainActor actor) =>
+        (Dictionary<string, CopilotHive.Actors.GoalBrainActor>)typeof(CopilotHive.Actors.BrainActor)
+            .GetField("_childActors", NonPublicInstance)!.GetValue(actor)!;
+
     [Fact]
     public async Task ForkSessionForGoalAsync_CreatesActorSessionFile()
     {
@@ -3263,7 +3269,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task ResetSessionAsync_Connected_RecreatesShadowActorAndClearsActorState()
+    public async Task ResetSessionAsync_Connected_KeepsActorAndGoalSessions()
     {
         var dir = NewTempDir();
         try
@@ -3279,35 +3285,48 @@ public sealed class DistributedBrainTests
                 Assert.True(File.Exists(ActorGoalFile(dir, "g7")));
 
                 var originalActor = (CopilotHive.Actors.BrainActor)original!;
+                var goalFileBefore = await File.ReadAllTextAsync(ActorGoalFile(dir, "g7"), TestContext.Current.CancellationToken);
+
+                // Seed the MASTER with history so the post-reset "empty master" assertion is
+                // non-vacuous: without this, MessageCount would be 0 either way.
+                var seed = CopilotHive.Actors.BrainActorMessages.CreateMergeSummaryMessage("seed-goal", "MASTER_SEED_BEFORE_RESET");
+                Assert.True(originalActor.Tell(seed));
+                await seed.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                var seededStats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(originalActor.Tell(seededStats));
+                var seededReply = await seededStats.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                Assert.Equal(2, seededReply!.MessageCount);
+
+                var childBefore = ReadChildActors(originalActor)["g7"];
 
                 await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
-                var recreated = GetBrainActor(brain);
-                Assert.NotNull(recreated);
-                Assert.NotSame(original, recreated);
+                // The SAME actor instance survives: a reset is one message handled by the live actor,
+                // never a detach-and-replace of the whole BrainActor.
+                var afterReset = GetBrainActor(brain);
+                Assert.NotNull(afterReset);
+                Assert.Same(original, afterReset);
+                Assert.False(originalActor.IsCompleted, "A reset must not dispose the actor.");
 
-                // The old actor was disposed — its mailbox loop is completed.
-                Assert.True(originalActor.IsCompleted, "Old actor must be disposed during reset");
+                // The goal's session file AND the SAME child instance survive untouched.
+                Assert.True(File.Exists(ActorGoalFile(dir, "g7")),
+                    "A goal session file must survive a master-only reset.");
+                Assert.Equal(goalFileBefore,
+                    await File.ReadAllTextAsync(ActorGoalFile(dir, "g7"), TestContext.Current.CancellationToken));
+                Assert.Same(childBefore, ReadChildActors(originalActor)["g7"]);
 
-                // All actor goal session files were deleted during reset. The new shadow actor's
-                // ConnectAsync immediately persists a fresh master session, so brain-master.json
-                // is recreated by the time the actor reports connected.
-                Assert.False(File.Exists(ActorGoalFile(dir, "g7")),
-                    "Actor goal session files must be deleted during reset");
-                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-master.json")),
-                    "brain-master.json must be recreated by the new shadow actor's ConnectAsync");
-
-                // The recreated shadow is live and connected.
+                // The still-live actor is connected and reports the fresh, empty master.
                 var stats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
-                Assert.True(((CopilotHive.Actors.BrainActor)recreated!).Tell(stats));
+                Assert.True(originalActor.Tell(stats));
                 var reply = await stats.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
                 Assert.NotNull(reply);
                 Assert.True(reply!.IsConnected);
+                Assert.Equal(0, reply.MessageCount);
 
-                // The recreated actor can fork a new goal session (proves it works end-to-end).
+                // A new fork on the same actor still works end-to-end.
                 await brain.ForkSessionForGoalAsync("g8", TestContext.Current.CancellationToken);
                 Assert.True(File.Exists(ActorGoalFile(dir, "g8")),
-                    "Recreated actor must handle new fork operations");
+                    "The surviving actor must handle new fork operations");
             }
         }
         finally { DeleteDir(dir); }
@@ -3328,6 +3347,130 @@ public sealed class DistributedBrainTests
 
                 Assert.Null(GetBrainActor(brain));
                 Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// Regression test for the reported production failure: a reset issued while a goal is in
+    /// progress must NOT disturb that goal. Goal A keeps its session, its history and its child
+    /// actor, so its prompt crafting still returns the ACTOR-generated prompt (not the generic
+    /// fallback) and its next planning call succeeds; goal B forked after the reset starts from
+    /// the new, empty master with the reloaded instructions.
+    /// </summary>
+    [Fact]
+    public async Task ResetSessionAsync_DuringInProgressGoal_KeepsGoalWorkingAndNewGoalsUseFreshMaster()
+    {
+        var dir = NewTempDir();
+        var agentsDir = Path.Combine(dir, "agents");
+        try
+        {
+            // The INITIAL instructions differ from the ones written before the reset, so goal B can
+            // only receive the NEW value if the reset really reloaded it from disk.
+            const string initialInstructions = "INITIAL_ORCHESTRATOR_INSTRUCTIONS";
+            const string reloadedInstructions = "RELOADED_ORCHESTRATOR_INSTRUCTIONS";
+            var agentsManager = new Agents.AgentsManager(agentsDir);
+            var orchestratorFile = agentsManager.GetAgentsMdPath(WorkerRole.Orchestrator);
+            File.WriteAllText(orchestratorFile, initialInstructions);
+
+            // One shared stub client per child actor so both prompt-crafting (text) and planning
+            // (tool call) work, and the crafted-prompt marker is uniquely attributable.
+            const string craftedMarker = "ACTOR_GENERATED_PROMPT_MARKER";
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                agentsManager: agentsManager,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
+
+            // Like production (systemPrompt: _systemPrompt), the actor is built with the facade's
+            // current system prompt, so children forked BEFORE the reset really carry the initial
+            // instructions and a stale-prompt forward is observable.
+            var systemPromptField = typeof(DistributedBrain).GetField("_systemPrompt", NonPublicInstance)!;
+            SetActorFactory(brain, stateDir => new CopilotHive.Actors.BrainActor(
+                "copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                chatClientFactory: _ => new CraftAndPlanStubClient(craftedMarker),
+                systemPrompt: (string)systemPromptField.GetValue(brain)!));
+
+            static string ChildSystemPrompt(CopilotHive.Actors.GoalBrainActor child) =>
+                ((AgentOptions)typeof(SharpCoder.CodingAgent)
+                    .GetField("_options", NonPublicInstance)!
+                    .GetValue(child.CodingAgent)!).SystemPrompt!;
+
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // Goal A is in progress: fork it, run a planning round so it accumulates history.
+                await brain.ForkSessionForGoalAsync("goal-a", TestContext.Current.CancellationToken);
+                var pipelineA = CreatePipeline("goal-a", "In-progress goal A");
+                var planBefore = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
+                Assert.False(planBefore.IsFailed);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+                var childA = ReadChildActors(actor!)["goal-a"];
+
+                // Baseline: a child forked before the reset carries the INITIAL instructions.
+                Assert.Contains(initialInstructions, ChildSystemPrompt(childA), StringComparison.Ordinal);
+                Assert.DoesNotContain(reloadedInstructions, ChildSystemPrompt(childA), StringComparison.Ordinal);
+
+                // Seed distinctive history into the MASTER itself. A goal forked from the unchanged
+                // old master would inherit it, so goal B's empty history below proves B forked the
+                // NEWLY EMPTIED master.
+                const string masterSeed = "MASTER_HISTORY_SEED_BEFORE_RESET";
+                var seed = CopilotHive.Actors.BrainActorMessages.CreateMergeSummaryMessage("seed-goal", masterSeed);
+                Assert.True(actor!.Tell(seed));
+                await seed.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                Assert.Contains(ActorMasterSession(brain).MessageHistory,
+                    m => m.Text.Contains(masterSeed, StringComparison.Ordinal));
+
+                // New instructions on disk before the reset, so the reset has something to reload.
+                File.WriteAllText(orchestratorFile, reloadedInstructions);
+                var historyCountBefore = childA.Session.MessageHistory.Count;
+                Assert.True(historyCountBefore > 0, "Goal A must have accumulated history before the reset.");
+
+                // Snapshot the EXACT pre-reset history texts, so survival can be asserted message by
+                // message. A count-only check would accept a rewritten session that happened to be
+                // the same length.
+                var historyBefore = childA.Session.MessageHistory.Select(m => m.Text).ToList();
+
+                // AWAITED reset to completion — exactly the production scenario.
+                await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+                // The SAME actor and the SAME child instance survive, along with the goal's file.
+                Assert.Same(actor, GetBrainActor(brain));
+                Assert.Same(childA, ReadChildActors(actor!)["goal-a"]);
+                Assert.True(File.Exists(ActorGoalFile(dir, "goal-a")));
+
+                // Every pre-reset history entry is still present, in order.
+                var historyAfter = childA.Session.MessageHistory.Select(m => m.Text).ToList();
+                Assert.True(historyAfter.Count >= historyCountBefore,
+                    "Goal A must keep its pre-reset message history.");
+                Assert.Equal(historyBefore, historyAfter.Take(historyCountBefore));
+
+                // CraftPromptAsync must return the ACTOR-generated prompt — the fallback would not
+                // contain the stub's marker, so this asserts real actor routing, not a silent fallback.
+                var crafted = await brain.CraftPromptAsync(
+                    pipelineA, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
+                Assert.False(crafted.IsEscalation);
+                Assert.Contains(craftedMarker, crafted.Prompt!, StringComparison.Ordinal);
+
+                // Goal A's next planning call still succeeds on its own surviving child.
+                var planAfter = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
+                Assert.False(planAfter.IsFailed, $"Goal A must still plan after a reset: {planAfter.FailureReason}");
+
+                // Goal B, forked AFTER the reset, starts from the NEWLY EMPTIED master: the seed that
+                // was in the old master is absent and B's forked history is empty.
+                await brain.ForkSessionForGoalAsync("goal-b", TestContext.Current.CancellationToken);
+                var childB = ReadChildActors(actor!)["goal-b"];
+                Assert.Empty(childB.Session.MessageHistory);
+                Assert.DoesNotContain(childB.Session.MessageHistory,
+                    m => m.Text.Contains(masterSeed, StringComparison.Ordinal));
+                Assert.DoesNotContain(childB.Session.MessageHistory,
+                    m => m.Text.Contains("In-progress goal A", StringComparison.Ordinal));
+
+                // …and its child receives the NEW orchestrator instructions, not the initial ones.
+                Assert.Contains(reloadedInstructions, ChildSystemPrompt(childB), StringComparison.Ordinal);
+                Assert.DoesNotContain(initialInstructions, ChildSystemPrompt(childB), StringComparison.Ordinal);
             }
         }
         finally { DeleteDir(dir); }
@@ -3799,4 +3942,67 @@ file sealed class DisposableCountingChatClient : IChatClient
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
 
     public void Dispose() => DisposeCount++;
+}
+/// <summary>
+/// IChatClient stub for the in-progress-reset regression test. It serves BOTH Brain jobs from one
+/// instance: a craft-prompt request returns the distinctive <paramref name="craftedMarker"/> text,
+/// a planning request returns a valid <c>report_iteration_plan</c> tool call, and the post-tool
+/// follow-up returns plain text so the agent loop terminates. Dispatch is deterministic — a
+/// request whose LAST message is a tool result is always the follow-up, a craft request is
+/// recognized from its prompt text, everything else is a planning request — so no call can be
+/// misrouted however the goal's history has grown.
+/// </summary>
+file sealed class CraftAndPlanStubClient(string craftedMarker) : IChatClient
+{
+    public ChatClientMetadata Metadata => new("craft-and-plan", null, "stub-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var all = messages.ToList();
+        var last = all.Count > 0 ? all[^1] : null;
+
+        // Follow-up after the planning tool call: plain text ends the agent loop.
+        if (last is not null && last.Role == ChatRole.Tool)
+        {
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Plan reported."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+        }
+
+        var lastUserText = all.LastOrDefault(m => m.Role == ChatRole.User)?.Text ?? string.Empty;
+
+        if (lastUserText.Contains("Craft a prompt for the", StringComparison.Ordinal))
+        {
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, craftedMarker))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+        }
+
+        var toolCall = new FunctionCallContent("craft-plan-call", "report_iteration_plan", new Dictionary<string, object?>
+        {
+            ["phases"] = new[] { "coding", "testing", "review", "merging" },
+            ["phase_instructions"] = "{}",
+            ["reason"] = "craft-and-plan stub plan",
+            ["model_tiers"] = null,
+        });
+        return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCall]))
+        {
+            FinishReason = ChatFinishReason.ToolCalls,
+        });
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming not used in craft-and-plan stub.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
 }

@@ -93,11 +93,13 @@ public class BrainActorTests
         string model = "test-model",
         int maxContextTokens = 100_000,
         int maxSteps = 50,
-        LlmSessionRegistry? sessionRegistry = null) =>
+        LlmSessionRegistry? sessionRegistry = null,
+        string? systemPrompt = null) =>
         new(model, maxContextTokens, stateDir, NullLogger<BrainActor>.Instance,
             chatClientFactory: _ => new StubChatClient(),
             maxSteps: maxSteps,
-            sessionRegistry: sessionRegistry);
+            sessionRegistry: sessionRegistry,
+            systemPrompt: systemPrompt);
 
     private static GoalPipeline CreatePipeline(string goalId) =>
         new(new Goal { Id = goalId, Description = $"Description for {goalId}" });
@@ -107,6 +109,18 @@ public class BrainActorTests
         var field = typeof(BrainActor).GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
         return (AgentSession)field.GetValue(actor)!;
     }
+
+    /// <summary>Reads the live child-actor map off the actor.</summary>
+    private static Dictionary<string, GoalBrainActor> GetChildActors(BrainActor actor) =>
+        (Dictionary<string, GoalBrainActor>)typeof(BrainActor)
+            .GetField("_childActors", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(actor)!;
+
+    /// <summary>Reads the system prompt a child's <see cref="CodingAgent"/> was configured with.</summary>
+    private static string? GetChildSystemPrompt(GoalBrainActor child) =>
+        ((AgentOptions)typeof(CodingAgent)
+            .GetField("_options", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(child.CodingAgent)!).SystemPrompt;
 
     private static async Task<bool> ConnectAsync(BrainActor actor)
     {
@@ -700,9 +714,9 @@ public class BrainActorTests
 
     // -- RegisterExistingSessionMessage / InjectOrchestratorInstructionsMessage tests --
 
-    private static async Task<BrainActor> CreateConnectedActorAsync(string dir)
+    private static async Task<BrainActor> CreateConnectedActorAsync(string dir, string? systemPrompt = null)
     {
-        var actor = CreateActor(dir);
+        var actor = CreateActor(dir, systemPrompt: systemPrompt);
         actor.Start();
         var connect = BrainActorMessages.CreateConnectMessage();
         Assert.True(actor.Tell(connect));
@@ -1055,6 +1069,166 @@ public class BrainActorTests
         var fork = BrainActorMessages.CreateForkSessionMessage(goalId);
         Assert.True(actor.Tell(fork));
         await AwaitReplyAsync(fork.Reply);
+    }
+
+    // ── ResetMasterSessionMessage: master-only reset ──
+
+    [Fact]
+    public async Task ResetMasterSession_ReplacesMasterAndKeepsChildren()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir, systemPrompt: "INITIAL_SYSTEM_PROMPT");
+            await using (actor)
+            {
+                // Seed the master so the replacement is observable, then fork two goals.
+                var merge = BrainActorMessages.CreateMergeSummaryMessage("seed-goal", "MASTER_BEFORE_RESET");
+                Assert.True(actor.Tell(merge));
+                Assert.True(await AwaitReplyAsync(merge.Reply));
+                await ForkSessionAsync(actor, "goal-1");
+                await ForkSessionAsync(actor, "goal-2");
+
+                var masterBefore = GetMasterSession(actor);
+                Assert.Contains(masterBefore.MessageHistory,
+                    m => m.Text.Contains("MASTER_BEFORE_RESET", StringComparison.Ordinal));
+                var goalFileBefore = await File.ReadAllTextAsync(
+                    Path.Combine(dir, "brain-goal-goal-1.json"), TestContext.Current.CancellationToken);
+
+                // Capture the child INSTANCES before the reset so survival is asserted by identity,
+                // not by a dictionary lookup that a replacement child could also satisfy. The
+                // pre-reset prompt is captured too, so the reloaded prompt below is proven to be a
+                // genuine CHANGE rather than the initial value merely lingering.
+                var child1Before = GetChildActors(actor)["goal-1"];
+                var child2Before = GetChildActors(actor)["goal-2"];
+                Assert.Equal("INITIAL_SYSTEM_PROMPT", GetChildSystemPrompt(child1Before));
+
+                var reset = BrainActorMessages.CreateResetMasterSessionMessage("RELOADED_INSTRUCTIONS");
+                Assert.True(actor.Tell(reset));
+                Assert.True(await AwaitReplyAsync(reset.Reply));
+
+                // The master was REPLACED: a fresh session (new instance) with an empty history.
+                var masterAfter = GetMasterSession(actor);
+                Assert.NotSame(masterBefore, masterAfter);
+                Assert.Empty(masterAfter.MessageHistory);
+
+                // …and persisted to disk.
+                var persisted = await AgentSession.LoadAsync(
+                    Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+                Assert.Empty(persisted.MessageHistory);
+
+                // The SAME child instances and goal session files survive the reset.
+                var children = GetChildActors(actor);
+                Assert.Equal(2, children.Count);
+                Assert.Same(child1Before, children["goal-1"]);
+                Assert.Same(child2Before, children["goal-2"]);
+                Assert.Equal(goalFileBefore, await File.ReadAllTextAsync(
+                    Path.Combine(dir, "brain-goal-goal-1.json"), TestContext.Current.CancellationToken));
+
+                // The reloaded instructions are in effect for children created AFTER the reset.
+                await ForkSessionAsync(actor, "goal-3");
+                Assert.Equal("RELOADED_INSTRUCTIONS", GetChildSystemPrompt(children["goal-3"]));
+                Assert.NotEqual("INITIAL_SYSTEM_PROMPT", GetChildSystemPrompt(children["goal-3"]));
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task ResetMasterSession_SaveFailure_KeepsOldMasterAndOldInstructions()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir, systemPrompt: "INITIAL_SYSTEM_PROMPT");
+            await using (actor)
+            {
+                var merge = BrainActorMessages.CreateMergeSummaryMessage("seed-goal", "MASTER_SURVIVES_FAILURE");
+                Assert.True(actor.Tell(merge));
+                Assert.True(await AwaitReplyAsync(merge.Reply));
+
+                var masterBefore = GetMasterSession(actor);
+                Assert.Contains(masterBefore.MessageHistory,
+                    m => m.Text.Contains("MASTER_SURVIVES_FAILURE", StringComparison.Ordinal));
+
+                // Baseline: a child forked BEFORE the failed reset records the instructions that are
+                // genuinely in effect, so the post-failure child can be compared against it (a
+                // NotEqual-against-the-replacement check alone would accept any other value).
+                await ForkSessionAsync(actor, "goal-before-failure");
+                var baselineSystemPrompt = GetChildSystemPrompt(GetChildActors(actor)["goal-before-failure"]);
+                Assert.Equal("INITIAL_SYSTEM_PROMPT", baselineSystemPrompt);
+
+                // Make the master save throw deterministically: replace the master FILE with a
+                // DIRECTORY of the same name, so no write to that path can succeed.
+                var masterPath = Path.Combine(dir, "brain-master.json");
+                File.Delete(masterPath);
+                Directory.CreateDirectory(masterPath);
+
+                var reset = BrainActorMessages.CreateResetMasterSessionMessage("REPLACEMENT_INSTRUCTIONS");
+                Assert.True(actor.Tell(reset));
+                await AwaitSettledAsync(reset.Reply);
+
+                Assert.True(reset.Reply.Task.IsFaulted, "A failed save must fault the reset reply.");
+                Assert.False(reset.Reply.Task.IsCanceled);
+                // The reply carries the actor's real save failure: writing to a path that is a
+                // directory fails with UnauthorizedAccessException (verified independently), so this
+                // also proves the failing SaveSessionAsync — not a timeout or a cancellation — is
+                // what reached the caller.
+                Assert.IsType<UnauthorizedAccessException>(reset.Reply.Task.Exception!.InnerException);
+
+                // The OLD in-memory master is still in effect: same instance, same history, and the
+                // session has NOT been swapped for the fresh one.
+                var masterAfter = GetMasterSession(actor);
+                Assert.Same(masterBefore, masterAfter);
+                Assert.Contains(masterAfter.MessageHistory,
+                    m => m.Text.Contains("MASTER_SURVIVES_FAILURE", StringComparison.Ordinal));
+
+                // A child forked AFTER the failure still starts from the OLD master's history, and its
+                // instructions are UNCHANGED from the pre-failure baseline — the replacement never
+                // took effect in the actor's state.
+                await ForkSessionAsync(actor, "goal-after-failure");
+                var child = GetChildActors(actor)["goal-after-failure"];
+                Assert.Contains(child.Session.MessageHistory,
+                    m => m.Text.Contains("MASTER_SURVIVES_FAILURE", StringComparison.Ordinal));
+                Assert.Equal(baselineSystemPrompt, GetChildSystemPrompt(child));
+                Assert.NotEqual("REPLACEMENT_INSTRUCTIONS", GetChildSystemPrompt(child));
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task ResetMasterSession_NotConnected_ReplyFaulted_WithNotConnectedError()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = CreateActor(dir);
+            actor.Start();
+            await using (actor)
+            {
+                var reset = BrainActorMessages.CreateResetMasterSessionMessage("INSTRUCTIONS");
+                Assert.True(actor.Tell(reset));
+                await AwaitSettledAsync(reset.Reply);
+
+                Assert.True(reset.Reply.Task.IsFaulted, "A pre-connect reset must fault the reply.");
+                Assert.False(reset.Reply.Task.IsCanceled);
+
+                // Same error identity as EnsureConnected(): the ForkSession path.
+                var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
+                Assert.True(actor.Tell(fork));
+                await AwaitSettledAsync(fork.Reply);
+                var forkError = Assert.IsType<InvalidOperationException>(fork.Reply.Task.Exception!.InnerException);
+                var resetError = Assert.IsType<InvalidOperationException>(reset.Reply.Task.Exception!.InnerException);
+
+                Assert.Equal("Brain is not connected.", resetError.Message);
+                Assert.Equal(forkError.Message, resetError.Message);
+
+                // No master file was created by the rejected reset.
+                Assert.False(File.Exists(Path.Combine(dir, "brain-master.json")));
+            }
+        }
+        finally { DeleteTempPath(dir); }
     }
 
     [Fact]
