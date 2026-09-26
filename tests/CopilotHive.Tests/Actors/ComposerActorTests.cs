@@ -791,6 +791,44 @@ public sealed class ComposerActorTests
         }
     }
 
+    /// <summary>
+    /// Chat client whose streaming response is an async iterator that THROWS before its first
+    /// yield. This is the realistic provider-failure shape: SharpCoder's <c>CodingAgent</c>
+    /// catches it and reports it as a FINAL <c>Completed</c> update carrying
+    /// <c>AgentResult.Status == "Error"</c> and the failure text in <c>AgentResult.Message</c> —
+    /// it never propagates as a real exception (except OperationCanceledException,
+    /// HttpRequestException and ObjectDisposedException).
+    /// </summary>
+    private sealed class ThrowBeforeFirstYieldClient(Exception failure) : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("throw-before-yield", null, "throw-before-yield-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw failure;
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+
+            // The throw IS the whole point: the exception surfaces from the FIRST MoveNextAsync,
+            // so the agent converts it into a Completed/Error update instead of rethrowing.
+            throw failure;
+#pragma warning disable CS0162 // Unreachable: required to make this an async iterator.
+            yield break;
+#pragma warning restore CS0162
+        }
+
+        public void Dispose() { }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
     /// <summary>ILogger that records formatted messages for assertion.</summary>
     private sealed class RecordingLogger : ILogger
     {
@@ -7205,6 +7243,180 @@ public sealed class ComposerActorTests
         }
         finally
         {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Completed/Error-status terminal shape (SharpCoder 0.21.1 provider-failure contract) ──
+
+    /// <summary>
+    /// SharpCoder reports a provider failure as a FINAL <c>Completed</c> update whose
+    /// <c>Result.Status</c> is <c>"Error"</c> and whose <c>Result.Message</c> carries the provider
+    /// text — no exception is thrown out of the enumeration. The actor must route that shape
+    /// through its EXISTING generic error path: the error callback fires, the accumulated
+    /// streaming content gains the <c>❌ Error:</c> marker, and the session is NOT saved (a failed
+    /// turn has no complete response to persist). If the status check were removed, this
+    /// update would be treated as a successful completion: the error callback would never fire,
+    /// the message would be missing, and <c>saveSession</c> would be called.
+    /// </summary>
+    [Fact]
+    public async Task CompletedErrorStatus_InvokesErrorCallbackAndDoesNotSaveSession()
+    {
+        var stateDir = CreateTempDir();
+        var client = new ThrowBeforeFirstYieldClient(
+            new InvalidOperationException("provider blew up (NOT an overflow)"));
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var errors = new List<string>();
+        var saveSessionCalls = 0;
+        var errorGate = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ =>
+            {
+                Interlocked.Increment(ref saveSessionCalls);
+                return Task.CompletedTask;
+            },
+            status =>
+            {
+                lock (registryStatuses)
+                {
+                    registryStatuses.Add(status);
+                    if (status == "idle") idleGate.TrySetResult(true);
+                }
+            },
+            _ => { },
+            () => { },
+            (_, _) => { },
+            error =>
+            {
+                lock (errors) errors.Add(error);
+                errorGate.TrySetResult(error);
+            },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            // The error callback fires inside the mailbox terminal handler — wait for it directly
+            // instead of polling for a timing window.
+            var reported = await errorGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            Assert.Contains("provider blew up", reported, StringComparison.Ordinal);
+            lock (errors) Assert.Single(errors);
+
+            // The error callback fires before the terminal "idle" status; wait for idle so the
+            // whole terminal sequence has completed before asserting on registry/content state.
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.True(saveSessionCalls == 0,
+                "A Completed/Error turn must not save the session — the error path never persists");
+
+            // The error text is appended to the accumulated content, exactly as on the
+            // exception-driven path.
+            var content = GetStreamingContent(actor);
+            Assert.Contains("❌ Error:", content, StringComparison.Ordinal);
+            Assert.Contains("provider blew up", content, StringComparison.Ordinal);
+
+            // Exactly one terminal handling, and the actor is reusable/idle again.
+            lock (registryStatuses) Assert.Equal(["streaming", "idle"], registryStatuses);
+            Assert.False(GetIsStreaming(actor));
+            Assert.True(GetTerminated(actor), "The error terminal must latch _terminated");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// The overflow variant of the same contract: a <c>Completed</c> update with
+    /// <c>Result.Status == "Error"</c> and <c>Result.Message</c> containing
+    /// <c>model_max_prompt_tokens_exceeded</c> must take the EXISTING overflow-recovery path — the
+    /// session is reset to a fresh (empty) one, the overflow-recovery callback fires so the facade
+    /// clears its compaction caches and deletes the stale session file, and the reset session is
+    /// never persisted. Removing the status check makes this a plain completion: the session
+    /// would keep its history, no recovery callback would run, and the session WOULD be saved.
+    /// </summary>
+    [Fact]
+    public async Task CompletedOverflowErrorStatus_ResetsSessionAndInvokesOverflowRecovery()
+    {
+        var stateDir = CreateTempDir();
+        var client = new ThrowBeforeFirstYieldClient(
+            new InvalidOperationException("model_max_prompt_tokens_exceeded"));
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        // Seed the session so the overflow-driven reset is observable as a cleared history.
+        service.Session.MessageHistory.Add(new ChatMessage(ChatRole.User, "seed message"));
+        Assert.Single(service.Session.MessageHistory);
+
+        var registryStatuses = new List<string>();
+        var saveSessionCalls = 0;
+        var overflowRecoveryCalls = 0;
+        var recoveryGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ =>
+            {
+                Interlocked.Increment(ref saveSessionCalls);
+                return Task.CompletedTask;
+            },
+            status =>
+            {
+                lock (registryStatuses)
+                {
+                    registryStatuses.Add(status);
+                    if (status == "idle") idleGate.TrySetResult(true);
+                }
+            },
+            _ => { },
+            () => { },
+            (_, _) => { },
+            _ => { },
+            () =>
+            {
+                Interlocked.Increment(ref overflowRecoveryCalls);
+                recoveryGate.TrySetResult();
+            });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            // The recovery callback fires inside the mailbox terminal handler, so this gate
+            // deterministically signals that the overflow path completed.
+            await recoveryGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            Assert.Equal(1, overflowRecoveryCalls);
+
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // The session was REPLACED by the recovery (fresh, empty history)…
+            Assert.Empty(service.Session.MessageHistory);
+
+            // …and the reset session is deliberately not persisted: saving it would overwrite
+            // the on-disk history with the empty post-overflow session.
+            Assert.True(saveSessionCalls == 0,
+                "Overflow recovery must NOT persist the reset (empty) session");
+
+            lock (registryStatuses) Assert.Equal(["streaming", "idle"], registryStatuses);
+            Assert.False(GetIsStreaming(actor));
+            Assert.True(GetTerminated(actor), "The overflow terminal must latch _terminated");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
             TryDeleteDir(stateDir);
         }
     }

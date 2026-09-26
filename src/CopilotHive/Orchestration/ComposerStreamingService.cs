@@ -78,7 +78,19 @@ internal sealed class ComposerStreamingService(
                         break;
 
                     case StreamingUpdateKind.Completed:
-                        _lastToolCalls = update.Result?.ToolCallCount ?? 0;
+                        // SharpCoder reports most provider failures as a FINAL Completed update
+                        // whose Result.Status is "Error" (Result.Message carries the provider
+                        // message); only OperationCanceledException, HttpRequestException and
+                        // ObjectDisposedException still propagate as real exceptions. Re-raise
+                        // it from INSIDE this try so the EXISTING overflow/generic catch blocks
+                        // below own the recovery — never duplicate those paths here.
+                        var completed = update.Result;
+                        if (completed is not null && completed.Status == "Error")
+                        {
+                            throw new InvalidOperationException(completed.Message);
+                        }
+
+                        _lastToolCalls = completed?.ToolCallCount ?? 0;
                         break;
                 }
             }
@@ -124,12 +136,29 @@ internal sealed class ComposerStreamingService(
     {
         while (ex is not null)
         {
-            if (ex.Message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase))
+            if (IsContextOverflowErrorMessage(ex.Message))
                 return true;
             ex = ex.InnerException;
         }
         return false;
     }
+
+    /// <summary>
+    /// Returns <c>true</c> if <paramref name="message"/> is a context overflow error from the LLM
+    /// provider, identified by the <c>model_max_prompt_tokens_exceeded</c> error code.
+    /// <para>
+    /// The string overload exists because SharpCoder reports provider failures as a final
+    /// <c>Completed</c> update carrying <c>AgentResult.Status == "Error"</c> and the provider text
+    /// in <c>AgentResult.Message</c>, with no exception object available. It applies EXACTLY the
+    /// same matching rule as the exception overload (which delegates here), so both shapes of the
+    /// same provider failure are classified identically.
+    /// </para>
+    /// </summary>
+    /// <param name="message">The message to inspect.</param>
+    /// <returns><c>true</c> when the message indicates a context-window overflow.</returns>
+    internal static bool IsContextOverflowErrorMessage(string? message)
+        => message is not null
+           && message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase);
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()

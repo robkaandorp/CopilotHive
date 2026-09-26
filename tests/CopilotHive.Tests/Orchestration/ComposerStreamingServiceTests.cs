@@ -175,6 +175,44 @@ public sealed class ComposerStreamingServiceTests
     }
 
     /// <summary>
+    /// A streaming chat client whose response is an async iterator that THROWS before its first
+    /// yield. This is the realistic provider-failure shape: SharpCoder's <c>CodingAgent</c>
+    /// catches it and reports it as a FINAL <c>Completed</c> update carrying
+    /// <c>AgentResult.Status == "Error"</c> and the failure text in <c>AgentResult.Message</c> —
+    /// it never propagates as a real exception (except OperationCanceledException,
+    /// HttpRequestException and ObjectDisposedException).
+    /// </summary>
+    private sealed class ThrowBeforeFirstYieldClient(Exception failure) : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("throw-before-yield", null, "throw-before-yield-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw failure;
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+
+            // The throw IS the whole point: the exception surfaces from the FIRST MoveNextAsync,
+            // so the agent converts it into a Completed/Error update instead of rethrowing.
+            throw failure;
+#pragma warning disable CS0162 // Unreachable: required to make this an async iterator.
+            yield break;
+#pragma warning restore CS0162
+        }
+
+        public void Dispose() { }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
+    /// <summary>
     /// A streaming chat client that blocks on a <see cref="SemaphoreSlim"/> until released,
     /// allowing tests to keep the streaming loop alive for cancellation/disposal tests.
     /// </summary>
@@ -818,8 +856,46 @@ public sealed class ComposerStreamingServiceTests
         Assert.False(ComposerStreamingService.IsContextOverflowError(null));
     }
 
-    // ── 9. IsContextOverflowError delegates from Composer ──
+    // ── 8b. IsContextOverflowErrorMessage string helper ──
 
+    /// <summary>
+    /// The string overload is what classifies a <c>Completed</c> update's
+    /// <c>AgentResult.Message</c> (where there is no exception object to inspect). It must apply
+    /// exactly the same rule as the exception overload, which delegates to it.
+    /// </summary>
+    [Fact]
+    public void IsContextOverflowErrorMessage_MatchesTheSameRuleAsTheExceptionOverload()
+    {
+        // The provider code is detected, case-insensitively.
+        Assert.True(ComposerStreamingService.IsContextOverflowErrorMessage("model_max_prompt_tokens_exceeded"));
+        Assert.True(ComposerStreamingService.IsContextOverflowErrorMessage(
+            "HTTP 400: MODEL_MAX_PROMPT_TOKENS_EXCEEDED"));
+        // And it may be embedded in a longer provider message.
+        Assert.True(ComposerStreamingService.IsContextOverflowErrorMessage(
+            "error: model_max_prompt_tokens_exceeded (requested 200000)"));
+
+        // Unrelated text — including near-misses — is NOT an overflow.
+        Assert.False(ComposerStreamingService.IsContextOverflowErrorMessage("Something went wrong"));
+        Assert.False(ComposerStreamingService.IsContextOverflowErrorMessage("model_max_prompt_tokens"));
+        Assert.False(ComposerStreamingService.IsContextOverflowErrorMessage(string.Empty));
+        Assert.False(ComposerStreamingService.IsContextOverflowErrorMessage(null));
+
+        // The exception overload delegates here: an exception whose message the string helper
+        // rejects must also be rejected by the exception overload, and vice versa.
+        foreach (var message in new[]
+        {
+            "model_max_prompt_tokens_exceeded",
+            "Something went wrong",
+            "model_max_prompt_tokens",
+        })
+        {
+            Assert.Equal(
+                ComposerStreamingService.IsContextOverflowErrorMessage(message),
+                ComposerStreamingService.IsContextOverflowError(new InvalidOperationException(message)));
+        }
+    }
+
+    // ── 9. IsContextOverflowError delegates from Composer ──
     [Fact]
     public void Composer_IsContextOverflowError_DelegatesToStreamingService()
     {
@@ -1059,6 +1135,111 @@ public sealed class ComposerStreamingServiceTests
                 // Never let a failed assertion leave the injected task hanging.
                 tcs.TrySetResult(true);
             }
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    // ── 13b. Completed/Error-status shape (SharpCoder 0.21.1 provider-failure contract) ──
+
+    /// <summary>
+    /// SharpCoder reports a provider failure as a FINAL <c>Completed</c> update whose
+    /// <c>Result.Status</c> is <c>"Error"</c> and whose <c>Result.Message</c> carries the provider
+    /// text — no exception leaves the enumeration. The service must route that shape through its
+    /// EXISTING generic catch: the <c>❌ Error: {message}</c> text is appended and
+    /// <c>saveSession</c> is NOT called for that turn, exactly like the exception-driven path.
+    /// Removing the status check makes the turn a normal completion: no error text would be
+    /// appended and the incomplete turn WOULD be persisted.
+    /// </summary>
+    [Fact]
+    public async Task RunStreamingAsync_CompletedWithErrorStatus_AppendsErrorAndSkipsSessionSave()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            var client = new ThrowBeforeFirstYieldClient(
+                new InvalidOperationException("service-level provider failure (NOT an overflow)"));
+            await InjectFakeChatClient(composer, client);
+
+            var streamingService = GetStreamingService(composer);
+            streamingService.SendMessage("hello");
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (streamingService.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, CancellationToken.None);
+
+            Assert.False(streamingService.IsStreaming, "Streaming should have finished after the error");
+
+            // The generic-error path appended the marker and the provider text…
+            Assert.Contains("❌ Error:", streamingService.StreamingContent, StringComparison.Ordinal);
+            Assert.Contains("service-level provider failure", streamingService.StreamingContent,
+                StringComparison.Ordinal);
+
+            // …and the failed turn was NOT persisted (no saveSession for an errored turn).
+            Assert.False(
+                File.Exists(Path.Combine(tmpDir, "composer-session.json")),
+                "A Completed/Error turn must not save the session");
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The overflow variant of the same contract: a <c>Completed</c> update with
+    /// <c>Result.Status == "Error"</c> and the <c>model_max_prompt_tokens_exceeded</c> code in
+    /// <c>Result.Message</c> must take the EXISTING overflow path — the warning is appended and
+    /// the overflow-recovery callback (which deletes the stale session file) runs. The turn is
+    /// never persisted. Removing the status check makes the turn a normal completion: no warning
+    /// would be appended, the recovery callback would not run, and the session WOULD be saved.
+    /// </summary>
+    [Fact]
+    public async Task RunStreamingAsync_CompletedWithOverflowErrorStatus_AppendsWarningAndRunsOverflowRecovery()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            // A stale session file exists; overflow recovery is what deletes it.
+            var sessionFile = Path.Combine(tmpDir, "composer-session.json");
+            await File.WriteAllTextAsync(sessionFile, "{}", TestContext.Current.CancellationToken);
+            Assert.True(File.Exists(sessionFile));
+
+            var client = new ThrowBeforeFirstYieldClient(
+                new InvalidOperationException("model_max_prompt_tokens_exceeded"));
+            await InjectFakeChatClient(composer, client);
+
+            var streamingService = GetStreamingService(composer);
+            streamingService.SendMessage("hello");
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (streamingService.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, CancellationToken.None);
+
+            Assert.False(streamingService.IsStreaming, "Streaming should have finished after the overflow");
+
+            // The OVERFLOW path ran — not the generic error path.
+            Assert.Contains("⚠️", streamingService.StreamingContent, StringComparison.Ordinal);
+            Assert.Contains("Context limit reached", streamingService.StreamingContent, StringComparison.Ordinal);
+            Assert.DoesNotContain("❌", streamingService.StreamingContent, StringComparison.Ordinal);
+
+            // The overflow-recovery callback deleted the stale session file, proving it ran.
+            Assert.False(File.Exists(sessionFile),
+                "Session file should be deleted by the overflow recovery callback");
+
+            // The reset session was not persisted, and the recovery cleared the facade caches.
+            Assert.False(composer.IsCompacting, "IsCompacting should be reset by overflow recovery");
+            Assert.False(composer.WasCompacted, "WasCompacted should be reset by overflow recovery");
         }
         finally
         {
