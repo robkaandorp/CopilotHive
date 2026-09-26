@@ -646,6 +646,32 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
 
             await foreach (var update in _agentService.Agent!.ExecuteStreamingAsync(_agentService.Session, userMessage, ct))
             {
+                // SharpCoder reports most provider failures as a FINAL Completed update whose
+                // Result.Status is "Error" (Result.Message carries the provider text); only
+                // OperationCanceledException, HttpRequestException and ObjectDisposedException
+                // still propagate as real exceptions. Re-raise it from INSIDE this try so the
+                // EXISTING catch blocks below own the outcome — the overflow branch
+                // (_agentService.ResetSessionAsync + ComposerStreamingCompleteMessage(0, true,
+                // false) + the _onSessionLoaded(false) publish rule when the reset fails) and
+                // the generic branch (log + ComposerStreamingErrorMessage). Duplicating either
+                // here would fork the recovery semantics.
+                //
+                // ORDERING: this runs BEFORE the cancellation short-circuit below. SharpCoder
+                // converts every non-cancellation failure into this terminal shape — including a
+                // failure that surfaces while the caller's token is already cancelled (a real
+                // provider failure that raced the cancellation, or a cancellation that arrived
+                // after the stream faulted). Classifying that as a plain cancellation would
+                // silently swallow the failure: the terminal would be marked cancelled and the
+                // error path's reporting/recovery callbacks would never run. Only a Completed
+                // update with a non-null Result is affected; a TextDelta carries a null Result,
+                // and a NORMAL completion (Success/MaxStepsReached) that races cancellation is
+                // still classified as cancelled exactly as before.
+                if (update.Kind == StreamingUpdateKind.Completed
+                    && update.Result is { Status: "Error" } errorResult)
+                {
+                    throw new InvalidOperationException(errorResult.Message);
+                }
+
                 if (ct.IsCancellationRequested)
                 {
                     cancelled = true;
