@@ -4265,6 +4265,10 @@ internal sealed class PatchCancellationFactory : WebApplicationFactory<Program>
             services.AddSingleton(_config);
             services.AddSingleton<ConfigRepoManager>(_repo);
             services.AddSingleton<ConfigModelService>();
+
+            // The Brain is mandatory in production (Program registers it unconditionally and
+            // resolves it eagerly after builder.Build()); this host supplies its own explicitly.
+            services.ReplaceDistributedBrain(new NoOpDistributedBrain());
         });
     }
 }

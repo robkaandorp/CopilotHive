@@ -197,6 +197,141 @@ public sealed class Program
             sp.GetService<CopilotEndpointResolver>()));
     }
 
+    /// <summary>
+    /// The SINGLE, fixed startup-contract message raised when <c>orchestrator.model</c> is not
+    /// configured. It names the missing setting, states that CopilotHive requires a Brain, and
+    /// tells the operator exactly how to supply one.
+    /// <para>
+    /// It deliberately contains NO configuration value and NO URL, so it is safe to surface
+    /// verbatim (log line, startup error, API response) on any deployment.
+    /// </para>
+    /// </summary>
+    internal const string BrainModelRequiredMessage =
+        "orchestrator.model is not configured — CopilotHive requires a Brain. " +
+        "Start CopilotHive with --config-repo pointing at a hive-config.yaml that sets orchestrator.model.";
+
+    /// <summary>
+    /// The Brain startup contract: returns the configured <c>orchestrator.model</c> (trimmed), or
+    /// fails startup with the single actionable <see cref="BrainModelRequiredMessage"/>.
+    /// </summary>
+    /// <remarks>
+    /// CopilotHive has no no-Brain operating mode, so an unconfigured (null/blank) orchestrator
+    /// model is a STARTUP ERROR rather than a silent, Brain-less degradation. Extracted as a named
+    /// helper so the contract is verifiable without booting the host.
+    /// </remarks>
+    /// <param name="config">The parsed hive configuration.</param>
+    /// <returns>The trimmed orchestrator model.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <paramref name="config"/> declares no orchestrator model.
+    /// </exception>
+    internal static string RequireBrainModel(HiveConfigFile config)
+    {
+        var model = config.Orchestrator?.Model;
+        if (string.IsNullOrWhiteSpace(model))
+            throw new InvalidOperationException(BrainModelRequiredMessage);
+
+        return model.Trim();
+    }
+
+    /// <summary>
+    /// Registers the production <see cref="IDistributedBrain"/> UNCONDITIONALLY (there is no
+    /// no-Brain operating mode). Extracted as a named helper so the registration seam is
+    /// verifiable against a test <see cref="IServiceCollection"/> without booting the host.
+    /// </summary>
+    /// <remarks>
+    /// The factory, in order:
+    /// <list type="number">
+    /// <item>enforces the startup contract via <see cref="RequireBrainModel"/> (a missing
+    /// <c>orchestrator.model</c> throws <see cref="BrainModelRequiredMessage"/> instead of
+    /// degrading to an unregistered Brain);</item>
+    /// <item>logs <c>Brain enabled — model: {BrainModel}</c> on the resolved
+    /// <see cref="ILogger{Program}"/> — so the announcement belongs to the REAL Brain and a host
+    /// that supplies its own Brain (test hosts) neither emits it nor constructs this factory;</item>
+    /// <item>builds <see cref="DistributedBrain"/> with the effective model, the catalog context
+    /// window (else the default) and <c>orchestrator.brain_max_steps</c>.</item>
+    /// </list>
+    /// <para>
+    /// The registration is deferred (a factory, never an instance), so nothing here runs at
+    /// registration time and an empty model only fails when the Brain is actually resolved — which
+    /// Program does eagerly, immediately after <c>builder.Build()</c>, before any other startup
+    /// step. <c>BRAIN_MODEL</c> never gates or seeds the Brain, and
+    /// <c>BRAIN_CONTEXT_WINDOW</c>/<c>BRAIN_MAX_STEPS</c> never override the config.
+    /// </para>
+    /// </remarks>
+    /// <param name="services">The service collection to register into.</param>
+    /// <param name="stateDir">Directory used for persistent Brain state (session files).</param>
+    internal static void AddDistributedBrain(IServiceCollection services, string stateDir)
+    {
+        services.AddSingleton<IDistributedBrain>(sp =>
+        {
+            var config = sp.GetRequiredService<HiveConfigFile>();
+
+            // 1. Startup contract FIRST: an unconfigured orchestrator.model fails here, so a real
+            //    Brain is never constructed (and nothing claims to be enabled) without a model.
+            var effectiveModel = RequireBrainModel(config);
+
+            // 2. Announce the EFFECTIVE model on the same resolved logger Program used before, so
+            //    the line reaches the dashboard sink through the normal logging pipeline.
+            sp.GetRequiredService<ILogger<Program>>()
+                .LogInformation("Brain enabled — model: {BrainModel}", effectiveModel);
+
+            // 3. Build the production Brain: the model comes from the parsed config (effective
+            //    value, trimmed by RequireBrainModel), the context window from the model catalog
+            //    when the model has one (else the default), max steps straight from
+            //    orchestrator.brain_max_steps (a non-nullable int).
+            var maxCtx = config.TryGetContextWindowForModel(effectiveModel)
+                ?? Constants.DefaultBrainContextWindow;
+            var maxSteps = config.Orchestrator.BrainMaxSteps;
+
+            return new DistributedBrain(effectiveModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
+                sp.GetRequiredService<MetricsTracker>(),
+                sp.GetService<AgentsManager>(),
+                maxCtx,
+                maxSteps,
+                sp.GetService<IBrainRepoManager>(),
+                stateDir,
+                sp.GetRequiredService<IGoalStore>(),
+                compactionModel: config.GetCompactionModel(),
+                knowledgeGraph: sp.GetService<KnowledgeGraph>(),
+                hiveConfig: config,
+                sessionRegistry: sp.GetService<LlmSessionRegistry>(),
+                configRepo: sp.GetService<ConfigRepoManager>(),
+                reasoningEffort: ParseConfiguredReasoningEffort(
+                    config.Orchestrator.ReasoningEffort,
+                    "orchestrator.reasoning_effort",
+                    sp.GetService<ILogger<DistributedBrain>>()),
+                issueStore: sp.GetService<IIssueStore>(),
+                eventBus: sp.GetService<IEventBus>());
+        });
+    }
+
+    /// <summary>
+    /// Parses a configured reasoning effort leniently: an unrecognised value degrades to
+    /// <c>null</c> (unset) instead of throwing. Startup validation
+    /// (<see cref="HiveConfigFile.ValidateReasoningEffort"/>) is the authority for rejecting bad
+    /// values; DI factories resolve lazily and must never crash the host — or a later dynamic
+    /// config reload — over an invalid string.
+    /// </summary>
+    /// <param name="value">The configured effort string, possibly null/blank/invalid.</param>
+    /// <param name="field">The config field name to name in the warning.</param>
+    /// <param name="logger">Optional logger for the degradation warning.</param>
+    /// <returns>The parsed effort, or <c>null</c> when unset or unrecognised.</returns>
+    private static Microsoft.Extensions.AI.ReasoningEffort? ParseConfiguredReasoningEffort(
+        string? value, string field, ILogger? logger)
+    {
+        try
+        {
+            return ReasoningEffortConverter.Parse(value);
+        }
+        catch (ArgumentException)
+        {
+            logger?.LogWarning(
+                "Invalid {Field} '{Effort}' in configuration; using reasoning effort unset.",
+                field, value);
+            return null;
+        }
+    }
+
     private static async Task<int> Main(string[] args)
     {
         // ── Server mode (only mode) ──────────────────────────────────────────────────
@@ -414,10 +549,11 @@ public sealed class Program
             // EXACTLY ONE registration (one configuration authority), so IEnumerable<HiveConfigFile>
             // never exposes both a false- and true-provenance instance. When no config repo is
             // configured, the fallback singleton has a NULL Orchestrator.Model (via
-            // OrchestratorConfig.CreateEmptyModelFallback) so the Brain is NOT registered (Slice 2:
-            // the Brain gate below requires a non-blank orchestrator model) and the Composer
-            // registers as a disconnected shell (resolver-only — the fallback's null orchestrator
-            // model yields no Composer default).
+            // OrchestratorConfig.CreateEmptyModelFallback). That fallback is for test hosts, which
+            // supply a Brain explicitly: in production a null orchestrator model FAILS STARTUP
+            // (RequireBrainModel — CopilotHive requires a Brain), and the Composer registers as a
+            // disconnected shell (resolver-only — the fallback's null orchestrator model yields no
+            // Composer default).
             HiveConfigFile hiveConfigFile;
             if (!string.IsNullOrEmpty(configRepoUrl))
             {
@@ -469,7 +605,10 @@ public sealed class Program
             }
             else
             {
-                // No config repo: the single HiveConfigFile is the empty fallback.
+                // No config repo: the single HiveConfigFile is the empty fallback. In production
+                // its NULL orchestrator.model FAILS STARTUP at the eager Brain resolution below
+                // (CopilotHive requires a Brain — RequireBrainModel). It is retained for test
+                // hosts, which supply a Brain explicitly.
                 hiveConfigFile = new HiveConfigFile
                 {
                     Orchestrator = OrchestratorConfig.CreateEmptyModelFallback()
@@ -488,49 +627,17 @@ public sealed class Program
                 sp.GetRequiredService<ILogger<ConfigFacade>>(),
                 sp.GetService<IBrainRepoManager>()));
 
-            // Brain: direct LLM connection via SharpCoder. Registered ONLY when the parsed config
-            // declares an orchestrator model (Slice 2 — config-driven registration; BRAIN_MODEL no
-            // longer gates or seeds the Brain, and BRAIN_CONTEXT_WINDOW/BRAIN_MAX_STEPS no longer
-            // override the config). When unconfigured, IDistributedBrain is NOT registered at all:
-            // GetService<IDistributedBrain>() returns null and consumers (GoalDispatcher, dashboard,
-            // etc.) degrade gracefully.
+            // Brain: direct LLM connection via SharpCoder. Registered UNCONDITIONALLY — CopilotHive
+            // has no no-Brain operating mode, so a missing orchestrator.model FAILS STARTUP
+            // instead of leaving IDistributedBrain unregistered. AddDistributedBrain evaluates the
+            // startup contract first (RequireBrainModel: the single actionable
+            // BrainModelRequiredMessage, no config values), then announces the effective model and
+            // only then builds the DistributedBrain. A host that supplies its own Brain (test
+            // hosts, via a later registration) never reaches this factory and therefore neither
+            // throws nor logs "Brain enabled". BRAIN_MODEL never gates or seeds the Brain, and
+            // BRAIN_CONTEXT_WINDOW/BRAIN_MAX_STEPS never override the config.
             var ollamaApiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
-            if (!string.IsNullOrWhiteSpace(hiveConfigFile.Orchestrator.Model))
-            {
-                builder.Services.AddSingleton<IDistributedBrain>(sp =>
-                {
-                    var config = sp.GetRequiredService<HiveConfigFile>();
-                    // The Brain's model is the parsed config.Orchestrator.Model (effective value —
-                    // the registration gate above guarantees it is non-blank; the null-forgiving
-                    // operator is a compile-safe assertion of that gate). The context window
-                    // comes from the model catalog when the model has one, else the default; max
-                    // steps come straight from orchestrator.brain_max_steps (a non-nullable int).
-                    var effectiveModel = config.Orchestrator.Model!;
-                    var maxCtx = config.TryGetContextWindowForModel(effectiveModel)
-                        ?? Constants.DefaultBrainContextWindow;
-                    var maxSteps = config.Orchestrator.BrainMaxSteps;
-
-                    return new DistributedBrain(effectiveModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
-                        sp.GetRequiredService<MetricsTracker>(),
-                        sp.GetService<AgentsManager>(),
-                        maxCtx,
-                        maxSteps,
-                        sp.GetService<IBrainRepoManager>(),
-                        stateDir,
-                        sp.GetRequiredService<IGoalStore>(),
-                        compactionModel: config.GetCompactionModel(),
-                        knowledgeGraph: sp.GetService<KnowledgeGraph>(),
-                        hiveConfig: config,
-                        sessionRegistry: sp.GetService<LlmSessionRegistry>(),
-                        configRepo: sp.GetService<ConfigRepoManager>(),
-                        reasoningEffort: ParseConfiguredReasoningEffort(
-                            config.Orchestrator.ReasoningEffort,
-                            "orchestrator.reasoning_effort",
-                            sp.GetService<ILogger<DistributedBrain>>()),
-                        issueStore: sp.GetService<IIssueStore>(),
-                        eventBus: sp.GetService<IEventBus>());
-                });
-            }
+            AddDistributedBrain(builder.Services, stateDir);
 
             builder.Services.AddSingleton<WorkerUtilizationService>();
             builder.Services.AddSingleton<ClarificationQueueService>();
@@ -913,6 +1020,17 @@ public sealed class Program
 
             var app = builder.Build();
 
+            // Brain startup contract, enforced EAGERLY and BEFORE every later startup step
+            // (DB migration/backup, user service, repo clones, knowledge sweep, gRPC/endpoint
+            // mapping, Composer connect): a missing orchestrator.model must stop the process right
+            // after the config sync/load above, not surface later as a half-started orchestrator.
+            // The config sync and load that precede builder.Build() are REQUIRED to obtain the
+            // model, so they stay where they are. The resolved instance is reused below for the
+            // single startup ConnectAsync. A host that supplies its own Brain (test hosts) simply
+            // resolves that instance — it never reaches the contract, so it neither throws nor
+            // logs "Brain enabled".
+            var brain = app.Services.GetRequiredService<IDistributedBrain>();
+
             var logger = app.Services.GetRequiredService<ILogger<Program>>();
             logger.LogInformation("Starting gRPC server on port {GrpcPort}, HTTP on port {HttpPort}", port, port + 1);
 
@@ -983,13 +1101,6 @@ public sealed class Program
             // no config repo is configured.
             AttachLiveTokenResolver(app.Services, userService);
 
-            // Brain registration is config-driven (Slice 2): enabled exactly when the parsed
-            // hive-config declares a non-blank orchestrator.model.
-            if (!string.IsNullOrWhiteSpace(hiveConfigFile.Orchestrator.Model))
-                logger.LogInformation("Brain enabled — model: {BrainModel}", hiveConfigFile.Orchestrator.Model);
-            else
-                logger.LogWarning("Brain disabled — no brain model configured in hive-config.yaml");
-
             if (!string.IsNullOrEmpty(configRepoUrl))
             {
                 logger.LogInformation("Synced config repo from {ConfigRepoUrl}", configRepoUrl);
@@ -1023,13 +1134,12 @@ public sealed class Program
             }
 
             // Wire up Brain and completion event
-            var brain = app.Services.GetService<IDistributedBrain>();
-            if (brain is not null)
-            {
-                logger.LogInformation("Connecting Brain…");
-                await brain.ConnectAsync();
-                logger.LogInformation("Brain connected.");
-            }
+            // The Brain instance was resolved eagerly right after builder.Build() (startup
+            // contract), so this is the SAME singleton — its "Brain enabled — model: …" line was
+            // emitted when the registration factory ran.
+            logger.LogInformation("Connecting Brain…");
+            await brain.ConnectAsync();
+            logger.LogInformation("Brain connected.");
 
             // Wire up Composer
             // Force construction of the event subscriber so its subscription is active
@@ -1165,27 +1275,6 @@ public sealed class Program
 
             await app.RunAsync();
             return 0;
-        }
-
-        // Parses a configured reasoning effort leniently: an unrecognised value degrades to
-        // null (unset) instead of throwing. Startup validation
-        // (HiveConfigFile.ValidateReasoningEffort) is the authority for rejecting bad values;
-        // these DI factories resolve lazily and must never crash the host — or a later dynamic
-        // config reload — over an invalid string.
-        static Microsoft.Extensions.AI.ReasoningEffort? ParseConfiguredReasoningEffort(
-            string? value, string field, ILogger? logger)
-        {
-            try
-            {
-                return ReasoningEffortConverter.Parse(value);
-            }
-            catch (ArgumentException)
-            {
-                logger?.LogWarning(
-                    "Invalid {Field} '{Effort}' in configuration; using reasoning effort unset.",
-                    field, value);
-                return null;
-            }
         }
 
         static void PrintBanner()

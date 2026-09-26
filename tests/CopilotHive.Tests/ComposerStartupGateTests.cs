@@ -291,6 +291,12 @@ internal sealed class ComposerStartupGateFactory : WebApplicationFactory<Program
         // Registered after Program's own registration: the LAST singleton wins for
         // GetRequiredService, so the Composer factory resolves this config.
         builder.ConfigureServices(services => services.AddSingleton(_config));
+
+        // The Brain is mandatory in production (Program registers it unconditionally and resolves
+        // it eagerly after builder.Build()). This host supplies its own Brain explicitly rather
+        // than relying on a configured orchestrator.model.
+        builder.ConfigureServices(services =>
+            services.ReplaceDistributedBrain(new NoOpDistributedBrain()));
     }
 
     /// <inheritdoc />

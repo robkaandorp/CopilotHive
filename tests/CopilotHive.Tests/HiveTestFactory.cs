@@ -66,6 +66,14 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     {
         builder.UseEnvironment("Testing");
 
+        // The Brain is mandatory in production: Program registers IDistributedBrain
+        // unconditionally and resolves it eagerly right after builder.Build(). A test host booted
+        // without a config repo gets the null-orchestrator.model fallback, so it MUST supply a
+        // Brain explicitly — the no-op stub. Registered after Program's own registration (and
+        // removing that descriptor) so the stub is what the host resolves.
+        builder.ConfigureServices(services =>
+            services.ReplaceDistributedBrain(new NoOpDistributedBrain()));
+
         // Replace IBrainRepoManager with mock if set
         if (MockRepoManager is not null)
         {

@@ -1114,6 +1114,10 @@ internal sealed class CustomEndpointFactory : WebApplicationFactory<Program>
             services.AddSingleton<CopilotEndpointResolver>(
                 (token, ct) => Task.FromResult(new Uri("https://api.githubcopilot.com/")));
             services.AddSingleton<ModelDiscoveryService>();
+
+            // The Brain is mandatory in production (Program registers it unconditionally and
+            // resolves it eagerly after builder.Build()); this host supplies its own explicitly.
+            services.ReplaceDistributedBrain(new NoOpDistributedBrain());
         });
     }
 }

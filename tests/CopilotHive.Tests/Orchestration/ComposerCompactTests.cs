@@ -2376,6 +2376,10 @@ internal sealed class ComposerCompactPartialEndpointFactory : WebApplicationFact
                     "chat client unavailable in test — Composer stays unconnected"));
 
             services.AddSingleton(composer);
+
+            // The Brain is mandatory in production (Program registers it unconditionally and
+            // resolves it eagerly after builder.Build()); this host supplies its own explicitly.
+            services.ReplaceDistributedBrain(new NoOpDistributedBrain());
         });
     }
 

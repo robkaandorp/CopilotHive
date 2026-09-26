@@ -110,6 +110,11 @@ public class ConfigFacadeTests
                     services.RemoveAll<ModelDiscoveryService>();
                     services.AddSingleton(_discovery);
                 }
+
+                // The Brain is mandatory in production (Program registers it unconditionally and
+                // resolves it eagerly after builder.Build()); this host supplies its own
+                // explicitly rather than relying on a configured orchestrator.model.
+                services.ReplaceDistributedBrain(new NoOpDistributedBrain());
             });
         }
     }

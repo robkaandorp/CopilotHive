@@ -14,18 +14,18 @@ using Microsoft.Extensions.DependencyInjection;
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Slice 2 config-driven Brain registration tests (Program.cs): with a real config repo
-/// (<c>--config-repo</c>) the Brain is registered ONLY when <c>orchestrator.model</c> is
-/// non-blank; its model / context-window / max-steps come from the parsed config (never
-/// <c>BRAIN_MODEL</c> / <c>BRAIN_CONTEXT_WINDOW</c> / <c>BRAIN_MAX_STEPS</c>); and the startup
-/// connect block connects the registered Brain (offline-safe — no SharpCoder/Copilot network
-/// I/O at connect) or skips cleanly when unconfigured.
+/// Mandatory-Brain registration tests (Program.cs): with a real config repo
+/// (<c>--config-repo</c>) the Brain is registered UNCONDITIONALLY (there is no no-Brain operating
+/// mode); its model / context-window / max-steps come from the parsed config (never
+/// <c>BRAIN_MODEL</c> / <c>BRAIN_CONTEXT_WINDOW</c> / <c>BRAIN_MAX_STEPS</c>); an unconfigured
+/// <c>orchestrator.model</c> FAILS STARTUP with the fixed
+/// <see cref="Program.BrainModelRequiredMessage"/>; and the startup connect block connects the
+/// registered Brain (offline-safe — no SharpCoder/Copilot network I/O at connect).
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class BrainRegistrationTests : IDisposable
 {
     private const string BrainEnabledLog = "Brain enabled — model:";
-    private const string BrainDisabledLog = "Brain disabled — no brain model configured in hive-config.yaml";
 
     private readonly string? _previousBrainModel;
     private readonly string? _previousBrainContextWindow;
@@ -169,13 +169,22 @@ public sealed class BrainRegistrationTests : IDisposable
         Assert.Equal(7, stats.MaxSteps);
     }
 
+    // ── Unconfigured orchestrator.model FAILS STARTUP (mandatory Brain) ───────
+
     /// <summary>
-    /// A parsed config that OMITS <c>orchestrator: model:</c> leaves <see cref="OrchestratorConfig.Model"/>
-    /// at <c>null</c> (UNCONFIGURED — Slice 3a parse-time normalization), so the Brain is NOT
-    /// registered. BRAIN_MODEL env (set) must NOT seed the model.
+    /// REGRESSION (unconditional registration): a parsed config that OMITS
+    /// <c>orchestrator: model:</c> leaves <see cref="OrchestratorConfig.Model"/> at <c>null</c>
+    /// (parse-time normalization), and the host must FAIL STARTUP with the fixed
+    /// <see cref="Program.BrainModelRequiredMessage"/> — not start with an unregistered Brain.
+    /// <c>BRAIN_MODEL</c> env (set) must NOT seed the model.
+    /// <para>
+    /// Seam: host boot. RequireBrainModel → the AddDistributedBrain factory → the eager
+    /// GetRequiredService in Program.Main all run while WebApplicationFactory starts the server,
+    /// so touching <c>factory.Services</c> surfaces the InvalidOperationException.
+    /// </para>
     /// </summary>
     [Fact]
-    public async Task ConfigRepo_ModelOmitted_BrainNotRegistered_GetServiceNull()
+    public async Task ConfigRepo_ModelOmitted_StartupFails_WithFixedBrainModelRequiredMessage()
     {
         const string yaml = """
             version: "1.0"
@@ -184,24 +193,22 @@ public sealed class BrainRegistrationTests : IDisposable
             """;
 
         await using var factory = await BootWithConfigRepoAsync(yaml);
-        var brain = factory.Services.GetService<IDistributedBrain>();
 
-        Assert.Null(brain);
+        var ex = Record.Exception(() => factory.Services);
+        var innermost = Innermost(ex);
 
-        var logs = StartupLogs(factory);
-        Assert.Contains(logs, m => m.Contains(BrainDisabledLog, StringComparison.Ordinal));
-        Assert.DoesNotContain(logs, m => m.Contains(BrainEnabledLog, StringComparison.Ordinal));
+        Assert.IsType<InvalidOperationException>(innermost);
+        Assert.Equal(Program.BrainModelRequiredMessage, innermost!.Message);
     }
 
-    // ── Brain NOT registered when orchestrator.model is blank/whitespace ──────
-
     /// <summary>
-    /// A parsed config whose <c>orchestrator.model</c> is whitespace-only is treated as NOT
-    /// configured: the Brain descriptor is absent (GetService returns null), no crash, and the
-    /// startup log reports the config-driven disable message. BRAIN_MODEL env is set and ignored.
+    /// REGRESSION (unconditional registration): a parsed config whose <c>orchestrator.model</c> is
+    /// whitespace-only is treated as NOT configured by parse-time normalization, so the host must
+    /// FAIL STARTUP with the fixed <see cref="Program.BrainModelRequiredMessage"/>.
+    /// <c>BRAIN_MODEL</c> env is set and must NOT seed the model.
     /// </summary>
     [Fact]
-    public async Task ConfigRepo_BlankModel_BrainNotRegistered_GetServiceNull_EnvHasNoEffect()
+    public async Task ConfigRepo_BlankModel_StartupFails_WithFixedBrainModelRequiredMessage_EnvHasNoEffect()
     {
         const string yaml = """
             version: "1.0"
@@ -211,17 +218,15 @@ public sealed class BrainRegistrationTests : IDisposable
             """;
 
         await using var factory = await BootWithConfigRepoAsync(yaml);
-        var brain = factory.Services.GetService<IDistributedBrain>();
 
-        Assert.Null(brain);
+        var ex = Record.Exception(() => factory.Services);
+        var innermost = Innermost(ex);
 
-        // Consumers degrade: the host started and core singletons resolve with a null Brain.
-        Assert.NotNull(factory.Services.GetService<GoalDispatcher>());
-
-        var logs = StartupLogs(factory);
-        Assert.Contains(logs, m => m.Contains(BrainDisabledLog, StringComparison.Ordinal));
-        Assert.DoesNotContain(logs, m => m.Contains(BrainEnabledLog, StringComparison.Ordinal));
-        Assert.DoesNotContain(logs, m => m.Contains("BRAIN_MODEL", StringComparison.Ordinal));
+        // The fixed message — NEVER an env-var-derived model, and never the framework's
+        // "no service for type" fallback (which is what a conditional registration guard yields).
+        Assert.IsType<InvalidOperationException>(innermost);
+        Assert.Equal(Program.BrainModelRequiredMessage, innermost!.Message);
+        Assert.DoesNotContain("BRAIN_MODEL", innermost.Message, StringComparison.Ordinal);
     }
 
     // ── Reasoning validation is NON-FATAL at startup (Slice 3c) ─────────────
@@ -296,9 +301,15 @@ public sealed class BrainRegistrationTests : IDisposable
     // ── Registration seam: startup connect uses the registered Brain ───────────
 
     /// <summary>
-    /// The startup connect block (<c>GetService&lt;IDistributedBrain&gt;()</c> + ConnectAsync) drives
-    /// whatever instance is registered. Replacing Program's factory with a stub proves the block
-    /// invokes ConnectAsync on the registered Brain — no real SharpCoder/Copilot network connect.
+    /// The startup connect block (<c>GetRequiredService&lt;IDistributedBrain&gt;()</c> + ConnectAsync)
+    /// drives whatever instance is registered. Replacing Program's factory with a stub proves the
+    /// block invokes ConnectAsync on the registered Brain — no real SharpCoder/Copilot network
+    /// connect.
+    /// <para>
+    /// The override also proves the "Brain enabled" announcement belongs to the PRODUCTION Brain:
+    /// the real registration factory never runs when a host supplies its own Brain, so the line
+    /// must be ABSENT even though the resolved Brain has a configured model in the config file.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task ConfigRepo_BrainReplacedWithStub_StartupConnectsRegisteredBrain()
@@ -318,11 +329,26 @@ public sealed class BrainRegistrationTests : IDisposable
         Assert.Equal(1, stub.ConnectCount);
 
         var logs = StartupLogs(factory);
-        Assert.Contains(logs, m => m.Contains($"{BrainEnabledLog} copilot/stub-model", StringComparison.Ordinal));
         Assert.Contains(logs, m => m.Contains("Connecting Brain", StringComparison.Ordinal));
+        // The stub-Brain host must NOT announce the production "Brain enabled — model: …" line:
+        // that line is emitted by the production registration factory, which never runs here.
+        Assert.DoesNotContain(logs, m => m.Contains(BrainEnabledLog, StringComparison.Ordinal));
     }
 
     // ── Test infrastructure ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The INNERMOST exception of <paramref name="ex"/>: host boot wraps the startup failure
+    /// (DeferredHost/TargetInvocationException layers), so assertions about the CONTRACT must
+    /// compare against the original thrown exception, never an outer wrapper's message.
+    /// </summary>
+    private static Exception? Innermost(Exception? ex)
+    {
+        while (ex?.InnerException is not null)
+            ex = ex.InnerException;
+
+        return ex;
+    }
 
     private static IReadOnlyList<string> StartupLogs(WebApplicationFactory<Program> factory) =>
         factory.Services.GetRequiredService<DashboardLogSink>()
