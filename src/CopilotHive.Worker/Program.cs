@@ -160,14 +160,45 @@ while (!cts.IsCancellationRequested)
 
     // From here on nothing can reach the catches above, so a throwing diagnostic can neither be
     // misclassified as a connection failure (creating a fresh attempt) nor alter the exit code.
-    if (outcome == WorkerRunOutcome.WorkStreamEnded)
+    //
+    // THE DECISION ITSELF is the extracted WorkerProgramDecisions.DecideOutcome — a pure mapping, so
+    // it can be exercised directly — while every effect (backoff, diagnostics, exit code, loop
+    // control) stays right here.
+    var outcomeAction = WorkerProgramDecisions.DecideOutcome(outcome);
+    if (outcomeAction == WorkerOutcomeAction.Reconnect)
     {
-        // Static and secret-free: the accepted work stream ended and this process is exiting.
-        // Deliberately NOT a reconnect trigger — a returned outcome ALWAYS stops the loop, and the
-        // write is best-effort so a closed/redirected stdout cannot change that.
-        WriteBestEffort(Console.Out, "[Worker] Work stream ended; the worker is exiting.");
+        // THE RECONNECT TRIGGER. A returned outcome means the attempt finished cleanly — the
+        // accepted work stream ended and the whole lifecycle teardown completed — which is exactly
+        // what an orchestrator restart looks like from this side. The ATTEMPT is over; the PROCESS
+        // is not: the SAME service is entered again with the SAME bounded backoff the classified
+        // connection-failure branch above uses, so a worker holding a CARRIED assignment registers
+        // again (the service still owns that assignment, and the next run claims it through
+        // current_task_id) and can be adopted instead of losing the task.
+        //
+        // Static and secret-free, and best-effort so a closed/redirected stdout cannot change that.
+        WriteBestEffort(
+            Console.Out,
+            $"[Worker] Work stream ended; reconnecting in {delay.TotalSeconds}s...");
+
+        try
+        {
+            await Task.Delay(delay, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[Worker] Shutting down gracefully.");
+            break;
+        }
+
+        delay = delay * 2 > maxDelay ? maxDelay : delay * 2;
+
+        // EXPLICITLY END THIS ITERATION, exactly as the classified-throw branch does: the next
+        // attempt starts on the SAME service, and this path may never fall through into the
+        // remaining outcome handling below.
+        continue;
     }
-    else if (outcome != WorkerRunOutcome.RegistrationRejected)
+
+    if (outcomeAction == WorkerOutcomeAction.Fatal)
     {
         // An UNKNOWN/unexpected enum value must never silently retry and never silently exit. It is
         // an ordinary fatal InvalidOperationException, classified by the SAME sanitizer the fatal
@@ -181,9 +212,32 @@ while (!cts.IsCancellationRequested)
         break;
     }
 
-    // The registration-rejection diagnostic is emitted by the service itself. BOTH known outcomes
-    // stop this loop with the same exit code as before: the attempt is over.
+    // The registration-rejection diagnostic is emitted by the service itself. A REJECTED
+    // registration is not retryable: this loop ends with the same exit code as before.
     break;
+}
+
+// ── THE CARRIED-ASSIGNMENT DRAIN, BEFORE THE ONE FINAL DISPOSAL ───────────────────
+//
+// FIRST cancel and drain any RETAINED assignment — including the carried delivery continuation it
+// owns — so no live producer survives the process's own teardown and no carried task is left
+// half-delivered. Only AFTER that does the ONE final service disposal below run.
+//
+// Each failure is reported SEPARATELY, in the same sanitized form the other fatal paths use, turns
+// the process into a failure, and is NEVER retried: process-level teardown is not an attempt, so
+// none of these faults may be classified as a connection failure. A drain fault must not skip the
+// disposal, and the disposal must not be skipped merely because the drain threw — the two blocks
+// are therefore independent, and the exit code is decided only after both.
+//
+// The drain-and-report step is the extracted WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync
+// (the SAME guarded, sanitized fatal line, never retried, never throwing), so it can be exercised with
+// a genuinely throwing drain; turning its failure into the fatal exit code stays right here.
+if (await WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync(async () =>
+{
+    await service.DrainCarriedAssignmentAsync();
+}))
+{
+    exitCode = 1;
 }
 
 // ── THE ONE FINAL SERVICE DISPOSAL, AFTER LOOP TERMINATION ────────────────────────

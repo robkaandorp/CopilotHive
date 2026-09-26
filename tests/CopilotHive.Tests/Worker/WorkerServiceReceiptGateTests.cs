@@ -1256,11 +1256,12 @@ public sealed class WorkerServiceReceiptGateTests
         var writer = new GatedWriter();
         var reader = new ChannelResponseReader();
         var service = BuildService(runner);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
 
         var connection = TestConnectionFactory.Attach(
             service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
             completionReceiptAckEnabled: true, completionReadyRequired: true);
-        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessages(service, connection, loopCts.Token);
 
         System.Threading.Tasks.Task? execution = null;
         System.Threading.Tasks.Task? reporting = null;
@@ -1277,10 +1278,14 @@ public sealed class WorkerServiceReceiptGateTests
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(0, writer.ReadyCount);
 
-            // EOF: the drain consults the SAME gate — no ACK, so no ordinary Ready is emitted —
-            // and never WAITS for one. The loop finishes on its own bounded join.
+            // CANCEL THE PROCESS/LOOP TOKEN (the token that still expresses the cancel-and-drain
+            // teardown; an EOF with a LIVE token now CARRIES the assignment instead). The drain
+            // consults the SAME gate — no ACK, so no ordinary Ready is emitted — and never WAITS for
+            // one. The loop finishes on its own bounded join, surfacing its cancelled read.
+            await loopCts.CancelAsync();
             reader.TryComplete();
-            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
 
             Assert.Equal(0, writer.ReadyCount);
             Assert.Equal(0, GetSlotOccupancy(service));
@@ -2538,15 +2543,71 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     /// <summary>
-    /// EOF TEARDOWN WITH A THROWING CANCELLATION CALLBACK: the drain clears WITHOUT any ACK wait
-    /// (the ACK is permanently absent), emits NO ordinary Ready, and the DEFERRED cancellation-
-    /// cleanup failure propagates because there is no primary — after the ownership clear, the
+    /// Non-carry EOF with a LIVE process token: ACK tracking is enabled but ordinary Ready is
+    /// ungated, so ReadyStarted wins before EOF despite NO receipt ACK. The loop itself must
+    /// propagate the deferred cancellation-callback failure AFTER joining the held Ready and
+    /// clearing ownership; dropping the deferred failure cannot pass this vector.
+    /// </summary>
+    [Fact]
+    public async Task AckOnlyMode_EofAfterReadyStarted_ThrowingCallbackPropagatesFromLoopWithoutPrimary()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: false);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+        CancellationTokenRegistration callbackRegistration = default;
+        Task? execution = null;
+        Task? reporting = null;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            var ownerCts = GetOwnerCts(service);
+            var failure = new GateDeferredCancellationException("callback must propagate from loop");
+            callbackRegistration = ownerCts.Token.Register(() => throw failure);
+            Assert.Equal(1, writer.ReadyCount);
+            Assert.False(ownerCts.IsCancellationRequested);
+
+            // This is EOF with a LIVE process token and an actual started ordinary Ready.
+            reader.TryComplete();
+            writer.ReleaseReady(0);
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Contains(failure, Flatten(surfaced));
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.True(connection.IsRetired);
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+        }
+        finally
+        {
+            callbackRegistration.Dispose();
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution), ("assignment reporting", reporting), ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// EOF TEARDOWN UNDER PROCESS-TOKEN CANCELLATION WITH A THROWING CANCELLATION CALLBACK (an EOF
+    /// with a LIVE token now CARRIES, so this variant is the one that still drains): the drain clears
+    /// WITHOUT any ACK wait (the ACK is permanently absent), emits NO ordinary Ready, and the
+    /// deferred cancellation-cleanup failure is the observed outcome after the ownership clear, the
     /// heartbeat-state cleanup and the retirement. Sanitized, guarded diagnostics only.
     /// <para>
     /// REMOVAL PROOF. A teardown that waited for an ACK would never reach the callback's
-    /// propagation; a teardown that lost the deferred failure would complete the loop normally and
-    /// fail the throw assertion; one that surfaced it BEFORE the clear would fail the
-    /// connection-binding assertions taken at the drain's completion.
+    /// propagation; a teardown that lost the deferred failure would complete the loop normally; one
+    /// that surfaced it BEFORE the clear would fail the connection-binding assertions taken at the
+    /// drain's completion.
     /// </para>
     /// </summary>
     [Fact]
@@ -2556,11 +2617,12 @@ public sealed class WorkerServiceReceiptGateTests
         var writer = new GatedWriter();
         var reader = new ChannelResponseReader();
         var service = BuildService(runner);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
 
         var connection = TestConnectionFactory.Attach(
             service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
             completionReceiptAckEnabled: true, completionReadyRequired: true);
-        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessages(service, connection, loopCts.Token);
 
         var originalErr = Console.Error;
         var stdErr = new StringWriter();
@@ -2584,13 +2646,19 @@ public sealed class WorkerServiceReceiptGateTests
             var deferredFailure = new GateDeferredCancellationException("throwing cancellation callback");
             callbackRegistration = ownerCts.Token.Register(() => throw deferredFailure);
 
-            // EOF with the ACK permanently absent: the teardown drains, clears and retires, and
-            // the deferred cancellation-callback failure then propagates (no primary exists).
+            // CANCEL THE PROCESS/LOOP TOKEN (the token that still expresses the cancel-and-drain
+            // teardown; an EOF with a LIVE token now CARRIES the assignment instead): the teardown
+            // drains and clears, and the throwing cancellation callback's failure is observed on the
+            // cancellation request's OWN dispatch — never as an unobserved thread-pool fault.
+            var cancellationFailure = await Record.ExceptionAsync(() => loopCts.CancelAsync());
+            Assert.NotNull(cancellationFailure);
+            Assert.Contains(deferredFailure, Flatten(cancellationFailure!));
             reader.TryComplete();
 
-            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+            // The loop itself surfaces its CANCELLED READ; the callback evidence stays on the
+            // cancellation request captured above.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
                 () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-            Assert.Contains(deferredFailure, Flatten(surfaced));
 
             // The clear/retire ordering is preserved: the slot is empty, the connection retired.
             Assert.Equal(0, writer.ReadyCount);
@@ -3007,6 +3075,7 @@ public sealed class WorkerServiceReceiptGateTests
         var writer = new GatedWriter();
         var reader = new ChannelResponseReader();
         var service = BuildService(runner);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         var clock = new ManualRetransmissionClock();
         typeof(WorkerService)
             .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
@@ -3016,7 +3085,7 @@ public sealed class WorkerServiceReceiptGateTests
         var connection = TestConnectionFactory.Attach(
             service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
             completionReceiptAckEnabled: true, completionReadyRequired: true);
-        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessages(service, connection, loopCts.Token);
 
         Task? execution = null;
         Task? reporting = null;
@@ -3067,8 +3136,14 @@ public sealed class WorkerServiceReceiptGateTests
             Assert.Empty(writer.Completes);
             Assert.Equal(0, writer.ReadyCount);
 
+            // CANCEL THE PROCESS/LOOP TOKEN: the token that still expresses the cancel-and-drain
+            // teardown (an EOF with a LIVE token now CARRIES the assignment, so no drain — and no
+            // retry join — would run at all). The drain closes retry admission and joins the
+            // retained retry task before the ownership clear.
+            await loopCts.CancelAsync();
             reader.TryComplete();
-            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
 
             // THE EXACT retained retry task terminated as part of the drain, before the clear.
             await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);

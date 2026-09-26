@@ -621,6 +621,14 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             responses.TryComplete();
             await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            // CLEANUP (the carry contract): an EOF with a LIVE process token now CARRIES the
+            // running assignment instead of cancelling and draining it, so the retained body is
+            // released by the PROCESS-level drain — the same cleanup Program.cs runs at shutdown —
+            // which cancels and joins it exactly as the loop's teardown used to. Every assertion
+            // below is unchanged: the drain observes the body's bridge failure on the way out.
+            await service.DrainCarriedAssignmentAsync()
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
             Assert.Equal(0, connection.PendingToolResponseCount);
             Assert.True(connection.IsRetired);
             Assert.NotNull(runner.ObservedBridgeFailure);
@@ -1122,6 +1130,15 @@ public sealed class WorkerConnectionToolCallLifetimeTests
     /// and the bounded loop join fails by name; without drain-before-retire, the retired
     /// connection rejects the body's Ready and the Ready-count assertion fails by name.
     /// </para>
+    /// <para>
+    /// THE CARRY CONTRACT. With a LIVE process token an EOF now CARRIES the running assignment: the
+    /// loop's own teardown ends the response waits and returns WITHOUT cancelling or draining, so
+    /// the body stays parked in its prompt and no drain ever holds the loop. The ORDER the original
+    /// vector proved — response waits end before the assignment is released, and the connection is
+    /// retired only after the released assignment has unwound — is now proven across the two steps
+    /// that actually perform it: the loop's EOF teardown, and the PROCESS-LEVEL drain that
+    /// Program.cs runs at shutdown (which is what cancels a carried assignment).
+    /// </para>
     /// </summary>
     [Fact]
     public async Task AssignmentBridgeWait_OnIndependentToken_IsReleasedByEof_WhileUnwindGateHoldsTheDrain()
@@ -1151,32 +1168,40 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             responses.TryComplete();
 
             // The wait was released INDEPENDENTLY of the assignment token, by the loop's teardown
-            // ending the response waits FIRST.
+            // ending the response waits FIRST — and that teardown does not wait for the body.
             await runner.BridgeFailed("task-unwind")
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(WorkerConnection.DisconnectedMessage, runner.ObservedBridgeFailure!.Message);
             Assert.Equal(0, connection.PendingToolResponseCount);
 
-            // The body observed the assignment cancellation and is now HELD in its unwind gate:
-            // the loop's drain must still wait for the body before clearing the slot or retiring.
+            // THE LOOP FINISHES AND RETIRES WITHOUT WAITING FOR THE CARRIED BODY: no cancel, no
+            // drain, and the body is still parked in its prompt.
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(runner.CancelObserved("task-unwind").IsCompleted,
+                "A stream loss must not cancel the carried body.");
+            Assert.Equal(1, GetSlotOccupancy(service));
+            Assert.True(connection.IsRetired,
+                "Retirement must not wait for the carried body to unwind.");
+
+            // THE PROCESS-LEVEL DRAIN is what releases the carried assignment: it cancels the
+            // assignment token, the body observes it and parks in its unwind gate, so the loop
+            // provably cannot have waited for it. The slot stays occupied while the drain is held.
+            var drain = service.DrainCarriedAssignmentAsync();
             await runner.CancelObserved("task-unwind")
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            Assert.False(loop.IsCompleted, "The loop must not finish while the body is still unwinding.");
             Assert.Equal(1, GetSlotOccupancy(service));
-            Assert.False(connection.IsRetired);
 
-            // Release the unwind: the drain completes, the slot clears, the connection retires.
+            // Release the unwind: the drain completes and the slot clears.
             runner.ReleaseUnwind();
-            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await drain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             Assert.Equal(0, GetSlotOccupancy(service));
             Assert.Null(GetHeartbeatTaskId(service));
-            Assert.True(connection.IsRetired);
 
-            // SINGLE FINAL READY: exactly the drained body's own claim — no duplicate from the
-            // teardown, and it really was written (the connection was still usable at that point).
-            Assert.Equal(1, requests.ReadyCount);
-            // NO resend of the tool request: exactly one request write ever happened.
+            // NO Ready was written to the retired original stream after stream loss (a carried
+            // assignment claims no ordinary Ready on its dead connection), and NO resend of the
+            // tool request: exactly one request write ever happened.
+            Assert.Equal(0, requests.ReadyCount);
             Assert.Equal(1, requests.ToolRequestCount);
         }
         finally

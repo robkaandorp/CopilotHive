@@ -1469,24 +1469,32 @@ public sealed class WorkerServiceSendSerializationTests
                 Assert.Equal(2, harness.Requests.CompletedWriteCount); // the retry write is PARKED.
                 Assert.False(retry.IsCompleted);
 
-                // THE DRAIN: EOF with the receipt permanently unconfirmed and the retry inside its
-                // admitted write. The loop must NOT finish until that write terminates.
-                harness.Responses.Push(null);
-                var prematureLoop = await Record.ExceptionAsync(() =>
-                    loop.WaitAsync(TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken));
-                Assert.IsType<TimeoutException>(prematureLoop);
-                Assert.False(retry.IsCompleted, "the drain must be joining the admitted retry write.");
+                // THE DRAIN: PROCESS-TOKEN CANCELLATION with the receipt permanently unconfirmed and
+                // the retry inside its admitted write — the token that still expresses the
+                // cancel-and-drain teardown, since an EOF with a LIVE token now CARRIES the
+                // assignment and performs no drain at all. The admitted write observes that token
+                // and parks in the fake's own cancellation-unwind hold, so the drain's JOIN is
+                // observable as a genuinely in-flight write rather than a token-only claim.
+                var unwindHold = new System.Threading.Tasks.TaskCompletionSource<bool>(
+                    System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+                harness.Requests.CancellationUnwind = unwindHold;
+
+                loopCts.Cancel();
+                await harness.Requests.WaitForCancellationEnteredAsync(
+                    TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+                Assert.False(retry.IsCompleted, "the drain must still be joining the admitted retry write.");
 
                 // RELEASE the admitted write: the drain joins it and the loop then completes.
-                harness.Requests.ReleaseCurrentWrite();
-                await loop.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+                unwindHold.TrySetResult(true);
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                    () => loop.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
 
                 // THE EXACT retained retry task TERMINATED. The claim is taken SYNCHRONOUSLY at
                 // the instant the loop returned — awaiting first would let a drain that merely
                 // cancelled and ABANDONED the unwind pass.
                 Assert.True(
                     retry.IsCompleted,
-                    "the EOF drain must JOIN the retained retry task BEFORE the loop returns.");
+                    "the drain must JOIN the retained retry task BEFORE the loop returns.");
                 await retry.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
                 // The teardown joined everything: the gate is back to one permit, and NO ordinary
