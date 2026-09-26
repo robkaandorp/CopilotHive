@@ -1017,7 +1017,8 @@ public sealed class CiMonitorServiceTests : IDisposable
             await bothInFlight.Task.WaitAsync(TimeSpan.FromSeconds(5));
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        // The CI timeout must outlast the rendezvous budget: under full-suite load the second repo's request can arrive after the default 500 ms test-wide Timeout expires, so the first repo's linked probe token is already dead when the barrier releases and its success is misclassified as a terminal CI timeout that publishes no event — leaving only 1 of the expected 2 CiSucceeded events. Success returns immediately after the rendezvous, so the longer timeout adds no runtime, and the 5-second barrier still proves concurrency.
+        var service = CreateService(handler, config: config, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(30));
 
         await service.MonitorGoalAsync("goal-1", "sha1,sha2", ["repo-a", "repo-b"], TestContext.Current.CancellationToken);
 
@@ -2268,7 +2269,8 @@ public sealed class CiMonitorServiceTests : IDisposable
             await bothInFlight.Task.WaitAsync(TimeSpan.FromSeconds(5));
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        // The CI timeout must outlast the rendezvous budget: under full-suite load the second repo's request can arrive after the default 500 ms test-wide Timeout expires, so the first repo's linked probe token is already dead when the barrier releases and its success is misclassified as a terminal CI timeout that publishes no event — leaving only 1 of the expected 2 CiSucceeded events. Success returns immediately after the rendezvous, so the longer timeout adds no runtime, and the 5-second barrier still proves concurrency and repository-aware dedup.
+        var service = CreateService(handler, config: config, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(30));
 
         // Identical SHA for both repositories — only the repository dimension separates them.
         await service.MonitorGoalAsync("goal-1", "same-sha,same-sha", ["repo-a", "repo-b"], TestContext.Current.CancellationToken);
