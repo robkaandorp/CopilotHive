@@ -79,6 +79,11 @@ public sealed class WorkerServiceCancelCorrelationTests
         runner.Release("task-B");
         await runner.PromptFinished("task-B");
 
+        // B's OWN Ready must be observed BEFORE EOF: an EOF that wins the race carries B under the
+        // EOF carry contract instead of settling its Ready, so ordering the write first is what
+        // makes the assertion below about the late cancel for A rather than about the EOF race.
+        await requests.ReadyReached(2).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
         responses.Complete();
         await loop;
 
@@ -343,16 +348,49 @@ public sealed class WorkerServiceCancelCorrelationTests
     /// </summary>
     private sealed class RecordingRequestStream : IClientStreamWriter<WorkerMessage>
     {
+        private readonly object _gate = new();
+        private readonly Dictionary<int, TaskCompletionSource> _readyWaiters = [];
         private int _readyCount;
 
         public int ReadyCount => Volatile.Read(ref _readyCount);
 
         public WriteOptions? WriteOptions { get; set; }
 
+        /// <summary>
+        /// Completes once at least <paramref name="count"/> <c>WorkerReady</c> messages have been
+        /// written, so a test can observe a Ready write BEFORE ending the stream. Deterministic:
+        /// signalled from <see cref="WriteAsync"/>, with no polling and no sleeps.
+        /// </summary>
+        public Task ReadyReached(int count)
+        {
+            lock (_gate)
+            {
+                if (_readyCount >= count) return Task.CompletedTask;
+                if (!_readyWaiters.TryGetValue(count, out var tcs))
+                {
+                    tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _readyWaiters[count] = tcs;
+                }
+                return tcs.Task;
+            }
+        }
+
         public Task WriteAsync(WorkerMessage message)
         {
-            if (message.PayloadCase == WorkerMessage.PayloadOneofCase.Ready)
-                Interlocked.Increment(ref _readyCount);
+            if (message.PayloadCase != WorkerMessage.PayloadOneofCase.Ready)
+                return Task.CompletedTask;
+
+            List<TaskCompletionSource> ready = [];
+            lock (_gate)
+            {
+                _readyCount++;
+                foreach (var (threshold, tcs) in _readyWaiters)
+                {
+                    if (_readyCount >= threshold) ready.Add(tcs);
+                }
+            }
+            foreach (var tcs in ready) tcs.TrySetResult();
+
             return Task.CompletedTask;
         }
 
