@@ -782,6 +782,21 @@ public sealed class SharpCoderRunner : IAgentRunner
             _log.Error($"Agent finished with non-success status: {result.Status} - {result.Message}");
         }
 
+        // An "Error" result is a PROVIDER FAILURE, not agent output: SharpCoder reports most provider
+        // failures that way (only OperationCanceledException, HttpRequestException and
+        // ObjectDisposedException propagate as real exceptions). Returning result.Message would hand
+        // the provider's failure text to TaskExecutor as the turn's normal output, which would treat
+        // it as a completed phase and report TaskOutcome.Completed. Throwing routes the turn through
+        // TaskExecutor's EXISTING generic catch: TaskOutcome.Failed, a FAIL verdict, no session save.
+        //
+        // The exception deliberately carries NO provider text — result.Message can echo a provisioned
+        // secret and travels to the orchestrator (see SafeExceptionLog and AgentTurnFailedException).
+        //
+        // MaxStepsReached (and any other non-success status) keeps its previous behavior: the status
+        // is logged above and the partial text is returned; the worker's report tools decide its verdict.
+        if (result.Status == "Error")
+            throw new AgentTurnFailedException();
+
         return result.Message;
     }
 
