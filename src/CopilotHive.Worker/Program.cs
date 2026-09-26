@@ -160,7 +160,12 @@ while (!cts.IsCancellationRequested)
 
     // From here on nothing can reach the catches above, so a throwing diagnostic can neither be
     // misclassified as a connection failure (creating a fresh attempt) nor alter the exit code.
-    if (outcome == WorkerRunOutcome.WorkStreamEnded)
+    //
+    // THE DECISION ITSELF is the extracted WorkerProgramDecisions.DecideOutcome — a pure mapping, so
+    // it can be exercised directly — while every effect (backoff, diagnostics, exit code, loop
+    // control) stays right here.
+    var outcomeAction = WorkerProgramDecisions.DecideOutcome(outcome);
+    if (outcomeAction == WorkerOutcomeAction.Reconnect)
     {
         // THE RECONNECT TRIGGER. A returned outcome means the attempt finished cleanly — the
         // accepted work stream ended and the whole lifecycle teardown completed — which is exactly
@@ -193,7 +198,7 @@ while (!cts.IsCancellationRequested)
         continue;
     }
 
-    if (outcome != WorkerRunOutcome.RegistrationRejected)
+    if (outcomeAction == WorkerOutcomeAction.Fatal)
     {
         // An UNKNOWN/unexpected enum value must never silently retry and never silently exit. It is
         // an ordinary fatal InvalidOperationException, classified by the SAME sanitizer the fatal
@@ -223,15 +228,15 @@ while (!cts.IsCancellationRequested)
 // none of these faults may be classified as a connection failure. A drain fault must not skip the
 // disposal, and the disposal must not be skipped merely because the drain threw — the two blocks
 // are therefore independent, and the exit code is decided only after both.
-try
+//
+// The drain-and-report step is the extracted WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync
+// (the SAME guarded, sanitized fatal line, never retried, never throwing), so it can be exercised with
+// a genuinely throwing drain; turning its failure into the fatal exit code stays right here.
+if (await WorkerProgramDecisions.DrainCarriedAssignmentFailedAsync(async () =>
 {
     await service.DrainCarriedAssignmentAsync();
-}
-catch (Exception ex)
+}))
 {
-    // Sanitized for the same reason as the attempt paths: this boundary reaches the assignment's
-    // transport and the agent runner, whose errors can quote provisioned configuration.
-    WriteBestEffort(Console.Error, $"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
     exitCode = 1;
 }
 

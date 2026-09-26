@@ -3656,17 +3656,30 @@ public sealed class WorkerService(
 
                         TryLogInfo($"{CarriedDeliveredMessage} {assignment.TaskId}");
                     }
-                    catch (OperationCanceledException)
+                    catch (OperationCanceledException ex)
+                        when (assignmentToken.IsCancellationRequested || ex.CancellationToken == assignmentToken)
                     {
-                        // Cancellation ends this task: a cancelled assignment has no delivery to
-                        // make, and it must not be retried on another connection. The Ready claim is
-                        // left UNCONSUMED.
+                        // ASSIGNMENT cancellation — and ONLY assignment cancellation — ends this
+                        // task: a cancelled assignment has no delivery to make, and it must not be
+                        // retried on another connection. The Ready claim is left UNCONSUMED.
+                        //
+                        // THE CALLER-VS-TRANSPORT DISTINCTION is the codebase's established one: the
+                        // ASSIGNMENT token is re-checked after the await (and the exception's own
+                        // token is compared by identity), so only a cancellation this assignment
+                        // actually requested reaches here. A cancellation raised by the TRANSPORT
+                        // while the assignment token is still LIVE — the disposal of a dead adopted
+                        // stream cancels its pending writes — is NOT assignment cancellation: it
+                        // falls through to the general failure path below, exactly like any other
+                        // write failure, so the delivery waits for a DIFFERENT adoption instead of
+                        // ending with the assignment still Carried.
                         return;
                     }
                     catch (Exception ex)
                     {
-                        // A NON-cancellation failure is reported sanitized and the wait resumes for a
-                        // DIFFERENT adopted connection, so there is no spin against the same stream.
+                        // A NON-cancellation failure — or a transport-origin cancellation while the
+                        // assignment token is still live — is reported sanitized and the wait
+                        // resumes for a DIFFERENT adopted connection, so there is no spin against
+                        // the same stream.
                         TryLogSanitized(CarriedDeliveryFailedMessage, ex);
                         lastTried = adopted.Connection;
                         continue;
