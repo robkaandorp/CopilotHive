@@ -129,6 +129,31 @@ public sealed class WorkerService(
     internal Func<WorkerConnection, CancellationTokenSource, Task>? HeartbeatTaskFactory { get; set; }
 
     /// <summary>
+    /// TEST SEAM — the instant INSIDE <see cref="DeliverCarriedAssignmentAsync"/> immediately BEFORE
+    /// its carried <c>Complete</c> write, receiving the ASSIGNMENT token that the send then uses.
+    /// <c>null</c> in production, where the instant contains nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// It exists so a test can observe and control whether the carried delivery is about to write —
+    /// and with which token — without any timer, sleep or artificial barrier in production code. It
+    /// is awaited, so a blocking hook holds the delivery exactly there; it is never invoked when
+    /// unset.
+    /// </remarks>
+    internal Func<CancellationToken, Task>? CarriedBeforeCompleteSendHook { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — the instant INSIDE <see cref="DeliverCarriedAssignmentAsync"/> AFTER its carried
+    /// Complete write succeeded and BEFORE its Ready claim. <c>null</c> in production, where the
+    /// instant contains nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// It exists so a test can hold the delivery exactly between "result delivered" and "Ready
+    /// claimed", which is the window in which a successor assignment's authorization is decided. It
+    /// is awaited, so a blocking hook holds the delivery there; it is never invoked when unset.
+    /// </remarks>
+    internal Func<Task>? CarriedBeforeReadyClaimHook { get; set; }
+
+    /// <summary>
     /// THE CLOCK SEAM FOR COMPLETION RETRANSMISSION — the ONLY test hook this behavior adds, and the
     /// ONLY clock production reads for the retry wait. It defaults to
     /// <see cref="System.TimeProvider.System"/>, is read exactly ONCE per assignment (the value is
@@ -161,8 +186,162 @@ public sealed class WorkerService(
     /// stale teardown can never drop a different registration's connection. A no-op when the
     /// published connection is already something else (or nothing).
     /// </summary>
-    private void UnpublishConnection(WorkerConnection expected) =>
+    /// <remarks>
+    /// It also CLEARS the ADOPTION publication when that publication belongs to
+    /// <paramref name="expected"/> (see <see cref="ClearAdoption"/>), so the ONE identity-checked
+    /// teardown that removes the connection also removes the adoption record of it: a retired
+    /// adopted connection can never be handed to a waiter, and no second lifecycle hook is needed.
+    /// </remarks>
+    private void UnpublishConnection(WorkerConnection expected)
+    {
+        ClearAdoption(expected);
         Interlocked.CompareExchange(ref _connection, null, expected);
+    }
+
+    // ── Adoption publication ────────────────────────────────────────────────────
+    //
+    // A SECOND, DELIBERATELY SEPARATE PUBLICATION from the connection above. The connection
+    // publication says "this is the registration this service currently works on"; the ADOPTION
+    // publication says "this is the connection a CARRIED assignment is now allowed to deliver its
+    // retained result on". They change at different moments and are consumed by different code, so
+    // they are kept apart: the reconnect path publishes an adoption only when the orchestrator
+    // ACCEPTED the carried task, and the carried delivery is the ONLY consumer.
+
+    /// <summary>
+    /// ONE ADOPTED CONNECTION together with the STREAM TOKEN of the run that adopted it — the token
+    /// the carried <c>Ready</c> must be written with, exactly like
+    /// <see cref="OrdinaryReadySlot.StreamToken"/>.
+    /// </summary>
+    private sealed record AdoptedConnection(WorkerConnection Connection, CancellationToken StreamToken);
+
+    /// <summary>
+    /// THE MOST RECENTLY ADOPTED CONNECTION together with that run's stream token, or <c>null</c>
+    /// while nothing is adopted. At most ONE is retained, so an adoption can never accumulate
+    /// history, and an identity-checked teardown clears exactly the connection it owns.
+    /// </summary>
+    private AdoptedConnection? _adopted;
+
+    /// <summary>
+    /// THE ADOPTION-CHANGE SIGNAL — the way a waiter parks until the adoption publication changes.
+    /// It is REPLACED on every change (a new adoption, or the clear that follows the adopted
+    /// connection's retirement), so every waiter re-evaluates its own condition exactly ONCE per
+    /// change: there is no polling, no timer and no spin.
+    /// </summary>
+    private TaskCompletionSource _adoptionChanged =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>The lock serializing the adoption publication, its signal swap and its clear.</summary>
+    private readonly object _adoptionLock = new();
+
+    /// <summary>
+    /// ADOPTION PUBLICATION — the carried assignment's result may now be delivered on
+    /// <paramref name="connection"/>, written with the ADOPTING run's <paramref name="streamToken"/>.
+    /// Called by the run that ADOPTED a carried assignment, as its LAST step before the message loop
+    /// (in place of the initial Ready).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It REPLACES the previous adoption rather than adding one: only the most recently adopted
+    /// connection can be waited for, which is exactly what the carried delivery needs — one delivery
+    /// target, no queue and no per-adoption bookkeeping. Every waiter is woken by the signal swap, so
+    /// a wait that started before this call re-evaluates and observes the new adoption.
+    /// </para>
+    /// <para>
+    /// Nothing here is inferred from a registration answer: the caller publishes only after the
+    /// orchestrator ACCEPTED the carried task, and a rejected or non-adopted registration never
+    /// reaches this method.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">The connection that will carry the carried assignment's delivery.</param>
+    /// <param name="streamToken">The stream token of the ADOPTING run.</param>
+    internal void PublishAdoption(WorkerConnection connection, CancellationToken streamToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+
+        TaskCompletionSource woken;
+        lock (_adoptionLock)
+        {
+            _adopted = new AdoptedConnection(connection, streamToken);
+            woken = ReplaceAdoptionSignal_Locked();
+        }
+
+        // OUTSIDE the lock: a waiter's continuation may publish or clear an adoption itself.
+        woken.TrySetResult();
+    }
+
+    /// <summary>
+    /// CLEARS the adoption publication when it belongs to <paramref name="expected"/>, by REFERENCE
+    /// IDENTITY — the adoption half of <see cref="UnpublishConnection"/>, and a no-op for any other
+    /// connection (or none).
+    /// </summary>
+    /// <remarks>
+    /// Retirement is the end of an adopted connection's usability, so the record of it is dropped
+    /// with it and every waiter re-evaluates exactly once. Without the clear, a parked carried
+    /// delivery could be handed a connection whose stream is already gone. It never throws.
+    /// </remarks>
+    /// <param name="expected">The connection whose adoption record is being retired.</param>
+    private void ClearAdoption(WorkerConnection expected)
+    {
+        TaskCompletionSource woken;
+        lock (_adoptionLock)
+        {
+            if (!ReferenceEquals(_adopted?.Connection, expected))
+                return;
+
+            _adopted = null;
+            woken = ReplaceAdoptionSignal_Locked();
+        }
+
+        woken.TrySetResult();
+    }
+
+    /// <summary>
+    /// Swaps in a FRESH adoption signal and returns the previous one for the caller to complete
+    /// outside the lock. Must be called with <see cref="_adoptionLock"/> held.
+    /// </summary>
+    private TaskCompletionSource ReplaceAdoptionSignal_Locked()
+    {
+        var previous = _adoptionChanged;
+        _adoptionChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        return previous;
+    }
+
+    /// <summary>
+    /// WAITS for an adopted connection OTHER THAN <paramref name="lastTried"/> — the carrying
+    /// assignment's delivery target. The wait PARKS rather than polls: it reads the publication under
+    /// the lock, and when the current one is not usable it awaits the next change of that
+    /// publication, then re-evaluates.
+    /// </summary>
+    /// <remarks>
+    /// NON-THROWING apart from the caller's own cancellation: a cleared publication is simply "not
+    /// yet", never an error, and a retired adopted connection is never handed out. Because the
+    /// publication is replaced (not removed) on each change, a waiter that re-evaluates cannot spin
+    /// on a signal it has already consumed.
+    /// </remarks>
+    /// <param name="lastTried">The connection the caller already tried, or <c>null</c> for the first wait.</param>
+    /// <param name="ct">The ASSIGNMENT token — cancelling it ends the wait.</param>
+    private async Task<AdoptedConnection> AwaitAdoptedConnectionAsync(
+        WorkerConnection? lastTried, CancellationToken ct)
+    {
+        while (true)
+        {
+            Task changed;
+            lock (_adoptionLock)
+            {
+                var candidate = _adopted;
+                if (candidate is not null
+                    && !ReferenceEquals(candidate.Connection, lastTried)
+                    && !candidate.Connection.IsRetired)
+                {
+                    return candidate;
+                }
+
+                changed = _adoptionChanged.Task;
+            }
+
+            await changed.WaitAsync(ct);
+        }
+    }
 
     /// <summary>
     /// CHECKED ACCESS — the published connection, or the EXISTING disconnected error when none is
@@ -412,6 +591,39 @@ public sealed class WorkerService(
         }
         finally
         {
+            // THE EXIT RE-CHECK — the ONE post-run ownership check, and the ONLY one. It runs HERE,
+            // in this `finally`, i.e. strictly AFTER <see cref="RunCoreAsync"/> has returned or thrown
+            // and therefore after that method's lexical `using var stream` / `using var ownedChannel`
+            // disposal has completed: a pending write of the previous run's stream has been cancelled
+            // by that disposal, so joining the carried delivery can no longer wait on a transport that
+            // is still parked.
+            //
+            // A RETAINED assignment whose state is NOT Carried is finished here — which covers the
+            // DELIVERED case (its delivery completed and was retained so a successor could be
+            // authorized by its started Ready) and, defensively, any state a partially unwound run
+            // left behind. A CARRIED assignment is deliberately LEFT ALONE: it is the whole point of
+            // this slice, and it survives into the next sequential run.
+            //
+            // Cancel, join EVERY owned task (including the carried delivery), and only THEN clear the
+            // slot — the same order every other ownership transition uses, so nothing is abandoned and
+            // no task observes a released slot.
+            if (_activeAssignment is { } retained && !retained.State.IsCarried)
+            {
+                try
+                {
+                    await DrainAssignmentAsync(retained, cancelFirst: true);
+                }
+                finally
+                {
+                    // The slot is cleared on EVERY path, including a deferred cancellation failure, so
+                    // a follow-up run can never inherit a finished assignment.
+                    ClearActiveAssignment();
+                }
+
+                _currentTaskId = null;
+                _currentRole = null;
+            }
+
             // DETACH, THEN RELEASE — in that order, on EVERY path, including an early setup failure
             // and even a run that never installed a callback. The release runs even when the
             // detachment itself fails, so a failing detach can never leave the service stuck Running.
@@ -436,6 +648,31 @@ public sealed class WorkerService(
     /// <returns>The observed run outcome.</returns>
     private async Task<WorkerRunOutcome> RunCoreAsync(CancellationToken ct)
     {
+        // THE DEFENSIVE ENTRY RULE. A retained assignment that is NOT Carried is finished here,
+        // BEFORE `ConnectAsync`, the initial Ready or any new assignment: it has nothing left to
+        // deliver and must never be inherited by this run. In practice this is a SECOND GUARD only —
+        // the exit re-check in <see cref="RunAsync"/> already cleared every non-carried assignment
+        // after the previous run's lexical disposal — but it also covers a first-ever run on a service
+        // that was handed a non-carried assignment directly (the focused fixtures do exactly that),
+        // and it keeps the invariant local to the run that owns the ownership slot.
+        //
+        // A CARRIED assignment is deliberately left untouched: it is the one thing that must survive
+        // this boundary, and the reconnect path (round two) is what adopts and delivers it.
+        if (_activeAssignment is { } inherited && !inherited.State.IsCarried)
+        {
+            try
+            {
+                await DrainAssignmentAsync(inherited, cancelFirst: true);
+            }
+            finally
+            {
+                ClearActiveAssignment();
+            }
+
+            _currentTaskId = null;
+            _currentRole = null;
+        }
+
         // Prepare the agent runner. This creates NO LLM client: worker containers hold no LLM
         // credentials of their own, so the client is created lazily on the first prompt, after
         // the orchestrator has provisioned credentials.
@@ -1354,21 +1591,93 @@ public sealed class WorkerService(
     }
 
     /// <summary>
+    /// THE ASSIGNMENT'S ONE ATOMIC STATE CELL — the single <c>int</c> every ordinary-Ready claim and
+    /// every carry transition is decided by, read and claimed exclusively through
+    /// <see cref="Interlocked"/> so exactly one participant can win a transition.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// FOUR STATES, TWO EXCLUSIVE FAMILIES. <see cref="Open"/> is the only state from which a normal
+    /// assignment can move: an ordinary Ready write claims <c>Open → ReadyStarted</c>, and a stream
+    /// loss claims <c>Open → Carried</c>. Those two claims are therefore MUTUALLY EXCLUSIVE by the
+    /// CAS itself — an assignment that already started its ordinary Ready can never be carried, and
+    /// a carried assignment can never start an ordinary Ready on its retired original connection.
+    /// <see cref="Delivered"/> is reached only from <see cref="Carried"/> (one carried delivery
+    /// finished its Complete and its Ready attempt) and is terminal.
+    /// </para>
+    /// <para>
+    /// ONE-WAY AND MONOTONIC. No transition ever moves backwards and none is ever retried: the cell
+    /// holds one <c>int</c>, no queue, no waiter and no timer.
+    /// </para>
+    /// </remarks>
+    private sealed class AssignmentState
+    {
+        /// <summary>No ordinary Ready has been started and no stream loss has carried this assignment.</summary>
+        private const int Open = 0;
+
+        /// <summary>This assignment's ORIGINAL connection claimed the ordinary Ready write.</summary>
+        private const int ReadyStarted = 1;
+
+        /// <summary>A stream loss carried this assignment; its result is delivered on an adopted connection.</summary>
+        private const int Carried = 2;
+
+        /// <summary>The carried result was delivered on an adopted connection. Terminal.</summary>
+        private const int Delivered = 3;
+
+        private int _state = Open;
+
+        /// <summary>The raw retained state, for diagnostics and the retained-state readers.</summary>
+        public int Value => Volatile.Read(ref _state);
+
+        /// <summary>Whether a stream loss carried this assignment and no delivery has finished yet.</summary>
+        public bool IsCarried => Value == Carried;
+
+        /// <summary>Whether the carried delivery finished (its Complete and Ready attempt are done).</summary>
+        public bool IsDelivered => Value == Delivered;
+
+        /// <summary>
+        /// THE READY-SETTLEMENT CLAIM — <c>Open → ReadyStarted</c>. Returns <c>true</c> for the ONLY
+        /// caller allowed to consume the assignment's shared Ready claim and start an ordinary Ready
+        /// write; every later caller gets <c>false</c> and must claim nothing and write nothing.
+        /// </summary>
+        public bool TryStartReady() =>
+            Interlocked.CompareExchange(ref _state, ReadyStarted, Open) == Open;
+
+        /// <summary>
+        /// THE CARRY CLAIM — <c>Open → Carried</c>. Returns <c>true</c> for the ONLY caller that may
+        /// start the assignment's single carried-delivery task; a <c>false</c> result means
+        /// the assignment already started an ordinary Ready (which is NOT carried) or was already
+        /// carried/delivered.
+        /// </summary>
+        public bool TryCarry() =>
+            Interlocked.CompareExchange(ref _state, Carried, Open) == Open;
+
+        /// <summary>
+        /// THE DELIVERY COMPLETION — <c>Carried → Delivered</c>. Returns <c>true</c> for the first
+        /// caller only, so the delivered transition is published exactly once.
+        /// </summary>
+        public bool TryDeliver() =>
+            Interlocked.CompareExchange(ref _state, Delivered, Carried) == Carried;
+    }
+
+    /// <summary>
     /// Tracks one assignment's identity, its in-flight EXECUTION, its separately owned
     /// connection-bound REPORTING, its separately owned RETRANSMISSION, its cancellation scope, its
     /// Ready claim, its terminal result and its ordinary-readiness slot.
     /// </summary>
     /// <remarks>
-    /// UP TO THREE OWNED TASKS, ONE OWNER. Execution is the work itself (provisioning, preparation,
+    /// UP TO FOUR OWNED TASKS, ONE OWNER. Execution is the work itself (provisioning, preparation,
     /// the executor and the retention of its result); reporting is the transport work of the
     /// ORIGINAL connection's stream (the Complete write) together with the publication of the
-    /// ordinary-Ready eligibility fact; and on a both-flags connection a THIRD task retransmits the
-    /// frozen completion while its receipt stays unacknowledged. They are separated so a held, failed
-    /// or cancelled transport write — and a held retransmission — can never keep the execution task
-    /// itself running, and so a retry can never hold reporting. The owner keeps EVERY owned task, and
-    /// every ownership transition (replacement, matching cancel, teardown) joins ALL of them — and
-    /// any readiness write already started from the eligibility — before the CTS is disposed and the
-    /// slot is cleared, so nothing is ever abandoned.
+    /// ordinary-Ready eligibility fact; on a both-flags connection a THIRD task retransmits the
+    /// frozen completion while its receipt stays unacknowledged; and a CARRIED assignment owns a
+    /// FOURTH, <see cref="CarriedDelivery"/> — the continuation that delivers the retained result
+    /// and its Ready on an ADOPTED connection. They are separated so a held, failed or cancelled
+    /// transport write — and a held retransmission — can never keep the execution task itself
+    /// running, and so a retry can never hold reporting. The owner keeps EVERY owned task, and
+    /// every ownership transition (replacement, matching cancel, teardown, carried drain) joins ALL
+    /// of them — and any readiness write already started from the eligibility — before the CTS is
+    /// disposed and the slot is cleared, so nothing is ever abandoned.
     /// </remarks>
     private sealed class ActiveAssignment(
         string taskId,
@@ -1387,6 +1696,35 @@ public sealed class WorkerService(
         /// never abort the assignment that replaced it, nor consume its Ready claim.
         /// </summary>
         public string TaskId { get; } = taskId;
+
+        /// <summary>
+        /// THE ASSIGNMENT'S ROLE, set ONCE by the assignment handler when the fully constructed
+        /// owner is installed. The heartbeat's task state is restored from here when a stream loss
+        /// carries the assignment while its reporter has already cleared the service's live task
+        /// state, so the carried assignment keeps being reported as busy — with its real role —
+        /// until it is delivered.
+        /// </summary>
+        /// <remarks>
+        /// An <c>init</c> property rather than a constructor parameter, deliberately: the
+        /// constructor's parameter list stays EXACTLY what it was, so every existing construction
+        /// site (including the focused fixtures that build an owner reflectively) keeps working
+        /// unchanged. An owner built without one carries the empty role, exactly like an assignment
+        /// whose role was never resolved.
+        /// </remarks>
+        public string Role { get; init; } = string.Empty;
+
+        /// <summary>
+        /// THE ASSIGNMENT'S ONE ATOMIC STATE CELL — the single <c>int</c> every ordinary-Ready claim
+        /// and every carry transition of THIS assignment is decided by.
+        /// </summary>
+        /// <remarks>
+        /// The cell lives with the assignment's ordinary-readiness slot because exactly ONE slot
+        /// exists per assignment and it is the slot's own settlement that must apply the
+        /// <c>Open → ReadyStarted</c> claim BEFORE consulting the shared Ready claim; the owner
+        /// exposes the same cell as its state, so the loop's teardown, the refusal boundary and the
+        /// carry transitions all read and claim the ONE cell this assignment has.
+        /// </remarks>
+        public AssignmentState State => OrdinaryReady.State;
 
         /// <summary>
         /// The running EXECUTION task: provisioning, config-repo preparation, the executor itself,
@@ -1447,6 +1785,47 @@ public sealed class WorkerService(
         /// them once and starts the write), so neither has to discover it through the ownership slot.
         /// </summary>
         public OrdinaryReadySlot OrdinaryReady { get; } = ordinaryReady;
+
+        /// <summary>
+        /// THE ASSIGNMENT'S ONE CARRIED-DELIVERY TASK, or <c>null</c> while the assignment has not
+        /// been carried. Written EXACTLY ONCE by the carry-CAS winner (the loop's stream-loss
+        /// teardown) and stored here so every ownership transition that joins this assignment's
+        /// tasks joins it too.
+        /// </summary>
+        /// <remarks>
+        /// ONE reference slot, not a list: the carry transition happens once per assignment, so the
+        /// delivery is started at most once and is never restarted — an already-carried assignment
+        /// observed by a later teardown simply keeps the task it has.
+        /// </remarks>
+        public Task? CarriedDelivery
+        {
+            get { lock (_carriedGate) return _carriedDelivery; }
+            set { lock (_carriedGate) _carriedDelivery = value; }
+        }
+
+        /// <summary>
+        /// WHETHER THIS ASSIGNMENT'S CARRIED READY WRITE WAS INITIATED — a ONE-WAY flag set
+        /// IMMEDIATELY BEFORE that write is claimed and sent, exactly like the ordinary readiness
+        /// slot's started-write fact.
+        /// </summary>
+        /// <remarks>
+        /// It is the carried counterpart of <c>OrdinaryReady.HasStartedWrite</c>, and it is what
+        /// authorizes a successor assignment on an ADOPTED connection: once the carried Ready has
+        /// genuinely been initiated, the orchestrator may have dequeued the successor, so refusing it
+        /// would strand this worker. It is deliberately NOT write completion — the write may still be
+        /// pending, and may yet fail, exactly as an ordinary Ready write may.
+        /// </remarks>
+        public bool CarriedReadyStarted => Volatile.Read(ref _carriedReadyStarted) != 0;
+
+        private Task? _carriedDelivery;
+        private readonly object _carriedGate = new();
+        private int _carriedReadyStarted;
+
+        /// <summary>
+        /// Publishes the one-way fact that the carried Ready write has been INITIATED (the claim was
+        /// won and the write is about to be started). Idempotent and monotonic.
+        /// </summary>
+        public void MarkCarriedReadyStarted() => Interlocked.Exchange(ref _carriedReadyStarted, 1);
     }
 
     /// <summary>
@@ -1546,6 +1925,14 @@ public sealed class WorkerService(
 
         /// <summary>The ORIGINAL stream token, captured with the assignment.</summary>
         public CancellationToken StreamToken { get; } = streamToken;
+
+        /// <summary>
+        /// THE ASSIGNMENT'S ONE ATOMIC STATE — the single <c>int</c> this assignment's lifecycle is
+        /// decided by, created WITH the assignment's readiness slot because exactly one slot exists
+        /// per assignment and it is that assignment's own cell (the owning
+        /// <see cref="ActiveAssignment"/> exposes it as its state).
+        /// </summary>
+        public AssignmentState State { get; } = new();
 
         /// <summary>The single retained readiness write, or <c>null</c> while none has been started.</summary>
         public Task? Write
@@ -1739,6 +2126,24 @@ public sealed class WorkerService(
                 if (!ReadinessHolds_Locked())
                     return null;
 
+                // THE ONE READY-SETTLEMENT RULE, applied by EVERY ordinary-Ready path (the response
+                // loop's observation and the settlement inside every drain) BEFORE the claim is
+                // consulted: only the Open → ReadyStarted winner may consume the shared claim or
+                // start an ordinary Ready write. A LOSER claims nothing and writes nothing — which is
+                // what keeps a Carried (or Delivered) assignment from ever emitting an ordinary
+                // Ready on its retired original connection, and what keeps ReadyStarted and Carried
+                // mutually exclusive.
+                //
+                // The loser still marks the slot SETTLED — with no write retained — for the same
+                // reason a winner does: the state it lost to can never move back to Open, so no Ready
+                // can ever be produced from this slot again. Leaving it unsettled would hand the
+                // response loop a completed readiness observation on EVERY iteration and spin it.
+                if (!State.TryStartReady())
+                {
+                    _settled = true;
+                    return _write;
+                }
+
                 _settled = true;
 
                 // Single-flight: the claim is consumed by the write, so at most one Ready is ever
@@ -1831,7 +2236,20 @@ public sealed class WorkerService(
     /// </exception>
     private void RefuseAssignmentBeforeAuthorizedReady(WorkerConnection connection)
     {
-        // LEGACY / ACK-ONLY FIRST: the boundary does not exist for those shapes at all.
+        // A CARRIED (or DELIVERED) predecessor is decided FIRST, in EVERY negotiated mode and
+        // regardless of the ordinary-readiness gate: its authorization is the CARRIED Ready's own
+        // one-way started-write fact, so the ordinary rule below must not be consulted for it at all.
+        if (_activeAssignment is { } predecessor
+            && (predecessor.State.IsCarried || predecessor.State.IsDelivered))
+        {
+            if (!predecessor.CarriedReadyStarted)
+                throw new InvalidOperationException(AssignmentBeforeAuthorizedReadyMessage);
+
+            return;
+        }
+
+        // LEGACY / ACK-ONLY: for those shapes the ordinary-Ready boundary does not exist at all, and
+        // there is no carried predecessor left to consider.
         if (!OrdinaryReadyGateEnabled(connection))
             return;
 
@@ -2034,6 +2452,14 @@ public sealed class WorkerService(
         Exception? primaryFailure = null;
         Task<OrchestratorMessage?>? pendingRead = null;
 
+        // THE STREAM-LOSS FLAG. It is set ONLY at the loop's read-await site, and ONLY for the two
+        // narrow observations the carried contract recognizes — the pending read reaching EOF, or the
+        // pending read itself faulting with an RpcException or an IOException — and only while the
+        // PROCESS token is not cancelled. A HANDLER exception (a refused successor, an unknown role,
+        // any dispatch failure) and anything observed after process-token cancellation are NOT stream
+        // loss: they keep today's cancel-and-drain teardown exactly.
+        var streamLoss = false;
+
         try
         {
             // ONE OWNED PENDING READ, RE-ARMED after each dispatched message (exactly what the
@@ -2066,9 +2492,49 @@ public sealed class WorkerService(
                     continue;
                 }
 
-                var message = await pendingRead;
+                OrchestratorMessage? message;
+                try
+                {
+                    // THE READ-AWAIT SITE — the ONLY place a stream loss is ever RECORDED. The
+                    // filter is deliberately narrow: a pending read that faulted with an RpcException
+                    // or an IOException while the process token is still live is the stream going
+                    // away underneath this worker. Every other failure — a cancelled read, a handler
+                    // fault, anything at all after process-token cancellation — falls through
+                    // unchanged and keeps today's teardown.
+                    message = await pendingRead;
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested && (ex is RpcException or IOException))
+                {
+                    // OLD-STREAM WRITE BOUNDARY — RETIRE FIRST. This is the VERY FIRST action of the
+                    // stream-loss path, taken at the read-await site itself: from here on, every NEW
+                    // operation on this connection fails with the existing disconnected error, so a
+                    // write that has not yet passed SendAsync's post-gate EnsureUsable check writes
+                    // NOTHING to the dead stream. A write that already passed that check is a
+                    // tolerated pre-loss write. Retirement is idempotent, and the loop's `finally`
+                    // still retires too.
+                    streamLoss = true;
+                    connection.Retire();
+                    ClearAdoption(connection);
+
+                    // The fault keeps propagating exactly as today: it stays the loop's PRIMARY
+                    // failure (so a deferred cancellation-cleanup failure can never replace it), and
+                    // the caller still observes the original exception identity.
+                    throw;
+                }
+
                 if (message is null)
+                {
+                    // EOF — the same stream loss, with no fault at all. RETIRE FIRST, exactly as
+                    // above, BEFORE the teardown decides what to do with the retained assignment.
+                    if (!ct.IsCancellationRequested)
+                    {
+                        streamLoss = true;
+                        connection.Retire();
+                        ClearAdoption(connection);
+                    }
+
                     break;
+                }
 
                 switch (message.PayloadCase)
                 {
@@ -2267,11 +2733,16 @@ public sealed class WorkerService(
                         var retryTask = receipt.Retry?.Start(reporting);
 
                         // EVERY OWNED TASK is obtained BEFORE the fully constructed owner is
-                        // published, so the slot never exposes a half-built assignment.
+                        // published, so the slot never exposes a half-built assignment. The ROLE is
+                        // carried with the owner so a stream loss can restore the heartbeat's task
+                        // state from the assignment itself, without re-deriving it from anything.
                         InstallActiveAssignment(
                             new ActiveAssignment(
                                 domainTask.TaskId, execution, reporting, retryTask, taskCts, readyClaim,
-                                terminalResult, receipt, ordinaryReady));
+                                terminalResult, receipt, ordinaryReady)
+                            {
+                                Role = domainTask.Role.ToRoleName(),
+                            });
                         break;
 
                     case OrchestratorMessage.PayloadOneofCase.Cancel:
@@ -2396,17 +2867,106 @@ public sealed class WorkerService(
             // A deferred cancellation-cleanup failure is held until AFTER the ownership clear, the
             // heartbeat-state cleanup and retirement below, so a throwing cancellation callback can
             // never skip any of them (nor either of the two joins).
-            var teardownDrainFailure = _activeAssignment is not null
-                ? await DrainRetainedForTeardownAsync()
-                : null;
+            Exception? teardownDrainFailure;
+            var retained = _activeAssignment;
 
-            _currentTaskId = null;
-            _currentRole = null;
+            // THE CARRY CLAIM IS ATTEMPTED FIRST — before this branch decides anything else — because
+            // `Open → Carried` is exactly the decision that makes the rest of the teardown differ.
+            // It is consulted ONLY on a recorded stream loss: every other loop failure (a handler
+            // exception, anything after process-token cancellation) keeps today's teardown exactly.
+            // A failed claim leaves the state at ReadyStarted (which is NOT carried), Carried or
+            // Delivered, and each of those is handled below.
+            var carried = streamLoss && retained is not null && retained.State.TryCarry();
+
+            if (carried && retained is not null)
+            {
+                // ── STREAM LOSS: THE ASSIGNMENT IS CARRIED, NOT KILLED ───────────────────────────────
+                //
+                // `Open → Carried` WON, so this assignment never started an ordinary Ready and its
+                // single carry transition happens here. NO cancel and NO drain: the execution, the
+                // reporting (possibly still blocked in, or still failing, its Complete write on the
+                // retired original connection) and the retransmission are deliberately left running —
+                // the carried delivery OBSERVES the reporting to termination instead of joining it
+                // here, because a pending old-connection write is released by the transport disposal
+                // that happens at the end of this run, AFTER this loop has returned.
+                //
+                // The assignment STAYS RETAINED, so the result it holds (or will hold) survives into
+                // the next run, where it is delivered on an ADOPTED connection.
+                //
+                // The retransmission admission is CLOSED here: nothing about the original connection's
+                // retry may outlive the stream that carried it, and the carried delivery is the only
+                // sender for this assignment from now on. (Closing admission cancels a pending retry
+                // delay or permit wait; an already-admitted transport write keeps its own outcome,
+                // exactly as every other drain's close does.)
+                //
+                // The heartbeat task state is RESTORED from the assignment so the orchestrator keeps
+                // seeing this worker as busy on the same task: the reporter's own `finally` may have
+                // cleared it already, and nothing else will set it again until the delivery completes.
+                retained.Receipt.Retry?.CloseAdmission();
+                _currentTaskId = retained.TaskId;
+                _currentRole = retained.Role;
+
+                // THE ONE CARRIED DELIVERY, started exactly once, by this CAS winner, and retained on
+                // the assignment so every ownership transition joins it.
+                retained.CarriedDelivery = DeliverCarriedAssignmentAsync(retained);
+
+                teardownDrainFailure = null;
+            }
+            else if (streamLoss && retained is not null
+                && (retained.State.IsCarried || retained.State.IsDelivered))
+            {
+                // ── STREAM LOSS WITH AN ALREADY-CARRIED (OR DELIVERED) ASSIGNMENT ────────────────────
+                //
+                // The assignment was carried by an EARLIER stream loss and its delivery task is
+                // already running (or has finished): there is NOTHING to cancel or join here, and the
+                // delivery is NEVER restarted. A DELIVERED assignment is finished by the EXIT RE-CHECK
+                // in RunAsync, which runs AFTER this run's lexical stream disposal.
+                //
+                // The heartbeat task state is re-asserted for the CARRIED case: this worker is still
+                // working on that task and the orchestrator must keep seeing it as busy. A delivered
+                // assignment is already finished with its task and is deliberately NOT re-asserted.
+                if (retained.State.IsCarried)
+                {
+                    _currentTaskId = retained.TaskId;
+                    _currentRole = retained.Role;
+                }
+
+                teardownDrainFailure = null;
+            }
+            else
+            {
+                // ── TODAY'S TEARDOWN ────────────────────────────────────────────────────────────────
+                //
+                // Either this is not a stream loss at all (a handler failure, or anything after the
+                // process token was cancelled), or the assignment already claimed its ordinary Ready
+                // write (`ReadyStarted`, which is mutually exclusive with `Carried` by the CAS), or
+                // nothing is retained. Stream shutdown must not leave a task running: Program disposes
+                // the runner right after this returns, and a still-running turn holds the client
+                // lifecycle lease, so the assignment is cancelled and drained as today, and the
+                // heartbeat's task state is cleared as today.
+                //
+                // ORDERING PRECEDENCE. On the stream-loss path the connection was ALREADY retired at
+                // the read-await site — the very first action there — so in this branch the connection
+                // is retired BEFORE the drain rather than after it. Everything else in this teardown
+                // keeps today's relative order: cancel, drain (execution, reporting, retransmission,
+                // readiness write), clear the heartbeat state, then the idempotent Retire below.
+                teardownDrainFailure = _activeAssignment is not null
+                    ? await DrainRetainedForTeardownAsync()
+                    : null;
+
+                _currentTaskId = null;
+                _currentRole = null;
+            }
 
             // RETIRE ACCESS only AFTER the drain above. A report draining behind an EOF or a reader
             // failure with a LIVE token therefore still got its single Ready attempt; from here on,
             // any NEW operation on this connection fails disconnected instead of starting transport.
+            // On the stream-loss path this is the idempotent second call — the early retire at the
+            // read-await site already ran. The adoption record of THIS connection is dropped with it,
+            // by reference identity, so a parked carried delivery can never be handed a connection
+            // whose stream has just gone away.
             connection.Retire();
+            ClearAdoption(connection);
 
             // ERROR PRECEDENCE. With a primary loop failure already propagating (a reader fault, a
             // cancelled read, a handler failure), that primary is what surfaces and the secondary
@@ -2723,6 +3283,19 @@ public sealed class WorkerService(
                 await CaptureJoinFailureAsync(retryTask), DrainObservedFaultMessage);
         }
 
+        // THEN THE CARRIED DELIVERY — the FOURTH owned task, present only for an assignment that a
+        // stream loss carried. It OBSERVES the reporting task joined above and waits on the ADOPTED
+        // publication with the assignment token, which the cancellation above has already ended, so
+        // this join terminates without a delivery and without waiting for any connection. It is
+        // joined BEFORE the readiness settlement below so no carried write can be in flight while the
+        // ordinary settlement runs, and before the CTS disposal so it never observes a disposed
+        // source. A non-carried assignment has no such task, so this is a no-op for it.
+        if (assignment.CarriedDelivery is { } carriedDelivery)
+        {
+            ReportIfPresent(
+                await CaptureJoinFailureAsync(carriedDelivery), DrainObservedFaultMessage);
+        }
+
         // THEN SETTLE AND JOIN THE ORDINARY READINESS WRITE — the third owned task an assignment can
         // now have outstanding. Settlement is EXACTLY ONCE and shared with the response loop, and it
         // consults the SAME gate: a transition that sees the report terminate before the loop could
@@ -2750,6 +3323,241 @@ public sealed class WorkerService(
 
     /// <summary>The sanitized report message for a fault observed while draining an assignment.</summary>
     private const string DrainObservedFaultMessage = "Task drain observed a fault";
+
+    /// <summary>The sanitized report message for a failed CARRIED completion delivery attempt.</summary>
+    private const string CarriedDeliveryFailedMessage = "Carried completion delivery failed";
+
+    /// <summary>The sanitized report message for a failed CARRIED Ready write.</summary>
+    private const string CarriedReadyFailedMessage = "Carried readiness write failed";
+
+    /// <summary>The GUARDED diagnostic emitted once when a carried completion is delivered.</summary>
+    private const string CarriedDeliveredMessage = "Carried completion delivered for task";
+
+    /// <summary>
+    /// Publishes ONE informational diagnostic under the SAME guard the sanitized failure reporters
+    /// use: a diagnostic must never affect the outcome of the work it describes. It carries no
+    /// completion payload, no provisioned value and no exception text.
+    /// </summary>
+    /// <param name="message">The static, secret-free message.</param>
+    private void TryLogInfo(string message)
+    {
+        try
+        {
+            _log.Info(message);
+        }
+        catch
+        {
+            // A diagnostic must never affect the delivery's outcome.
+        }
+    }
+
+    /// <summary>
+    /// DRAINS any RETAINED assignment — cancelling it first — including the CARRIED delivery
+    /// continuation it owns. Used by the process's final cleanup and by every path that abandons a
+    /// carried assignment (a refused adoption, a rejected registration, explicit cancellation).
+    /// </summary>
+    /// <remarks>
+    /// It is the public-ish counterpart of the loop's teardown drain and adds NO new ownership rule:
+    /// it takes the retained assignment, cancel-drains it through the EXISTING
+    /// <see cref="DrainAssignmentAsync"/> (which now also joins the carried delivery), clears the
+    /// heartbeat's task state and the ownership slot, then re-raises any deferred cancellation-cleanup
+    /// failure with the EXISTING evidence-preserving rule. It is a no-op when nothing is retained, so a
+    /// caller may invoke it unconditionally.
+    /// </remarks>
+    /// <exception cref="Exception">
+    /// The deferred cancellation-cleanup failure, re-raised with its ORIGINAL evidence, exactly as
+    /// the existing drains do.
+    /// </exception>
+    internal async Task DrainCarriedAssignmentAsync()
+    {
+        if (_activeAssignment is null)
+            return;
+
+        Exception? deferredCancellationFailure = null;
+        try
+        {
+            (_, deferredCancellationFailure) = await DrainRetainedForMatchingCancelAsync();
+        }
+        finally
+        {
+            // The heartbeat state is cleared on EVERY path — after a deferred cancellation failure
+            // too — because the assignment is no longer retained either way.
+            _currentTaskId = null;
+            _currentRole = null;
+        }
+
+        RethrowDeferred(deferredCancellationFailure);
+    }
+
+    /// <summary>
+    /// THE CARRIED DELIVERY — ONE owned continuation per carried assignment. It observes the
+    /// assignment's ORIGINAL reporting task to termination, then delivers the retained completion and
+    /// the assignment's single Ready on an ADOPTED connection.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// STEP 0 — OBSERVE, NEVER JOIN. The reporting task is awaited directly and every outcome is
+    /// observed; it is deliberately NOT joined by the carry teardown (nor by this method's callers),
+    /// because a write park on the OLD connection is released by that run's transport disposal at the
+    /// end of the run — long after the teardown has returned. Awaiting the reporting HERE is safe:
+    /// this continuation is owned and joined by every ownership transition, and a pending
+    /// old-connection write is released by that disposal. The retained terminal result is then read;
+    /// it may legitimately be absent (a provisioning failure, a cancellation or a mapping failure
+    /// produced none).
+    /// </para>
+    /// <para>
+    /// STEPS 0-3 USE THE ASSIGNMENT TOKEN (including the send-gate wait), so a cancellation before
+    /// the Complete write is initiated ends this task with NO Complete and WITHOUT consuming the
+    /// Ready claim. An already-initiated write cannot be retracted — that is inherent, exactly as it
+    /// is for an ordinary Complete. STEP 4 (the Ready) instead uses the ADOPTED RUN'S STREAM TOKEN,
+    /// so assignment cancellation can never suppress a Ready that has already been claimed.
+    /// </para>
+    /// <para>
+    /// STEP 1 — ONE ADOPTED TARGET, NO SPIN. A delivery attempt that failed on a connection returns
+    /// to the wait, and the wait only returns a connection OTHER than the one last tried, so a
+    /// retry can never busy-loop against the same broken stream. A failure that is a cancellation
+    /// ends the task instead.
+    /// </para>
+    /// <para>
+    /// STEP 3 — DELIVERED. After the successful Complete (or when there was no result at all) the
+    /// assignment's state moves <c>Carried → Delivered</c> and the heartbeat's task state is cleared.
+    /// From that point the assignment token is not observed again: what remains is the Ready
+    /// attempt, which belongs to the adopting run.
+    /// </para>
+    /// <para>
+    /// STEP 4 — THE ONE READY, THROUGH THE EXISTING CLAIM. The same single-flight
+    /// <see cref="ReadyClaim"/> the explicit-cancel fallback uses decides whether a Ready is sent at
+    /// all, so exactly ONE Ready is ever attempted per assignment. The claim is followed immediately
+    /// by <see cref="ActiveAssignment.MarkCarriedReadyStarted"/> and then by the write, with NO
+    /// cancellation check in between: a successor assignment is authorized by that fact, so it must
+    /// not be published without the write actually being started.
+    /// </para>
+    /// <para>
+    /// IT NEVER RETHROWS. Every outcome of the carried Ready — success, failure and cancellation
+    /// alike — is observed and, for a failure, reported through ONE guarded sanitized diagnostic.
+    /// That matches a failed ordinary Ready exactly: one attempt, no retry, and no run-ending
+    /// mechanism of its own. A failed carried Ready leaves this assignment retained as Delivered with
+    /// <see cref="ActiveAssignment.CarriedReadyStarted"/> set, and one of the EXISTING transitions
+    /// finishes it: the stream ends (the Delivered teardown plus the exit re-check clear it), a
+    /// successor assignment arrives (authorized by that flag, taking the existing replacement drain),
+    /// or the process shuts down (<see cref="DrainCarriedAssignmentAsync"/>).
+    /// </para>
+    /// </remarks>
+    /// <param name="assignment">The carried assignment this continuation belongs to.</param>
+    private async Task DeliverCarriedAssignmentAsync(ActiveAssignment assignment)
+    {
+        var assignmentToken = assignment.Cts.Token;
+
+        // The adopted connection and stream token the Ready attempt will use. STEP 3 always leaves
+        // one: the connection whose Complete write succeeded, or the one that had no result to send.
+        AdoptedConnection? deliveredOn = null;
+
+        try
+        {
+            // STEP 0 — OBSERVE the original reporting to termination (any outcome), then read the
+            // retained terminal result. It may be absent.
+            try
+            {
+                await assignment.Reporting;
+            }
+            catch
+            {
+                // Observed only: the reporting task keeps its own evidence for whoever joins it.
+            }
+
+            // STEP 1 — the FIRST adopted connection (nothing has been tried yet).
+            WorkerConnection? lastTried = null;
+            while (true)
+            {
+                var adopted = await AwaitAdoptedConnectionAsync(lastTried, assignmentToken);
+
+                // STEPS 2-3 — deliver the retained Complete ONCE on this connection.
+                if (assignment.TerminalResult.Result is { } result)
+                {
+                    try
+                    {
+                        // The TEST SEAM's instant: immediately BEFORE the Complete write, with the
+                        // ASSIGNMENT token the send below will use.
+                        if (CarriedBeforeCompleteSendHook is { } beforeSend)
+                            await beforeSend(assignmentToken);
+
+                        await SendAsync(
+                            adopted.Connection,
+                            new WorkerMessage
+                            {
+                                WorkerId = adopted.Connection.AssignedId,
+                                Complete = GrpcMapper.ToGrpc(result),
+                            },
+                            assignmentToken);
+
+                        TryLogInfo($"{CarriedDeliveredMessage} {assignment.TaskId}");
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Cancellation ends this task: a cancelled assignment has no delivery to
+                        // make, and it must not be retried on another connection. The Ready claim is
+                        // left UNCONSUMED.
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        // A NON-cancellation failure is reported sanitized and the wait resumes for a
+                        // DIFFERENT adopted connection, so there is no spin against the same stream.
+                        TryLogSanitized(CarriedDeliveryFailedMessage, ex);
+                        lastTried = adopted.Connection;
+                        continue;
+                    }
+                }
+
+                deliveredOn = adopted;
+                break;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The assignment was cancelled while waiting for an adopted connection: this task ends
+            // with NO Complete and WITHOUT consuming the Ready claim.
+            return;
+        }
+
+        // STEP 3 — CARRIED → DELIVERED, then the heartbeat state is cleared. The transition happens
+        // here, BEFORE the Ready, because the delivery of the result is what makes this assignment
+        // delivered: the Ready is the adopted run's last act and must stay possible even if the
+        // process cancels the assignment right now. After this point the assignment token is NOT
+        // observed again.
+        assignment.State.TryDeliver();
+        _currentTaskId = null;
+        _currentRole = null;
+
+        // THE TEST SEAM's instant: after the Complete write succeeded and BEFORE the Ready claim.
+        if (CarriedBeforeReadyClaimHook is { } beforeClaim)
+            await beforeClaim();
+
+        // STEP 4 — THE ONE READY, THROUGH THE EXISTING SINGLE-FLIGHT CLAIM. A LOST claim sends no
+        // Ready at all (exactly one Ready is ever attempted per assignment). There is deliberately NO
+        // cancellation check between the winning claim and the write: the started-write fact below
+        // authorizes a successor, so it must never be published for a write that was not started.
+        if (!assignment.Ready.TryClaim())
+            return;
+
+        var adoptedConnection = deliveredOn!.Connection;
+        var adoptedStreamToken = deliveredOn.StreamToken;
+        assignment.MarkCarriedReadyStarted();
+
+        try
+        {
+            // The ADOPTED RUN'S STREAM TOKEN — never the assignment token — so cancelling the
+            // assignment can never suppress a Ready that has already been claimed.
+            await SendWorkerReady(adoptedConnection, adoptedStreamToken);
+        }
+        catch (Exception ex)
+        {
+            // A failed carried Ready has EXACTLY the semantics of a failed ordinary Ready today: ONE
+            // guarded sanitized diagnostic, no retry, and it does NOT end the run. The assignment
+            // stays retained as Delivered with the started-write fact set.
+            TryLogSanitized(CarriedReadyFailedMessage, ex);
+        }
+    }
 
     #region Assignment execution and config-repo preparation
 
@@ -2936,8 +3744,27 @@ public sealed class WorkerService(
             // THE EXISTING LOGICAL POINT: after completion reporting. The heartbeat state is cleared
             // here FIRST and the eligibility is published AFTERWARDS, so the heartbeat state is
             // always already cleared by the time the write the eligibility leads to can be observed.
+            //
+            // CLEAR-THEN-RECHECK. A carried assignment must keep being reported as busy even when its
+            // reporter reaches this point — the reporter may well finish BEFORE the stream loss that
+            // carries the assignment, and its own cleanup would otherwise silently blank a heartbeat
+            // state that the carried assignment still needs. So: clear first (exactly as today), then
+            // re-read the retained assignment's state and, only for a CARRIED one, set the task state
+            // again from the assignment. Nothing else is resurrected: a Delivered assignment has
+            // finished with its task and stays cleared, and a non-carried assignment keeps today's
+            // cleared state.
+            //
+            // The retained assignment is only consulted for a CARRIED one whose task ID is THIS
+            // report's own task, so a report can never resurrect a DIFFERENT assignment's task state
+            // (which is reachable only in a fixture that drives this method with no installed owner).
             _currentTaskId = null;
             _currentRole = null;
+            if (_activeAssignment is { State.IsCarried: true } retained
+                && string.Equals(retained.TaskId, task.TaskId, StringComparison.Ordinal))
+            {
+                _currentTaskId = retained.TaskId;
+                _currentRole = retained.Role;
+            }
 
             if (executionTerminatedNormally)
                 ordinaryReady.PublishEligibility();
