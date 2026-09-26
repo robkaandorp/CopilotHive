@@ -56,7 +56,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public string StateDirectory => _stateDir;
 
     private volatile bool _disposing;
-    private bool _resetting;
     private bool _connected;
 
     /// <summary>The brain actor — the sole execution path for Brain LLM calls and session state.</summary>
@@ -65,7 +64,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Test seam for constructing the actor from a state directory.</summary>
     internal Func<string, BrainActor>? _actorFactory;
 
-    /// <summary>Test seam: deletes a file during reset. Default is File.Delete.</summary>
+    /// <summary>Test seam for deleting a file. Default is File.Delete.</summary>
     internal Action<string> _fileDeleter = File.Delete;
 
     /// <summary>Test seam: copies a file during migration. Returns true on success, false on failure.</summary>
@@ -310,9 +309,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// </summary>
     private void MigrateSessionFiles(string actorStateDir)
     {
-        if (Volatile.Read(ref _resetting))
-            return;
-
         var markerPath = Path.Combine(actorStateDir, ".migrated");
         if (File.Exists(markerPath))
             return;
@@ -388,18 +384,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
-    /// <summary>Throws when the brain is currently being reset.</summary>
-    private void EnsureNotResetting()
-    {
-        if (Volatile.Read(ref _resetting))
-            throw new InvalidOperationException("Brain is being reset.");
-    }
-
     /// <inheritdoc />
     public async Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct)
     {
         EnsureConnected();
-        EnsureNotResetting();
 
         // Serialized against every other model update (and connect/reset) so that reading the
         // current configured effort, sending it to the actor and committing the local fields is
@@ -512,7 +500,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         EnsureConnected();
         if (_disposing)
             throw new InvalidOperationException("Brain is being disposed.");
-        EnsureNotResetting();
 
         var forkMsg = BrainActorMessages.CreateForkSessionMessage(goalId);
         await AskActorAsync(forkMsg, forkMsg.Reply, ct, TimeSpan.FromSeconds(3));
@@ -525,7 +512,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         EnsureConnected();
         if (_disposing)
             throw new InvalidOperationException("Brain is being disposed.");
-        EnsureNotResetting();
 
         var regMsg = BrainActorMessages.CreateRegisterExistingSessionMessage(goalId);
         await AskActorAsync(regMsg, regMsg.Reply, ct, TimeSpan.FromSeconds(3));
@@ -536,7 +522,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
         EnsureConnected();
-        EnsureNotResetting();
 
         var deleteMsg = BrainActorMessages.CreateDeleteSessionMessage(goalId);
         await AskActorAsync(deleteMsg, deleteMsg.Reply, ct, TimeSpan.FromSeconds(3));
@@ -567,7 +552,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct)
     {
         EnsureConnected();
-        EnsureNotResetting();
 
         pipeline.Conversation.Add(new ConversationEntry("system", note, pipeline.Iteration, "plan-adjustment"));
 
@@ -581,7 +565,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
     {
         EnsureConnected();
-        EnsureNotResetting();
 
         if (!string.IsNullOrWhiteSpace(instructions))
         {
@@ -849,7 +832,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         EnsureConnected();
-        EnsureNotResetting();
 
         var prompt = BrainPromptBuilder.BuildSummarizePrompt(pipeline);
         var (summaryText, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
@@ -1058,7 +1040,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         EnsureConnected();
-        EnsureNotResetting();
 
         var actor = Volatile.Read(ref _brainActor)
             ?? throw new InvalidOperationException("BrainActor not available.");
@@ -1116,8 +1097,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (!_connected) return null;
 
-        // No _resetting check: during a reset the actor is detached, so the null-actor guard
-        // below is what makes GetStats report "no stats".
+        // A reset is handled inside the live actor, so the actor stays attached throughout: the
+        // null-actor guard below only covers a never-created or already-disposed actor.
         if (Volatile.Read(ref _brainActor) is not { } actor)
             return null;
 
@@ -1157,90 +1138,69 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        // NOTE: ResetSessionAsync intentionally does NOT call EnsureConnected(). All session state
-        // lives in the BrainActor, so a reset detaches and disposes it, clears the persisted state
-        // files, reloads orchestrator instructions from disk, and starts a fresh actor.
+        // The master session lives in the BrainActor, so the reset is ONE mailbox message: the
+        // actor keeps serving goals while the message is queued and processed, and there is no
+        // detached-actor window during which goal operations would be rejected.
         //
-        // _sessionLock is held for the ENTIRE reset — including ResetBrainActorAsync — so that
-        // ConnectAsync and DisposeAsyncCore (which both take the same lock) can never observe a
-        // half-reset brain, e.g. a detached-but-not-yet-replaced actor. The wait uses
-        // CancellationToken.None because an interrupted reset would leave exactly that state.
+        // Per-goal sessions, their child actors, their brain-goal-*.json files and the migration
+        // marker are never touched. A goal that was already forked keeps the session it owns;
+        // "goals started after the reset" means exactly those whose ForkSessionMessage the actor
+        // processes after it processed this reset — a fork queued ahead of it legitimately uses
+        // the old master.
+        //
+        // The facade's _systemPrompt is reloaded up front because it is what a NEW actor is
+        // constructed with (and what re-injection sends); the live actor receives it explicitly
+        // on the reset message.
+        //
+        // _sessionLock is held for the whole reset so ConnectAsync, UpdateModelAsync and
+        // DisposeAsyncCore never observe a half-completed reset.
         await _sessionLock.WaitAsync(CancellationToken.None);
         try
         {
-            Volatile.Write(ref _resetting, true);
-
             var freshInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
             _systemPrompt = string.IsNullOrWhiteSpace(freshInstructions)
                 ? BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)
                 : $"{BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)}\n\n{freshInstructions}";
 
-            await ResetBrainActorAsync();
-            _logger.LogInformation("Brain session reset — actor state cleared, orchestrator instructions reloaded from disk, and session files deleted.");
-        }
-        catch
-        {
-            _connected = false;
-            _sessionRegistry?.Unregister("brain-master");
-            throw;
+            if (!_connected)
+            {
+                // Not connected: reload the instructions only, exactly as before — no files touched.
+                return;
+            }
+
+            try
+            {
+                var resetMsg = BrainActorMessages.CreateResetMasterSessionMessage(_systemPrompt);
+                await AskActorAsync(resetMsg, resetMsg.Reply, ct, TimeSpan.FromSeconds(3));
+            }
+            catch (Exception ex)
+            {
+                // The same live actor keeps serving: a failed, timed-out or cancelled reset never
+                // disconnects the Brain, never unregisters brain-master and never touches a goal
+                // session. The failure surfaces to the caller.
+                _logger.LogWarning(ex,
+                    "Brain master session reset failed — the Brain stays connected and goal sessions are untouched");
+                throw;
+            }
+
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = "brain-master",
+                SessionType = LlmSessionType.Brain,
+                Model = _modelOverride,
+                Status = "idle",
+                CurrentTokens = 0,
+                MaxTokens = _maxContextTokens,
+                ReasoningEffort = _configuredReasoningEffort ?? _reasoningEffort,
+            });
+
+            _logger.LogInformation(
+                "Brain master session reset — orchestrator instructions reloaded; active goal sessions preserved.");
         }
         finally
         {
-            Volatile.Write(ref _resetting, false);
             _sessionLock.Release();
         }
-    }
-
-    /// <summary>
-    /// Atomically detaches and disposes the brain actor, clears all session state from both the
-    /// actor and legacy state directories, then starts a fresh actor with strict startup.
-    /// Throws when any session file survives deletion or when the replacement actor fails to start.
-    /// </summary>
-    private async Task ResetBrainActorAsync()
-    {
-        var oldActor = Interlocked.Exchange(ref _brainActor, null);
-
-        _logger.LogWarning("Brain actor detached during reset — concurrent operations will fail until the replacement actor starts");
-
-        if (oldActor is not null)
-        {
-            try { await oldActor.DisposeAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose brain actor during reset"); }
-        }
-
-        if (!_connected)
-            return;
-
-        var actorsDir = Path.Combine(_stateDir, "actors");
-
-        if (Directory.Exists(actorsDir))
-        {
-            foreach (var file in Directory.EnumerateFiles(actorsDir, "brain-*.json"))
-            {
-                try { _fileDeleter(file); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete actor state file {File}", file); }
-            }
-        }
-
-        var migratedMarker = Path.Combine(actorsDir, ".migrated");
-        if (File.Exists(migratedMarker))
-        {
-            try { _fileDeleter(migratedMarker); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete migration marker {File}", migratedMarker); }
-        }
-
-        foreach (var file in Directory.EnumerateFiles(_stateDir, "brain-*.json"))
-        {
-            try { _fileDeleter(file); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete legacy state file {File}", file); }
-        }
-
-        var actorSurvivors = Directory.Exists(actorsDir) && Directory.EnumerateFiles(actorsDir, "brain-*.json").Any();
-        var stateSurvivors = Directory.EnumerateFiles(_stateDir, "brain-*.json").Any();
-        if (actorSurvivors || stateSurvivors)
-            throw new InvalidOperationException("Failed to clear session state during reset");
-
-        await StartBrainActorAsync(CancellationToken.None, throwOnFailure: true);
     }
 
     private void EnsureConnected()

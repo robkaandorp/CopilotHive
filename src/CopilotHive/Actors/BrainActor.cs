@@ -111,6 +111,19 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                 m.Reply.TrySetResult(true);
                 break;
 
+            case ResetMasterSessionMessage m:
+                if (!_connected || _masterSession is null)
+                {
+                    // Faulted with the SAME error identity EnsureConnected() throws, so callers see
+                    // one message regardless of which path detected the disconnected brain.
+                    m.Reply.TrySetException(NotConnectedError());
+                    break;
+                }
+
+                await ResetMasterSessionAsync(m.SystemPrompt, ct);
+                m.Reply.TrySetResult(true);
+                break;
+
             case DeleteSessionMessage m:
                 await DeleteSessionAsync(m.GoalId);
                 m.Reply.TrySetResult(true);
@@ -271,6 +284,21 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         var path = GetMasterSessionFilePath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await _masterSession.SaveAsync(path, ct);
+    }
+
+    /// <summary>
+    /// Replaces the master session with a fresh, empty one, persisting it to disk FIRST so that a
+    /// failed save leaves the previous in-memory master and orchestrator instructions completely in
+    /// effect. Per-goal sessions, their child actors, every <c>brain-goal-*.json</c> file and the
+    /// migration marker are never touched — only the master session is reset.
+    /// </summary>
+    private async Task ResetMasterSessionAsync(string systemPrompt, CancellationToken ct)
+    {
+        var fresh = AgentSession.Create("brain");
+        await SaveSessionAsync(fresh, GetMasterSessionFilePath(), ct);
+
+        _masterSession = fresh;
+        _orchestratorInstructions = systemPrompt;
     }
 
     private async Task ForkSessionAsync(string goalId, CancellationToken ct)
@@ -578,7 +606,11 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private AgentSession EnsureConnected() =>
         _connected && _masterSession is not null
             ? _masterSession
-            : throw new InvalidOperationException("Brain is not connected.");
+            : throw NotConnectedError();
+
+    /// <summary>The single error used whenever the master session is not available.</summary>
+    private static InvalidOperationException NotConnectedError() =>
+        new("Brain is not connected.");
 
     private static async Task SaveSessionAsync(AgentSession session, string path, CancellationToken ct)
     {
@@ -622,6 +654,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         {
             case ConnectMessage m: m.Reply.TrySetCanceled(); break;
             case ForkSessionMessage m: m.Reply.TrySetCanceled(); break;
+            case ResetMasterSessionMessage m: m.Reply.TrySetCanceled(); break;
             case DeleteSessionMessage m: m.Reply.TrySetCanceled(); break;
             case MergeSummaryMessage m: m.Reply.TrySetCanceled(); break;
             case UpdateModelMessage m: m.Reply.TrySetCanceled(); break;
@@ -642,6 +675,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         {
             case ConnectMessage m: m.Reply.TrySetException(ex); break;
             case ForkSessionMessage m: m.Reply.TrySetException(ex); break;
+            case ResetMasterSessionMessage m: m.Reply.TrySetException(ex); break;
             case DeleteSessionMessage m: m.Reply.TrySetException(ex); break;
             case MergeSummaryMessage m: m.Reply.TrySetException(ex); break;
             case UpdateModelMessage m: m.Reply.TrySetException(ex); break;
