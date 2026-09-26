@@ -664,23 +664,54 @@ public class GoalBrainActorTests
         }
     }
 
+    /// <summary>
+    /// SharpCoder reports most provider failures as a non-throwing completion whose
+    /// <c>AgentResult.Status</c> is <c>"Error"</c> (the failure text lands in <c>AgentResult.Message</c>);
+    /// only OperationCanceledException, HttpRequestException and ObjectDisposedException propagate as
+    /// real exceptions. Such a result must NEVER be treated as a successful Brain reply: the actor
+    /// faults the reply with an InvalidOperationException carrying the provider text, skips the
+    /// session save for the failed turn, still returns its registry entry to "idle", and keeps
+    /// serving the mailbox.
+    /// <para>
+    /// The fake client throws a NON-HTTP <see cref="InvalidOperationException"/> from
+    /// <c>GetResponseAsync</c>, which is what makes SharpCoder's <c>ExecuteAsync</c> RETURN an
+    /// Error-status result instead of rethrowing.
+    /// </para>
+    /// </summary>
     [Fact]
-    public async Task ExecutePrompt_WhenAgentReturnsError_RepliesWithErrorText()
+    public async Task ExecutePrompt_WhenAgentReturnsError_FaultsReply()
     {
         var dir = CreateTempDir();
         try
         {
+            var registry = new LlmSessionRegistry();
             var client = new FakeChatClient(_ => throw new InvalidOperationException("agent-level failure"));
-            await using var actor = CreateActor(dir, client);
+            await using var actor = CreateActor(dir, client, sessionRegistry: registry);
             actor.Start();
 
             var exec = GoalBrainActorMessages.CreateExecutePromptMessage("hi", CancellationToken.None);
             Assert.True(actor.Tell(exec));
-            var result = await AwaitReplyAsync(exec.Reply);
+            await AwaitSettledAsync(exec.Reply);
 
-            Assert.Contains("agent-level failure", result.Text, StringComparison.Ordinal);
-            Assert.Null(result.ToolCall);
+            // The error result takes the failure path: the reply is faulted (never a successful
+            // reply carrying the provider text) with an InvalidOperationException.
+            Assert.True(exec.Reply.Task.IsFaulted, "An Error-status result must fault the reply");
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await exec.Reply.Task);
+            Assert.Contains("agent-level failure", thrown.Message, StringComparison.Ordinal);
+
+            // The failed turn's session was not saved.
             Assert.False(File.Exists(Path.Combine(dir, "brain-goal-goal-1.json")));
+
+            // The registry entry returned to "idle" on the error path.
+            var sessionInfo = Assert.Single(registry.GetAll());
+            Assert.Equal("idle", sessionInfo.Status);
+            Assert.Equal("goal-1", sessionInfo.GoalId);
+
+            // The loop survives the failure: a following message is still answered.
+            var state = GoalBrainActorMessages.CreateGetGoalStateMessage();
+            Assert.True(actor.Tell(state));
+            var snapshot = await AwaitReplyAsync(state.Reply);
+            Assert.Equal("goal-1", snapshot.GoalId);
         }
         finally
         {

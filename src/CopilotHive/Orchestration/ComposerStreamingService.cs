@@ -85,7 +85,7 @@ internal sealed class ComposerStreamingService(
                         // it from INSIDE this try so the EXISTING overflow/generic catch blocks
                         // below own the recovery — never duplicate those paths here.
                         var completed = update.Result;
-                        if (completed is not null && completed.Status == "Error")
+                        if (completed is not null && completed.IsError())
                         {
                             throw new InvalidOperationException(completed.Message);
                         }

@@ -5,6 +5,7 @@ using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
+using CopilotHive.Orchestration;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -211,6 +212,16 @@ public class GoalReviewService
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 cts.CancelAfter(TimeSpan.FromMinutes(5));
                 var result = await agent.ExecuteAsync(reviewPrompt, cts.Token);
+
+                // SharpCoder reports most provider failures as a non-throwing completion whose
+                // Result.Status is "Error" (Result.Message carries the provider text); only
+                // OperationCanceledException, HttpRequestException and ObjectDisposedException
+                // propagate as real exceptions. Raise it from INSIDE this try so the EXISTING
+                // generic catch below owns the failed-review outcome (NeedsChanges, the
+                // "Review failed: …" issue, the failure review document and the persisted
+                // status) instead of parsing the error text as a review verdict.
+                if (result.IsError())
+                    throw new InvalidOperationException(result.Message);
 
                 // Parse the verdict, issues, and verified items.
                 var (verdict, issues, verified, summary) = ParseReviewResult(result.Message);

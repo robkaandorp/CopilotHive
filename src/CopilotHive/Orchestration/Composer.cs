@@ -1355,6 +1355,19 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
             await foreach (var update in _agentService.Agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
             {
+                // SharpCoder reports most provider failures as a FINAL Completed update whose
+                // Result.Status is "Error" (Result.Message carries the provider text); only
+                // OperationCanceledException, HttpRequestException and ObjectDisposedException
+                // propagate as real exceptions. Raise it from INSIDE this try so the EXISTING
+                // generic catch below owns the outcome (log + escalate to human + return null)
+                // rather than treating the failure text as a clarification answer.
+                if (update.Kind == StreamingUpdateKind.Completed
+                    && update.Result is { } clarificationResult
+                    && clarificationResult.IsError())
+                {
+                    throw new InvalidOperationException(clarificationResult.Message);
+                }
+
                 if (update.Kind == StreamingUpdateKind.TextDelta)
                     responseText += update.Text;
             }

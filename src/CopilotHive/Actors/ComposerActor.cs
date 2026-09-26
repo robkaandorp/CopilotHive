@@ -667,7 +667,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 // and a NORMAL completion (Success/MaxStepsReached) that races cancellation is
                 // still classified as cancelled exactly as before.
                 if (update.Kind == StreamingUpdateKind.Completed
-                    && update.Result is { Status: "Error" } errorResult)
+                    && update.Result is { } errorResult
+                    && errorResult.IsError())
                 {
                     throw new InvalidOperationException(errorResult.Message);
                 }

@@ -619,6 +619,48 @@ public sealed class GoalReviewServiceTests
         Assert.Contains("Agent crashed", doc.Content);
     }
 
+    /// <summary>
+    /// SharpCoder reports a provider failure as a NON-THROWING completion whose
+    /// <c>AgentResult.Status</c> is <c>"Error"</c>, with the provider text in
+    /// <c>AgentResult.Message</c> and no exception object available. <c>ReviewGoalAsync</c> must
+    /// classify that as a failed review through its EXISTING generic catch (NeedsChanges, the
+    /// <c>"Review failed: {message}"</c> issue, the standard failure summary, and the failure
+    /// review document) instead of parsing the error text as a review verdict.
+    /// <para>
+    /// DISCRIMINATOR: without the status check the result's Issues would be
+    /// <c>"[ERROR] Failed to parse review response"</c> and the summary would say the response
+    /// "could not be parsed as JSON", because the bare error text is not valid review JSON.
+    /// The fake client throws a <see cref="InvalidOperationException"/> (NOT an
+    /// <c>HttpRequestException</c>), which is what makes SharpCoder's <c>ExecuteAsync</c> RETURN
+    /// an Error-status result rather than rethrowing.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ReviewGoalAsync_ErrorStatusResult_TakesFailedReviewPath()
+    {
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var service = CreateServiceWithFactory(
+            _ => new ThrowingStubChatClient(new InvalidOperationException("provider exploded")),
+            knowledgeGraph: kg);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        Assert.Equal("NeedsChanges", result.Verdict);
+        Assert.Equal("Review failed: provider exploded", result.Issues);
+        Assert.Equal(
+            "The review agent encountered an error and could not complete the review.",
+            result.Summary);
+
+        // The verdict was never parsed from the error text (the pre-fix behaviour).
+        Assert.DoesNotContain("could not be parsed", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("Failed to parse review response", result.Issues, StringComparison.Ordinal);
+
+        var doc = kg.GetDocument($"review-{goal.Id}");
+        Assert.NotNull(doc);
+        Assert.Contains("Review failed: provider exploded", doc!.Content, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task ReviewGoalAsync_PersistedGoalAlreadyPending_Throws()
     {

@@ -561,7 +561,8 @@ public class DistributedBrainShadowTests
 
     // ════════════════════════════════════════════════════════════════════════
     // Criterion 12: ExecuteBrainAsync split — authoritative routing sends the prompt
-    // to the actor on non-throwing completion including Status="Error"
+    // to the actor on a non-throwing completion. A Status="Error" result is still
+    // ROUTED to the actor's child, but the child then faults the reply for it.
     // ════════════════════════════════════════════════════════════════════════
 
     [Fact]
@@ -603,31 +604,31 @@ public class DistributedBrainShadowTests
         var dir = NewTempDir();
         try
         {
-            // A throwing client causes CodingAgent.ExecuteAsync to return Status="Error" (not throw).
-            // ExecuteBrainAsync completes without throwing and still routes through the actor.
-            var throwing = new ThrowingChatClient();
-            var brain = NewShadowBrain(dir, chatClient: throwing);
+            // The CHILD actor's client is the one that runs the LLM call, so it must be the throwing
+            // one: NewShadowBrain builds children from factoryChatClientFactory (which defaults to a
+            // permissive TrackingChatClient). A throwing GetResponseAsync makes SharpCoder's
+            // ExecuteAsync RETURN Status="Error" (it is not an HttpRequestException, so it is not
+            // rethrown), and GoalBrainActor now faults the child reply for that result.
+            var brain = NewShadowBrain(dir, factoryChatClientFactory: _ => new ThrowingChatClient());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
                 await brain.ForkSessionForGoalAsync("goal-err", TestContext.Current.CancellationToken);
 
-                var pipeline = CreatePipeline("goal-err", "error test goal");
-                // AskQuestionAsync catches exceptions and returns a fallback, so it won't throw.
-                // But the throwing client causes CodingAgent to return Status="Error" — a non-throwing completion.
-                var response = await brain.AskQuestionAsync("goal-err", 1, "coding", "coder", "what?", TestContext.Current.CancellationToken);
-                Assert.NotNull(response);
+                // Invoke the actor-only routing method directly. AskQuestionAsync would wrap this in
+                // CopilotRetryPolicy and spend real 5s→5min backoff before giving up, so it is not used.
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    InvokeExecuteBrainAsync(brain, "prompt", "goal-err", CancellationToken.None));
+                Assert.Contains("client-throws-on-purpose", ex.Message, StringComparison.Ordinal);
 
-                // Verify the actor received the prompt despite Status="Error".
+                // The failing call was still routed through the actor's child for this goal.
                 var actor = (BrainActor?)GetBrainActor(brain);
                 Assert.NotNull(actor);
-                var children = GetChildActors(actor!);
-                Assert.True(children.ContainsKey("goal-err"), "Actor should have a child for goal-err.");
-                var child = children["goal-err"];
+                Assert.True(GetChildActors(actor!).ContainsKey("goal-err"),
+                    "Actor should still have a child for goal-err after the failed turn.");
 
-                // The child's session should have messages — the prompt was routed to the actor.
-                Assert.True(child.Session.MessageHistory.Count > 0,
-                    "Child session should have messages after actor execution (Status=Error still routes).");
+                // NOTE: no assertion on the child session's MessageHistory — a failed turn is never
+                // saved and SharpCoder does not append the user message on an Error result.
             }
         }
         finally { DeleteDir(dir); }

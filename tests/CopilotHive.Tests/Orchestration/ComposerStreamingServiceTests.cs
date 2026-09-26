@@ -1247,6 +1247,145 @@ public sealed class ComposerStreamingServiceTests
         }
     }
 
+    // ── 13c. Clarification answers must not accept a Completed/Error stream result ──
+
+    /// <summary>
+    /// A streaming chat client that yields ONE text update before throwing from inside the async
+    /// iterator. SharpCoder therefore emits <c>TextDelta("partial answer")</c> followed by a FINAL
+    /// <c>Completed</c> update whose <c>Result.Status</c> is <c>"Error"</c> and whose
+    /// <c>Result.Message</c> carries the failure text — no exception leaves the enumeration.
+    /// <para>
+    /// The throw MUST happen inside the iterator (like <see cref="ThrowBeforeFirstYieldClient"/>):
+    /// a synchronous throw from <c>GetStreamingResponseAsync</c> would propagate as a real exception
+    /// and would NOT exercise the Completed/Error path.
+    /// </para>
+    /// </summary>
+    private sealed class PartialThenThrowClient(string partialText, Exception failure) : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("partial-then-throw", null, "partial-then-throw-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw failure;
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            yield return new ChatResponseUpdate(ChatRole.Assistant, [new TextContent(partialText)]);
+
+            // Surfaces from a LATER MoveNextAsync, so the agent turns it into a Completed/Error
+            // update after the TextDelta has already been observed.
+            throw failure;
+        }
+
+        public void Dispose() { }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
+    /// <summary>
+    /// SharpCoder reports a provider failure that happens AFTER partial output as a final
+    /// <c>Completed</c> update with <c>Result.Status == "Error"</c>. <c>AnswerClarificationAsync</c>
+    /// must treat that as a failure — escalate the request to the human and return <c>null</c>,
+    /// discarding the partial text — rather than returning the partial text as a confident answer.
+    /// <para>
+    /// DISCRIMINATOR: without the error-status check the method returns the partial text and the
+    /// request stays <see cref="ClarificationStatus.AwaitingComposer"/>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_CompletedErrorStatus_EscalatesToHumanAndDiscardsPartialText()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            // A throwing GetResponseAsync would suffice for the non-streaming path, but the
+            // clarification answer goes through ExecuteStreamingAsync, so the throw is placed
+            // inside the iterator to produce the Completed/Error terminal.
+            await InjectFakeChatClient(composer,
+                new PartialThenThrowClient("partial answer", new InvalidOperationException("provider exploded mid-stream")));
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-error",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-error",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            // The failure path ran: no answer, escalated to the human.
+            Assert.Null(answer);
+            Assert.Equal(ClarificationStatus.AwaitingHuman, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(1, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Positive control for the test above: a NORMAL completion (Status "Success") must still
+    /// return the Composer's answer and must NOT escalate. Without this control the error test
+    /// would also pass if <c>AnswerClarificationAsync</c> escalated unconditionally, so this
+    /// test pins the Success behaviour that the error check must leave untouched.
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_SuccessfulCompletion_ReturnsAnswerWithoutEscalating()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+            await InjectFakeChatClient(composer, new StreamingTextClient("Use JSON."));
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-ok",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-ok",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal("Use JSON.", answer);
+            Assert.Equal(ClarificationStatus.AwaitingComposer, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(0, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
     // ── 14. Cleanup helper throws on failure (does not silently swallow) ──
 
     [Fact]

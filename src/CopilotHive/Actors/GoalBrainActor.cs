@@ -226,23 +226,30 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         {
             var result = await CodingAgent.ExecuteAsync(sessionRef, message.Prompt, linkedCts.Token);
 
-            if (result.Status != "Error")
-            {
-                try
-                {
-                    await sessionRef.SaveAsync(_sessionFilePath, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to save goal Brain session for {GoalId}", GoalId);
-                }
+            // SharpCoder reports most provider failures as a non-throwing completion whose
+            // Result.Status is "Error" (Result.Message carries the provider text); only
+            // OperationCanceledException, HttpRequestException and ObjectDisposedException
+            // propagate as real exceptions. A failed result must never be treated as a
+            // successful Brain reply: raise it from INSIDE this try so the EXISTING catch
+            // below owns the failure handling (log + registry idle + reply.TrySetException),
+            // and so the session save, the usage log and the success reply are skipped.
+            if (result.IsError())
+                throw new InvalidOperationException(result.Message);
 
-                if (result.Usage is not null)
-                {
-                    _logger.LogDebug(
-                        "Goal Brain usage: model={Model} in={InputTokens} out={OutputTokens} tools={ToolCalls}",
-                        result.ModelId, result.Usage.InputTokenCount, result.Usage.OutputTokenCount, result.ToolCallCount);
-                }
+            try
+            {
+                await sessionRef.SaveAsync(_sessionFilePath, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to save goal Brain session for {GoalId}", GoalId);
+            }
+
+            if (result.Usage is not null)
+            {
+                _logger.LogDebug(
+                    "Goal Brain usage: model={Model} in={InputTokens} out={OutputTokens} tools={ToolCalls}",
+                    result.ModelId, result.Usage.InputTokenCount, result.Usage.OutputTokenCount, result.ToolCallCount);
             }
 
             RegisterSessionStatus("idle", sessionRef);
