@@ -186,6 +186,27 @@ public sealed class WorkerService(
     internal Func<Task>? ReportBeforeCompleteSendHook { get; set; }
 
     /// <summary>
+    /// TEST SEAM — the FIRST statement INSIDE the assignment's execution task, BEFORE step 1's
+    /// provisioner selection, receiving the ASSIGNMENT token that the body's provisioning and
+    /// execution then use. <c>null</c> in production, where the instant contains nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It exists so a test can reach the <em>NO-RESULT</em> shape of an assignment deterministically:
+    /// it is awaited, so a blocking hook parks the body BEFORE any provisioning, any config-repo
+    /// preparation and any executor exists — and anything it throws flows through the body's EXISTING
+    /// catches unchanged (the <see cref="OperationCanceledException"/> tolerance and the sanitized
+    /// generic handler), which leaves the assignment's terminal-result holder EMPTY while the report
+    /// still publishes the ordinary-Ready eligibility exactly as it does for a handled failure.
+    /// </para>
+    /// <para>
+    /// It is never invoked when unset, so production pays nothing, and it is awaited at that ONE
+    /// place only: the top of the single execution task.
+    /// </para>
+    /// </remarks>
+    internal Func<CancellationToken, Task>? ExecutionStartHook { get; set; }
+
+    /// <summary>
     /// THE CLOCK SEAM FOR COMPLETION RETRANSMISSION — the ONLY test hook this behavior adds, and the
     /// ONLY clock production reads for the retry wait. It defaults to
     /// <see cref="System.TimeProvider.System"/>, is read exactly ONCE per assignment (the value is
@@ -3030,6 +3051,18 @@ public sealed class WorkerService(
                         {
                             try
                             {
+                                // STEP 0 — the TEST SEAM's instant: the FIRST statement of the body,
+                                // BEFORE step 1's provisioner selection, so a hook can hold the body
+                                // before any provisioning, preparation or executor exists. It is
+                                // awaited with the ASSIGNMENT token — the very token the steps below
+                                // use — and anything it throws is handled by the catches at the end of
+                                // this block exactly like any other pre-executor failure: the terminal
+                                // result stays ABSENT (no completion is fabricated) while the report
+                                // still publishes the ordinary-Ready eligibility. Null in production,
+                                // where this is a single null check.
+                                if (ExecutionStartHook is { } onExecutionStart)
+                                    await onExecutionStart(bodyCts.Token);
+
                                 // STEP 1 — provisioner selection. A connection with NO provisioner
                                 // (a direct-loop fixture) SKIPS the whole config-repo preparation
                                 // and keeps the LEGACY executor.
