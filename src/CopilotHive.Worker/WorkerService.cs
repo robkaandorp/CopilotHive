@@ -79,6 +79,14 @@ public sealed class WorkerService(
     private volatile string? _currentRole;
 
     /// <summary>
+    /// TEST SEAM — the EXACT value the next heartbeat tick would report as
+    /// <c>CurrentTaskId</c>, read through the same field the heartbeat reads. Observation only: it
+    /// writes nothing, changes no production path and exists so a test can assert the heartbeat
+    /// state without reflection.
+    /// </summary>
+    internal string? HeartbeatTaskIdForTest => _currentTaskId;
+
+    /// <summary>
     /// THE SERVICE'S ONE PUBLISHED CONNECTION — an ACCEPTED registration together with its opened
     /// duplex work stream, the gRPC client for that registration and the provisioner associated with
     /// them. Every production operation SNAPSHOTS this one reference, once, before it awaits, so it
@@ -184,6 +192,31 @@ public sealed class WorkerService(
     /// only when a terminal result exists (an assignment with no result writes no Complete).
     /// </remarks>
     internal Func<Task>? ReportBeforeCompleteSendHook { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — the instant INSIDE <see cref="ReportAssignmentAsync"/>'s <c>finally</c>, after
+    /// completion reporting and IMMEDIATELY BEFORE it clears <c>_currentTaskId</c>/<c>_currentRole</c>.
+    /// <c>null</c> in production, where the instant contains nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It exists so a test can ORDER the reporter's own heartbeat-state cleanup against the stream
+    /// loss that CARRIES its assignment. Both orders are legitimate and both end with the carried
+    /// task still reported as busy, but only one of them exercises the existing
+    /// clear-then-recheck: a reporter that reaches this point BEFORE the carry clears (and finds
+    /// nothing Carried to restore, so the carry's own re-assertion is what sets the state), whereas a
+    /// reporter parked HERE while the carry happens clears AFTER it and is restored by the re-check.
+    /// Awaiting the seam is what makes those two orderings observable without any timer, sleep or
+    /// artificial barrier in production code.
+    /// </para>
+    /// <para>
+    /// It is awaited, so a blocking hook parks the reporting exactly there; it is never invoked when
+    /// unset, and it is awaited at that one place only. It is a rendezvous and nothing else: it must
+    /// not throw, because this instant is inside a <c>finally</c> and a throwing hook would replace
+    /// whatever outcome the reporting was already carrying.
+    /// </para>
+    /// </remarks>
+    internal Func<Task>? ReportingFinallyBeforeClearHook { get; set; }
 
     /// <summary>
     /// TEST SEAM — the FIRST statement INSIDE the assignment's execution task, BEFORE step 1's
@@ -4219,6 +4252,13 @@ public sealed class WorkerService(
             // The retained assignment is only consulted for a CARRIED one whose task ID is THIS
             // report's own task, so a report can never resurrect a DIFFERENT assignment's task state
             // (which is reachable only in a fixture that drives this method with no installed owner).
+            //
+            // THE TEST SEAM's instant: immediately BEFORE that clear, so a test can order this
+            // reporter's cleanup against the stream loss that carries its assignment. It is a
+            // rendezvous only — never consulted in production, where it is a single null check.
+            if (ReportingFinallyBeforeClearHook is { } beforeClear)
+                await beforeClear();
+
             _currentTaskId = null;
             _currentRole = null;
             if (_activeAssignment is { State.IsCarried: true } retained
@@ -4917,6 +4957,18 @@ public sealed class WorkerService(
         while (await timer.WaitForNextTickAsync(ct))
             await SendHeartbeatAsync(connection, ct);
     }
+
+    /// <summary>
+    /// TEST SEAM — ONE heartbeat tick, driven directly through the SAME per-tick method the
+    /// production loop calls. It adds no behavior of its own: it reuses
+    /// <see cref="SendHeartbeatAsync"/> verbatim, so a test that wants to prove WHAT a heartbeat
+    /// reports at a given instant gets the real send, its real checked connection access and its
+    /// real failure contract instead of a copy of them.
+    /// </summary>
+    /// <param name="connection">The connection the tick must go through.</param>
+    /// <param name="ct">The token the real tick would use.</param>
+    internal Task SendHeartbeatOnceForTestAsync(WorkerConnection connection, CancellationToken ct) =>
+        SendHeartbeatAsync(connection, ct);
 
     /// <summary>
     /// ONE heartbeat tick on the given connection: snapshots the connection's identity and the
