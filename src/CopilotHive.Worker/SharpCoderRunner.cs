@@ -777,8 +777,20 @@ public sealed class SharpCoderRunner : IAgentRunner
             }
         }
 
-        if (result.Status != "Success")
+        if (result.Status == "Error")
         {
+            // THE one status whose Message is NOT agent output. SharpCoder reports most provider
+            // failures as a Completed/Error result carrying the PROVIDER's failure text, and that text
+            // can echo a provisioned secret — WorkerLogger.Error goes to Console.Error, i.e. the
+            // container's stderr, which is shipped with the worker's logs. So the line names the status
+            // and nothing else. It deliberately does NOT quote the omitted text even as a label, so
+            // nothing that looks like an echo of the provider's wording can appear on stderr.
+            _log.Error($"Agent finished with non-success status: {result.Status} (provider error text omitted)");
+        }
+        else if (result.Status != "Success")
+        {
+            // Every other non-success status (MaxStepsReached, ...) is the agent's OWN partial output:
+            // its content is logged exactly as before.
             _log.Error($"Agent finished with non-success status: {result.Status} - {result.Message}");
         }
 
@@ -959,6 +971,32 @@ public sealed class SharpCoderRunner : IAgentRunner
     private static readonly string DiagnosticsDir =
         Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? Path.Combine(Path.GetTempPath(), "copilothive-diagnostics");
 
+    /// <summary>
+    /// THE placeholder written as <c>agentResponse</c> in the diagnostics document in place of an
+    /// Error result's message. Fixed text: it never echoes any part of the provider's failure text.
+    /// </summary>
+    internal const string OmittedProviderFailureText = "(omitted: provider failure text)";
+
+    /// <summary>
+    /// The agent response that may be PERSISTED for <paramref name="result"/>.
+    /// <para>
+    /// For <c>Status == "Error"</c> the result's message is the PROVIDER's failure text, not agent
+    /// output. SharpCoder reports most provider failures as a Completed/Error result carrying whatever
+    /// the provider returned, and that text can echo a provisioned secret (see the
+    /// <see cref="SafeExceptionLog"/> rationale). The post-execution diagnostics JSON under
+    /// <c>DIAGNOSTICS_DIR</c> must therefore write <see cref="OmittedProviderFailureText"/> instead;
+    /// <c>RunPromptTurnAsync</c>'s own closing stderr line applies the same rule by naming the status
+    /// alone.
+    /// </para>
+    /// <para>
+    /// Every other status is UNCHANGED: <c>Success</c> is the agent's answer and <c>MaxStepsReached</c>
+    /// (or any other status) carries the agent's own partial output, which already travels to the
+    /// orchestrator, so its message is returned verbatim. A <c>null</c> result yields <c>null</c>.
+    /// </para>
+    /// </summary>
+    internal static string? SafeAgentResponse(AgentResult? result)
+        => result?.Status == "Error" ? OmittedProviderFailureText : result?.Message;
+
     private void WriteDiagnosticsFile(AgentResult? result, string userPrompt, TimeSpan elapsed, AgentOptions options, string phase)
     {
         try
@@ -1010,7 +1048,10 @@ public sealed class SharpCoderRunner : IAgentRunner
                 },
                 systemPrompt = diag?.SystemPrompt ?? options.SystemPrompt ?? "(not yet assembled)",
                 userMessage = userPrompt,
-                agentResponse = result?.Message
+                // An Error result's message here is provider failure text (it can echo a provisioned
+                // secret), so it is replaced by a fixed placeholder; every other status writes
+                // result.Message exactly as before.
+                agentResponse = SafeAgentResponse(result)
             };
 
             var json = JsonSerializer.Serialize(doc, new JsonSerializerOptions

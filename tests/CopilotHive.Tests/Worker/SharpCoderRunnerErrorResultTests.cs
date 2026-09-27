@@ -4,6 +4,8 @@ using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
 
+using SharpCoder;
+
 using System.Runtime.CompilerServices;
 
 namespace CopilotHive.Tests.Worker;
@@ -152,11 +154,104 @@ public sealed class SharpCoderRunnerErrorResultTests
     }
 
     /// <summary>
+    /// THE stderr LEAK. An Error result's message is the PROVIDER's failure text, which can echo a
+    /// provisioned secret, and <see cref="WorkerLogger"/>.Error writes straight to
+    /// <see cref="Console.Error"/> — the container's stderr, which is shipped with the worker's logs.
+    /// The closing line must therefore name the status and nothing else, while the turn still throws
+    /// <see cref="AgentTurnFailedException"/>. On the rejected revision the same flow wrote
+    /// <c>Agent finished with non-success status: Error - provider failure SECRET-TOKEN-123</c> to
+    /// stderr, so the two absence assertions below fail on it.
+    /// </summary>
+    [Fact]
+    public async Task SendPromptAsync_ErrorStatusResult_DoesNotWriteProviderFailureTextToStderr()
+    {
+        var workDir = CreateWorkDir();
+        var runner = new SharpCoderRunner();
+        var client = new ThrowBeforeFirstYieldChatClient(new InvalidOperationException(ProviderFailureText));
+        var stderr = new StringWriter();
+        var originalErr = Console.Error;
+
+        try
+        {
+            Console.SetError(stderr);
+            runner.ClientCreationSeam = _ => client;
+            runner.SetCustomAgent(WorkerRole.Coder, "coder");
+
+            await Assert.ThrowsAsync<AgentTurnFailedException>(
+                () => runner.SendPromptAsync("work", workDir, TestContext.Current.CancellationToken));
+
+            var logged = stderr.ToString();
+
+            // The status is still observable on stderr...
+            Assert.Contains("Agent finished with non-success status: Error", logged, StringComparison.Ordinal);
+
+            // ...but the provider's failure text is not: not the secret, and not the provider's
+            // wording either — the omitted text is not echoed in any form.
+            Assert.DoesNotContain("SECRET-TOKEN-123", logged, StringComparison.Ordinal);
+            Assert.DoesNotContain("provider failure", logged, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            await runner.DisposeAsync();
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The DIAGNOSTICS value, tested on the helper <c>WriteDiagnosticsFile</c> uses for
+    /// <c>agentResponse</c> (the file itself is deliberately NOT located: <c>DiagnosticsDir</c> is a
+    /// static readonly field whose filenames collide across parallel tests). An Error message is
+    /// provider failure text, so it must be replaced by the fixed placeholder; every non-Error status
+    /// keeps its message VERBATIM — asserted by reference identity, so a mutant that derives, copies or
+    /// truncates the text is killed too.
+    /// </summary>
+    [Fact]
+    public void SafeAgentResponse_ErrorIsPlaceholderAndEveryOtherStatusKeepsMessageByIdentity()
+    {
+        var errorValue = SharpCoderRunner.SafeAgentResponse(new AgentResult { Status = "Error", Message = ProviderFailureText });
+
+        Assert.Equal(SharpCoderRunner.OmittedProviderFailureText, errorValue);
+        Assert.DoesNotContain("SECRET-TOKEN-123", errorValue!, StringComparison.Ordinal);
+        Assert.DoesNotContain(ProviderFailureText, errorValue!, StringComparison.Ordinal);
+
+        const string AgentOutput = "partial progress.";
+        Assert.Same(AgentOutput, SharpCoderRunner.SafeAgentResponse(new AgentResult { Status = "MaxStepsReached", Message = AgentOutput }));
+
+        const string SuccessOutput = "All done.";
+        Assert.Same(SuccessOutput, SharpCoderRunner.SafeAgentResponse(new AgentResult { Status = "Success", Message = SuccessOutput }));
+
+        // No result (the pre-execution write): still null, never a fabricated placeholder.
+        Assert.Null(SharpCoderRunner.SafeAgentResponse(null));
+    }
+
+    /// <summary>
+    /// The exact Status comparison is the ONLY switch: any status that is not the literal
+    /// <c>"Error"</c> — including a status the runner has never seen — keeps its message untouched.
+    /// </summary>
+    [Theory]
+    [InlineData("Success")]
+    [InlineData("MaxStepsReached")]
+    [InlineData("Cancelled")]
+    [InlineData("error")]
+    public void SafeAgentResponse_NonErrorStatus_ReturnsMessageVerbatim(string status)
+    {
+        const string Message = "agent output SECRET-TOKEN-123";
+
+        Assert.Same(Message, SharpCoderRunner.SafeAgentResponse(new AgentResult { Status = status, Message = Message }));
+    }
+
+    /// <summary>
     /// POSITIVE CONTROL for the "only the exact status Error throws" rule: a
     /// <c>MaxStepsReached</c> result is NOT a provider failure, so the turn must still RETURN the
     /// agent's accumulated partial text instead of throwing. The status is read from the runner's own
     /// closing log line so the control is anchored to the ACTUAL status value — without it, a mutant
     /// that throws for every non-success status could still satisfy the assertions below.
+    /// <para>
+    /// The same run's STDERR is asserted too: a non-Error status keeps the pre-existing line, message
+    /// and all. That kills a mutant that applied the Error redaction to every non-success status —
+    /// the partial text below would be missing.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task SendPromptAsync_MaxStepsReachedStatus_ReturnsPartialTextWithoutThrowing()
@@ -165,11 +260,14 @@ public sealed class SharpCoderRunnerErrorResultTests
         var runner = new SharpCoderRunner();
         var client = new AlwaysToolCallChatClient();
         var stdout = new StringWriter();
+        var stderr = new StringWriter();
         var originalOut = Console.Out;
+        var originalErr = Console.Error;
 
         try
         {
             Console.SetOut(stdout);
+            Console.SetError(stderr);
             runner.ClientCreationSeam = _ => client;
             runner.SetCustomAgent(WorkerRole.Coder, "coder");
 
@@ -184,10 +282,16 @@ public sealed class SharpCoderRunnerErrorResultTests
 
             // ...and the partial text came back instead of an AgentTurnFailedException.
             Assert.Contains("partial progress.", result, StringComparison.Ordinal);
+
+            // The closing stderr line is UNCHANGED for a non-Error status: status AND message.
+            var logged = stderr.ToString();
+            Assert.Contains("Agent finished with non-success status: MaxStepsReached - ", logged, StringComparison.Ordinal);
+            Assert.Contains("partial progress.", logged, StringComparison.Ordinal);
         }
         finally
         {
             Console.SetOut(originalOut);
+            Console.SetError(originalErr);
             await runner.DisposeAsync();
             Directory.Delete(workDir, recursive: true);
         }
