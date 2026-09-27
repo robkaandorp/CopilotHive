@@ -10,17 +10,35 @@ namespace CopilotHive.Actors;
 public abstract class Actor<TMessage> : IAsyncDisposable
     where TMessage : class
 {
+    /// <summary>
+    /// How long <see cref="DisposeAsync"/> waits for the message loop to exit before invoking
+    /// <see cref="OnDisposeTimeout"/>. Exposed to the test assembly so deterministic tests can
+    /// rendezvous on this exact window instead of duplicating or guessing the literal.
+    /// </summary>
+    internal static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(5);
+
     private readonly Channel<TMessage> _mailbox = Channel.CreateUnbounded<TMessage>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private readonly CancellationTokenSource _cts = new();
     private readonly TaskCompletionSource _loopCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _lifecycleLock = new();
+    private readonly TimeProvider _timeProvider;
     private readonly CancellationToken _loopToken;
     private Task? _loopTask;
     private bool _disposed;
 
-    /// <summary>Initializes the mailbox and lifecycle cancellation token.</summary>
-    protected Actor() => _loopToken = _cts.Token;
+    /// <summary>Initializes the mailbox and lifecycle cancellation token using the system clock.</summary>
+    protected Actor() : this(TimeProvider.System) { }
+
+    /// <summary>
+    /// Initializes the mailbox and lifecycle cancellation token, arming the dispose timeout
+    /// through <paramref name="timeProvider"/>.
+    /// </summary>
+    protected Actor(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider;
+        _loopToken = _cts.Token;
+    }
 
     /// <summary>Completes when the message loop has exited.</summary>
     public Task Completion => _loopCompletion.Task;
@@ -157,7 +175,7 @@ public abstract class Actor<TMessage> : IAsyncDisposable
             {
                 try
                 {
-                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    using var timeoutCts = new CancellationTokenSource(DisposeTimeout, _timeProvider);
                     await _loopCompletion.Task.WaitAsync(timeoutCts.Token);
                 }
                 catch (OperationCanceledException)

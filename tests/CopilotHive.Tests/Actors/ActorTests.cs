@@ -5,8 +5,6 @@ namespace CopilotHive.Tests.Actors;
 
 public class ActorTests
 {
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
-
     internal sealed record TestMessage(TaskCompletionSource? Reply = null)
     {
         public bool Handled;
@@ -16,7 +14,15 @@ public class ActorTests
     {
         private readonly Func<TestMessage, CancellationToken, Task>? _handler;
 
-        public TestActor(Func<TestMessage, CancellationToken, Task>? handler = null) => _handler = handler;
+        /// <summary>
+        /// The clock is REQUIRED, deliberately not optional-with-a-<see cref="TimeProvider.System"/>
+        /// fallback: every actor in this class must run on a test-owned manual clock, so the dispose
+        /// window can only fire when a test advances it. A silent default would re-introduce exactly
+        /// the wall-clock race this suite is removing.
+        /// </summary>
+        public TestActor(ControlledTimeProvider clock, Func<TestMessage, CancellationToken, Task>? handler = null)
+            : base(clock)
+            => _handler = handler;
 
         public int LoopStartedCount;
         public int HandleCallCount;
@@ -71,16 +77,41 @@ public class ActorTests
         protected override void OnDisposeTimeout() => Interlocked.Increment(ref DisposeTimeoutCount);
     }
 
+    /// <summary>
+    /// Bounded hang-guard around an awaited signal. There is no real-time RACE here: every task
+    /// passed in is completed by correct production code without any wall-clock time passing, so
+    /// the only way this can expire is a genuine hang — never scheduler load. The manual clock the
+    /// actor runs on means even a blocking handler cannot tie with this budget.
+    /// </summary>
     private static async Task AwaitAsync(Task task)
+        => await task.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+
+    /// <summary>
+    /// Rendezvous on <see cref="Actor{TMessage}.DisposeTimeout"/> being armed on the manual clock.
+    /// The failure is NAMED: if the dispose window never reaches the injected
+    /// <see cref="TimeProvider"/> (e.g. production kept a real-time CancellationTokenSource), this
+    /// test fails here with the missing-timer message — not with an anonymous hang-guard timeout
+    /// that could be misread as a slow machine.
+    /// </summary>
+    private static async Task RendezvousOnDisposeTimeoutAsync(ControlledTimeProvider clock)
     {
-        await Task.WhenAny(task, Task.Delay(Timeout));
-        Assert.True(task.IsCompleted, "Task did not complete in time.");
+        try
+        {
+            await clock.WaitForPendingTimerAsync(
+                Actor<TestMessage>.DisposeTimeout, TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException ex)
+        {
+            Assert.Fail(
+                $"dispose timeout ({Actor<TestMessage>.DisposeTimeout.TotalSeconds:0} s) never registered with the controlled clock: {ex.Message}");
+        }
     }
 
     [Fact]
     public async Task StartCalledTwice_OnlyOneLoopRuns()
     {
-        await using var actor = new TestActor();
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock);
         actor.Start();
         actor.Start();
 
@@ -89,37 +120,149 @@ public class ActorTests
         await AwaitAsync(message.Reply!.Task);
 
         Assert.Equal(1, actor.LoopStartedCount);
+
+        await AwaitAsync(actor.DisposeAsync().AsTask());
+        Assert.Equal(0, actor.DisposeTimeoutCount);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task ConcurrentStartAndDispose_DoesNotDeadlock()
     {
-        var actor = new TestActor();
-        using var barrier = new Barrier(2);
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock);
 
-        var startTask = Task.Factory.StartNew(() =>
+        // Worker lifetime is owned by this test, not by the outer wait. Every blocking point inside
+        // a worker (the barrier rendezvous and the dispose join) is bounded by the hang-guard AND by
+        // this cleanup token, so on ANY failure path the finally below can cancel it and join both
+        // workers: no helper thread is ever left parked on a manual clock that will never advance.
+        // The barrier and the token source are disposed only after both workers have terminated.
+        var barrier = new Barrier(2);
+        var workerCleanup = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var workerToken = workerCleanup.Token;
+        Task? startTask = null;
+        Task? disposeTask = null;
+        var workersTerminated = false;
+        var outerGuardExpired = false;
+        try
         {
-            barrier.SignalAndWait();
-            actor.Start();
-        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            startTask = Task.Factory.StartNew(() =>
+            {
+                SignalAndWaitBounded(barrier, workerToken, "start");
+                actor.Start();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
-        var disposeTask = Task.Factory.StartNew(() =>
+            disposeTask = Task.Factory.StartNew(() =>
+            {
+                SignalAndWaitBounded(barrier, workerToken, "dispose");
+                try
+                {
+                    // Bounded INSIDE the worker: a dispose that never completes faults this worker
+                    // with a named TimeoutException instead of blocking its thread forever.
+                    actor.DisposeAsync().AsTask()
+                        .WaitAsync(ControlledTimeProvider.HangGuard, workerToken)
+                        .GetAwaiter().GetResult();
+                }
+                catch (TimeoutException ex)
+                {
+                    throw new TimeoutException(
+                        $"{nameof(ConcurrentStartAndDispose_DoesNotDeadlock)}: the dispose worker's DisposeAsync did not complete within the hang guard ({ControlledTimeProvider.HangGuard.TotalSeconds:0} s).",
+                        ex);
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+            var workers = Task.WhenAll(startTask, disposeTask);
+            try
+            {
+                await AwaitAsync(workers);
+            }
+            catch (TimeoutException) when (!workers.IsCompleted)
+            {
+                // The OUTER guard expired while a worker was still running (a worker's own named
+                // TimeoutException completes `workers` and is rethrown unchanged instead). The
+                // failure is reported only AFTER the finally has cancelled and joined the workers,
+                // so the diagnostic states whether cleanup actually terminated them.
+                outerGuardExpired = true;
+            }
+        }
+        finally
         {
-            barrier.SignalAndWait();
-            actor.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            // Release every bounded wait a worker could still be inside (barrier or dispose join),
+            // then join both workers. Only once both have terminated is it safe to dispose the
+            // barrier and the token source they use; otherwise they are deliberately left alive.
+            workerCleanup.Cancel();
+            workersTerminated = await JoinWorkersQuietlyAsync(startTask, disposeTask);
+            if (workersTerminated)
+            {
+                barrier.Dispose();
+                workerCleanup.Dispose();
+            }
+        }
 
-        await AwaitAsync(Task.WhenAll(startTask, disposeTask));
+        Assert.False(
+            outerGuardExpired,
+            $"{nameof(ConcurrentStartAndDispose_DoesNotDeadlock)}: the start/dispose workers did not finish within the hang guard ({ControlledTimeProvider.HangGuard.TotalSeconds:0} s); after cleanup cancellation workersTerminated={workersTerminated}.");
+        Assert.True(
+            workersTerminated,
+            $"{nameof(ConcurrentStartAndDispose_DoesNotDeadlock)}: a start/dispose worker did not terminate after cleanup cancellation.");
 
-        // No deadlock, no crash — the actor is disposed and its loop completed.
+        // No deadlock, no crash — the actor is disposed and Completion is signalled.
         await AwaitAsync(actor.Completion);
         Assert.True(actor.IsCompleted);
+
+        // What this race proves: no deadlock and no crash, whichever side wins. Dispose may win the
+        // Barrier race, in which case Start() returns without launching a loop and DisposeAsync takes
+        // the UNSTARTED path (no dispose timer is ever created); or Start() wins and DisposeAsync takes
+        // the STARTED path and joins the loop. In EITHER outcome the dispose-timeout hook must not have
+        // fired and no timer may be left pending on the manual clock. This test does NOT prove which
+        // path ran, so it is not evidence that a started loop was joined or that the dispose CTS
+        // released its timer — that is proven by the deterministically started tests below
+        // (e.g. DisposeWhileHandling_DrainsQueuedMessages, DisposeAfterStart_TellFromLoopTokenCallback_IsRejected).
+        Assert.Equal(0, actor.DisposeTimeoutCount);
+        Assert.Equal(0, clock.PendingTimerCount);
+    }
+
+    /// <summary>
+    /// Bounded barrier rendezvous for a helper worker: fails the worker with a named
+    /// <see cref="TimeoutException"/> if its partner never arrives within the hang guard, and
+    /// exits promptly (OperationCanceledException) when the owning test cancels cleanup.
+    /// </summary>
+    private static void SignalAndWaitBounded(Barrier barrier, CancellationToken cleanup, string worker)
+    {
+        if (!barrier.SignalAndWait(ControlledTimeProvider.HangGuard, cleanup))
+        {
+            throw new TimeoutException(
+                $"{nameof(ConcurrentStartAndDispose_DoesNotDeadlock)}: the {worker} worker's partner never reached the barrier within the hang guard ({ControlledTimeProvider.HangGuard.TotalSeconds:0} s).");
+        }
+    }
+
+    /// <summary>
+    /// Joins helper workers for use exclusively in a <c>finally</c>: bounded, outcome discarded so
+    /// the test's own assertion/failure remains the one reported. Returns whether every started
+    /// worker actually terminated, which gates disposal of the resources they use.
+    /// </summary>
+    private static async Task<bool> JoinWorkersQuietlyAsync(params Task?[] workers)
+    {
+        var started = workers.OfType<Task>().ToArray();
+        var all = Task.WhenAll(started);
+        try
+        {
+            await all.WaitAsync(ControlledTimeProvider.HangGuard, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            // Joining only: worker faults/cancellations are already surfaced (or deliberately
+            // secondary to the failure that sent us down this path).
+        }
+
+        return all.IsCompleted;
     }
 
     [Fact]
     public async Task DisposeWithoutStart_DrainsMessagesAndCallsHook()
     {
-        var actor = new TestActor();
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock);
         var message = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         Assert.True(actor.Tell(message));
 
@@ -133,23 +276,38 @@ public class ActorTests
         Assert.Contains(message, actor.Canceled);
     }
 
+    /// <summary>
+    /// Proves the dispose window is armed on the injected <see cref="TimeProvider"/>: the handler
+    /// never returns, so dispose can only complete after the test OBSERVES the 5 s timer registered
+    /// on the manual clock and then advances it. No wall-clock time passes anywhere — the rendezvous
+    /// is what keeps "the timeout has not fired yet" a fact rather than a race.
+    /// </summary>
     [Fact]
     public async Task DisposeWithBlockedHandler_CallsDisposeTimeoutHook()
     {
-        var actor = new TestActor((_, _) => new TaskCompletionSource().Task);
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock, (_, _) => new TaskCompletionSource().Task);
         actor.Start();
         Assert.True(actor.Tell(new TestMessage()));
         await AwaitAsync(actor.EnteredHandler.Task);
 
-        await actor.DisposeAsync();
+        // Started but NOT awaited: the dispose task must be pending on the timer rendezvous below.
+        var disposeTask = actor.DisposeAsync().AsTask();
+
+        await RendezvousOnDisposeTimeoutAsync(clock);
+
+        clock.Advance(Actor<TestMessage>.DisposeTimeout);
+        await AwaitAsync(disposeTask);
 
         Assert.Equal(1, actor.DisposeTimeoutCount);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MailboxCompleted_CallsShutdownHook()
     {
-        var actor = new TestActor();
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock);
         actor.Start();
         var message = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         Assert.True(actor.Tell(message));
@@ -159,13 +317,15 @@ public class ActorTests
 
         await AwaitAsync(actor.Completion);
         Assert.Equal(1, actor.ShutdownCount);
-        await actor.DisposeAsync();
+        await AwaitAsync(actor.DisposeAsync().AsTask());
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task HandlerThrows_RoutesToUnhandledExceptionHook()
     {
-        var actor = new TestActor((_, _) => throw new InvalidOperationException("boom"));
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock, (_, _) => throw new InvalidOperationException("boom"));
         actor.Start();
         var failing = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         Assert.True(actor.Tell(failing));
@@ -178,14 +338,16 @@ public class ActorTests
         // The loop keeps running after a handler failure.
         var next = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         Assert.True(actor.Tell(next));
-        await actor.DisposeAsync();
+        await AwaitAsync(actor.DisposeAsync().AsTask());
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task DisposeWhileHandling_DrainsQueuedMessages()
     {
+        var clock = new ControlledTimeProvider();
         var gate = new TaskCompletionSource();
-        var actor = new TestActor(async (_, ct) => await gate.Task.WaitAsync(ct));
+        var actor = new TestActor(clock, async (_, ct) => await gate.Task.WaitAsync(ct));
         actor.Start();
 
         var first = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
@@ -200,7 +362,7 @@ public class ActorTests
             Assert.True(actor.Tell(m));
         }
 
-        await actor.DisposeAsync();
+        await AwaitAsync(actor.DisposeAsync().AsTask());
 
         Assert.True(first.Reply!.Task.IsCanceled);
         foreach (var m in queued)
@@ -208,6 +370,9 @@ public class ActorTests
             Assert.True(m.Reply!.Task.IsCanceled);
             Assert.False(m.Handled);
         }
+
+        Assert.Equal(0, actor.DisposeTimeoutCount);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -221,7 +386,8 @@ public class ActorTests
     {
         // Non-cancelable gate — the handler awaits it directly, ignoring the loop token.
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var actor = new TestActor(async (_, _) => await gate.Task);
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock, async (_, _) => await gate.Task);
         actor.Start();
 
         var blocking = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
@@ -248,6 +414,7 @@ public class ActorTests
         Assert.Contains(buffered, actor.Canceled);
         Assert.Equal(0, actor.DisposeTimeoutCount);
         Assert.Equal(0, actor.UnhandledCount);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -262,7 +429,7 @@ public class ActorTests
     [Fact]
     public async Task DisposeWithoutStart_TellFromLoopTokenCallback_IsRejected()
     {
-        var actor = new TestActor();
+        var actor = new TestActor(new ControlledTimeProvider());
         var rejected = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         var callbackRan = false;
         bool? tellResult = null;
@@ -300,7 +467,8 @@ public class ActorTests
         // Cancelable gate: the handler parks here so the loop is inside the read/handle path,
         // and the loop token release lets disposal complete without the timeout hook.
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var actor = new TestActor(async (_, ct) => await gate.Task.WaitAsync(ct));
+        var clock = new ControlledTimeProvider();
+        var actor = new TestActor(clock, async (_, ct) => await gate.Task.WaitAsync(ct));
 
         // Hoisted so the finally can await the ORIGINAL disposal task even when an assertion
         // above throws: a second DisposeAsync sees _disposed and returns early, so only the
@@ -339,6 +507,7 @@ public class ActorTests
 
             Assert.Equal(0, actor.DisposeTimeoutCount);
             Assert.True(actor.IsCompleted);
+            Assert.Equal(0, clock.PendingTimerCount);
 
             tryBlockPassed = true;
         }
@@ -351,7 +520,7 @@ public class ActorTests
             // joining the loop, so the first task is the only authoritative join.
             if (disposeTask is not null)
             {
-                try { await disposeTask; }
+                try { await AwaitAsync(disposeTask); }
                 catch (Exception) when (!tryBlockPassed)
                 {
                     // The try block already failed; THAT exception is the one under test and
