@@ -424,6 +424,36 @@ public sealed class CiMonitorServiceTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The exact dedup-append stamp every builder writes, rendered from the test-owned manual
+    /// clock's current time — the value the production dedup call sites must read through the
+    /// service's <see cref="TimeProvider"/>.
+    /// </summary>
+    private static string ExpectedStamp(ControlledTimeProvider clock) =>
+        $"[Updated {clock.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture)}]";
+
+    /// <summary>
+    /// Pre-seeds an open issue with the given title, source goal <c>goal-1</c> and repository
+    /// <c>test-repo</c>: the issue <c>CreateOrUpdateIssueAsync</c> must find and append to.
+    /// </summary>
+    private static Issue SeedExistingIssue(FakeIssueStore issueStore, string title, string description)
+    {
+        var existingIssue = new Issue
+        {
+            Id = "issue-existing",
+            Type = IssueType.Bug,
+            Title = title,
+            Description = description,
+            Severity = IssueSeverity.High,
+            Status = IssueStatus.Open,
+            RepositoryNames = ["test-repo"],
+            SourceGoalId = "goal-1",
+            SourceRole = "ci",
+        };
+        issueStore.Issues[existingIssue.Id] = existingIssue;
+        return existingIssue;
+    }
+
     private static IHttpClientFactory CreateFactory(ScriptedHttpMessageHandler handler)
     {
         var factory = new Mock<IHttpClientFactory>();
@@ -892,25 +922,36 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Equal(EventType.CiFailed, evt.Type);
     }
 
+    /// <summary>
+    /// Check-run-output dedup (<c>BuildDedupAppend</c>): the second call for the same goal and
+    /// title appends a block stamped with EXACTLY the service clock's current time. The clock is
+    /// advanced between the two calls, so the stamp must be read at append time from the
+    /// service's <see cref="TimeProvider"/>, not from the wall clock or a captured value.
+    /// </summary>
     [Fact]
     public async Task MonitorMergeAsync_DedupSameTitleAndGoal_AppendsDescription()
     {
         var eventBus = new RecordingEventBus();
         var issueStore = new FakeIssueStore();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ =>
             OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "✗ MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum", "First failure"))));
-        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
 
         // First call creates the issue.
         await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
         var issue = Assert.Single(issueStore.Issues.Values);
         Assert.DoesNotContain("---", issue.Description);
+        Assert.Equal(0, clock.PendingTimerCount);
+
+        // Move the manual clock to a distinctive instant (sub-second ticks show in "O" format).
+        clock.Advance(TimeSpan.FromMinutes(3) + TimeSpan.FromTicks(1_234_567));
 
         // Second call (same goal, same title) appends.
         await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
-        Assert.Single(issueStore.Issues.Values);
-        Assert.Contains("---", issueStore.Issues.Values.Single().Description);
-        Assert.Contains("[Updated", issueStore.Issues.Values.Single().Description);
+        var updated = Assert.Single(issueStore.Issues.Values);
+        Assert.Contains("---", updated.Description);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n", updated.Description);
     }
 
     [Fact]
@@ -1631,14 +1672,15 @@ public sealed class CiMonitorServiceTests : IDisposable
     // ── Startup scan ───────────────────────────────────────────────────────
 
     /// <summary>
-    /// Records every <see cref="CiMonitorService.MonitorMergeAsync"/> launch (the startup scan's
-    /// fire-and-forget continuation) instead of performing it, so tests can assert whether
-    /// background monitoring was started and with which cancellation token.
+    /// Records every <see cref="CiMonitorService.StartBackgroundMonitoring"/> launch (the startup
+    /// scan's fire-and-forget hand-off) synchronously instead of performing it, so once
+    /// <see cref="CiMonitorService.StartupScanAsync"/> returns, tests can assert exactly — with
+    /// no waits — whether background monitoring was started and with which cancellation token.
+    /// The real hand-off to <see cref="CiMonitorService.MonitorMergeAsync"/> is covered by
+    /// <see cref="StartBackgroundMonitoring_ForwardsToMonitorMergeAsyncWithScanToken"/>.
     /// </summary>
     private sealed class MonitorRecordingService : CiMonitorService
     {
-        private readonly TaskCompletionSource _firstCall = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
         public MonitorRecordingService(
             IGoalStore? goalStore,
             HiveConfigFile config,
@@ -1675,13 +1717,41 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         public ConcurrentBag<(string GoalId, string Repo, string Sha, CancellationToken Token)> Monitored { get; } = [];
 
-        /// <summary>Completes as soon as the first monitoring launch is observed.</summary>
-        public Task FirstCall => _firstCall.Task;
+        internal override void StartBackgroundMonitoring(string goalId, string repoName, string sha, CancellationToken ct) =>
+            Monitored.Add((goalId, repoName, sha, ct));
+    }
+
+    /// <summary>
+    /// Overrides ONLY <see cref="CiMonitorService.MonitorMergeAsync"/>, so the REAL base
+    /// <see cref="CiMonitorService.StartBackgroundMonitoring"/> runs and its forwarded arguments
+    /// can be observed.
+    /// </summary>
+    private sealed class MonitorForwardingService : CiMonitorService
+    {
+        public MonitorForwardingService(
+            IGoalStore goalStore,
+            HiveConfigFile config,
+            IHttpClientFactory httpClientFactory,
+            IEventBus eventBus,
+            ControlledTimeProvider clock)
+            : base(
+                goalStore: goalStore,
+                eventBus: eventBus,
+                config: config,
+                httpClientFactory: httpClientFactory,
+                pollInterval: PollInterval,
+                timeoutOverride: Timeout,
+                timeProvider: clock)
+        {
+        }
+
+        /// <summary>Completes with the arguments of the first forwarded monitoring call.</summary>
+        public TaskCompletionSource<(string GoalId, string Repo, string Sha, CancellationToken Token)> Forwarded { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public override Task MonitorMergeAsync(string goalId, string repoName, string mergeCommitSha, CancellationToken ct)
         {
-            Monitored.Add((goalId, repoName, mergeCommitSha, ct));
-            _firstCall.TrySetResult();
+            Forwarded.TrySetResult((goalId, repoName, mergeCommitSha, ct));
             return Task.CompletedTask;
         }
     }
@@ -1695,6 +1765,13 @@ public sealed class CiMonitorServiceTests : IDisposable
         ControlledTimeProvider? clock = null) =>
         new(goalStore, config ?? CreateConfig(CreateRepo()), CreateFactory(handler), eventBus, startupScanWindow, clock);
 
+    /// <summary>
+    /// The fixed "now" of every fresh <see cref="ControlledTimeProvider"/>: the default
+    /// <see cref="Goal.CompletedAt"/> of <see cref="CompletedGoal"/>, so goals built without an
+    /// explicit completion time are deterministically "just merged" on any fresh manual clock.
+    /// </summary>
+    private static readonly DateTime ClockEpoch = new ControlledTimeProvider().GetUtcNow().UtcDateTime;
+
     private static Goal CompletedGoal(
         string id = "goal-1",
         string? mergeCommitHash = "abc123",
@@ -1706,7 +1783,7 @@ public sealed class CiMonitorServiceTests : IDisposable
             Description = "test goal",
             Status = status,
             MergeCommitHash = mergeCommitHash,
-            CompletedAt = completedAt ?? DateTime.UtcNow,
+            CompletedAt = completedAt ?? ClockEpoch,
             RepositoryNames = repositoryNames.Length == 0 ? ["test-repo"] : [.. repositoryNames],
         };
 
@@ -1717,13 +1794,6 @@ public sealed class CiMonitorServiceTests : IDisposable
             store.AddGoal(goal);
         return store;
     }
-
-    /// <summary>
-    /// Waits long enough for a fire-and-forget monitoring launch to have been observed, so an
-    /// assertion that monitoring did NOT start is not merely winning a race.
-    /// </summary>
-    private static async Task AllowFireAndForgetToRunAsync() =>
-        await Task.Delay(250, TestContext.Current.CancellationToken);
 
     [Fact]
     public async Task StartupScanAsync_CompletedGoalCiSucceeded_PublishesCiSucceeded()
@@ -1752,6 +1822,7 @@ public sealed class CiMonitorServiceTests : IDisposable
     public async Task ScanGoalAsync_HashesPairedWithTargets_NotAllRepositories()
     {
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ =>
             OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
         var goal = new Goal
@@ -1760,7 +1831,7 @@ public sealed class CiMonitorServiceTests : IDisposable
             Description = "target pairing test",
             Status = GoalStatus.Completed,
             MergeCommitHash = "sha-b,sha-a",
-            CompletedAt = DateTime.UtcNow,
+            CompletedAt = clock.GetUtcNow().UtcDateTime,
             // Three repositories, but only repo-b and repo-a are targets (in that order).
             RepositoryNames = ["repo-a", "repo-b", "repo-c"],
             TargetRepositoryNames = "repo-b, repo-a",
@@ -1770,7 +1841,7 @@ public sealed class CiMonitorServiceTests : IDisposable
             CreateRepo("repo-b"),
             CreateRepo("repo-c"));
         var service = CreateService(handler, config: config, eventBus: eventBus,
-            goalStore: StoreWith(goal));
+            goalStore: StoreWith(goal), clock: clock);
 
         await service.ScanGoalAsync(goal, TestContext.Current.CancellationToken);
 
@@ -1819,8 +1890,8 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         using var cts = new CancellationTokenSource();
         await service.StartupScanAsync(cts.Token);
-        await service.FirstCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
+        // The hand-off is recorded synchronously, so this is exact once the scan has returned.
         var monitored = Assert.Single(service.Monitored);
         Assert.Equal(("goal-1", "test-repo", "abc123"), (monitored.GoalId, monitored.Repo, monitored.Sha));
         Assert.Equal(cts.Token, monitored.Token);
@@ -1828,16 +1899,51 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Empty(eventBus.Published);
     }
 
+    /// <summary>
+    /// The REAL <see cref="CiMonitorService.StartBackgroundMonitoring"/>, reached through a
+    /// still-running startup scan, must forward the goal, repository, commit and the scan's own
+    /// token to <see cref="CiMonitorService.MonitorMergeAsync"/>. This covers the hand-off the
+    /// <see cref="MonitorRecordingService"/> replaces in the other startup-scan tests.
+    /// </summary>
+    [Fact]
+    public async Task StartBackgroundMonitoring_ForwardsToMonitorMergeAsyncWithScanToken()
+    {
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "in_progress", null, null, null))));
+        var goal = CompletedGoal(completedAt: clock.GetUtcNow().UtcDateTime);
+        var service = new MonitorForwardingService(
+            StoreWith(goal), CreateConfig(CreateRepo()), CreateFactory(handler), eventBus, clock);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartupScanAsync(cts.Token);
+
+        // Positive signal from the fire-and-forget task: a bounded hang-guard is appropriate.
+        var forwarded = await service.Forwarded.Task.WaitAsync(
+            ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+
+        Assert.Equal(("goal-1", "test-repo", "abc123"), (forwarded.GoalId, forwarded.Repo, forwarded.Sha));
+        Assert.Equal(cts.Token, forwarded.Token);
+        Assert.Single(handler.Requests);
+        Assert.Empty(eventBus.Published);
+    }
+
+    /// <summary>
+    /// A no-checks commit merged one tick MORE than the 5-minute grace period ago is skipped:
+    /// the grace predicate is a strict <c>&lt;</c>, so this is the first instant past the boundary.
+    /// </summary>
     [Fact]
     public async Task StartupScanAsync_NoChecksAndMergedLongAgo_SkipsMonitoring()
     {
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(0)));
-        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-10));
-        var service = CreateRecordingService(handler, StoreWith(goal), eventBus: eventBus);
+        var goal = CompletedGoal(
+            completedAt: clock.GetUtcNow().UtcDateTime - TimeSpan.FromMinutes(5) - TimeSpan.FromTicks(1));
+        var service = CreateRecordingService(handler, StoreWith(goal), eventBus: eventBus, clock: clock);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
-        await AllowFireAndForgetToRunAsync();
 
         // The commit WAS probed — the skip is a decision about the result, not a no-op.
         Assert.Single(handler.Requests);
@@ -1846,19 +1952,20 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Complement of the test above: the identical no-checks response for a just-merged commit
-    /// must start monitoring, proving the 5-minute grace period is what decides.
+    /// Complement of the test above: the identical no-checks response for a commit merged
+    /// EXACTLY 5 minutes ago must start monitoring — the strict <c>&lt;</c> grace predicate keeps
+    /// the boundary itself inside the grace period — proving the grace period is what decides.
     /// </summary>
     [Fact]
     public async Task StartupScanAsync_NoChecksAndRecentlyMerged_StartsMonitoring()
     {
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(0)));
-        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-1));
-        var service = CreateRecordingService(handler, StoreWith(goal), eventBus: eventBus);
+        var goal = CompletedGoal(completedAt: clock.GetUtcNow().UtcDateTime - TimeSpan.FromMinutes(5));
+        var service = CreateRecordingService(handler, StoreWith(goal), eventBus: eventBus, clock: clock);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
-        await service.FirstCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         var monitored = Assert.Single(service.Monitored);
         Assert.Equal("abc123", monitored.Sha);
@@ -1873,7 +1980,6 @@ public sealed class CiMonitorServiceTests : IDisposable
         var service = CreateRecordingService(handler, StoreWith(CompletedGoal()), eventBus: eventBus);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
-        await AllowFireAndForgetToRunAsync();
 
         Assert.Single(handler.Requests);
         Assert.Empty(service.Monitored);
@@ -1892,7 +1998,6 @@ public sealed class CiMonitorServiceTests : IDisposable
         var service = CreateRecordingService(handler, StoreWith(CompletedGoal()), eventBus: eventBus);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
-        await service.FirstCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.Single(service.Monitored);
         Assert.Empty(eventBus.Published);
@@ -1912,15 +2017,22 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Empty(eventBus.Published);
     }
 
+    /// <summary>
+    /// A goal completed one tick BEFORE the 10-minute window's cutoff is not scanned: the
+    /// window predicate is an inclusive <c>&gt;=</c>, so this is the first instant outside it.
+    /// </summary>
     [Fact]
     public async Task StartupScanAsync_GoalCompletedOutsideWindow_NotScanned()
     {
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ =>
             OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
-        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-30));
+        var goal = CompletedGoal(
+            completedAt: clock.GetUtcNow().UtcDateTime - TimeSpan.FromMinutes(10) - TimeSpan.FromTicks(1));
         var service = CreateService(
-            handler, eventBus: eventBus, goalStore: StoreWith(goal), startupScanWindow: TimeSpan.FromMinutes(10));
+            handler, eventBus: eventBus, goalStore: StoreWith(goal), startupScanWindow: TimeSpan.FromMinutes(10),
+            clock: clock);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
 
@@ -1929,18 +2041,21 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     /// <summary>
-    /// The complement of the out-of-window test: the same goal inside the configured window IS
-    /// scanned, so an empty result cannot come from the scan being broken outright.
+    /// The complement of the out-of-window test: the same goal completed EXACTLY at the
+    /// 10-minute cutoff IS scanned (the inclusive <c>&gt;=</c> boundary), so an empty result
+    /// cannot come from the scan being broken outright.
     /// </summary>
     [Fact]
     public async Task StartupScanAsync_GoalCompletedInsideWindow_IsScanned()
     {
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ =>
             OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
-        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-5));
+        var goal = CompletedGoal(completedAt: clock.GetUtcNow().UtcDateTime - TimeSpan.FromMinutes(10));
         var service = CreateService(
-            handler, eventBus: eventBus, goalStore: StoreWith(goal), startupScanWindow: TimeSpan.FromMinutes(10));
+            handler, eventBus: eventBus, goalStore: StoreWith(goal), startupScanWindow: TimeSpan.FromMinutes(10),
+            clock: clock);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
 
@@ -2074,24 +2189,47 @@ public sealed class CiMonitorServiceTests : IDisposable
             // The startup scan's request: CI has already failed.
             return OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "Build failed", null)));
         });
-        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(
+            handler, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()), clock: clock);
 
         using var monitorCts = new CancellationTokenSource();
-        var monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", monitorCts.Token);
-        await monitorRequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Task? monitorTask = null;
+        try
+        {
+            monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", monitorCts.Token);
+            await monitorRequestStarted.Task.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+            await service.StartupScanAsync(TestContext.Current.CancellationToken);
 
-        Assert.True(requestCount >= 2, $"The scan must have probed; only {requestCount} request(s) were made.");
-        Assert.Empty(issueStore.Issues);
+            // Exactly the live monitor's parked request plus the scan's own probe.
+            Assert.Equal(2, Volatile.Read(ref requestCount));
+            Assert.Empty(issueStore.Issues);
+            Assert.Empty(eventBus.Published);
+        }
+        finally
+        {
+            // Best-effort teardown that never replaces an original failure. Cancelling first
+            // means the live monitor's still-running result ends the loop without publishing
+            // anything of its own; releasing then unblocks its parked request.
+            try { await monitorCts.CancelAsync(); } catch { /* best-effort cleanup */ }
+            try { releaseMonitor.TrySetResult(); } catch { /* best-effort cleanup */ }
+            if (monitorTask is not null)
+            {
+                try
+                {
+                    await monitorTask.WaitAsync(ControlledTimeProvider.HangGuard, CancellationToken.None);
+                }
+                catch
+                {
+                    // Best-effort: an original failure must never be replaced by a cleanup failure.
+                }
+            }
+        }
+
+        Assert.True(monitorTask.IsCompletedSuccessfully, "The live monitor must return normally once cancelled and released.");
         Assert.Empty(eventBus.Published);
-
-        // Unblock the live monitor: cancelling first means its still-running result ends the
-        // loop without publishing anything of its own.
-        await monitorCts.CancelAsync();
-        releaseMonitor.TrySetResult();
-        await monitorTask;
-        Assert.Empty(eventBus.Published);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -2251,32 +2389,52 @@ public sealed class CiMonitorServiceTests : IDisposable
     [Fact]
     public async Task ProbeCiStatusAsync_403WithRateLimitReset_ReturnsRetryAfterUntilReset()
     {
-        var resetEpoch = DateTimeOffset.UtcNow.AddSeconds(120).ToUnixTimeSeconds();
+        var clock = new ControlledTimeProvider();
+        var resetEpoch = clock.GetUtcNow().AddSeconds(120).ToUnixTimeSeconds();
         var handler = new ScriptedHttpMessageHandler(_ =>
             ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0",
                 rateLimitReset: resetEpoch.ToString(CultureInfo.InvariantCulture)));
 
-        var result = await ProbeAsync(handler);
+        var result = await ProbeAsync(handler, clock);
 
         Assert.Equal(CiProbeStatus.Error, result.Status);
         Assert.Equal("403-rate-limit", result.ErrorDetail);
-        Assert.NotNull(result.RetryAfter);
-        Assert.InRange(result.RetryAfter!.Value, TimeSpan.FromSeconds(100), TimeSpan.FromSeconds(121));
+        Assert.Equal(TimeSpan.FromSeconds(120), result.RetryAfter);
     }
 
     /// <summary>A reset timestamp already in the past must clamp to zero, never a negative delay.</summary>
     [Fact]
     public async Task ProbeCiStatusAsync_403WithPastRateLimitReset_ClampsRetryAfterToZero()
     {
-        var resetEpoch = DateTimeOffset.UtcNow.AddSeconds(-120).ToUnixTimeSeconds();
+        var clock = new ControlledTimeProvider();
+        var resetEpoch = clock.GetUtcNow().AddSeconds(-120).ToUnixTimeSeconds();
         var handler = new ScriptedHttpMessageHandler(_ =>
             ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0",
                 rateLimitReset: resetEpoch.ToString(CultureInfo.InvariantCulture)));
 
-        var result = await ProbeAsync(handler);
+        var result = await ProbeAsync(handler, clock);
 
         Assert.Equal("403-rate-limit", result.ErrorDetail);
         Assert.Equal(TimeSpan.Zero, result.RetryAfter);
+    }
+
+    /// <summary>
+    /// The HTTP-date form of <c>Retry-After</c> is converted to the exact wait until that date,
+    /// measured against the service's clock.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithHttpDateRetryAfter_ReturnsExactDelayUntilDate()
+    {
+        var clock = new ControlledTimeProvider();
+        var retryAt = (clock.GetUtcNow() + TimeSpan.FromSeconds(90)).ToString("R", CultureInfo.InvariantCulture);
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, retryAfter: retryAt));
+
+        var result = await ProbeAsync(handler, clock);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.Equal(TimeSpan.FromSeconds(90), result.RetryAfter);
     }
 
     [Fact]
@@ -2510,16 +2668,16 @@ public sealed class CiMonitorServiceTests : IDisposable
     [Fact]
     public async Task ProbeCiStatusAsync_403MalformedRetryAfterWithReset_UsesResetForWait()
     {
-        var resetEpoch = DateTimeOffset.UtcNow.AddSeconds(120).ToUnixTimeSeconds();
+        var clock = new ControlledTimeProvider();
+        var resetEpoch = clock.GetUtcNow().AddSeconds(120).ToUnixTimeSeconds();
         var handler = new ScriptedHttpMessageHandler(_ =>
             ErrorResponse(HttpStatusCode.Forbidden, retryAfter: "not-a-number",
                 rateLimitReset: resetEpoch.ToString(CultureInfo.InvariantCulture)));
 
-        var result = await ProbeAsync(handler);
+        var result = await ProbeAsync(handler, clock);
 
         Assert.Equal("403-rate-limit", result.ErrorDetail);
-        Assert.NotNull(result.RetryAfter);
-        Assert.InRange(result.RetryAfter!.Value, TimeSpan.FromSeconds(100), TimeSpan.FromSeconds(121));
+        Assert.Equal(TimeSpan.FromSeconds(120), result.RetryAfter);
     }
 
     /// <summary>
@@ -4773,32 +4931,25 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Single(handler.JobsEndpointHits);
     }
 
+    /// <summary>
+    /// Log-derived dedup (<c>BuildLogDerivedDedupAppend</c>): the append block is stamped with
+    /// EXACTLY the service clock's current time.
+    /// </summary>
     [Fact]
     public async Task MonitorMergeAsync_DedupAppends_LogDerivedAppendBlockAppended()
     {
         var issueStore = new FakeIssueStore();
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new CiFailureRoutingHandler(
             CheckRunsJsonWithDetailsUrl("123", summary: null),
             runId => JobsJsonOneFailedJob(111),
             jobId => LogWithOneFailure());
-        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
 
         // Pre-seed an existing open issue with the same title and source goal — this is the
         // issue that CreateOrUpdateIssueAsync will find and append to.
-        var existingIssue = new Issue
-        {
-            Id = "issue-existing",
-            Type = IssueType.Bug,
-            Title = "CI failure: Tests.Alpha.First",
-            Description = "Original description for the first failure.",
-            Severity = IssueSeverity.High,
-            Status = IssueStatus.Open,
-            RepositoryNames = ["test-repo"],
-            SourceGoalId = "goal-1",
-            SourceRole = "ci",
-        };
-        issueStore.Issues[existingIssue.Id] = existingIssue;
+        SeedExistingIssue(issueStore, "CI failure: Tests.Alpha.First", "Original description for the first failure.");
 
         await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
 
@@ -4806,13 +4957,86 @@ public sealed class CiMonitorServiceTests : IDisposable
         var issue = Assert.Single(issueStore.Issues.Values);
         Assert.Equal("issue-existing", issue.Id);
         Assert.StartsWith("Original description for the first failure.", issue.Description);
-        // The log-derived dedup append block is appended.
+        // The log-derived dedup append block is appended, stamped with the manual clock's time.
         Assert.Contains("---", issue.Description);
-        Assert.Contains("[Updated ", issue.Description);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\nTest: Tests.Alpha.First\n", issue.Description);
         Assert.Contains("Test: Tests.Alpha.First", issue.Description);
         Assert.Contains("Error: alpha failure", issue.Description);
         Assert.Contains("Stack Trace:", issue.Description);
         Assert.Contains("at Alpha.First()", issue.Description);
+    }
+
+    /// <summary>
+    /// Log-fallback dedup (<c>BuildLogFallbackDedupAppend</c>): same routing shape as
+    /// <see cref="MonitorMergeAsync_NoOutputLogNoTestsWithSnippet_CreatesFallbackIssue"/>, but a
+    /// matching open issue already exists, so no issue is created and the existing one gains a
+    /// block stamped with EXACTLY the service clock's current time followed by the log snippet.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_LogFallbackDedup_AppendsExactClockStamp()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithNoFailuresAndSnippet());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+        SeedExistingIssue(issueStore, "CI failure: build", "Original fallback description.");
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // No new issue: the existing one is updated with the log-fallback append block.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("issue-existing", issue.Id);
+        Assert.StartsWith("Original fallback description.", issue.Description);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\nLog output (last 500 chars):\n", issue.Description);
+        Assert.Contains("Passed!", issue.Description);
+        Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
+        Assert.Single(handler.JobLogHits);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    /// <summary>
+    /// URL-only dedup (<c>BuildUrlOnlyDedupAppend</c>): same routing shapes as
+    /// <see cref="MonitorMergeAsync_NoOutputLogNoTestsEmptySnippet_CreatesUrlOnlyIssue"/> (log
+    /// fetched but empty) and <see cref="MonitorMergeAsync_NoOutputNoLogs_CreatesUrlOnlyIssue"/>
+    /// (jobs endpoint 404), but a matching open issue already exists, so no issue is created
+    /// and the existing one gains EXACTLY the clock-stamped URL-only block.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task MonitorMergeAsync_UrlOnlyDedup_AppendsExactClockStamp(bool logFetchedButEmpty)
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var handler = logFetchedButEmpty
+            ? new CiFailureRoutingHandler(
+                CheckRunsJsonWithDetailsUrl("123", summary: null),
+                runId => JobsJsonOneFailedJob(111),
+                jobId => EmptyLog())
+            : new CiFailureRoutingHandler(
+                CheckRunsJsonWithDetailsUrl("123", summary: null),
+                runId => null,
+                jobId => null);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+        SeedExistingIssue(issueStore, "CI failure: build", "Original URL-only description.");
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // No new issue: the existing one is updated with exactly the URL-only append block.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("issue-existing", issue.Id);
+        Assert.Equal(
+            $"Original URL-only description.\n\n---\n{ExpectedStamp(clock)}\nCI run: https://github.com/org/test-repo/actions/runs/123",
+            issue.Description);
+        Assert.Single(handler.JobsEndpointHits);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
     }
 
     [Fact]

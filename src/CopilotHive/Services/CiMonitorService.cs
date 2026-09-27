@@ -576,7 +576,7 @@ public class CiMonitorService
 
         // CompletedAt is the merge-time proxy: a goal is marked Completed at the moment its
         // merge lands, so it bounds how stale the commit's CI state can be.
-        var cutoff = DateTime.UtcNow - _startupScanWindow;
+        var cutoff = _timeProvider.GetUtcNow().UtcDateTime - _startupScanWindow;
         var candidates = goals
             .Where(g => g.Status == GoalStatus.Completed
                         && !string.IsNullOrWhiteSpace(g.MergeCommitHash)
@@ -699,7 +699,7 @@ public class CiMonitorService
                 case CiProbeStatus.NoChecks:
                     // A commit merged long ago with no check runs almost certainly has no CI
                     // configured; only recent merges are given time for checks to appear.
-                    if (goal.CompletedAt.HasValue && goal.CompletedAt.Value < DateTime.UtcNow - NoChecksGracePeriod)
+                    if (goal.CompletedAt.HasValue && goal.CompletedAt.Value < _timeProvider.GetUtcNow().UtcDateTime - NoChecksGracePeriod)
                     {
                         _logger.LogDebug(
                             "CI startup scan: no check runs for goal {GoalId} repo {Repo} commit {Sha} merged more than {Grace} ago — skipping",
@@ -771,7 +771,7 @@ public class CiMonitorService
     /// Starts fire-and-forget monitoring for a commit found still-pending by the startup scan.
     /// Exceptions are logged rather than left unobserved.
     /// </summary>
-    private void StartBackgroundMonitoring(string goalId, string repoName, string sha, CancellationToken ct)
+    internal virtual void StartBackgroundMonitoring(string goalId, string repoName, string sha, CancellationToken ct)
     {
         _ = Task.Run(async () =>
         {
@@ -993,7 +993,7 @@ public class CiMonitorService
                     {
                         // Parsing only decides HOW LONG to wait; an unparseable value falls back
                         // to the reset header and then to the fixed default.
-                        var retryAfter = ParseRetryAfter(response) ?? ParseRateLimitReset(response) ?? DefaultRateLimitWait;
+                        var retryAfter = ParseRetryAfter(response, _timeProvider.GetUtcNow()) ?? ParseRateLimitReset(response, _timeProvider.GetUtcNow()) ?? DefaultRateLimitWait;
                         _logger.LogWarning(
                             "GitHub API rate limit exceeded for {Owner}/{Repo} — retry after {Seconds}s", owner, repo, retryAfter.TotalSeconds);
                         return new CiProbeResult(CiProbeStatus.Error, [], "403-rate-limit", retryAfter);
@@ -1010,7 +1010,7 @@ public class CiMonitorService
 
                 if (response.StatusCode == HttpStatusCode.TooManyRequests)
                 {
-                    var retryAfter = ParseRetryAfter(response) ?? DefaultRateLimitWait;
+                    var retryAfter = ParseRetryAfter(response, _timeProvider.GetUtcNow()) ?? DefaultRateLimitWait;
                     _logger.LogWarning("GitHub API returned 429 for {Owner}/{Repo} — retry after {Seconds}s", owner, repo, retryAfter.TotalSeconds);
                     return new CiProbeResult(CiProbeStatus.Error, [], "429", retryAfter);
                 }
@@ -1541,7 +1541,7 @@ public class CiMonitorService
                             var (c, u) = await CreateOrUpdateIssueAsync(
                                 goalId, repoName, title,
                                 BuildIssueDescription(goalId, sha, run),
-                                BuildDedupAppend(run), ct);
+                                BuildDedupAppend(run, _timeProvider.GetUtcNow().UtcDateTime), ct);
                             created += c;
                             updated += u;
                         }
@@ -1558,7 +1558,7 @@ public class CiMonitorService
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
                             BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
-                            BuildUrlOnlyDedupAppend(run.HtmlUrl), ct);
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                         continue;
@@ -1581,7 +1581,7 @@ public class CiMonitorService
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
                             BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
-                            BuildUrlOnlyDedupAppend(run.HtmlUrl), ct);
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                         continue;
@@ -1601,7 +1601,8 @@ public class CiMonitorService
                                 BuildLogDerivedIssueDescription(
                                     goalId, sha, run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace),
                                 BuildLogDerivedDedupAppend(
-                                    run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace), ct);
+                                    run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace,
+                                    _timeProvider.GetUtcNow().UtcDateTime), ct);
                             created += c;
                             updated += u;
                         }
@@ -1615,7 +1616,7 @@ public class CiMonitorService
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
                             BuildLogFallbackIssueDescription(goalId, sha, run.HtmlUrl, logResult.FallbackSnippet),
-                            BuildLogFallbackDedupAppend(run.HtmlUrl, logResult.FallbackSnippet), ct);
+                            BuildLogFallbackDedupAppend(run.HtmlUrl, logResult.FallbackSnippet, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                     }
@@ -1629,7 +1630,7 @@ public class CiMonitorService
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
                             BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
-                            BuildUrlOnlyDedupAppend(run.HtmlUrl), ct);
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                     }
@@ -1902,10 +1903,10 @@ public class CiMonitorService
     }
 
     /// <summary>Builds the dedup-append text for an issue created from a check run's own output.</summary>
-    private static string BuildDedupAppend(CheckRunData run)
+    private static string BuildDedupAppend(CheckRunData run, DateTime utcNow)
     {
         var errorOutput = CombineOutput(run);
-        return $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\n{errorOutput}\nCI run: {RenderHtmlUrl(run.HtmlUrl)}";
+        return $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\n{errorOutput}\nCI run: {RenderHtmlUrl(run.HtmlUrl)}";
     }
 
     /// <summary>Builds the description for a log-derived issue (one parsed test failure).</summary>
@@ -1915,8 +1916,8 @@ public class CiMonitorService
 
     /// <summary>Builds the dedup-append text for a log-derived issue.</summary>
     private static string BuildLogDerivedDedupAppend(
-        string? htmlUrl, string testName, string error, string stackTrace) =>
-        $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\nTest: {testName}\nError: {error}\nStack Trace:\n{stackTrace}\nCI run: {RenderHtmlUrl(htmlUrl)}";
+        string? htmlUrl, string testName, string error, string stackTrace, DateTime utcNow) =>
+        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nTest: {testName}\nError: {error}\nStack Trace:\n{stackTrace}\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Builds the description for a log-fallback issue (no tests parsed, snippet available).</summary>
     private static string BuildLogFallbackIssueDescription(
@@ -1924,16 +1925,16 @@ public class CiMonitorService
         $"CI failed for goal '{goalId}' (commit {sha}).\n\nLog output (last 500 chars):\n{snippet}\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Builds the dedup-append text for a log-fallback issue.</summary>
-    private static string BuildLogFallbackDedupAppend(string? htmlUrl, string snippet) =>
-        $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\nLog output (last 500 chars):\n{snippet}\nCI run: {RenderHtmlUrl(htmlUrl)}";
+    private static string BuildLogFallbackDedupAppend(string? htmlUrl, string snippet, DateTime utcNow) =>
+        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nLog output (last 500 chars):\n{snippet}\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Builds the description for a URL-only fallback issue (no logs or empty snippet).</summary>
     private static string BuildUrlOnlyIssueDescription(string goalId, string sha, string? htmlUrl) =>
         $"CI failed for goal '{goalId}' (commit {sha}).\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Builds the dedup-append text for a URL-only fallback issue.</summary>
-    private static string BuildUrlOnlyDedupAppend(string? htmlUrl) =>
-        $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\nCI run: {RenderHtmlUrl(htmlUrl)}";
+    private static string BuildUrlOnlyDedupAppend(string? htmlUrl, DateTime utcNow) =>
+        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Whether the response carries the named header at all, regardless of its value.</summary>
     private static bool HasHeader(HttpResponseMessage response, string name) =>
@@ -1946,7 +1947,7 @@ public class CiMonitorService
         return null;
     }
 
-    private static TimeSpan? ParseRetryAfter(HttpResponseMessage response)
+    private static TimeSpan? ParseRetryAfter(HttpResponseMessage response, DateTimeOffset now)
     {
         var value = GetHeaderValue(response, "Retry-After");
         if (value is null)
@@ -1957,7 +1958,7 @@ public class CiMonitorService
 
         if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
         {
-            var delay = date - DateTimeOffset.UtcNow;
+            var delay = date - now;
             return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
         }
 
@@ -1971,7 +1972,7 @@ public class CiMonitorService
     /// <see cref="DateTimeOffset.FromUnixTimeSeconds"/> would throw, so the caller falls back
     /// to the fixed default instead of the exception escaping the result-based contract.
     /// </summary>
-    private static TimeSpan? ParseRateLimitReset(HttpResponseMessage response)
+    private static TimeSpan? ParseRateLimitReset(HttpResponseMessage response, DateTimeOffset now)
     {
         var value = GetHeaderValue(response, "X-RateLimit-Reset");
         if (value is null)
@@ -1983,7 +1984,7 @@ public class CiMonitorService
         if (epochSeconds < MinUnixSeconds || epochSeconds > MaxUnixSeconds)
             return null;
 
-        var delay = DateTimeOffset.FromUnixTimeSeconds(epochSeconds) - DateTimeOffset.UtcNow;
+        var delay = DateTimeOffset.FromUnixTimeSeconds(epochSeconds) - now;
         return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
     }
 }
