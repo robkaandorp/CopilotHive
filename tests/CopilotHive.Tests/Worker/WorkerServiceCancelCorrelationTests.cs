@@ -75,6 +75,10 @@ public sealed class WorkerServiceCancelCorrelationTests
         Assert.False(runner.WasCancelled("task-B"), "A late cancel for task-A must not cancel task-B.");
         Assert.False(runner.IsFinished("task-B"));
 
+        // The late cancel emitted NO fallback Ready of its own: the only Ready so far is A's (joined
+        // by B's replacement drain before B's prompt could start).
+        Assert.Equal(1, requests.ReadyCount);
+
         // Let B finish normally; it must still be able to claim its own Ready.
         runner.Release("task-B");
         await runner.PromptFinished("task-B");
@@ -82,15 +86,43 @@ public sealed class WorkerServiceCancelCorrelationTests
         // B's OWN Ready must be observed BEFORE EOF: an EOF that wins the race carries B under the
         // EOF carry contract instead of settling its Ready, so ordering the write first is what
         // makes the assertion below about the late cancel for A rather than about the EOF race.
-        await requests.ReadyReached(2).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        //
+        // WAIT FOR B's OWN READY WRITE WHILE THE STREAM IS STILL LIVE — the determinism gate.
+        // PromptFinished fires in the runner's finally, BEFORE the executor returns, before B's
+        // reporting publishes its ordinary-Ready eligibility and before the loop starts that write.
+        // Ending the stream in that window is a genuine stream loss: the teardown's Open → Carried
+        // claim wins and a CARRIED assignment (correctly) writes no Ready on the retired stream, so
+        // the old ordering made ReadyCount 1-or-2 depending on scheduling. Gating EOF on B's counted
+        // Ready write removes the race; the bound is a failure guard only. If the late cancel had
+        // consumed B's claim, this Ready is never written and the gate fails by name.
+        var secondReady = requests.ReadyReached(2);
+        try
+        {
+            await secondReady.WaitAsync(ReadyFailsafe, TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new Xunit.Sdk.XunitException(
+                $"task-B never wrote its own Ready (ReadyCount={requests.ReadyCount}): the late cancel for " +
+                "task-A must not consume task-B's single-flight Ready claim. " + ex.Message);
+        }
 
         responses.Complete();
         await loop;
 
         // Exactly two Ready messages: one for A, one for B. If the late cancel had consumed B's
-        // claim, B's own completion would have found the claim taken and emitted none.
+        // claim, B's own completion would have found the claim taken and emitted none. B was never
+        // cancelled, and the EOF teardown found nothing to carry (B's Ready had started), so the
+        // ownership slot is empty.
         Assert.Equal(2, requests.ReadyCount);
+        Assert.False(runner.WasCancelled("task-B"), "task-B must complete without cancellation.");
+        Assert.Null(typeof(WorkerService)
+            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service));
     }
+
+    /// <summary>A bounded FAILURE guard for the Ready-count gate; never an ordering device.</summary>
+    private static readonly TimeSpan ReadyFailsafe = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// A cancel naming the ACTIVE task retains iteration-3 behaviour: the assignment is cancelled
@@ -354,6 +386,24 @@ public sealed class WorkerServiceCancelCorrelationTests
 
         public int ReadyCount => Volatile.Read(ref _readyCount);
 
+        /// <summary>
+        /// Completes once at least <paramref name="count"/> Ready writes have been recorded — a
+        /// counted-write gate, so a test never has to infer a Ready from timing.
+        /// </summary>
+        public Task WaitForReadyCountAsync(int count)
+        {
+            lock (_gate)
+            {
+                if (_readyCount >= count) return Task.CompletedTask;
+                if (!_readyWaiters.TryGetValue(count, out var tcs))
+                {
+                    tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _readyWaiters[count] = tcs;
+                }
+                return tcs.Task;
+            }
+        }
+
         public WriteOptions? WriteOptions { get; set; }
 
         /// <summary>
@@ -383,10 +433,14 @@ public sealed class WorkerServiceCancelCorrelationTests
             List<TaskCompletionSource> ready = [];
             lock (_gate)
             {
-                _readyCount++;
-                foreach (var (threshold, tcs) in _readyWaiters)
+                var count = Interlocked.Increment(ref _readyCount);
+                foreach (var (threshold, tcs) in _readyWaiters.ToArray())
                 {
-                    if (_readyCount >= threshold) ready.Add(tcs);
+                    if (count >= threshold)
+                    {
+                        _readyWaiters.Remove(threshold);
+                        ready.Add(tcs);
+                    }
                 }
             }
             foreach (var tcs in ready) tcs.TrySetResult();

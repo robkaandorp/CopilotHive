@@ -202,17 +202,34 @@ public sealed class WorkerService(
     //
     // A SECOND, DELIBERATELY SEPARATE PUBLICATION from the connection above. The connection
     // publication says "this is the registration this service currently works on"; the ADOPTION
-    // publication says "this is the connection a CARRIED assignment is now allowed to deliver its
-    // retained result on". They change at different moments and are consumed by different code, so
-    // they are kept apart: the reconnect path publishes an adoption only when the orchestrator
-    // ACCEPTED the carried task, and the carried delivery is the ONLY consumer.
+    // publication says "this is the connection a CARRIED assignment may now use". They change at
+    // different moments and are consumed by different code, so they are kept apart: the reconnect
+    // path publishes an adoption only when the orchestrator ACCEPTED the carried task.
+    //
+    // THREE CONSUMERS, ONE MEANING. The carried delivery is the first: it delivers the retained
+    // result and its Ready on this connection. The other two are the CALL-TIME retargets of a
+    // carried (or carried-then-delivered) assignment's connection-bound work: the bridge/session
+    // resolution behind its ConnectionBoundDependencies (which follows an adoption only when the
+    // adoption's recorded owner is that adapter's OWN assignment), and the ONE service-owned lazy
+    // provisioning callback installed when the assignment is carried. None of them may wait for an
+    // adoption or retry against a lost one: they either use the currently adopted LIVE connection or
+    // fail with the EXISTING disconnected error, so no response-bearing call is ever replayed and no
+    // in-flight call changes its lifetime.
 
     /// <summary>
     /// ONE ADOPTED CONNECTION together with the STREAM TOKEN of the run that adopted it — the token
     /// the carried <c>Ready</c> must be written with, exactly like
-    /// <see cref="OrdinaryReadySlot.StreamToken"/>.
+    /// <see cref="OrdinaryReadySlot.StreamToken"/> — and the STATE CELL of the carried assignment it
+    /// adopted.
     /// </summary>
-    private sealed record AdoptedConnection(WorkerConnection Connection, CancellationToken StreamToken);
+    /// <remarks>
+    /// <see cref="Owner"/> is what keeps a call-time retarget ASSIGNMENT-SCOPED: an assignment's
+    /// connection-bound work may follow this adoption only when the adoption is ITS OWN (the owner is
+    /// that assignment's own cell, compared by reference identity). It is <c>null</c> for an adoption
+    /// published while no carried assignment was retained, which no assignment's work follows.
+    /// </remarks>
+    private sealed record AdoptedConnection(
+        WorkerConnection Connection, CancellationToken StreamToken, AssignmentState? Owner);
 
     /// <summary>
     /// THE MOST RECENTLY ADOPTED CONNECTION together with that run's stream token, or <c>null</c>
@@ -251,6 +268,13 @@ public sealed class WorkerService(
     /// orchestrator ACCEPTED the carried task, and a rejected or non-adopted registration never
     /// reaches this method.
     /// </para>
+    /// <para>
+    /// THE ADOPTED ASSIGNMENT IS RECORDED WITH IT. The adopting run calls this while the ownership
+    /// slot still holds exactly the CARRIED assignment it just claimed (nothing can deliver or replace
+    /// that assignment before an adoption exists), so the slot's carried state cell is captured here
+    /// as the adoption's <see cref="AdoptedConnection.Owner"/>. That is the one fact that lets an
+    /// assignment's connection-bound work tell ITS OWN adoption apart from a later task's.
+    /// </para>
     /// </remarks>
     /// <param name="connection">The connection that will carry the carried assignment's delivery.</param>
     /// <param name="streamToken">The stream token of the ADOPTING run.</param>
@@ -258,10 +282,14 @@ public sealed class WorkerService(
     {
         ArgumentNullException.ThrowIfNull(connection);
 
+        var owner = Volatile.Read(ref _activeAssignment) is { State.IsCarried: true } carried
+            ? carried.State
+            : null;
+
         TaskCompletionSource woken;
         lock (_adoptionLock)
         {
-            _adopted = new AdoptedConnection(connection, streamToken);
+            _adopted = new AdoptedConnection(connection, streamToken, owner);
             woken = ReplaceAdoptionSignal_Locked();
         }
 
@@ -342,6 +370,107 @@ public sealed class WorkerService(
             await changed.WaitAsync(ct);
         }
     }
+
+    /// <summary>
+    /// THE CALL-TIME ADOPTION LOOKUP — the CURRENTLY ADOPTED live connection, or <c>null</c> when
+    /// nothing is adopted (or when the adopted connection has itself already been retired).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It reads the SAME publication <see cref="AwaitAdoptedConnectionAsync"/> consumes — under the
+    /// SAME <see cref="_adoptionLock"/> and with the SAME retired-candidate filter — so a carried
+    /// assignment's connection-bound work can never be handed a connection whose stream is already
+    /// gone. It NEVER WAITS for an adoption, never retries and never registers a waiter: a call-time
+    /// resolution must not park a bridge/session call (nor a lazy provisioning callback) on a future
+    /// reconnect, and it must not introduce one.
+    /// </para>
+    /// <para>
+    /// "Nothing adopted" is therefore simply "no target", never an error of its own: every caller
+    /// falls back to its OWN captured connection, which then fails with the EXISTING disconnected
+    /// error exactly as it does today.
+    /// </para>
+    /// </remarks>
+    private WorkerConnection? TryGetAdoptedConnection()
+    {
+        lock (_adoptionLock)
+        {
+            var candidate = _adopted;
+            return candidate is not null && !candidate.Connection.IsRetired
+                ? candidate.Connection
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// WHETHER an assignment's connection-bound work must FOLLOW ITS ADOPTION instead of its captured
+    /// connection: THAT assignment is CARRIED, or it was carried and its delivery finished
+    /// (DELIVERED).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Those are the two states in which the captured connection is known to be retired — the stream
+    /// loss that carried the assignment retired it — so the captured connection is no longer a
+    /// usable target for new work. Every other state keeps the captured connection exactly as today.
+    /// </para>
+    /// <para>
+    /// IT IS ASKED ABOUT THE ADAPTER'S OWN ASSIGNMENT, NEVER THE SERVICE-WIDE SLOT. The slot says who
+    /// owns the runner NOW; an adapter a finished task left behind must not start following a LATER
+    /// task's carry, and a delivered task's adapter must not stop following its own adoption just
+    /// because a successor took the slot.
+    /// </para>
+    /// </remarks>
+    /// <param name="state">The state cell of the assignment the adapter was built for.</param>
+    private static bool MustFollowAdoptedConnection(AssignmentState state) =>
+        state.IsCarried || state.IsDelivered;
+
+    /// <summary>
+    /// THE ASSIGNMENT-SCOPED ADOPTION LOOKUP — the currently adopted live connection, but ONLY when
+    /// that adoption is <paramref name="owner"/>'s own (recorded by <see cref="PublishAdoption"/> and
+    /// compared by reference identity); otherwise <c>null</c>.
+    /// </summary>
+    /// <remarks>
+    /// Same lock, same retired filter and the same no-wait/no-retry contract as
+    /// <see cref="TryGetAdoptedConnection"/>: a mismatched owner is simply "no target", so the caller
+    /// falls back to its own captured connection and fails exactly as it does today.
+    /// </remarks>
+    /// <param name="owner">The state cell of the assignment whose adoption is wanted.</param>
+    private WorkerConnection? TryGetAdoptedConnectionOf(AssignmentState owner)
+    {
+        lock (_adoptionLock)
+        {
+            var candidate = _adopted;
+            return candidate is not null
+                && ReferenceEquals(candidate.Owner, owner)
+                && !candidate.Connection.IsRetired
+                ? candidate.Connection
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// THE ONE CALL-TIME RESOLUTION RULE for connection-bound work made on behalf of ONE assignment —
+    /// the bridge and session calls of that assignment's <see cref="ConnectionBoundDependencies"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It is evaluated ONCE PER CALL, SYNCHRONOUSLY, BEFORE the call's first await — so a resolving
+    /// call can never straddle two registrations — and it performs NO transport of its own: it
+    /// merely selects the connection the existing checked implementations will use.
+    /// </para>
+    /// <para>
+    /// BOTH INPUTS BELONG TO THE ADAPTER'S OWN ASSIGNMENT: its captured connection and its state cell,
+    /// both taken when the adapter was built. The state cell is the assignment's single atomic cell
+    /// (read with <see cref="Volatile"/> semantics by its own accessors), so a carry performed on the
+    /// loop thread is visible to a call made on an agent-turn thread. Only the ADOPTION is read from
+    /// the service, and only an adoption owned by this same cell is followed.
+    /// </para>
+    /// </remarks>
+    /// <param name="captured">The connection the assignment's work is captured against.</param>
+    /// <param name="state">The state cell of the assignment the work belongs to.</param>
+    private WorkerConnection ResolveAssignmentConnectionFor(WorkerConnection captured, AssignmentState state) =>
+        MustFollowAdoptedConnection(state)
+            ? TryGetAdoptedConnectionOf(state) ?? captured
+            : captured;
 
     /// <summary>
     /// CHECKED ACCESS — the published connection, or the EXISTING disconnected error when none is
@@ -479,6 +608,45 @@ public sealed class WorkerService(
     /// <summary>The sanitized report message for a failed provisioning-callback detachment.</summary>
     private const string ProvisionerDetachmentFailedMessage = "Provisioner detachment failed";
 
+    /// <summary>The sanitized report message for a failed installation of the CARRIED provisioning callback.</summary>
+    private const string CarriedProvisionerInstallFailedMessage =
+        "Carried provisioning callback installation failed";
+
+    /// <summary>
+    /// THE SERVICE-OWNED LAZY PROVISIONING CALLBACK for a CARRIED assignment — installed ONCE, at the
+    /// instant the assignment is carried, and used for the whole time it stays carried (and across
+    /// the adopted run that delivers it).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY A SERVICE-OWNED CALLBACK. The per-run callback installed at step 5 is the connection's OWN
+    /// checked entry point. While an assignment is Carried that connection is RETIRED, so leaving that
+    /// callback installed (the fail-closed interim) makes every lazy first-client creation fail
+    /// disconnected for the rest of the task. This callback instead resolves the connection at CALL
+    /// time, so the lazy site follows the assignment onto the connection that ADOPTED it, exactly as
+    /// the assignment's bridge and session calls do.
+    /// </para>
+    /// <para>
+    /// IT RESOLVES, IT DOES NOT WAIT. Each call takes the CURRENTLY ADOPTED live connection (or none),
+    /// and routes through that connection's EXISTING checked <see cref="WorkerConnection.EnsureProvisionedAsync"/>
+    /// — so the retirement check, the provisioner selection and the "no provisioner" error are all the
+    /// ones that already exist, and nothing here duplicates them. With NO adopted connection the call
+    /// fails with the EXISTING disconnected error, immediately: there is deliberately NO blocking wait,
+    /// NO retry and no replay, and an eager provisioning call is untouched by all of this (it stays one
+    /// captured-connection unit inside the assignment body).
+    /// </para>
+    /// <para>
+    /// ONE INSTANCE, ONE INSTALL. The callback is stateless, so it can be installed once and survive
+    /// every later run until the assignment leaves Carried (see <see cref="DetachProvisioner"/>, whose
+    /// existing IsCarried early return keeps it installed and whose ordinary path detaches it once the
+    /// assignment is finished).
+    /// </para>
+    /// </remarks>
+    private Func<string?, CancellationToken, Task> CreateCarriedProvisioningCallback() =>
+        (model, ct) => (TryGetAdoptedConnection()
+                ?? throw new InvalidOperationException(WorkerConnection.DisconnectedMessage))
+            .EnsureProvisionedAsync(model, ct);
+
     /// <summary>
     /// DETACHES the run's provisioning callback from the shared runner, ONCE the run's execution and
     /// heartbeat have reached quiescence (this runs after the whole invocation body, including its
@@ -505,22 +673,23 @@ public sealed class WorkerService(
     /// <param name="primaryFailure">The run failure already propagating, or <c>null</c>.</param>
     private void DetachProvisioner(Exception? primaryFailure)
     {
-        // ── THE FAIL-CLOSED INTERIM: NEVER DETACH WHILE AN ASSIGNMENT IS CARRIED ───────────────────
+        // ── NEVER DETACH WHILE AN ASSIGNMENT IS CARRIED ───────────────────────────────────────────
         //
         // The installed callback is the carrying assignment's ONLY lazy provisioning route, and the
         // assignment outlives the run that owns it. Nulling it here would leave a Carried assignment
-        // with NO callback at all for the whole time it is carried — strictly worse than the interim
-        // state, in which the callback is the ORIGINAL connection's own checked entry point: that
-        // connection is retired, so a lazy call fails with the EXISTING disconnected error, the
-        // executor's normal error path produces a failure result, and the carried delivery delivers
-        // it. Retargeting the callback onto an adopted connection is a follow-up goal's job.
+        // with NO callback at all for the whole time it is carried. Since the carry transition
+        // installs the SERVICE-OWNED callback (see CreateCarriedProvisioningCallback), what survives
+        // here is a callback that follows the assignment onto whichever connection adopts it — so
+        // keeping it is not merely safer than detaching, it is what makes lazy provisioning work
+        // across the reconnect at all.
         //
-        // So while an assignment is Carried the callback stays exactly as it was. An ADOPTED run
-        // never REPLACED it either (step 5 is skipped for an adopted run), so the interim callback
-        // survives the whole adopted run — including a successor assignment accepted on the same
-        // adopted stream after the carried assignment became Delivered. At the END of a run with no
-        // assignment left Carried, this detaches as today, and every later non-adopted run installs
-        // its own as today.
+        // So while an assignment is Carried the callback stays exactly as the CARRY SITE installed
+        // it. An ADOPTED run never REPLACED it either (step 5 is skipped for an adopted run), so the
+        // service-owned callback survives the whole adopted run — including a successor assignment
+        // accepted on the same adopted stream after the carried assignment became Delivered. At the
+        // END of a run with no assignment left Carried, this detaches as today, and every later
+        // non-adopted run installs its own per-run callback as today: the ordinary per-run
+        // install/detach applies again the moment the assignment leaves Carried.
         if (_activeAssignment is { State.IsCarried: true })
             return;
 
@@ -926,12 +1095,10 @@ public sealed class WorkerService(
             //
             //    SKIPPED FOR AN ADOPTED RUN, deliberately and exactly as the runner preparation is:
             //    an adopted run must NOT replace the callback that belongs to the assignment it
-            //    adopted. Leaving it installed is the FAIL-CLOSED interim: the callback is the
-            //    ORIGINAL connection's own checked entry point, that connection is retired, so a
-            //    lazy provisioning call fails with the EXISTING disconnected error — the executor's
-            //    normal error path produces a failure result, which the carried delivery delivers.
-            //    Retargeting the callback onto the adopted connection is a follow-up goal's job, and
-            //    NO mid-run install is performed here.
+            //    adopted. What is installed for such an assignment is the SERVICE-OWNED callback the
+            //    carry transition installed (see CreateCarriedProvisioningCallback): it resolves the
+            //    adopted connection at call time, so it is already the right callback for THIS run —
+            //    replacing it here would clobber it with a connection-captured one for no gain.
             if (!adopted)
                 _agentRunner.SetConfigProvisioner(connection.CreateProvisioningCallback());
 
@@ -2807,7 +2974,13 @@ public sealed class WorkerService(
                         // receives this service: a bridge or session call it makes resolves the
                         // assignment's OWN connection (or fails with the existing disconnected error
                         // once that connection retires) rather than whatever is published later.
-                        var connectionBound = new ConnectionBoundDependencies(this, connection);
+                        //
+                        // It also captures THIS assignment's own state cell (the readiness slot's,
+                        // which the owner exposes as its State), so the carried retarget is decided
+                        // by THIS assignment's Carried/Delivered state and ITS OWN adoption — never
+                        // by whichever assignment owns the service-wide slot when a call is made.
+                        var connectionBound = new ConnectionBoundDependencies(
+                            this, connection, ordinaryReady.State);
 
                         // Run task execution concurrently so message loop can process
                         // ToolCallResponse messages from the orchestrator during execution.
@@ -3069,6 +3242,32 @@ public sealed class WorkerService(
                 retained.Receipt.Retry?.CloseAdmission();
                 _currentTaskId = retained.TaskId;
                 _currentRole = retained.Role;
+
+                // THE ONE SERVICE-OWNED LAZY PROVISIONING CALLBACK, installed exactly once, here,
+                // by the SAME CAS winner that transitions the assignment to Carried. From now on the
+                // lazy first-client creation of ANY run this assignment spans resolves the CURRENTLY
+                // ADOPTED connection at call time instead of the retired one it was captured with —
+                // so a lazy provisioning that used to fail disconnected for the rest of the task now
+                // follows the assignment onto its adopting connection.
+                //
+                // IT IS DELIBERATELY NOT REPLACED LATER. DetachProvisioner keeps it for as long as
+                // the assignment is Carried, and an ADOPTED run skips step 5, so this exact callback
+                // serves the whole carried lifetime — including an adopted run that accepts a
+                // successor after delivery, where a mid-run install would otherwise clobber it.
+                //
+                // A FAILURE TO INSTALL IS REPORTED, NEVER PROPAGATED. The carry transition is already
+                // complete and the delivery is about to start; throwing from here would replace that
+                // teardown with a runner fault. With the install failed, the previous (per-run)
+                // callback simply stays installed and keeps its existing fail-closed behavior, which
+                // is exactly the interim contract — strictly no worse than not installing at all.
+                try
+                {
+                    _agentRunner.SetConfigProvisioner(CreateCarriedProvisioningCallback());
+                }
+                catch (Exception ex)
+                {
+                    ReportIfPresent(ex, CarriedProvisionerInstallFailedMessage);
+                }
 
                 // THE ONE CARRIED DELIVERY, started exactly once, by this CAS winner, and retained on
                 // the assignment so every ownership transition joins it.
@@ -4158,7 +4357,8 @@ public sealed class WorkerService(
 
     /// <summary>
     /// THE IMPLICIT-REBINDING FIX: the ONE small adapter an assignment's executor is given for BOTH
-    /// its tool-call bridge and its session client, BOUND to the assignment's EXPECTED connection.
+    /// its tool-call bridge and its session client, BOUND to the assignment's EXPECTED connection —
+    /// and, once that assignment is CARRIED, to whichever connection ADOPTS it.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -4168,14 +4368,35 @@ public sealed class WorkerService(
     /// makes bound to nothing in particular: a call made after a later connection was published would
     /// silently retarget onto that newer registration, pairing one assignment's work with another
     /// connection's stream, identity or client. This adapter captures the expected connection ONCE at
-    /// construction — BEFORE execution starts — and every member simply forwards to the service's
-    /// SHARED connection-taking implementation with THAT captured connection. There is no worker-ID
-    /// lookup and no fallback to a newer published connection anywhere in it.
+    /// construction — BEFORE execution starts — and every member forwards to the service's SHARED
+    /// connection-taking implementation with THAT connection (or with the one its ADOPTION retarget
+    /// selected — see below). There is no worker-ID lookup and no fallback to the merely PUBLISHED
+    /// connection anywhere in it: the only connection it can ever hand on is the assignment's own, or
+    /// the one that ADOPTED that very assignment.
     /// </para>
     /// <para>
     /// ONE INSTANCE, TWO SLOTS. The same object implements both interfaces, so the two dependencies an
     /// assignment's executor receives are the same captured binding rather than two independently
     /// resolved ones — they can never disagree about which connection the assignment belongs to.
+    /// </para>
+    /// <para>
+    /// ONE EXCEPTION TO "CAPTURED": A CARRIED (OR CARRIED-THEN-DELIVERED) ASSIGNMENT FOLLOWS ITS
+    /// ADOPTION. Capture alone is correct only while the captured connection can still be the
+    /// assignment's transport. A stream loss carries the assignment AND retires that very connection,
+    /// so every later bridge or session call would fail with the EXISTING disconnected error for the
+    /// remainder of the task — even though the assignment is still running and is about to be adopted
+    /// on a NEW connection. In those two states the adapter therefore resolves the connection AT CALL
+    /// TIME through <see cref="WorkerService.ResolveAssignmentConnectionFor"/>: ITS OWN assignment's
+    /// adopted live connection when there is one, and otherwise the captured connection, which then
+    /// fails exactly as it does today. A NON-carried assignment is completely unaffected — the
+    /// resolver returns the captured connection for it, byte for byte as before.
+    /// </para>
+    /// <para>
+    /// ASSIGNMENT-SCOPED, NOT SLOT-SCOPED. The adapter captures its assignment's STATE CELL at
+    /// construction, beside the connection, and the retarget is decided by that cell alone. The
+    /// service-wide ownership slot is never consulted: an adapter retained from a finished task can
+    /// never follow a LATER task's adoption, and a carried-then-delivered task's adapter keeps
+    /// following its OWN adoption even after a successor has replaced the slot.
     /// </para>
     /// <para>
     /// It performs NO buffering, retry, replay or synthesis, and it adds NO policy of its own: a
@@ -4185,37 +4406,50 @@ public sealed class WorkerService(
     /// exposed: it is created per assignment inside the message loop and never published.
     /// </para>
     /// </remarks>
-    private sealed class ConnectionBoundDependencies(WorkerService service, WorkerConnection connection)
+    private sealed class ConnectionBoundDependencies(
+        WorkerService service, WorkerConnection connection, AssignmentState state)
         : IToolCallBridge, ISessionClient
     {
         /// <inheritdoc/>
         public Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct) =>
-            service.RequestClarificationOnConnectionAsync(connection, taskId, question, ct);
+            service.RequestClarificationOnConnectionAsync(Resolve(), taskId, question, ct);
 
         /// <inheritdoc/>
         public Task ReportProgressAsync(string taskId, string status, string details, CancellationToken ct) =>
-            service.ReportProgressOnConnectionAsync(connection, taskId, status, details, ct);
+            service.ReportProgressOnConnectionAsync(Resolve(), taskId, status, details, ct);
 
         /// <inheritdoc/>
         public Task ReportNarrativeAsync(string taskId, string narrative, CancellationToken ct) =>
-            service.ReportNarrativeOnConnectionAsync(connection, taskId, narrative, ct);
+            service.ReportNarrativeOnConnectionAsync(Resolve(), taskId, narrative, ct);
 
         /// <inheritdoc/>
         public Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct) =>
-            service.GetGoalOnConnectionAsync(connection, taskId, goalId, ct);
+            service.GetGoalOnConnectionAsync(Resolve(), taskId, goalId, ct);
 
         /// <inheritdoc/>
         public Task<string> RaiseIssueAsync(
             string taskId, string type, string title, string description, string severity, CancellationToken ct) =>
-            service.RaiseIssueOnConnectionAsync(connection, taskId, type, title, description, severity, ct);
+            service.RaiseIssueOnConnectionAsync(Resolve(), taskId, type, title, description, severity, ct);
 
         /// <inheritdoc/>
         public Task<string?> GetSessionAsync(string sessionId, CancellationToken ct) =>
-            service.GetSessionOnConnectionAsync(connection, sessionId, ct);
+            service.GetSessionOnConnectionAsync(Resolve(), sessionId, ct);
 
         /// <inheritdoc/>
         public Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct) =>
-            service.SaveSessionOnConnectionAsync(connection, sessionId, sessionJson, ct);
+            service.SaveSessionOnConnectionAsync(Resolve(), sessionId, sessionJson, ct);
+
+        /// <summary>
+        /// THE ONE RESOLUTION each call makes, evaluated BEFORE the call's first await: the
+        /// assignment's own connection, EXCEPT while THIS assignment is Carried (or was carried and
+        /// delivered), where it is THIS assignment's adopted live connection when one exists.
+        /// </summary>
+        /// <remarks>
+        /// Both the captured connection and the state cell are this adapter's own, fixed at
+        /// construction; only the adoption publication is read from the service, and only an
+        /// adoption owned by this same cell is ever followed.
+        /// </remarks>
+        private WorkerConnection Resolve() => service.ResolveAssignmentConnectionFor(connection, state);
     }
 
     #region IToolCallBridge

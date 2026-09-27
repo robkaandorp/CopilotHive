@@ -1445,6 +1445,53 @@ public sealed class WorkerServiceReconnectSurvivalTests
         }
     }
 
+    /// <summary>
+    /// THE ADOPTION MILESTONE: completes when the service's ADOPTION PUBLICATION holds a connection.
+    /// The adopted run publishes it as its last step before the message loop, and a test that wants
+    /// to make a call "after adoption" must observe that fact rather than race the run's remaining
+    /// setup.
+    /// </summary>
+    /// <remarks>
+    /// NO POLLING. It uses production's OWN adoption-change signal — the <c>_adoptionChanged</c>
+    /// source that <c>PublishAdoption</c> completes and replaces on every change — read under
+    /// production's <c>_adoptionLock</c> TOGETHER with the publication, exactly the way
+    /// <c>AwaitAdoptedConnectionAsync</c> reads them. So there is no gap in which a publication can
+    /// be missed, and the loop re-evaluates exactly ONCE per real publication change (a clear is a
+    /// change too, and simply re-parks). The bound is a FAILURE GUARD only.
+    /// </remarks>
+    private static async Task<WorkerConnection> WaitForAdoptedConnectionAsync(
+        WorkerService service, string because)
+    {
+        var serviceType = typeof(WorkerService);
+        var adoptionLock = serviceType
+            .GetField("_adoptionLock", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service)!;
+        var changedField = serviceType
+            .GetField("_adoptionChanged", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        while (true)
+        {
+            Task changed;
+            lock (adoptionLock)
+            {
+                if (GetAdoptedConnectionOrNull(service) is { } adopted)
+                    return adopted;
+
+                changed = ((TaskCompletionSource)changedField.GetValue(service)!).Task;
+            }
+
+            try
+            {
+                await changed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                throw new Xunit.Sdk.XunitException(
+                    $"{because} (no adoption was published within the failsafe bound).");
+            }
+        }
+    }
+
     private static WorkerConnection? GetPublishedConnection(WorkerService service) =>
         (WorkerConnection?)typeof(WorkerService)
             .GetField("_connection", BindingFlags.NonPublic | BindingFlags.Instance)!
@@ -1710,6 +1757,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         private readonly List<WorkerMessage> _completes = [];
         private readonly List<WorkerMessage> _readies = [];
         private readonly List<WorkerMessage> _writes = [];
+        private readonly List<WorkerMessage> _toolRequests = [];
+        private readonly Dictionary<int, TaskCompletionSource> _toolRequestCountWaiters = [];
         private readonly Dictionary<int, TaskCompletionSource> _completeEntered = [];
         private readonly Dictionary<int, TaskCompletionSource> _completeRelease = [];
         private readonly Dictionary<int, TaskCompletionSource> _readyEntered = [];
@@ -1757,6 +1806,37 @@ public sealed class WorkerServiceReconnectSurvivalTests
         internal IReadOnlyList<WorkerMessage> Writes
         {
             get { lock (_gate) return [.. _writes]; }
+        }
+
+        /// <summary>
+        /// Every <c>ToolRequest</c> write in arrival order — the bridge's own traffic, separate from
+        /// Readies and Completes, so a retargeting assertion can name the exact tool call, its
+        /// task ID and the identity it was written with.
+        /// </summary>
+        internal IReadOnlyList<WorkerMessage> ToolRequests
+        {
+            get { lock (_gate) return [.. _toolRequests]; }
+        }
+
+        /// <summary>
+        /// Completes once at least <paramref name="count"/> TOOL REQUEST writes landed on this
+        /// stream. It is the bounded arrival observation for a bridge call: the caller's own await
+        /// already returned, so this only turns a missing write into a NAMED failure.
+        /// </summary>
+        internal Task WaitForToolRequestCountAsync(int count)
+        {
+            lock (_gate)
+            {
+                if (_toolRequests.Count >= count)
+                    return Task.CompletedTask;
+                if (!_toolRequestCountWaiters.TryGetValue(count, out var waiter))
+                {
+                    waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _toolRequestCountWaiters[count] = waiter;
+                }
+
+                return waiter.Task;
+            }
         }
 
         /// <summary>
@@ -1864,8 +1944,51 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 _releaseImmediately = true;
                 foreach (var source in _completeRelease.Values) source.TrySetResult();
                 foreach (var source in _readyRelease.Values) source.TrySetResult();
+                _initialWriteHold?.TrySetResult();
             }
         }
+
+        /// <summary>
+        /// THE INITIAL-WRITE HOLD — OFF unless <see cref="ArmInitialWriteHold"/> is called, so every
+        /// existing use of this fake keeps its behavior exactly. When armed, the stream's FIRST write
+        /// (the run's initial Ready) is RECORDED as usual (the write-count waiters fire), then PARKS
+        /// inside the fake until <see cref="ReleaseInitialWrite"/>. Production awaits that write before
+        /// its message loop enters the first read, so while it is held the write-before-first-read
+        /// window is FORCED open, independent of scheduling.
+        /// </summary>
+        internal void ArmInitialWriteHold()
+        {
+            lock (_gate)
+                _initialWriteHold ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        /// <summary>Completes once the held initial write has ENTERED the fake and been recorded.</summary>
+        internal Task InitialWriteHeld => _initialWriteHeld.Task;
+
+        /// <summary>Releases a held initial write (a no-op when none is armed).</summary>
+        internal void ReleaseInitialWrite()
+        {
+            lock (_gate)
+                _initialWriteHold?.TrySetResult();
+        }
+
+        /// <summary>
+        /// Whether an initial write is still PARKED in this fake (armed but not yet released).
+        /// Observation only: it reads the hold source's completion state, so a released (or
+        /// cancelled) hold reports <c>false</c>.
+        /// </summary>
+        internal bool IsInitialWriteHeld
+        {
+            get
+            {
+                lock (_gate)
+                    return _initialWriteHold is { } hold && !hold.Task.IsCompleted;
+            }
+        }
+
+        private TaskCompletionSource? _initialWriteHold;
+        private readonly TaskCompletionSource _initialWriteHeld =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         /// <summary>
         /// THE DISPOSAL FAULT: every write currently parked in this fake unwinds with
@@ -1880,6 +2003,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 _disposed = true;
                 foreach (var source in _completeRelease.Values) source.TrySetCanceled();
                 foreach (var source in _readyRelease.Values) source.TrySetCanceled();
+                _initialWriteHold?.TrySetCanceled();
             }
         }
 
@@ -1932,10 +2056,26 @@ public sealed class WorkerServiceReconnectSurvivalTests
             }
 
             if (message.PayloadCase != WorkerMessage.PayloadOneofCase.Ready)
+            {
+                // TOOL REQUESTS are recorded (a bridge call's own arrival observation) even though
+                // they are never gated — the reconnect criteria assert WHICH connection saw them.
+                if (message.PayloadCase == WorkerMessage.PayloadOneofCase.ToolRequest)
+                {
+                    lock (_gate)
+                    {
+                        _toolRequests.Add(message);
+                        _writes.Add(message);
+                        SignalToolRequestCountLocked();
+                        SignalWriteCountLocked();
+                    }
+                }
+
                 return;
+            }
 
             int ordinal;
             TaskCompletionSource? readyRelease;
+            TaskCompletionSource? initialHold;
             lock (_gate)
             {
                 ordinal = _readies.Count - (CountsFirstReadyAsInitial ? 1 : 0);
@@ -1944,6 +2084,11 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 readyRelease = ordinal >= _holdReadiesFrom ? Slot(_readyRelease, ordinal) : null;
                 if (_disposed && readyRelease is not null) readyRelease.TrySetCanceled();
                 else if (_releaseImmediately && readyRelease is not null) readyRelease.TrySetResult();
+
+                // THE ARMED INITIAL-WRITE HOLD applies to the stream's FIRST write only, and only
+                // after it has been RECORDED above (so the write-count waiters still observe it).
+                initialHold = _writes.Count == 1 ? _initialWriteHold : null;
+
                 SignalWriteCountLocked();
                 foreach (var (threshold, waiter) in _readyCountWaiters.ToArray())
                     if (_readies.Count >= threshold)
@@ -1952,6 +2097,15 @@ public sealed class WorkerServiceReconnectSurvivalTests
                         waiter.TrySetResult();
                     }
                 if (ordinal >= 0) Slot(_readyEntered, ordinal).TrySetResult();
+            }
+
+            if (initialHold is not null)
+            {
+                // The write is recorded and PENDING: the caller's WriteAsync has not returned, so the
+                // message loop that follows it in production cannot have started a read yet. Honors
+                // the forwarded token exactly like every other parked write in this fake.
+                _initialWriteHeld.TrySetResult();
+                await initialHold.Task.WaitAsync(ct);
             }
 
             if (readyRelease is not null)
@@ -1973,7 +2127,33 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 throw readyFailure;
         }
 
-        public Task CompleteAsync() => Task.CompletedTask;
+        /// <summary>
+        /// COMPLETES the client's half of the stream, so this fake is safe as a SOLE shutdown path:
+        /// closing the request stream RELEASES the opt-in initial-write hold.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// WHY IT RELEASES THE HOLD. <see cref="ArmInitialWriteHold"/> parks the stream's first write
+        /// inside <see cref="WriteCoreAsync"/> until <see cref="ReleaseInitialWrite"/> (or
+        /// <see cref="ReleaseAll"/>, or a disposal). A future fixture that relies on
+        /// <c>CompleteAsync</c> alone to shut a run down would otherwise leave that parked write
+        /// unresolved, so the run it belongs to could never reach quiescence — a hang in the fixture,
+        /// not a production signal. Releasing here keeps the hold an OPT-IN WINDOW that always has a
+        /// way out.
+        /// </para>
+        /// <para>
+        /// The release is the SAME completion every existing releaser performs, so an UNARMED fake is
+        /// completely unaffected: with no armed hold the field is <c>null</c> and this is a no-op,
+        /// exactly as the previous <c>Task.CompletedTask</c> body was. Nothing else about the
+        /// <c>_disposed</c> / <c>_releaseImmediately</c> bookkeeping changes, and no production
+        /// behavior is involved — this is a test double.
+        /// </para>
+        /// </remarks>
+        public Task CompleteAsync()
+        {
+            ReleaseInitialWrite();
+            return Task.CompletedTask;
+        }
 
         private void SignalWriteCountLocked()
         {
@@ -1990,6 +2170,23 @@ public sealed class WorkerServiceReconnectSurvivalTests
 
             foreach (var waiter in ready)
                 waiter.TrySetResult();
+        }
+
+        /// <summary>Signals every tool-request arrival waiter whose threshold is now met. Caller holds the gate.</summary>
+        private void SignalToolRequestCountLocked()
+        {
+            List<int> ready = [];
+            foreach (var (threshold, _) in _toolRequestCountWaiters)
+            {
+                if (_toolRequests.Count >= threshold)
+                    ready.Add(threshold);
+            }
+
+            foreach (var threshold in ready)
+            {
+                if (_toolRequestCountWaiters.Remove(threshold, out var waiter))
+                    waiter.TrySetResult();
+            }
         }
 
         private static TaskCompletionSource Slot(
@@ -2114,12 +2311,35 @@ public sealed class WorkerServiceReconnectSurvivalTests
         private readonly object _gate = new();
         private readonly List<RegisterRequest> _registers = [];
         private readonly Dictionary<int, TaskCompletionSource> _registerWaiters = [];
+        private int _workerConfigFetchCount;
+        private int _loadCount;
+        private int _saveCount;
+        private string? _lastLoadSessionId;
+        private string? _lastSaveSessionId;
+        private string? _lastSavedJson;
 
         /// <summary>Snapshots the Register requests, oldest first.</summary>
         internal IReadOnlyList<RegisterRequest> Registers
         {
             get { lock (_gate) return [.. _registers]; }
         }
+
+        /// <summary>
+        /// How many <c>GetWorkerConfig</c> fetches THIS connection's provisioner performed — the
+        /// observable that names WHICH connection a provisioning call reached (the eager per-assignment
+        /// site and the lazy callback both route through the connection's own checked entry point).
+        /// </summary>
+        internal int WorkerConfigFetchCount => Volatile.Read(ref _workerConfigFetchCount);
+
+        /// <summary>How many session loads reached THIS connection's client.</summary>
+        internal int LoadCount => Volatile.Read(ref _loadCount);
+
+        /// <summary>How many session saves reached THIS connection's client.</summary>
+        internal int SaveCount => Volatile.Read(ref _saveCount);
+
+        internal string? LastLoadSessionId { get { lock (_gate) return _lastLoadSessionId; } }
+        internal string? LastSaveSessionId { get { lock (_gate) return _lastSaveSessionId; } }
+        internal string? LastSavedJson { get { lock (_gate) return _lastSavedJson; } }
 
         /// <summary>Completes once at least <paramref name="count"/> Register RPCs were made.</summary>
         internal Task WaitForRegisterCountAsync(int count, CancellationToken ct)
@@ -2145,17 +2365,12 @@ public sealed class WorkerServiceReconnectSurvivalTests
         public override AsyncUnaryCall<TResponse> AsyncUnaryCall<TRequest, TResponse>(
             Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request)
         {
-            var payload = method.FullName switch
+            object payload = method.FullName switch
             {
                 "/copilothive.HiveOrchestrator/Register" => RespondRegister(request),
-                "/copilothive.HiveOrchestrator/GetWorkerConfig" => new GetWorkerConfigResponse
-                {
-                    GithubToken = "ghp_fixture",
-                    LlmProvider = "copilot",
-                    ConfigRepoUrl = ConfigRepoUrl,
-                },
-                "/copilothive.HiveOrchestrator/GetSession" => new GetSessionResponse { Found = false },
-                "/copilothive.HiveOrchestrator/SaveSession" => new SaveSessionResponse { Success = true },
+                "/copilothive.HiveOrchestrator/GetWorkerConfig" => FetchWorkerConfig(),
+                "/copilothive.HiveOrchestrator/GetSession" => LoadSession(request),
+                "/copilothive.HiveOrchestrator/SaveSession" => SaveSession(request),
                 "/copilothive.HiveOrchestrator/Heartbeat" => new HeartbeatResponse { Acknowledged = true },
                 _ => throw new NotSupportedException($"Unexpected unary call {method.FullName}."),
             };
@@ -2166,6 +2381,41 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 () => new Status(StatusCode.OK, string.Empty),
                 () => new Metadata(),
                 () => { });
+        }
+
+        /// <summary>
+        /// ONE provisioning fetch on THIS connection. The credential-free response is deliberate: it
+        /// exercises the checked provisioning path (fetch, snapshot, revert-safe apply) without
+        /// touching the process environment, so a test can assert WHICH connection was provisioned
+        /// through while the assignment's model stays irrelevant to the assertion.
+        /// </summary>
+        private object FetchWorkerConfig()
+        {
+            Interlocked.Increment(ref _workerConfigFetchCount);
+            return new GetWorkerConfigResponse
+            {
+                LlmProvider = "copilot",
+                ConfigRepoUrl = ConfigRepoUrl,
+            };
+        }
+
+        private object LoadSession<TRequest>(TRequest request)
+        {
+            Interlocked.Increment(ref _loadCount);
+            lock (_gate) _lastLoadSessionId = (request as GetSessionRequest)?.SessionId;
+            return new GetSessionResponse { Found = false };
+        }
+
+        private object SaveSession<TRequest>(TRequest request)
+        {
+            Interlocked.Increment(ref _saveCount);
+            lock (_gate)
+            {
+                _lastSaveSessionId = (request as SaveSessionRequest)?.SessionId;
+                _lastSavedJson = (request as SaveSessionRequest)?.SessionJson;
+            }
+
+            return new SaveSessionResponse { Success = true };
         }
 
         private object RespondRegister<TRequest>(TRequest request)
@@ -3051,6 +3301,1016 @@ public sealed class WorkerServiceReconnectSurvivalTests
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // GOAL retarget-connection-bound-dependencies-after-adoption — the CALL-TIME
+    // resolution of a carried assignment's bridge/session calls and of the ONE
+    // service-owned lazy provisioning callback.
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // Everything here drives the REAL sequential RunAsync lifecycle (registration, publication,
+    // heartbeat seam, a genuine assignment, EOF, the adopted registration, the adoption publication)
+    // and then calls the dependency object the assignment's EXECUTOR actually received — captured
+    // through the runner's own SetToolBridge seam, never through a hand-built stand-in. Every gate is
+    // a TCS or a counted write; no sleeps and no polling anywhere.
+
+    /// <summary>
+    /// (a) THE CALL-TIME RETARGET, OBSERVED BETWEEN STREAMS AND AFTER ADOPTION. A carried assignment's
+    /// bridge and session calls fail with the EXISTING disconnected error while nothing is adopted
+    /// (the retired connection is still the only target), and after the second run adopts the task
+    /// they ALL go to connection 2: progress, narrative, GetSession and SaveSession. Connection 1
+    /// sees nothing after the carry, so the retarget is a real movement of new calls, not a duplicate
+    /// emission.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: with the captured binding still in place every call after the carry resolves
+    /// the RETIRED connection 1, so the four adopted assertions fail by name — the writes never appear
+    /// on stream 2 and the calls raise the disconnected error instead of returning. The reverse
+    /// regression (a NON-carried assignment following the publication) is covered by (c) and by the
+    /// unchanged binding fixture.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_a_CarriedAssignment_BridgeAndSessionCallsFollowTheAdoptedConnection()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            var execution = await plan.PushAssignmentAsync("task-A");
+            var bridge = await plan.Runner.BridgeCaptured
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var sessions = Assert.IsAssignableFrom<ISessionClient>(bridge);
+
+            // Still running on run 1: the assignment is not carried yet, so the calls use the
+            // CAPTURED connection 1 (proved by run 1's own writer taking them).
+            await bridge.ReportProgressAsync(
+                    "task-A", "pre-loss", "before the stream loss", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.Requests[0].WaitForToolRequestCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(
+                "report_progress", Assert.Single(plan.Requests[0].ToolRequests).ToolRequest.ToolName);
+
+            // STREAM LOSS: the assignment is carried and connection 1 is retired.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.True(plan.Connections[0].IsRetired);
+            Assert.Null(GetAdoptedConnectionOrNull(plan.Service));
+
+            // BETWEEN STREAMS (nothing adopted): both calls fail with the EXISTING disconnected error.
+            var progressFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => bridge.ReportProgressAsync(
+                    "task-A", "carried", "no adoption yet", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, progressFailure.Message);
+
+            var loadFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => sessions.GetSessionAsync("goal-A:coder", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, loadFailure.Message);
+
+            // NOTHING MORE REACHED CONNECTION 1 — the failed calls wrote nothing on the retired stream.
+            Assert.Single(plan.Requests[0].ToolRequests);
+            Assert.Equal(0, plan.Invokers[0].LoadCount);
+            Assert.Equal(0, plan.Invokers[0].SaveCount);
+
+            // RUN 2 — the adopted registration: the adoption publication is the retarget target.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted = await plan.WaitForPublishedConnectionAsync();
+            Assert.Equal("task-A", Assert.Single(plan.Invokers[1].Registers).CurrentTaskId);
+            Assert.Same(adopted, GetAdoptedConnection(plan.Service));
+
+            // EXECUTION IS STILL RUNNING: the calls below are made while the assignment is STILL
+            // Carried, which is exactly the state the retarget exists for.
+            Assert.False(execution.IsCompleted);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            // 1. PROGRESS → connection 2.
+            await bridge.ReportProgressAsync(
+                    "task-A", "adopted", "after adoption", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.WaitForToolRequestCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var progress = Assert.Single(plan.CurrentRequests.ToolRequests);
+            Assert.Equal("report_progress", progress.ToolRequest.ToolName);
+            Assert.Equal("task-A", progress.ToolRequest.TaskId);
+            Assert.Equal("worker-reconnect-a", progress.WorkerId);
+
+            // 2. NARRATIVE → connection 2.
+            await bridge.ReportNarrativeAsync(
+                    "task-A", "carried narrative", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.WaitForToolRequestCountAsync(2)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var narrative = plan.CurrentRequests.ToolRequests[1];
+            Assert.Equal("report_narrative", narrative.ToolRequest.ToolName);
+            Assert.Equal("task-A", narrative.ToolRequest.TaskId);
+
+            // 3. GetSession → connection 2's CLIENT (the unary RPC path).
+            var loaded = await sessions
+                .GetSessionAsync("goal-A:coder", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(loaded);
+            Assert.Equal(1, plan.Invokers[1].LoadCount);
+            Assert.Equal("goal-A:coder", plan.Invokers[1].LastLoadSessionId);
+
+            // 4. SaveSession → connection 2's CLIENT.
+            await sessions
+                .SaveSessionAsync("goal-A:coder", """{"turn":1}""", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, plan.Invokers[1].SaveCount);
+            Assert.Equal("goal-A:coder", plan.Invokers[1].LastSaveSessionId);
+            Assert.Equal("""{"turn":1}""", plan.Invokers[1].LastSavedJson);
+
+            // NOTHING MORE WENT TO CONNECTION 1: it still holds exactly the ONE pre-loss tool request
+            // and no session RPC at all.
+            Assert.Single(plan.Requests[0].ToolRequests);
+            Assert.Equal(0, plan.Invokers[0].LoadCount);
+            Assert.Equal(0, plan.Invokers[0].SaveCount);
+
+            // EXACTLY the two fire-and-forget bridge calls reached connection 2's writer (the
+            // response-bearing ones would register a pending wait, of which there are none here).
+            Assert.Equal(2, plan.CurrentRequests.ToolRequests.Count);
+            Assert.Equal(0, adopted.PendingToolResponseCount);
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (b) THE RETARGET FOLLOWS A SECOND LOSS. After the assignment is adopted on stream 2 it is lost
+    /// again and adopted on stream 3: the SAME dependency object then sends its calls to connection 3,
+    /// and neither connection 1 nor connection 2 sees any of them.
+    /// </summary>
+    /// <remarks>
+    /// The mid-flight adopted run ends by stream loss with its carried delivery's Complete PARKED in
+    /// that stream's fake (armed before the run started), so the run ends with the assignment still
+    /// Carried — the second loss the carry contract supports — and the delivery returns to its wait
+    /// instead of finishing. While the delivery is parked the send gate is held by its own write, so
+    /// the retarget on stream 2 is proved with the UNGATED session pair (unary RPCs, outside the send
+    /// gate); the bridge calls are proved on stream 3. The state cell is asserted at every step, so a
+    /// mutant that retargets only for the FIRST adoption (for example by caching the first adopted
+    /// connection) fails the connection-3 assertions by name.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_b_SecondLossAndReadoption_SameDependencyFollowsConnectionThree()
+    {
+        var plan = ReconnectPlan.StartAsync(
+            "task-A", register2Adopted: true, holdReportComplete: true);
+        try
+        {
+            var execution = await plan.PushAssignmentAsync("task-A");
+            var bridge = await plan.Runner.BridgeCaptured
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var sessions = Assert.IsAssignableFrom<ISessionClient>(bridge);
+
+            // RUN 1 → carried (the reporter parks in its held Complete, which the disposal faults).
+            plan.Runner.Release("task-A");
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.True(plan.Connections[0].IsRetired);
+
+            // The BODY finished with the run-1 result already retained: only the DELIVERY is still
+            // outstanding, which is what keeps the assignment Carried across the next two runs.
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.NotNull(GetRetainedResult(plan.Service));
+
+            // RUN 2 — adopted, with ITS COMPLETES HELD so the carried delivery cannot finish on this
+            // stream: the assignment is retargeted onto connection 2 and stays Carried.
+            plan.PendingHoldCompletesFrom = 0;
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted2 = await plan.WaitForPublishedConnectionAsync();
+            Assert.Same(
+                adopted2,
+                await WaitForAdoptedConnectionAsync(plan.Service, "The adopted run must publish the adoption."));
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE SESSION PAIR follows the adoption onto connection 2's CLIENT, while the assignment
+            // is still Carried (the parked Complete has not transitioned it).
+            Assert.Null(await sessions
+                .GetSessionAsync("goal-A:coder", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            await sessions
+                .SaveSessionAsync("goal-A:coder", """{"turn":2}""", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, plan.Invokers[1].LoadCount);
+            Assert.Equal(1, plan.Invokers[1].SaveCount);
+            Assert.Equal("goal-A:coder", plan.Invokers[1].LastSaveSessionId);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            // NOTHING NEW REACHED CONNECTION 1.
+            Assert.Equal(0, plan.Invokers[0].LoadCount);
+            Assert.Equal(0, plan.Invokers[0].SaveCount);
+            Assert.Empty(plan.Requests[0].ToolRequests);
+
+            // SECOND LOSS: stream 2 ends; its disposal faults the parked Complete, so the delivery
+            // returns to its wait and the assignment STAYS CARRIED for the next adoption.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.True(plan.Connections[1].IsRetired);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            // BETWEEN THE TWO ADOPTED RUNS the retired connection 2 is refused: the call fails with
+            // the EXISTING disconnected error rather than resurrecting the first adoption. (The
+            // session pair is used deliberately here: the parked carried Complete still holds the
+            // shared send gate, and these unary RPCs are entirely outside it.)
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => sessions.GetSessionAsync("goal-A:coder", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+            Assert.Null(GetAdoptedConnectionOrNull(plan.Service));
+
+            // RUN 3 — adopted again: the SAME dependency object now sends to connection 3.
+            plan.StartThirdRun(RegisterResponseFor(adopted: true));
+            var adopted3 = await plan.WaitForPublishedConnectionAsync();
+            await WaitForAdoptedConnectionAsync(plan.Service, "The third run must publish the adoption.");
+            Assert.NotSame(adopted2, adopted3);
+            await bridge.ReportProgressAsync(
+                    "task-A", "on-3", "adopted by the third stream", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.WaitForToolRequestCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var progress = Assert.Single(plan.CurrentRequests.ToolRequests);
+            Assert.Equal("report_progress", progress.ToolRequest.ToolName);
+            Assert.Equal("worker-reconnect-a", progress.WorkerId);
+
+            await bridge.ReportNarrativeAsync(
+                    "task-A", "third stream narrative", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.WaitForToolRequestCountAsync(2)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE FIRST ADOPTION'S PUBLICATION IS GONE — a call that arrives now can only ever reach
+            // the CURRENT adoption, so the assertions above cannot have passed by reaching connection 2.
+            await sessions
+                .SaveSessionAsync("goal-A:coder", """{"turn":3}""", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, plan.Invokers[1].SaveCount);
+            Assert.Equal(1, plan.Invokers[2].SaveCount);
+            Assert.Equal("""{"turn":3}""", plan.Invokers[2].LastSavedJson);
+
+            // NEITHER EARLIER CONNECTION SAW THE RETARGETED CALLS: connection 1 saw no tool request at
+            // all, connection 2 only the session pair made while IT was adopted.
+            Assert.Empty(plan.Requests[0].ToolRequests);
+            Assert.Empty(plan.Requests[1].ToolRequests);
+            Assert.Equal(2, plan.CurrentRequests.ToolRequests.Count);
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (c) A NON-CARRIED ASSIGNMENT STILL USES ITS CAPTURED CONNECTION — the retarget is scoped to the
+    /// Carried/Delivered states and nothing else. While the assignment is running on run 1 (state
+    /// Open), every call goes to connection 1 even though a SECOND connection is published underneath
+    /// it, and connection 2's writer, client and response registry stay completely untouched.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: this is the negative half of the retarget. A resolver that followed the
+    /// merely PUBLISHED connection (or the adoption publication unconditionally) sends these calls to
+    /// connection 2, and every one of the four assertions below fails by name.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_c_NonCarriedAssignment_StillUsesItsCapturedConnection()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: false);
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            var bridge = await plan.Runner.BridgeCaptured
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var sessions = Assert.IsAssignableFrom<ISessionClient>(bridge);
+            Assert.Equal(CarryStates.Open, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            // PUBLICATION MOVES TO A SECOND CONNECTION — the exact move the sibling binding fixture
+            // performs. The assignment is NOT carried, so its dependency must keep using its captured
+            // connection and send NOTHING here.
+            var second = plan.PublishStandaloneConnection();
+            Assert.NotSame(plan.Connections[0], second);
+            Assert.Same(second, GetPublishedConnection(plan.Service));
+
+            await bridge.ReportProgressAsync(
+                    "task-A", "captured", "still on connection one", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await bridge.ReportNarrativeAsync(
+                    "task-A", "captured narrative", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(await sessions
+                .GetSessionAsync("goal-A:coder", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            await sessions
+                .SaveSessionAsync("goal-A:coder", """{"turn":0}""", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // EVERY call landed on the CAPTURED connection 1. Each bridge call's own await already
+            // returned, so its write is recorded by now: these are IMMEDIATE assertions, which is what
+            // makes a misrouted call fail by NAME rather than at a bound.
+            Assert.Equal(1, plan.Invokers[0].LoadCount);
+            Assert.Equal(1, plan.Invokers[0].SaveCount);
+            Assert.Equal("goal-A:coder", plan.Invokers[0].LastSaveSessionId);
+            Assert.Equal(2, plan.Requests[0].ToolRequests.Count);
+            Assert.Equal("report_progress", plan.Requests[0].ToolRequests[0].ToolRequest.ToolName);
+            Assert.Equal("report_narrative", plan.Requests[0].ToolRequests[1].ToolRequest.ToolName);
+
+            // ...and the newly published connection 2 saw NOTHING at all.
+            Assert.Empty(plan.CurrentRequests.Writes);
+            Assert.Equal(0, plan.Invokers[1].LoadCount);
+            Assert.Equal(0, plan.Invokers[1].SaveCount);
+            Assert.Equal(0, second.PendingToolResponseCount);
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (d) A RESPONSE-BEARING CALL IN FLIGHT ON CONNECTION 1 IS NEVER REPLAYED. A
+    /// <c>request_clarification</c> is REGISTERED and written on connection 1 and left parked while
+    /// the stream is lost: the retirement faults its wait with the EXISTING disconnected error, and
+    /// the retarget — which is about NEW calls — neither re-sends the request on connection 2 nor
+    /// produces a second write anywhere.
+    /// </summary>
+    /// <remarks>
+    /// The write is HELD inside connection 1's fake, so the loss is guaranteed to happen while the
+    /// call is genuinely in flight rather than merely queued. Connection 2's tool-request traffic is
+    /// asserted EMPTY, which is what makes the absence of a replay observable rather than assumed.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_d_InFlightResponseBearingCallOnConnectionOne_IsNeverReplayed()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            var execution = await plan.PushAssignmentAsync("task-A");
+            var bridge = await plan.Runner.BridgeCaptured
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The response-bearing call is REGISTERED and its request is written on connection 1; the
+            // write itself completes, so what is in flight is the RESPONSE WAIT — parked on connection
+            // 1's registry until that connection can no longer deliver a response.
+            var clarification = bridge.RequestClarificationAsync(
+                "task-A", "in flight question", TestContext.Current.CancellationToken);
+            await plan.Requests[0].WaitForToolRequestCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(
+                "request_clarification",
+                Assert.Single(plan.Requests[0].ToolRequests).ToolRequest.ToolName);
+            Assert.Equal(1, plan.Connections[0].PendingToolResponseCount);
+            Assert.False(clarification.IsCompleted, "The response-bearing call must still be in flight.");
+
+            // STREAM LOSS while the call is in flight: the assignment is carried and connection 1
+            // retires — which faults the pending wait with the EXISTING disconnected error.
+            plan.CompleteStream();
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => clarification.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.False(execution.IsCompleted);
+
+            // ADOPT on stream 2, then release the body so the retained result is delivered.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted = await plan.WaitForPublishedConnectionAsync();
+            Assert.Same(adopted, GetAdoptedConnection(plan.Service));
+            plan.Runner.Release("task-A");
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // NO REPLAY: the only request on connection 1 is the ORIGINAL in-flight one, and the
+            // adopted connection carries exactly the carried Complete and its Ready — no tool request
+            // at all.
+            Assert.Single(plan.Requests[0].ToolRequests);
+            Assert.Empty(plan.CurrentRequests.ToolRequests);
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (p) THE SERVICE-OWNED LAZY PROVISIONING CALLBACK. After the assignment is carried the runner
+    /// holds a NON-NULL callback that is NOT the per-run connection-captured one; invoked with nothing
+    /// adopted it fails with the EXISTING disconnected error WITHOUT touching the retired connection;
+    /// invoked after adoption on stream 2 it provisions through connection 2's OWN checked entry point;
+    /// and once the assignment is delivered and cleared, the ordinary per-run install/detach applies
+    /// again.
+    /// </summary>
+    /// <remarks>
+    /// The provisioning observable is the per-connection <c>GetWorkerConfig</c> fetch count: the
+    /// eager per-assignment site and the lazy callback both route through the SAME checked
+    /// <c>EnsureProvisionedAsync</c>, so a fetch landing on a given connection's client names exactly
+    /// which connection performed the provisioning. Run 1's own eager provisioning is included in
+    /// connection 1's count and is asserted as such, so the later assertions are read against a known
+    /// baseline rather than a bare zero.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_p_LazyProvisionerWhileCarried_FollowsTheAdoptionAndDetachesAfterDelivery()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            var execution = await plan.PushAssignmentAsync("task-A");
+
+            // THE PER-RUN INSTALL: the callback connection 1 installed is the connection's own checked
+            // entry point, installed by the run that owns the assignment.
+            var installedAtStart = plan.Runner.Provisioners;
+            Assert.Single(installedAtStart);
+            Assert.NotNull(installedAtStart[0]);
+            Assert.Equal(1, plan.Invokers[0].WorkerConfigFetchCount);
+
+            // CARRY: the assignment's stream is lost and the service installs its OWN callback.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            var afterCarry = plan.Runner.Provisioners;
+            Assert.Equal(2, afterCarry.Count);
+            var carried = afterCarry[^1];
+            Assert.NotNull(carried);
+            Assert.NotSame(installedAtStart[0], carried);
+
+            // BETWEEN STREAMS: the callback fails with the EXISTING disconnected error and the retired
+            // connection 1 is NOT touched — no new provisioning fetch on it (the baseline is unchanged)
+            // and no session/tool traffic either.
+            var disconnected = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => carried("fixture-provider/fixture-model", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, disconnected.Message);
+            Assert.Equal(1, plan.Invokers[0].WorkerConfigFetchCount);
+            Assert.False(execution.IsCompleted);
+
+            // RUN 2 — ADOPTED: the SAME callback now provisions through connection 2's checked entry
+            // point, while connection 1's count stays exactly where the failed call left it.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted = await plan.WaitForPublishedConnectionAsync();
+            Assert.Same(adopted, GetAdoptedConnection(plan.Service));
+            Assert.Equal(0, plan.Invokers[1].WorkerConfigFetchCount);
+
+            await carried("fixture-provider/fixture-model", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, plan.Invokers[1].WorkerConfigFetchCount);
+            Assert.Equal(1, plan.Invokers[0].WorkerConfigFetchCount);
+
+            // THE CALLBACK SURVIVES THE ADOPTED RUN: the adopted run skipped its own install, so the
+            // service-owned callback is still the installed one (nothing replaced it mid-adoption).
+            Assert.Same(carried, plan.Runner.CurrentProvisioner);
+
+            // DELIVER, then end the adopted run: the assignment becomes Delivered and the exit
+            // re-check clears it, so the carried rule no longer applies to any assignment.
+            plan.Runner.Release("task-A");
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+
+            // THE ORDINARY PER-RUN INSTALL/DETACH APPLIES AGAIN: the detach installed null at the end
+            // of the adopted run, and the NEXT run installs its own connection-captured callback.
+            Assert.Null(plan.Runner.CurrentProvisioner);
+            plan.StartThirdRun(RegisterResponseFor(adopted: false));
+            await plan.CurrentRequests.WaitForWriteCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.NotNull(plan.Runner.CurrentProvisioner);
+            Assert.NotSame(carried, plan.Runner.CurrentProvisioner);
+            Assert.False(plan.Runner.WasCancelled("task-A"));
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (p2) THE SERVICE-OWNED CALLBACK IS INSTALLED BY THE CARRY TRANSITION ITSELF, exactly once, and
+    /// NOT by any later run: a carried assignment that survives two adopted runs keeps the SAME
+    /// callback instance the carry installed — no adopted run replaces it, and the detach that would
+    /// have nulled it is suppressed for exactly as long as the assignment is Carried.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: an implementation that installed the callback per run (or detached it at the
+    /// end of the carrying run) changes the recorded history and the instance identity, so both
+    /// assertions fail by name. The adopted run's carried delivery is HELD in that stream's fake, so
+    /// the run ends with the assignment still Carried rather than delivered — which is what makes the
+    /// "detach is suppressed while Carried" half observable across a SECOND run boundary.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_p2_AdoptedRunsNeverReplaceTheCarriedCallback_AndTheDetachIsSuppressedWhileCarried()
+    {
+        var plan = ReconnectPlan.StartAsync(
+            "task-A", register2Adopted: true, holdReportComplete: true);
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            plan.Runner.Release("task-A");
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            var atCarry = plan.Runner.Provisioners;
+            Assert.Equal(2, atCarry.Count);
+            Assert.NotNull(atCarry[^1]);
+
+            // The carrying run's teardown DETACHED NOTHING (the only two records are the per-run
+            // install and the carried install), and the assignment is genuinely still Carried.
+            Assert.DoesNotContain(null, atCarry);
+
+            // THE ADOPTED RUN adds no install of its own, and its carried delivery is HELD in stream 2
+            // so the run ends with the assignment still Carried.
+            plan.PendingHoldCompletesFrom = 0;
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            await plan.WaitForPublishedConnectionAsync();
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(2, plan.Runner.Provisioners.Count);
+            Assert.Same(atCarry[^1], plan.Runner.CurrentProvisioner);
+
+            // It ends by stream loss with the assignment still Carried: the detach was STILL suppressed
+            // at the end of the adopted run and the SAME callback stayed installed.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.Equal(2, plan.Runner.Provisioners.Count);
+            Assert.Same(atCarry[^1], plan.Runner.CurrentProvisioner);
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (i) A RETAINED ADAPTER FROM A FINISHED TASK NEVER FOLLOWS A SUCCESSOR'S ADOPTION. Task A
+    /// finishes normally on connection 1 (it started its own ordinary Ready, so it is NOT carried).
+    /// Successor B then runs on the same stream, is carried by the stream loss and is adopted on
+    /// connection 2. A's retained dependency must stay on A's CAPTURED connection 1 — now retired,
+    /// so its calls fail with the EXISTING disconnected error — and must put NOTHING on B's adopted
+    /// connection 2, while B's own dependency does reach connection 2 (the positive control).
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: a resolver that decides Carried/Delivered from the SERVICE-WIDE ownership
+    /// slot sees B (Carried) when A's adapter is called, so A's progress and session calls are sent to
+    /// B's adopted connection 2: the disconnected assertions and the connection-2 emptiness
+    /// assertions fail by name.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_i_FinishedTasksRetainedAdapter_NeverFollowsASuccessorsAdoption()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            // TASK A runs and finishes on connection 1, claiming its OWN ordinary Ready.
+            await plan.PushAssignmentAsync("task-A");
+            var bridgeA = await plan.Runner.BridgeInstalled(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var sessionsA = Assert.IsAssignableFrom<ISessionClient>(bridgeA);
+            var ownerA = GetActiveAssignment(plan.Service);
+            plan.Runner.Release("task-A");
+            await plan.CurrentRequests.WaitForAssignmentReadyCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.ReadyStarted, GetAssignmentState(ownerA));
+
+            // SUCCESSOR B replaces A on the same stream (the replacement drain joins A first). The
+            // POST-HANDLER gate is what makes the slot read below sound: the runner's prompt entry can
+            // legitimately precede InstallActiveAssignment, so `ownerB` is only read once B's handler
+            // has returned.
+            var readsBeforeB = await plan.CapturePostHandlerBaselineAsync();
+            plan.Push(ResultAssignment("task-B"));
+            await plan.Runner.PromptStarted("task-B").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeB);
+            var bridgeB = await plan.Runner.BridgeInstalled(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.NotSame(bridgeA, bridgeB);
+            var ownerB = GetActiveAssignment(plan.Service);
+            Assert.NotSame(ownerA, ownerB);
+            Assert.Equal("task-B", GetOwnerTaskId(ownerB));
+
+            // STREAM LOSS: B is carried; A stays finished (ReadyStarted, never carried).
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Same(ownerB, GetActiveAssignment(plan.Service));
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(ownerB));
+            Assert.Equal(CarryStates.ReadyStarted, GetAssignmentState(ownerA));
+            Assert.True(plan.Connections[0].IsRetired);
+            var toolRequestsOnOneBefore = plan.Requests[0].ToolRequests.Count;
+
+            // RUN 2 ADOPTS B.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted = await plan.WaitForPublishedConnectionAsync();
+            Assert.Same(
+                adopted,
+                await WaitForAdoptedConnectionAsync(plan.Service, "The adopted run must publish B's adoption."));
+            Assert.Equal("task-B", Assert.Single(plan.Invokers[1].Registers).CurrentTaskId);
+
+            // A's RETAINED ADAPTER: stays on its captured, retired connection 1 — disconnected.
+            var progressFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => bridgeA.ReportProgressAsync(
+                    "task-A", "stale", "finished task must not follow B", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, progressFailure.Message);
+            var loadFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => sessionsA.GetSessionAsync("goal-task-A:coder", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, loadFailure.Message);
+
+            // ...and NOTHING of A's reached B's adopted connection 2 (nor anything new on connection 1).
+            Assert.Empty(plan.CurrentRequests.ToolRequests);
+            Assert.Equal(0, plan.Invokers[1].LoadCount);
+            Assert.Equal(0, adopted.PendingToolResponseCount);
+            Assert.Equal(toolRequestsOnOneBefore, plan.Requests[0].ToolRequests.Count);
+
+            // POSITIVE CONTROL — B's OWN adapter does follow B's adoption onto connection 2.
+            await bridgeB.ReportProgressAsync(
+                    "task-B", "adopted", "B follows its own adoption", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var progressB = Assert.Single(plan.CurrentRequests.ToolRequests);
+            Assert.Equal("task-B", progressB.ToolRequest.TaskId);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(ownerB));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (ii) A DELIVERED CARRIED ASSIGNMENT'S ADAPTER KEEPS FOLLOWING ITS OWN ADOPTION AFTER A SUCCESSOR
+    /// TAKES THE SLOT. Task A is carried, adopted on connection 2 and delivered there; successor B is
+    /// then accepted on the same adopted stream and replaces A in the ownership slot. While
+    /// connection 2 stays live, A's retained dependency must still reach connection 2 (A is
+    /// Delivered-after-carried, and connection 2 is A's own adoption) instead of failing on A's
+    /// retired captured connection 1.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: a resolver that decides from the SERVICE-WIDE slot sees B (Open) when A's
+    /// adapter is called, so it returns A's captured connection 1 — retired — and the calls fail
+    /// disconnected: the connection-2 arrival assertions fail by name.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_ii_DeliveredCarriedAdapter_KeepsFollowingItsOwnAdoptionAfterASuccessorTakesTheSlot()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            // TASK A is carried by the stream loss while its body is still running.
+            await plan.PushAssignmentAsync("task-A");
+            var bridgeA = await plan.Runner.BridgeInstalled(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var sessionsA = Assert.IsAssignableFrom<ISessionClient>(bridgeA);
+            var ownerA = GetActiveAssignment(plan.Service);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(ownerA));
+
+            // RUN 2 ADOPTS A; the body finishes and the carried delivery completes on connection 2.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted = await plan.WaitForPublishedConnectionAsync();
+            Assert.Same(
+                adopted,
+                await WaitForAdoptedConnectionAsync(plan.Service, "The adopted run must publish A's adoption."));
+            plan.Runner.Release("task-A");
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(ownerA));
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+
+            // SUCCESSOR B is accepted on the same adopted stream and REPLACES A in the slot. The slot
+            // read below is gated on B's handler having RETURNED (the runner's prompt entry can precede
+            // InstallActiveAssignment).
+            var readsBeforeB = await plan.CapturePostHandlerBaselineAsync();
+            plan.Push(ResultAssignment("task-B"));
+            await plan.Runner.PromptStarted("task-B").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.Runner.BridgeInstalled(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeB);
+            var ownerB = GetActiveAssignment(plan.Service);
+            Assert.NotSame(ownerA, ownerB);
+            Assert.Equal("task-B", GetOwnerTaskId(ownerB));
+            Assert.Equal(CarryStates.Open, GetAssignmentState(ownerB));
+
+            // A's OWN adoption is still live — the premise of the Delivered-after-carried rule.
+            Assert.Same(adopted, GetAdoptedConnection(plan.Service));
+            Assert.False(adopted.IsRetired);
+            Assert.True(plan.Connections[0].IsRetired);
+
+            // A's RETAINED ADAPTER still follows A's adoption onto connection 2.
+            await bridgeA.ReportProgressAsync(
+                    "task-A", "delivered", "still on my own adoption", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var progressA = Assert.Single(plan.CurrentRequests.ToolRequests);
+            Assert.Equal("report_progress", progressA.ToolRequest.ToolName);
+            Assert.Equal("task-A", progressA.ToolRequest.TaskId);
+
+            await sessionsA
+                .SaveSessionAsync("goal-task-A:coder", """{"turn":9}""", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, plan.Invokers[1].SaveCount);
+            Assert.Equal("goal-task-A:coder", plan.Invokers[1].LastSaveSessionId);
+
+            // NOTHING went to A's retired captured connection 1.
+            Assert.Empty(plan.Requests[0].ToolRequests);
+            Assert.Equal(0, plan.Invokers[0].SaveCount);
+
+            plan.Runner.Release("task-B");
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (i-b) A DELIVERED CARRIED TASK'S ADAPTER NEVER FOLLOWS A SUCCESSOR'S LATER ADOPTION. Task A is
+    /// carried, adopted on connection 2 and delivered. Successor B is accepted on connection 2, is
+    /// itself carried when stream 2 is lost, and is adopted on connection 3. A is still
+    /// Delivered-after-carried, but connection 3 is B's adoption, NOT A's — so A's retained dependency
+    /// must NOT reach connection 3; it falls back to A's captured (retired) connection 1 and fails
+    /// with the EXISTING disconnected error. B's own dependency reaching connection 3 is the positive
+    /// control.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: this is the vector that needs the adoption's OWNER identity, not just the
+    /// adapter's own state (A's state alone says "follow"). Dropping the owner check — or any resolver
+    /// that follows "the current adoption" regardless of whose it is — sends A's calls to connection 3,
+    /// and the disconnected and connection-3 emptiness assertions fail by name.
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_ib_DeliveredTasksAdapter_NeverFollowsASuccessorsLaterAdoption()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            // A is carried by stream 1's loss, adopted on connection 2 and delivered there.
+            await plan.PushAssignmentAsync("task-A");
+            var bridgeA = await plan.Runner.BridgeInstalled(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var sessionsA = Assert.IsAssignableFrom<ISessionClient>(bridgeA);
+            var ownerA = GetActiveAssignment(plan.Service);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var adopted2 = await plan.WaitForPublishedConnectionAsync();
+            await WaitForAdoptedConnectionAsync(plan.Service, "The second run must publish A's adoption.");
+            plan.Runner.Release("task-A");
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "A's carried delivery must run.");
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(ownerA));
+
+            // SUCCESSOR B is accepted on connection 2 and is still running when stream 2 is lost. Both
+            // B's slot read here AND the stream loss below are gated on B's handler having RETURNED:
+            // ending the stream while that handler was still running would race the very publish the
+            // assertions below depend on.
+            var readsBeforeB = await plan.CapturePostHandlerBaselineAsync();
+            plan.Push(ResultAssignment("task-B"));
+            await plan.Runner.PromptStarted("task-B").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var bridgeB = await plan.Runner.BridgeInstalled(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeB);
+            var ownerB = GetActiveAssignment(plan.Service);
+            Assert.NotSame(ownerA, ownerB);
+            Assert.Equal("task-B", GetOwnerTaskId(ownerB));
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Same(ownerB, GetActiveAssignment(plan.Service));
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(ownerB));
+            Assert.True(adopted2.IsRetired);
+
+            // RUN 3 ADOPTS B (it claims task-B, not task-A).
+            plan.StartThirdRun(RegisterResponseFor(adopted: true));
+            var adopted3 = await plan.WaitForPublishedConnectionAsync();
+            Assert.Same(
+                adopted3,
+                await WaitForAdoptedConnectionAsync(plan.Service, "The third run must publish B's adoption."));
+            Assert.Equal("task-B", Assert.Single(plan.Invokers[2].Registers).CurrentTaskId);
+
+            // A's RETAINED ADAPTER is Delivered-after-carried, yet connection 3 is not ITS adoption.
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(ownerA));
+            var progressFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => bridgeA.ReportProgressAsync(
+                    "task-A", "stale", "must not follow B's adoption", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, progressFailure.Message);
+            var saveFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => sessionsA.SaveSessionAsync(
+                    "goal-task-A:coder", """{"turn":1}""", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, saveFailure.Message);
+            Assert.Empty(plan.CurrentRequests.ToolRequests);
+            Assert.Equal(0, plan.Invokers[2].SaveCount);
+
+            // POSITIVE CONTROL — B's OWN adapter follows B's adoption onto connection 3.
+            await bridgeB.ReportProgressAsync(
+                    "task-B", "adopted", "B follows its own adoption", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal("task-B", Assert.Single(plan.CurrentRequests.ToolRequests).ToolRequest.TaskId);
+
+            plan.Runner.Release("task-B");
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE READ-BASELINE CONTRACT on the EXACT path the reviewer identified as a counterexample
+    /// (Acceptance_g's second run): the run's first write lands BEFORE the message loop enters its
+    /// first read, so a baseline sampled at that instant could be zero — and then "baseline + 1" would
+    /// be satisfied by the INITIAL read instead of the read re-armed after the pushed assignment's
+    /// handler returned.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE WINDOW IS FORCED, NEVER LEFT TO THE RACE. The fake's write-count signal fires INSIDE the
+    /// initial write, so on a typical schedule the loop has already entered its first read by the time
+    /// the test resumes — and then even the OLD sample-immediately form would see a read in flight and
+    /// pass. The test therefore arms the stream's initial-write HOLD before releasing the runner
+    /// preparation: run 2's initial Ready is recorded and PARKED, production cannot reach its first
+    /// read until the test releases it, and the capture is started inside that window. Assertion (0)
+    /// then requires the capture to still be PENDING with zero reads started, which the old form (it
+    /// returns 0 at once) fails by name on every schedule.
+    /// </para>
+    /// <para>
+    /// After the release, the three assertions are the contract that closes that hole, and together
+    /// they are DISCRIMINATING against the old form:
+    /// </para>
+    /// <list type="number">
+    ///   <item><description>
+    ///   the captured baseline is at least 1 — <see cref="ReconnectPlan.CapturePostHandlerBaselineAsync"/>
+    ///   will not return until the current run has a read in flight, so a zero baseline (the unsound
+    ///   value the old form could sample, and which the helper now rejects by name) cannot be used;
+    ///   </description></item>
+    ///   <item><description>
+    ///   the capture itself starts NO new read: the value it returns is the SAME pending read, which is
+    ///   what makes it a baseline rather than an already-satisfied threshold;
+    ///   </description></item>
+    ///   <item><description>
+    ///   after the push, the gate's threshold (baseline + 1) is met by a read that is STRICTLY NEWER
+    ///   than the baseline — so the pending initial read alone could never have satisfied it.
+    ///   </description></item>
+    /// </list>
+    /// </remarks>
+    [Fact]
+    public async Task RetargetCallTime_r_ReadBaseline_EstablishesTheInitialPendingReadBeforeSampling()
+    {
+        var plan = ReconnectPlan.StartAsync(
+            "task-A", register2Adopted: false, holdReportComplete: true);
+        var connectEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowConnect = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            // RUN 1: an assignment is carried so run 2 is the drain-then-connect shape below.
+            await plan.PushAssignmentAsync("task-A");
+            plan.Runner.Release("task-A");
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+
+            // RUN 2: exactly Acceptance_g's run-2 shape — the runner preparation is SUSPENDED, then the
+            // run's first write (the initial Ready) is awaited, which is the instant the reviewer named.
+            plan.Runner.ConnectEnteredHook = async _ =>
+            {
+                connectEntered.TrySetResult();
+                await allowConnect.Task;
+            };
+            plan.StartSecondRun(RegisterResponseFor(adopted: false));
+            await connectEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE FORCED WINDOW. Before the runner preparation is released, arm the stream's
+            // initial-write hold: run 2's initial Ready is then RECORDED and PARKED inside the fake.
+            // Production awaits that write BEFORE its message loop creates the first pending read, so
+            // while it is held the run is provably in the write-before-first-read window — on EVERY
+            // schedule, including the one where the first read would otherwise have won the race.
+            plan.CurrentRequests.ArmInitialWriteHold();
+            allowConnect.TrySetResult();
+            await plan.CurrentRequests.InitialWriteHeld
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.WaitForInitialWriteAsync();
+
+            // (0) INSIDE THE WINDOW: the write is recorded and still pending, and NO read has started.
+            // A baseline sampled here would be ZERO — the unsound value — so the helper must NOT
+            // complete yet: it has to wait for the initial read to be established. The old
+            // sample-immediately form completes at once with 0 and fails HERE by name.
+            Assert.Equal(
+                WorkerMessage.PayloadOneofCase.Ready,
+                Assert.Single(plan.CurrentRequests.Writes).PayloadCase);
+            Assert.Equal(0, plan.Responses.ReadsStarted);
+            var capture = plan.CapturePostHandlerBaselineAsync();
+            Assert.False(
+                capture.IsCompleted,
+                "The baseline capture completed while run 2's initial Ready was still held and no read "
+                + "had started: it sampled the counter before establishing the initial pending read "
+                + $"(reads started {plan.Responses.ReadsStarted}).");
+            Assert.Equal(0, plan.Responses.ReadsStarted);
+
+            // RELEASE THE WRITE: the loop then enters its first read, which is what the capture waits for.
+            plan.CurrentRequests.ReleaseInitialWrite();
+
+            // (1) THE ESTABLISHED BASELINE: at least one read is in flight, and the helper's own
+            // establishment is what guarantees it rather than the fixture's luck.
+            var baseline = await capture;
+            Assert.True(
+                baseline >= 1,
+                "The helper must establish the current run's initial pending read before sampling: a "
+                + $"zero baseline cannot prove a handler return (observed {baseline}).");
+
+            // (2) IT IS A PENDING READ, NOT AN ALREADY-RE-ARMED ONE: capturing starts no new read.
+            Assert.Equal(baseline, plan.Responses.ReadsStarted);
+
+            // (3) THE POST-HANDLER RE-ARM IS STRICTLY NEWER THAN THE BASELINE.
+            await plan.PushAssignmentAsync("task-B");
+            Assert.True(
+                plan.Responses.ReadsStarted > baseline,
+                "The read the handler-return gate waited for must be STRICTLY newer than the baseline: "
+                + $"baseline {baseline}, reads started {plan.Responses.ReadsStarted}.");
+            Assert.Equal("task-B", GetOwnerTaskId(GetActiveAssignment(plan.Service)));
+
+            plan.Runner.Release("task-B");
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.WaitForAssignmentReadyCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal("task-B", Assert.Single(plan.CurrentRequests.Completes).Complete.TaskId);
+        }
+        finally
+        {
+            allowConnect.TrySetResult();
+            plan.CurrentRequests.ReleaseInitialWrite();
+            plan.Runner.ConnectEnteredHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE INITIAL-WRITE HOLD IS RELEASED BY <c>CompleteAsync</c>, so the fake is safe as a SOLE
+    /// shutdown path. An UNARMED stream keeps its previous no-op behavior exactly; an ARMED stream
+    /// parks its first write until the hold is satisfied, and closing the client's half of the stream
+    /// satisfies it — so a future fixture that only calls <c>CompleteAsync</c> can never leave that
+    /// write (and the run awaiting it) parked forever.
+    /// </summary>
+    /// <remarks>
+    /// Deterministic throughout: the parked write is observed through the fake's own
+    /// <c>InitialWriteHeld</c> TCS and released by <c>CompleteAsync</c> alone — no
+    /// <c>ReleaseInitialWrite</c>, no <c>ReleaseAll</c>, no disposal, no sleeps and no polling. The
+    /// unarmed half is the additive-hardening proof: it fails if <c>CompleteAsync</c> ever released
+    /// something that was never armed, and the armed half fails if it stopped releasing at all.
+    /// </remarks>
+    [Fact]
+    public async Task CarryRequestStream_CompleteAsync_ReleasesAnArmedInitialWriteHold()
+    {
+        var requests = new CarryRequestStream();
+
+        // UNARMED: nothing is held, and CompleteAsync is the no-op it always was.
+        Assert.False(requests.IsInitialWriteHeld);
+        await requests.CompleteAsync();
+        Assert.False(requests.IsInitialWriteHeld);
+
+        // ARMED: the stream's FIRST write is recorded and PARKED inside the fake.
+        requests.ArmInitialWriteHold();
+        var initialWrite = requests.WriteAsync(new WorkerMessage
+        {
+            WorkerId = "worker-reconnect-a",
+            Ready = new WorkerReady(),
+        });
+
+        await requests.InitialWriteHeld.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        Assert.True(requests.IsInitialWriteHeld, "The armed hold must park the first write.");
+        Assert.False(initialWrite.IsCompleted, "The held write must still be pending.");
+        Assert.Equal(
+            WorkerMessage.PayloadOneofCase.Ready,
+            Assert.Single(requests.Writes).PayloadCase);
+
+        // COMPLETE ALONE RELEASES IT: the write completes with no other releaser involved.
+        await requests.CompleteAsync();
+        Assert.False(requests.IsInitialWriteHeld, "CompleteAsync must release the armed hold.");
+        await initialWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        Assert.True(initialWrite.IsCompletedSuccessfully);
+    }
+
     // ── The multi-run reconnect plan ──────────────────────────────────────────
 
     /// <summary>
@@ -3132,6 +4392,15 @@ public sealed class WorkerServiceReconnectSurvivalTests
 
             var plan = new ReconnectPlan(service, runner, gitRestore);
             plan.StartNextRun(firstResponse);
+
+            // THE RUN-1 STARTUP MILESTONE. The run has been STARTED above, but its registration
+            // and initial-Ready writes are asynchronous: a test that observes anything BEFORE
+            // they land would race correct production behavior — the classic symptoms being an
+            // eager-provisioning fetch count that is still 0 (RetargetCallTime_p's baseline) or
+            // an adopted run that has not published its adoption yet. Gating on the CURRENT
+            // run's first write makes the plan's every later observation read settled state,
+            // exactly like the handler-return milestone below gates per-message work.
+            plan.WaitForInitialWriteAsync().GetAwaiter().GetResult();
             return plan;
         }
 
@@ -3252,20 +4521,176 @@ public sealed class WorkerServiceReconnectSurvivalTests
             PublishedConnections[^1].WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         /// <summary>
-        /// Pushes a genuine assignment on the CURRENT run's stream and returns its execution
-        /// task once the body has entered.
+        /// PUSHES one assignment on the CURRENT run's stream and returns its execution task once —
+        /// and only once — the ASSIGNMENT HANDLER for it has RETURNED.
         /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THE POST-HANDLER MILESTONE IS THE ONLY SOUND GATE HERE. Production starts the assignment's
+        /// execution task (whose runner entry these fixtures observe) and only THEN builds the owned
+        /// tasks and calls <c>InstallActiveAssignment</c>, all still INSIDE the handler and BEFORE the
+        /// message loop re-arms its next read. So an observation made on the runner's entry can
+        /// legitimately find the ownership slot EMPTY — the replacement drain has cleared the
+        /// predecessor and the successor is not installed yet — and reading or acting on the slot at
+        /// that instant would race correct production behavior.
+        /// </para>
+        /// <para>
+        /// <see cref="ChannelResponseReader.ReadStarted"/> for the NEXT read is exactly the
+        /// post-handler milestone: the loop re-arms that read only after the assignment handler
+        /// returns, so once read N+1 has STARTED, the handler for message N has provably completed —
+        /// including <c>InstallActiveAssignment</c>. Every caller of this helper therefore reads the
+        /// ownership slot, observes the assignment's adapter, or ends the stream only after the
+        /// successor is published, which is the happens-before relation the old runner-entry gate was
+        /// missing.
+        /// </para>
+        /// <para>
+        /// The read counter is captured BEFORE the push — but ONLY after the current run's INITIAL
+        /// pending read is ESTABLISHED (see <see cref="CapturePostHandlerBaselineAsync"/>). That
+        /// establishment is what makes the threshold sound on EVERY caller: "baseline + 1" is the read
+        /// re-armed after THIS message's handler return only when a read was ALREADY in flight when the
+        /// baseline was sampled. Production issues the run's first write (the registration/initial
+        /// Ready) BEFORE the loop enters its first read, so a caller that sampled the counter straight
+        /// after that write could observe no reads in flight and then await the INITIAL read instead of
+        /// the post-handler one — exactly the hole this gate closes.
+        /// </para>
+        /// <para>
+        /// A handler that faults never re-arms a read, so the bounded <see cref="Failsafe"/> turns that
+        /// into a named failure instead of a hang.
+        /// </para>
+        /// </remarks>
         internal async Task<Task> PushAssignmentAsync(string taskId)
         {
+            var readsBeforePush = await CapturePostHandlerBaselineAsync();
             Responses.Push(ResultAssignment(taskId));
-            await Runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await WaitForAssignmentHandlerReturnedAsync(readsBeforePush);
+
+            // THE EXECUTOR-SETTLED MILESTONE, on top of the handler-return one. The handler
+            // guarantees the assignment is INSTALLED, but its execution task has only been
+            // STARTED: whether the body has already entered (and how far) is the executor's own
+            // scheduling. A test that immediately releases the runner or asserts on the
+            // execution's progress would therefore race the body's entry. Gating on the
+            // assignment's PROMPT-STARTED signal — the runner's SendPromptAsync entry, completed
+            // by the body itself — makes the release and the later assertions deterministic:
+            // the executor is provably parked inside its gated prompt before anything acts.
+            await Runner.PromptStarted(taskId)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             return GetActiveExecution(Service);
         }
+
+        /// <summary>
+        /// CAPTURES THE READ BASELINE FOR ONE PUSH: it first ESTABLISHES that the CURRENT run's stream
+        /// has a pending read IN FLIGHT, and only then samples the read count.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// WHY THE ESTABLISHMENT COMES FIRST. Production re-arms its single pending read only AFTER a
+        /// dispatched message's handler returns, so "one more read than the baseline" proves the
+        /// handler returned — but only if the baseline was sampled while a read was ALREADY pending.
+        /// The run's registration/initial-Ready write is issued before the message loop enters its
+        /// first read, so a sample taken straight after that write can observe no reads in flight and
+        /// then await the INITIAL read rather than the post-handler one. Waiting for read #1 of the
+        /// CURRENT run first removes that hole for every caller: each run wires its own reader through
+        /// the stream factory, so that counter starts at zero for every run.
+        /// </para>
+        /// <para>
+        /// A run that never opens a stream (a rejected registration, a failed stream open) never starts
+        /// a read, and no caller pushes an assignment on such a run — those tests assert the run's own
+        /// outcome instead. If one ever did, the bounded <see cref="Failsafe"/> names the missing
+        /// milestone instead of hanging.
+        /// </para>
+        /// </remarks>
+        /// <returns>The read count, with the current run's initial read provably in flight.</returns>
+        internal async Task<int> CapturePostHandlerBaselineAsync()
+        {
+            await Responses.ReadStarted(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            return Responses.ReadsStarted;
+        }
+
+        /// <summary>
+        /// WAITS for the CURRENT run's assignment handler to RETURN — see
+        /// <see cref="PushAssignmentAsync"/> for why <c>ReadStarted</c> is the milestone. Used by the
+        /// successor tests, which push their messages directly so they can interleave their own gates.
+        /// </summary>
+        /// <param name="readsBeforePush">
+        /// The baseline from <see cref="CapturePostHandlerBaselineAsync"/>, captured with a read already
+        /// in flight: the awaited threshold is one MORE than it, i.e. the re-arm that only happens after
+        /// that handler returned.
+        /// </param>
+        /// <exception cref="Xunit.Sdk.XunitException">
+        /// <paramref name="readsBeforePush"/> is zero, meaning the caller sampled the counter before any
+        /// read was pending. The baseline would NOT prove a handler return, so the mistake is reported
+        /// by name instead of silently weakening the gate.
+        /// </exception>
+        internal Task WaitForAssignmentHandlerReturnedAsync(int readsBeforePush)
+        {
+            if (readsBeforePush < 1)
+            {
+                throw new Xunit.Sdk.XunitException(
+                    "The read baseline was sampled before the current run had a pending read: sample it " +
+                    "with CapturePostHandlerBaselineAsync, which establishes the initial read first. " +
+                    "Otherwise the awaited threshold is the INITIAL read rather than the one re-armed " +
+                    "after this assignment's handler returned.");
+            }
+
+            return Responses.ReadStarted(readsBeforePush + 1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+
+        /// <summary>
+        /// WAITS for the CURRENT run's FIRST WRITE to land — the registration/initial-Ready write a
+        /// non-adopted run issues right after publication. This is the RUN-STARTUP milestone: a
+        /// counted-write gate (no sleep, no polling), it makes every later observation in a test
+        /// read state that production has already settled instead of racing the run's asynchronous
+        /// startup. A run that is supposed to write an initial Ready always does, so the bounded
+        /// <see cref="Failsafe"/> turns a stalled startup into a named failure instead of a hang.
+        /// </summary>
+        /// <remarks>
+        /// ADOPTED runs never write an initial Ready — their first write is the carried delivery's —
+        /// so callers must only await this on a run wired with an ordinary (non-adopted) register
+        /// response, which is exactly what <see cref="StartFresh"/> wires.
+        /// </remarks>
+        internal Task WaitForInitialWriteAsync() =>
+            CurrentRequests.WaitForWriteCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         internal void Push(OrchestratorMessage message) => Responses.Push(message);
 
         /// <summary>Ends the CURRENT run's stream: the controlled stream loss.</summary>
         internal void CompleteStream() => Responses.TryComplete();
+
+        /// <summary>
+        /// PUBLISHES a standalone second connection UNDER the RUNNING run — no new run is started, so
+        /// the service's single-run guard is respected. This is the exact move the sibling binding
+        /// fixture makes to prove that a NON-carried assignment's captured dependency ignores a later
+        /// publication. The connection is recorded in <see cref="Invokers"/>,
+        /// <see cref="Requests"/> and <see cref="Connections"/> like a run's own, so the ordinary
+        /// per-connection observables apply.
+        /// </summary>
+        internal WorkerConnection PublishStandaloneConnection()
+        {
+            var requests = new CarryRequestStream();
+            requests.ReleaseAll();
+            var responses = new ChannelResponseReader();
+            responses.TryComplete();
+            var invoker = new ScriptedInvoker(RegisterFor(AssignedId));
+            var connection = new WorkerConnection(
+                AssignedId,
+                new HiveOrchestrator.HiveOrchestratorClient(invoker),
+                BuildFaultingStream(requests, responses),
+                provisionerOverride: null,
+                includeProductionProvisioner: false,
+                provisioningEnvironment: null,
+                completionReceiptAckEnabled: false,
+                completionReadyRequired: false);
+
+            Invokers.Add(invoker);
+            Requests.Add(requests);
+            Readers.Add(responses);
+            Connections.Add(connection);
+            PublishedConnections.Add(Task.FromResult(connection));
+            Service.PublishConnection(connection);
+            return connection;
+        }
 
         /// <summary>Joins the CURRENT run and asserts its clean outcome.</summary>
         internal async Task<WorkerRunOutcome> JoinRunAsync()
@@ -3330,6 +4755,57 @@ public sealed class WorkerServiceReconnectSurvivalTests
         internal int ConnectCount => Volatile.Read(ref _connectCount);
         private int _disposeCount;
         internal int DisposeCount => Volatile.Read(ref _disposeCount);
+
+        /// <summary>
+        /// THE DEPENDENCY THE REAL ASSIGNMENT SETUP INSTALLED, completed at the executor's own
+        /// <c>SetToolBridge</c> call. A <c>null</c> install is a production regression, so it is
+        /// surfaced as a failure rather than silently captured.
+        /// </summary>
+        internal Task<IToolCallBridge> BridgeCaptured => _bridgeCaptured.Task;
+
+        private readonly TaskCompletionSource<IToolCallBridge> _bridgeCaptured =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// THE N-TH BRIDGE DEPENDENCY the real assignment setup installed (0-based, one per executed
+        /// assignment), completed at that executor's own <c>SetToolBridge</c> call. The successor
+        /// tests use it to hold the PREDECESSOR's adapter and the SUCCESSOR's adapter side by side.
+        /// </summary>
+        internal Task<IToolCallBridge> BridgeInstalled(int index)
+        {
+            lock (_gate)
+            {
+                if (!_bridgesInstalled.TryGetValue(index, out var source))
+                {
+                    source = new TaskCompletionSource<IToolCallBridge>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _bridgesInstalled[index] = source;
+                }
+
+                return source.Task;
+            }
+        }
+
+        private readonly Dictionary<int, TaskCompletionSource<IToolCallBridge>> _bridgesInstalled = [];
+        private int _bridgeInstallCount;
+
+        /// <summary>
+        /// EVERY provisioning callback <c>WorkerService</c> installed on this runner, in order —
+        /// the observable that makes the carried callback's installation, its survival across a run
+        /// boundary, and the ordinary per-run install/detach directly checkable.
+        /// </summary>
+        internal IReadOnlyList<Func<string?, CancellationToken, Task>?> Provisioners
+        {
+            get { lock (_gate) return [.. _provisioners]; }
+        }
+
+        /// <summary>The callback currently installed, or <c>null</c> when the last call detached it.</summary>
+        internal Func<string?, CancellationToken, Task>? CurrentProvisioner
+        {
+            get { lock (_gate) return _provisioners.Count == 0 ? null : _provisioners[^1]; }
+        }
+
+        private readonly List<Func<string?, CancellationToken, Task>?> _provisioners = [];
 
         internal IReadOnlyList<string> EventLog
         {
@@ -3409,7 +4885,32 @@ public sealed class WorkerServiceReconnectSurvivalTests
         public WorkerReport? LastWorkerReport => null;
         public void ClearTestReport() { }
         public void ClearWorkerReport() { }
-        public void SetToolBridge(IToolCallBridge? bridge) { }
+
+        /// <summary>
+        /// Records the installed bridge dependency — the SAME seam the sibling binding fixture uses —
+        /// so a test can drive the REAL adapter the assignment's executor received.
+        /// </summary>
+        public void SetToolBridge(IToolCallBridge? bridge)
+        {
+            var installed = bridge ?? throw new InvalidOperationException(
+                "The assignment setup must install a non-null bridge dependency.");
+            _bridgeCaptured.TrySetResult(installed);
+
+            TaskCompletionSource<IToolCallBridge> source;
+            lock (_gate)
+            {
+                var index = _bridgeInstallCount++;
+                if (!_bridgesInstalled.TryGetValue(index, out source!))
+                {
+                    source = new TaskCompletionSource<IToolCallBridge>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _bridgesInstalled[index] = source;
+                }
+            }
+
+            source.TrySetResult(installed);
+        }
+
         public void SetCurrentTaskId(string? taskId) => _taskId = taskId;
         public void SetCurrentGoalId(string? goalId) { }
         public void SetTesterReport(string? report) { }
@@ -3421,7 +4922,12 @@ public sealed class WorkerServiceReconnectSurvivalTests
         public void SetCompactionModel(string? model) { }
         public void SetCompactionMaxTokens(int? maxTokens) { }
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
-        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
+
+        /// <summary>Records the installed provisioning callback, exactly as production installed it.</summary>
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner)
+        {
+            lock (_gate) _provisioners.Add(provisioner);
+        }
 
         internal Func<CancellationToken, Task>? ConnectEnteredHook { get; set; }
 
