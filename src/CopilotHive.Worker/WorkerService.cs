@@ -154,6 +154,38 @@ public sealed class WorkerService(
     internal Func<Task>? CarriedBeforeReadyClaimHook { get; set; }
 
     /// <summary>
+    /// TEST SEAM — the instant INSIDE <see cref="StartOrdinaryReadyWrite"/> AFTER the ordinary
+    /// readiness has been SETTLED (the slot's CAS was won and the assignment's shared claim
+    /// consumed) and IMMEDIATELY BEFORE the ordinary <c>WorkerReady</c> write is started.
+    /// <c>null</c> in production, where the instant contains nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// It exists so a test can hold the ordinary Ready exactly between its SETTLEMENT and its write
+    /// — the instant at which the stream loss can retire the very connection that write belongs to
+    /// — without any timer, sleep or artificial barrier in production code. It is awaited, so a
+    /// blocking hook holds the write exactly there; it is never invoked when unset, and it is
+    /// awaited at that one place only, so a settle that loses the CAS or the shared claim (a Carried
+    /// or already-ReadyStarted assignment) never reaches it.
+    /// </remarks>
+    internal Func<Task>? OrdinaryReadyBeforeSendHook { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — the instant INSIDE <see cref="ReportAssignmentAsync"/> immediately BEFORE the
+    /// assignment's ordinary <c>Complete</c> write. <c>null</c> in production, where the instant
+    /// contains nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// It exists so a test can hold the reporter exactly before that write — the boundary at which
+    /// the stream can be lost while the completion has not been written at all — without any timer,
+    /// sleep or artificial barrier in production code. It is awaited, so a blocking hook holds the
+    /// reporting exactly there, and it is inside the attempt whose termination
+    /// <see cref="OrdinaryReadySlot.PublishCompleteWriteTerminated"/> publishes, so holding it
+    /// changes nothing else about that attempt. It is never invoked when unset, and it is awaited
+    /// only when a terminal result exists (an assignment with no result writes no Complete).
+    /// </remarks>
+    internal Func<Task>? ReportBeforeCompleteSendHook { get; set; }
+
+    /// <summary>
     /// THE CLOCK SEAM FOR COMPLETION RETRANSMISSION — the ONLY test hook this behavior adds, and the
     /// ONLY clock production reads for the retry wait. It defaults to
     /// <see cref="System.TimeProvider.System"/>, is read exactly ONCE per assignment (the value is
@@ -3443,15 +3475,31 @@ public sealed class WorkerService(
     /// assignment's ORIGINAL connection object and its ORIGINAL stream token.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The ORIGINAL write task is returned, not a continuation of it, so the slot retains the very
     /// task every ownership transition joins and the write is never abandoned. Nothing awaits it
     /// here: its failure is NONFATAL, exactly as the previous ordinary-Ready attempt's treatment
     /// was — an ownership transition joins it and reports any fault through the EXISTING sanitized
     /// drain diagnostics, so it can never replace a reader/handler primary or a deferred
     /// cancellation-callback failure.
+    /// </para>
+    /// <para>
+    /// IT RETURNS AT ITS FIRST INCOMPLETE AWAIT, which is what keeps the caller's SYNCHRONOUS lock
+    /// semantics intact: the slot invokes this INSIDE its lock, and the two awaits below are the
+    /// optional TEST SEAM's instant and the write itself. An unset seam whose write has not yet
+    /// completed on its first await already yields control back to the caller — so the slot's
+    /// settlement, claim and retained write all happen under that lock exactly as they did when
+    /// this method was a plain expression body, while the actual transport write stays outside it.
+    /// </para>
     /// </remarks>
-    private Task StartOrdinaryReadyWrite(WorkerConnection connection, CancellationToken streamToken) =>
-        SendWorkerReady(connection, streamToken);
+    private async Task StartOrdinaryReadyWrite(WorkerConnection connection, CancellationToken streamToken)
+    {
+        // The TEST SEAM's instant: AFTER the settlement (CAS + claim) and BEFORE the write.
+        if (OrdinaryReadyBeforeSendHook is { } beforeSend)
+            await beforeSend();
+
+        await SendWorkerReady(connection, streamToken);
+    }
 
     /// <summary>
     /// THE COMPLETION-RECEIPT ACK CASE. It records — idempotently, on the assignment the loop still
@@ -4089,6 +4137,11 @@ public sealed class WorkerService(
                 // is never handed to the writer.
                 try
                 {
+                    // The TEST SEAM's instant: immediately BEFORE this Complete write, still
+                    // INSIDE the attempt whose termination is published below.
+                    if (ReportBeforeCompleteSendHook is { } beforeCompleteSend)
+                        await beforeCompleteSend();
+
                     await SendAsync(
                         connection,
                         retry is null

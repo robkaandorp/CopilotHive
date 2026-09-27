@@ -2300,6 +2300,55 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     /// <summary>
+    /// THE NO-RESULT PRODUCER DOUBLE for the carried-delivery vector: a
+    /// <see cref="WorkerConfigProvisioner"/> whose ONE provisioning fetch PARKS until it is released
+    /// and then fails with a non-<see cref="Grpc.Core.RpcException"/> error.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The provisioning fetch is the FIRST thing an assignment body does that can be parked for an
+    /// unbounded time, so it is the deterministic way to hold a body INSIDE its execution without any
+    /// timer: the body is parked before any terminal result can exist, and releasing it makes the body
+    /// terminate NORMALLY (its own failure handler contains the error) with the result holder still
+    /// EMPTY — no completion is ever fabricated.
+    /// </para>
+    /// <para>
+    /// The provisioner is installed through <see cref="WorkerService.TestProvisioner"/> BEFORE the
+    /// first run's connection exists, because a connection captures that instance at construction; a
+    /// later assignment of the property could not influence a body already running against the
+    /// captured one.
+    /// </para>
+    /// </remarks>
+    private sealed class ParkingProvisioner
+    {
+        private readonly TaskCompletionSource _entered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Completes once the assignment body has entered its provisioning fetch.</summary>
+        internal Task Entered => _entered.Task;
+
+        /// <summary>Releases the parked fetch; it then FAILS, so no result is ever produced.</summary>
+        internal void Release() => _release.TrySetResult();
+
+        /// <summary>The provisioner the service hands to its first connection.</summary>
+        internal WorkerConfigProvisioner Provisioner { get; }
+
+        internal ParkingProvisioner()
+        {
+            Provisioner = new WorkerConfigProvisioner(
+                "worker-reconnect",
+                async (_, _) =>
+                {
+                    _entered.TrySetResult();
+                    await _release.Task;
+                    throw new InvalidOperationException("fixture provisioning refused");
+                });
+        }
+    }
+
+    /// <summary>
     /// A fake <see cref="CallInvoker"/> answering the unary RPCs the accepted-registration
     /// lifecycle reaches, recording the Register requests so the reconnect tests (round 2) can
     /// assert the sent <c>current_task_id</c> per run. Any other call is a fixture bug.
@@ -4312,6 +4361,959 @@ public sealed class WorkerServiceReconnectSurvivalTests
         Assert.True(initialWrite.IsCompletedSuccessfully);
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // THE CARRIED-DELIVERY CONTRACT'S PRIORITY RACES. Every vector below is driven by the
+    // ORDERING of the loop's own events — the ordinary Ready settlement, the reporter's
+    // Complete attempt, the stream loss that carries the assignment, the adopted run's
+    // carried delivery and a matching CancelTask — through deterministic TCS gates only.
+    // No sleep, no polling and no true thread race is used as an ordering device.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// (a3) THE OLD-STREAM BOUNDARY RACE. The reporter is HELD immediately before its Complete
+    /// write; the stream loss is observed and the connection retired while it is held; only then is
+    /// the reporter released. Its Complete attempt therefore fails with the EXISTING disconnected
+    /// error — NOTHING is written to the retired original stream — the Open assignment is carried,
+    /// and the delivery happens EXACTLY ONCE on the adopted second stream.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: the hook-entry assertion fails by name if the reporter never reaches the
+    /// pre-write instant, and the emptiness assertions fail if the post-gate retirement check is
+    /// removed — the fake records a write even after its stream was disposed, so a write that
+    /// slipped through would be observed rather than assumed away.
+    /// </remarks>
+    [Fact]
+    public async Task PriorityRace_a3_ReporterHeldBeforeCompleteSend_EofRetiresThenTheHeldWriteFailsDisconnected()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completesAtHook = -1;
+        Task? reporting = null;
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            reporting = GetActiveReporting(plan.Service);
+
+            // INSTALL BEFORE THE REPORTER CAN REACH THE HOOK: the hook is awaited only after the body
+            // terminates, and the body is still parked in its gated prompt — so the arm can never
+            // race the very instant it must hold.
+            plan.Service.ReportBeforeCompleteSendHook = () =>
+            {
+                completesAtHook = plan.Requests[0].Completes.Count;
+                hookEntered.TrySetResult();
+                return hookRelease.Task;
+            };
+
+            // THE REPORTER RUNS TO THE HOOK AND PARKS THERE, before its Complete write.
+            plan.Runner.Release("task-A");
+            await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(0, completesAtHook);
+
+            // THE STREAM LOSS: EOF is observed, the connection retired, and the still-Open assignment
+            // carried — all while the reporter is HELD before its Complete write.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            await WaitForRetiredAsync(
+                plan.Connections[0], "The early retire must run at the read-await site.");
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.False(reporting.IsCompleted, "The reporter must still be held at the hook.");
+
+            // RELEASE: the Complete attempt runs strictly AFTER the retirement, so it fails
+            // disconnected and writes NOTHING on the retired stream.
+            hookRelease.TrySetResult();
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must receive no Complete and no Ready");
+            Assert.NotNull(GetRetainedResult(plan.Service));
+
+            // THE DELIVERY: exactly ONE Complete and ONE assignment Ready, on the ADOPTED stream only.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal("task-A", Assert.Single(plan.CurrentRequests.Completes).Complete.TaskId);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must still receive nothing");
+            Assert.Single(plan.Requests[0].Writes); // run 1's own initial Ready
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+        }
+        finally
+        {
+            hookRelease.TrySetResult();
+            plan.Service.ReportBeforeCompleteSendHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (e1) THE ORDINARY READY SETTLES AND ITS WRITE COMPLETES <em>BEFORE</em> EOF: the Complete and
+    /// the assignment Ready both land on the ORIGINAL stream, the state is READYSTARTED (never
+    /// Carried), and EOF takes today's cancel-and-drain teardown — the slot ends EMPTY and no carried
+    /// delivery ever exists. This is the positive half of the Ready-vs-carry ordering: the hook IS
+    /// entered (the settlement reached its pre-send instant) exactly once.
+    /// </summary>
+    [Fact]
+    public async Task PriorityRace_e1_OrdinaryReadySettlesAndWritesBeforeEof_NotCarriedAndDrainedOnEof()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: false);
+        var hookEntries = new int[1];
+        try
+        {
+            plan.Service.OrdinaryReadyBeforeSendHook = () =>
+            {
+                Interlocked.Increment(ref hookEntries[0]);
+                return Task.CompletedTask;
+            };
+
+            var execution = await plan.PushAssignmentAsync("task-A");
+            plan.Runner.Release("task-A");
+
+            // THE ORDINARY READY WINS: the Complete lands, the response loop observes the published
+            // eligibility, settles the slot (CAS + shared claim) and its write lands on stream 1.
+            await plan.CurrentRequests.WaitForAssignmentReadyCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.ReadyStarted, GetAssignmentState(owner));
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(1, Volatile.Read(ref hookEntries[0]));
+
+            // THE WRITE ITSELF COMPLETES — BEFORE EOF. The fake RECORDING the Ready (the milestone
+            // above) is NOT the write completing: it fires inside WriteCoreAsync, before that returns
+            // and before StartOrdinaryReadyWrite's task completes. So the ONE retained readiness write
+            // — the very task the settlement started — is joined here, successfully, before the stream
+            // is ended. It is readable now: the slot assigns it inside the SAME lock its Write getter
+            // takes, and the fake can only record the Ready after the settlement invoked the start
+            // under that lock, so this read blocks until the assignment is published and can never
+            // observe an unset slot. Only a genuinely COMPLETED write satisfies the join; a write
+            // still outstanding keeps the stream open until it finishes (or fails by name).
+            var readinessWrite = GetRetainedReadinessWrite(
+                plan.Service, "The settled ordinary readiness write must be started and retained.");
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(
+                readinessWrite.IsCompletedSuccessfully,
+                "The ordinary Ready write must COMPLETE SUCCESSFULLY before EOF is signalled.");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // EOF strictly AFTER the completed write: ReadyStarted is mutually exclusive with Carried.
+            plan.CompleteStream();
+            await WaitForRetiredAsync(
+                plan.Connections[0], "The early retire must run at the read-await site.");
+            await plan.JoinRunAsync();
+
+            Assert.Equal(CarryStates.ReadyStarted, GetAssignmentState(owner));
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+            Assert.Null(GetCarriedDeliveryOrNull(plan.Service));
+            Assert.Null(GetHeartbeatTaskId(plan.Service));
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+
+            // THE SETTLEMENT IS NEVER REPEATED: the settled slot is not observable again, so the
+            // pre-send instant is entered exactly ONCE for this assignment.
+            Assert.Equal(1, Volatile.Read(ref hookEntries[0]));
+        }
+        finally
+        {
+            plan.Service.OrdinaryReadyBeforeSendHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (e2) THE ORDINARY READY WINS THE CAS AND THE SHARED CLAIM BUT IS HELD BEFORE ITS WRITE, AND
+    /// THEN THE STREAM IS LOST. The connection is retired BEFORE the hook is released, so the held
+    /// write fails with the EXISTING disconnected error: NO assignment Ready is written after the
+    /// retirement, the assignment is NOT carried (the ReadyStarted branch cancels and drains) and the
+    /// slot ends EMPTY — so the next run's RECORDED RegisterRequest claims NOTHING.
+    /// </summary>
+    /// <remarks>
+    /// The retained readiness write is read only AFTER the retirement milestone: the retirement is
+    /// published by the very loop that settled the slot, so it is causally after the settlement
+    /// returned — the read can never race the settle's own retention of the write.
+    /// </remarks>
+    [Fact]
+    public async Task PriorityRace_e2_OrdinaryReadyHeldThenEof_HeldWriteFailsDisconnectedAndNothingIsCarried()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: false);
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookEntries = new int[1];
+        try
+        {
+            plan.Service.OrdinaryReadyBeforeSendHook = () =>
+            {
+                Interlocked.Increment(ref hookEntries[0]);
+                hookEntered.TrySetResult();
+                return hookRelease.Task;
+            };
+
+            await plan.PushAssignmentAsync("task-A");
+            plan.Runner.Release("task-A");
+
+            // THE CAS, THE CHAIN AND THE CLAIM ARE ALL WON — and the write is HELD before any write.
+            await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.ReadyStarted, GetAssignmentState(owner));
+            Assert.Equal(1, GetReadyClaimState(GetOwnerReadyClaim(owner)));
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+
+            // EOF: the carry CAS LOSES (ReadyStarted is not Open).
+            plan.CompleteStream();
+            await WaitForRetiredAsync(
+                plan.Connections[0], "The early retire must run at the read-await site.");
+            var readinessWrite = GetRetainedReadinessWrite(
+                plan.Service, "The ordinary readiness write must be started and retained.");
+
+            // RELEASE ONLY NOW: the held write runs against a RETIRED connection and fails with the
+            // EXISTING disconnected error instead of writing on the dead stream.
+            hookRelease.TrySetResult();
+            await plan.JoinRunAsync();
+
+            Assert.True(readinessWrite.IsFaulted, "The held readiness write must fail disconnected.");
+            var fault = await Assert.ThrowsAsync<InvalidOperationException>(() => readinessWrite);
+            Assert.Equal(WorkerConnection.DisconnectedMessage, fault.Message);
+
+            // NOTHING was written on the original stream after the retirement, and no carry happened.
+            // The Complete is the TOLERATED pre-loss write (the settlement's hook only ever runs after
+            // that attempt terminated), so the stream holds exactly it and run 1's own initial Ready —
+            // the HELD readiness write never reached the fake at all.
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+            Assert.Single(plan.Requests[0].Completes); // the tolerated pre-loss Complete
+            Assert.Equal(2, plan.Requests[0].Writes.Count); // the initial Ready + that Complete
+            Assert.Equal(1, Volatile.Read(ref hookEntries[0]));
+            Assert.Equal(CarryStates.ReadyStarted, GetAssignmentState(owner));
+            Assert.Null(GetCarriedDeliveryOrNull(plan.Service));
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+            Assert.Null(GetHeartbeatTaskId(plan.Service));
+
+            // THE NEXT RUN CLAIMS NOTHING: the recorded RegisterRequest has an EMPTY current_task_id.
+            plan.StartNextRun(RegisterResponseFor(adopted: false));
+            await plan.CurrentRequests.WaitForWriteCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(string.Empty, plan.Invokers[^1].Registers[0].CurrentTaskId);
+        }
+        finally
+        {
+            hookRelease.TrySetResult();
+            plan.Service.OrdinaryReadyBeforeSendHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (e3) EOF IS OBSERVED <em>BEFORE</em> THE ORDINARY READY SETTLES (the executor is still
+    /// running): the assignment IS carried. When its reporting finishes afterwards — on the retired
+    /// original connection, so nothing is written there — no ordinary Ready is attempted on ANY
+    /// stream: the settlement CAS loses (Carried), the pre-send hook is never entered, and even a
+    /// settlement driven through the production entry point claims nothing. After adoption the task is
+    /// delivered with exactly ONE Complete and ONE Ready, both on stream 2.
+    /// </summary>
+    [Fact]
+    public async Task PriorityRace_e3_EofBeforeTheOrdinaryReadySettles_IsCarriedAndOnlyStreamTwoSeesTheDelivery()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        var hookEntries = new int[1];
+        Task? execution = null;
+        Task? reporting = null;
+        try
+        {
+            plan.Service.OrdinaryReadyBeforeSendHook = () =>
+            {
+                Interlocked.Increment(ref hookEntries[0]);
+                return Task.CompletedTask;
+            };
+
+            execution = await plan.PushAssignmentAsync("task-A");
+            reporting = GetActiveReporting(plan.Service);
+
+            // EOF while the body is still parked: nothing was ever eligible, so the carry CAS WINS.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            // THE REPORTING FINISHES LATER. Its Complete attempt fails on the retired original
+            // connection, and its eligibility publication finds no settlement: the loop is gone and a
+            // settlement driven NOW — through the production entry point — loses the CAS.
+            plan.Runner.Release("task-A");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.NotNull(GetRetainedResult(plan.Service));
+            Assert.Null(InvokeSettleOrdinaryReady(plan.Service, GetOwnerOrdinaryReady(owner)));
+            Assert.Equal(0, Volatile.Read(ref hookEntries[0]));
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "A carried assignment must never write on its retired original stream");
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            // ADOPT AND DELIVER: exactly ONE Complete and ONE assignment Ready, both on stream 2.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal("task-A", Assert.Single(plan.CurrentRequests.Completes).Complete.TaskId);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(0, Volatile.Read(ref hookEntries[0]));
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must remain empty");
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+        }
+        finally
+        {
+            plan.Service.OrdinaryReadyBeforeSendHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (l2-i) CANCEL VS THE CARRIED COMPLETE ON THE ADOPTED STREAM. The carried delivery is held
+    /// immediately before its Complete write, with the ASSIGNMENT token in hand; the matching
+    /// CancelTask arrives and cancels exactly that token, so the hook returns NORMALLY and the send
+    /// that follows observes cancellation — NO Complete is written on ANY stream. The assignment's
+    /// single Ready is then the cancel handler's own claim-won fallback: exactly ONE assignment Ready
+    /// on the adopted stream, none on the original one.
+    /// </summary>
+    [Fact]
+    public async Task PriorityRace_l2i_CancelWhileDeliveryIsHeldBeforeItsComplete_NoCompleteAnywhereAndOneCancelReady()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationToken observedToken = default;
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+
+            // INSTALL BEFORE THE BODY IS RELEASED: the delivery reaches this instant only after its
+            // reporting terminates, which the release below is what causes.
+            plan.Service.CarriedBeforeCompleteSendHook = async token =>
+            {
+                observedToken = token;
+                hookEntered.TrySetResult();
+
+                // AWAIT THE ASSIGNMENT TOKEN ITSELF AND RETURN NORMALLY: the test never releases this
+                // hook, so the send that follows must observe the cancellation for itself.
+                var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var registration = token.Register(() => cancelled.TrySetResult());
+                await cancelled.Task;
+            };
+
+            // EOF with the executor still running: carried, with no result yet.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            // RUN 2 ADOPTS, then the body finishes: its Complete attempt on the RETIRED original
+            // connection fails disconnected (stream 1 stays empty), the result is retained and the
+            // delivery reaches the held instant with the assignment's own token.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            plan.Runner.Release("task-A");
+            await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.True(observedToken.CanBeCanceled, "The hook must receive the assignment's token.");
+            Assert.Equal(ownerCts.Token, observedToken);
+            Assert.False(
+                ownerCts.IsCancellationRequested,
+                "The delivery is held with a LIVE assignment token — nothing has cancelled it yet.");
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must receive nothing");
+
+            // THE MATCHING CANCEL: its DELIVERY to this run's loop is proved by the reader's own
+            // consumed counter. The held hook can only return when the ASSIGNMENT token is cancelled,
+            // and this cancel handler is the only thing that cancels it — so the ordering is
+            // structural: the cancel provably arrived while the delivery was still parked there, and
+            // the send that follows observes the cancelled token.
+            var readsBeforeCancel = await plan.CapturePostHandlerBaselineAsync();
+            plan.Push(new OrchestratorMessage
+            {
+                Cancel = new CancelTask { TaskId = "task-A", Reason = "cancelled before its Complete" },
+            });
+            await plan.Responses.Consumed(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeCancel);
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(
+                ownerCts.IsCancellationRequested,
+                "The hook returned only because the cancel handler cancelled the assignment token.");
+
+            // NO COMPLETE ON ANY STREAM, and exactly ONE assignment Ready — the cancel fallback's.
+            Assert.Empty(plan.Requests[0].Completes);
+            Assert.Empty(plan.CurrentRequests.Completes);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+        }
+        finally
+        {
+            plan.Service.CarriedBeforeCompleteSendHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (l2-ii) CANCEL BETWEEN THE CARRIED COMPLETE AND THE READY CLAIM. The carried Complete has
+    /// already succeeded on the adopted stream and the delivery is held immediately before its Ready
+    /// claim; the matching CancelTask's handler cancels the assignment while it is held (the gate) and
+    /// the hook is only then released. The cancel's own
+    /// drain joins the delivery BEFORE consulting the shared claim, so the delivery WINS it: exactly
+    /// ONE assignment Ready on the adopted stream — never a second one from the handler — and none on
+    /// the original stream.
+    /// </summary>
+    [Fact]
+    public async Task PriorityRace_l2ii_CancelBetweenTheCarriedCompleteAndTheReadyClaim_ExactlyOneAdoptedReady()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            plan.Service.CarriedBeforeReadyClaimHook = () =>
+            {
+                hookEntered.TrySetResult();
+                return hookRelease.Task;
+            };
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            plan.Runner.Release("task-A");
+
+            // THE CARRIED COMPLETE SUCCEEDED and the delivery is HELD before the Ready claim.
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
+            Assert.False(
+                GetCarriedReadyStarted(owner), "The held delivery has not authorized a successor yet.");
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(0, plan.CurrentRequests.AssignmentReadyCount);
+
+            // THE CANCEL HANDLER RUNS WHILE THE DELIVERY IS HELD — and only THEN is it released. The
+            // gate is NOT the reader's consumed counter (that fires inside MoveNext, before the handler
+            // runs at all): it is the ASSIGNMENT TOKEN being cancelled, which only the matching-cancel
+            // drain does (cancelFirst: true, as its first action, before it joins the carried
+            // delivery). The token is asserted LIVE while the delivery is held, so the observation can
+            // only complete from that handler's drain — proving the cancellation happened at the held
+            // instant, not after the release let the claim and write run.
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.False(
+                ownerCts.IsCancellationRequested,
+                "The delivery is held with a LIVE assignment token — nothing has cancelled it yet.");
+            var (assignmentCancelled, cancelRegistration) = ObserveAssignmentCancellation(ownerCts);
+            using (cancelRegistration)
+            {
+                var readsBeforeCancel = await plan.CapturePostHandlerBaselineAsync();
+                plan.Push(new OrchestratorMessage
+                {
+                    Cancel = new CancelTask { TaskId = "task-A", Reason = "cancelled before the claim" },
+                });
+                await WaitForAssignmentCancellationAsync(
+                    assignmentCancelled,
+                    "The matching CancelTask handler must cancel the assignment while the delivery is held");
+                Assert.False(delivery.IsCompleted, "The delivery must still be parked at the held instant.");
+                Assert.False(
+                    GetCarriedReadyStarted(owner),
+                    "The cancellation was requested while the delivery was still before its Ready claim.");
+                Assert.Equal(0, plan.CurrentRequests.AssignmentReadyCount);
+                hookRelease.TrySetResult();
+
+                // THE POST-HANDLER READ BARRIER: the re-armed read only happens after the cancel
+                // handler (its drain and its claim-lost fallback) returned.
+                await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeCancel);
+                await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must receive no assignment Ready");
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+        }
+        finally
+        {
+            hookRelease.TrySetResult();
+            plan.Service.CarriedBeforeReadyClaimHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (l2-iii) CANCEL AFTER THE READY CLAIM, WHILE THE WRITE IS HELD IN THE FAKE. The claim is
+    /// consumed and the carried Ready write is PARKED inside the adopted stream's fake; the matching
+    /// CancelTask's handler then cancels the assignment while the write is still held (the gate; its
+    /// drain joins the parked delivery) and only then is the write released. Exactly
+    /// ONE assignment Ready reaches the adopted stream and none reaches the original one.
+    /// </summary>
+    [Fact]
+    public async Task PriorityRace_l2iii_CancelWhileTheCarriedReadyWriteIsHeld_ExactlyOneAdoptedReady()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            // RUN 2 (adopted) HOLDS ITS CARRIED READY WRITE: the hold is armed BEFORE the run starts,
+            // so it can never race the write it must park.
+            plan.PendingHoldReadiesFrom = 0;
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            plan.Runner.Release("task-A");
+
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.AssignmentReadyEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
+            Assert.True(
+                GetCarriedReadyStarted(owner),
+                "The claim was won, so the carried Ready write is authorized and parked.");
+            Assert.False(delivery.IsCompleted, "The delivery is parked in the held Ready write.");
+
+            // THE CANCEL HANDLER RUNS WHILE THE READY WRITE IS HELD — THEN the held write is released.
+            // The gate is the ASSIGNMENT TOKEN being cancelled, not the reader's consumed counter
+            // (which fires inside MoveNext, before the handler runs). Only the matching-cancel drain
+            // cancels that token (cancelFirst: true, first, before it joins the parked delivery), and
+            // the parked carried Ready uses the adopted STREAM token, so this cancellation cannot
+            // release the write itself: the write stays parked until the explicit release below.
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.False(
+                ownerCts.IsCancellationRequested,
+                "The Ready write is held with a LIVE assignment token — nothing has cancelled it yet.");
+            var (assignmentCancelled, cancelRegistration) = ObserveAssignmentCancellation(ownerCts);
+            using (cancelRegistration)
+            {
+                var readsBeforeCancel = await plan.CapturePostHandlerBaselineAsync();
+                plan.Push(new OrchestratorMessage
+                {
+                    Cancel = new CancelTask { TaskId = "task-A", Reason = "cancelled with a held Ready" },
+                });
+                await WaitForAssignmentCancellationAsync(
+                    assignmentCancelled,
+                    "The matching CancelTask handler must cancel the assignment while the Ready write is held");
+                Assert.False(delivery.IsCompleted, "The delivery must still be parked in the held write.");
+                plan.CurrentRequests.ReleaseAssignmentReady(0);
+
+                // THE POST-HANDLER READ BARRIER: the re-armed read only happens after the cancel
+                // handler (its drain and its claim-lost fallback) returned.
+                await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeCancel);
+                await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must receive no assignment Ready");
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+        }
+        finally
+        {
+            plan.CurrentRequests.ReleaseAssignmentReady(0);
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (l3) CANCEL VS A NO-RESULT CARRIED DELIVERY. The carried task finishes with NO terminal result
+    /// (its producer fails before one exists), so — after adoption — its delivery reaches the held
+    /// Ready-claim instant WITHOUT any Complete. The matching CancelTask's handler cancels the assignment
+    /// while it is held (the gate) and the hook is only then released: exactly ONE assignment Ready is written on the adopted stream (from
+    /// one of the two claim paths, never both) and NO Complete is written on ANY stream.
+    /// </summary>
+    /// <remarks>
+    /// The producer is parked in its provisioning fetch and then RELEASED to fail with a
+    /// non-<c>RpcException</c>, which the assignment body's own failure handler contains: the
+    /// execution terminates normally without publishing a result, so the retained holder stays EMPTY
+    /// rather than carrying a fabricated completion.
+    /// </remarks>
+    [Fact]
+    public async Task PriorityRace_l3_CancelWhileTheNoResultDeliveryIsHeldAtTheReadyClaim_NoCompleteAndOneAdoptedReady()
+    {
+        var parked = new ParkingProvisioner();
+        var plan = ReconnectPlan.StartFresh(RegisterResponseFor(adopted: false), parked.Provisioner);
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task? execution = null;
+        Task? reporting = null;
+        try
+        {
+            // THE BODY PARKS IN ITS PROVISIONING FETCH — before any result can exist. The manual push
+            // plus the post-handler milestone is the only sound gate here: this assignment never
+            // reaches its prompt, so the executor-settled gate cannot be used for it.
+            var readsBeforePush = await plan.CapturePostHandlerBaselineAsync();
+            plan.Push(ResultAssignment("task-A"));
+            await parked.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforePush);
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal("task-A", GetOwnerTaskId(owner));
+            Assert.Equal(CarryStates.Open, GetAssignmentState(owner));
+            execution = GetActiveExecution(plan.Service);
+            reporting = GetActiveReporting(plan.Service);
+
+            // EOF while the body is parked: carried with NO result and NO eligibility published.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            // INSTALL THE HOOK BEFORE THE PRODUCER FAILS, so the delivery can never pass it.
+            plan.Service.CarriedBeforeReadyClaimHook = () =>
+            {
+                hookEntered.TrySetResult();
+                return hookRelease.Task;
+            };
+
+            // THE PRODUCER FAILS: no terminal result is published, and the reporting terminates too.
+            parked.Release();
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(GetRetainedResult(plan.Service));
+
+            // ADOPT: the delivery has NO result to send, so it reaches the held instant with NO
+            // Complete on any stream.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Empty(plan.Requests[0].Completes);
+            Assert.Empty(plan.CurrentRequests.Completes);
+
+            // THE CANCEL HANDLER RUNS WHILE THE DELIVERY IS HELD — and only THEN is the manually held
+            // hook released. This hook does NOT observe the assignment token (unlike l2-i's): it
+            // returns only when the test completes hookRelease. So the ordering is enforced by the
+            // gate below, not by the hook: the test waits for the ASSIGNMENT TOKEN to be cancelled —
+            // which only the matching-cancel drain does (cancelFirst: true, first, before it joins
+            // this parked delivery), never the reader's consumed counter (which fires inside MoveNext,
+            // before the handler runs). The token is asserted LIVE while the hook is held, so the
+            // observation completing proves the cancel handler's drain ran at the held instant.
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.False(
+                ownerCts.IsCancellationRequested,
+                "The delivery is held with a LIVE assignment token — nothing has cancelled it yet.");
+            var (assignmentCancelled, cancelRegistration) = ObserveAssignmentCancellation(ownerCts);
+            using (cancelRegistration)
+            {
+                var readsBeforeCancel = await plan.CapturePostHandlerBaselineAsync();
+                plan.Push(new OrchestratorMessage
+                {
+                    Cancel = new CancelTask { TaskId = "task-A", Reason = "cancelled with no result to deliver" },
+                });
+                await WaitForAssignmentCancellationAsync(
+                    assignmentCancelled,
+                    "The matching CancelTask handler must cancel the assignment while the delivery is held");
+                Assert.False(delivery.IsCompleted, "The delivery must still be parked at the held instant.");
+                Assert.False(
+                    GetCarriedReadyStarted(owner),
+                    "The cancellation was requested while the delivery was still before its Ready claim.");
+                Assert.Equal(0, plan.CurrentRequests.AssignmentReadyCount);
+                hookRelease.TrySetResult();
+
+                // THE POST-HANDLER READ BARRIER: the re-armed read only happens after the cancel
+                // handler (its drain and its claim-lost fallback) returned.
+                await plan.WaitForAssignmentHandlerReturnedAsync(readsBeforeCancel);
+                await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            // EXACTLY ONE Ready on the adopted stream — never both claimants — and no Complete anywhere.
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(0, plan.Requests[0].AssignmentReadyCount);
+            Assert.Empty(plan.CurrentRequests.Completes);
+            Assert.Empty(plan.Requests[0].Completes);
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+        }
+        finally
+        {
+            hookRelease.TrySetResult();
+            parked.Release();
+            plan.Service.CarriedBeforeReadyClaimHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (f5) THE EXIT RE-CHECK WITH A HELD CARRIED READY. The carried Complete succeeds on stream 2 and
+    /// its Ready write is then HELD inside the fake with NO release gate — only the transport disposal
+    /// faults it. EOF on stream 2's read finds the assignment DELIVERED, so the loop's teardown neither
+    /// cancels nor joins it and the loop returns; as <c>RunCoreAsync</c> unwinds, its lexical stream
+    /// disposal faults the held write, and the exit re-check then cancels, joins and clears. The run
+    /// must complete within the bounded await (no deadlock) with an EMPTY slot, so the following run
+    /// claims NOTHING.
+    /// </summary>
+    [Fact]
+    public async Task PriorityRace_f5_HeldCarriedReadyWithEof_ExitReCheckClearsWithoutDeadlock()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(GetActiveAssignment(plan.Service)));
+
+            // RUN 2 (adopted) HOLDS ITS CARRIED READY WRITE: armed before the run starts.
+            plan.PendingHoldReadiesFrom = 0;
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            plan.Runner.Release("task-A");
+
+            // (1) + (2) The Complete SUCCEEDED and the Ready write is now PARKED in the fake.
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await plan.CurrentRequests.AssignmentReadyEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(GetActiveAssignment(plan.Service)));
+            Assert.False(delivery.IsCompleted, "The delivery is parked in the held Ready write.");
+
+            // (3) EOF on stream 2's read. (4) The loop teardown sees Delivered and does NOT join, so
+            // the loop returns. (5) The lexical stream disposal faults the held write. (6) The exit
+            // re-check cancels, joins the delivery and clears the slot — within the bounded await.
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+
+            Assert.Null(GetActiveAssignmentOrNull(plan.Service));
+            Assert.True(delivery.IsCompleted, "The exit re-check joined the carried delivery.");
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Null(GetHeartbeatTaskId(plan.Service));
+            Assert.Null(GetHeartbeatRole(plan.Service));
+
+            // THE THIRD RUN CLAIMS NOTHING: the recorded RegisterRequest has an EMPTY current_task_id.
+            plan.StartThirdRun(RegisterResponseFor(adopted: false));
+            await plan.CurrentRequests.WaitForWriteCountAsync(1)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(string.Empty, plan.Invokers[^1].Registers[0].CurrentTaskId);
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+        }
+        finally
+        {
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// (f4) THE CARRIED-PREDECESSOR REFUSAL ON AN ADOPTED UNGATED CONNECTION (the fixture's default
+    /// registration shape). While the carried delivery is held BETWEEN its successful Complete and its
+    /// Ready claim — so <c>CarriedReadyStarted</c> is NOT set — a successor assignment is REFUSED with
+    /// the EXISTING fixed protocol error, BEFORE any replacement drain: the refusal throws from the
+    /// handler, the run faults with exactly that message, and the successor's own replacement path is
+    /// provably never reached — the runner is reset ONCE (task A's own assignment) rather than twice,
+    /// and task B never enters a prompt.
+    /// </summary>
+    /// <remarks>
+    /// WHY THE RESET COUNT IS THE DISCRIMINATOR. The successor path resets the runner only AFTER the
+    /// refusal check and only after its replacement drain returned, so a refusal that was moved after
+    /// that drain (or removed) makes the count 2 and lets task B's body enter. The ORDERING GATE is the
+    /// predecessor's assignment-token cancellation: only the refusal's own teardown drain
+    /// (<c>cancelFirst: true</c>) requests it, while an accepted successor's replacement drain
+    /// (<c>cancelFirst: false</c>) never does — so the hook is held until that post-refusal milestone,
+    /// with <c>CarriedReadyStarted</c> provably still unset, and a non-refusal fails by name there.
+    /// The held delivery is released only after that milestone so the teardown drain can reach
+    /// fixpoint; it then writes the ONE carried Ready, which also proves the cancel-side fallback
+    /// never adds a second one.
+    /// </remarks>
+    [Fact]
+    public async Task PriorityRace_f4_SuccessorBeforeCarriedReadyStarted_IsRefusedWithTheExistingError()
+    {
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hookRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await plan.PushAssignmentAsync("task-A");
+            plan.Service.CarriedBeforeReadyClaimHook = () =>
+            {
+                hookEntered.TrySetResult();
+                return hookRelease.Task;
+            };
+
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
+            plan.Runner.Release("task-A");
+
+            // The carried Complete lands on the adopted stream; the Ready claim is NOT yet taken,
+            // so no successor is authorized.
+            await plan.CurrentRequests.AssignmentCompleteEntered(0)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await hookEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
+            Assert.False(
+                GetCarriedReadyStarted(owner), "The held delivery has not authorized a successor yet.");
+            Assert.Single(plan.CurrentRequests.Completes);
+            Assert.Equal(0, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Equal(1, plan.Runner.ResetCount);
+
+            // THE SUCCESSOR ARRIVES WHILE THE PREDECESSOR IS RETAINED AND UNAUTHORIZED, AND THE HOOK
+            // STAYS HELD UNTIL A POST-REFUSAL MILESTONE. The reader's consumed counter is NOT that
+            // milestone (it fires inside MoveNext, before the refusal predicate even runs), so it is
+            // not used. The milestone is the PREDECESSOR'S ASSIGNMENT TOKEN being cancelled:
+            //   * the REFUSAL throws from the handler, the loop's catch records it, and its finally
+            //     takes today's teardown (no stream loss) — DrainRetainedForTeardownAsync, whose drain
+            //     cancels the predecessor's token FIRST (cancelFirst: true) and only then parks joining
+            //     the still-held carried delivery;
+            //   * an ACCEPTED successor instead takes the REPLACEMENT drain (cancelFirst: false), which
+            //     never cancels that token and simply parks joining the held delivery.
+            // The token is asserted LIVE while the hook is held, and the hook keeps the delivery before
+            // its Ready claim (so CarriedReadyStarted cannot become true meanwhile), so this
+            // cancellation can ONLY be produced by the refusal path — a non-refusal fails BY NAME here.
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.False(
+                ownerCts.IsCancellationRequested,
+                "The delivery is held with a LIVE assignment token — nothing has cancelled it yet.");
+            var (predecessorCancelled, cancelRegistration) = ObserveAssignmentCancellation(ownerCts);
+            using (cancelRegistration)
+            {
+                plan.Push(ResultAssignment("task-B"));
+                await WaitForAssignmentCancellationAsync(
+                    predecessorCancelled,
+                    "The successor must be REFUSED while the carried delivery is held before its Ready " +
+                    "claim: only the refusal's teardown drain cancels the predecessor (an accepted " +
+                    "successor's replacement drain does not)");
+
+                // STILL HELD AT THE MILESTONE: the refusal and its teardown's cancellation both
+                // happened with the predecessor unauthorized, the delivery parked and no Ready written.
+                Assert.False(delivery.IsCompleted, "The delivery must still be parked at the held instant.");
+                Assert.False(
+                    GetCarriedReadyStarted(owner),
+                    "The refusal was decided while the predecessor had not started its carried Ready.");
+                Assert.Equal(0, plan.CurrentRequests.AssignmentReadyCount);
+                Assert.Equal(1, plan.Runner.ResetCount);
+
+                // RELEASE the held delivery only NOW, so the teardown drain can reach fixpoint.
+                hookRelease.TrySetResult();
+                var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => plan.Run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+                Assert.Equal(WorkerService.AssignmentBeforeAuthorizedReadyMessage, failure.Message);
+            }
+
+            Assert.True(delivery.IsCompleted, "The drained delivery finished.");
+
+            // THE REPLACEMENT PATH WAS NEVER REACHED: exactly ONE runner reset (task A's assignment,
+            // NOT a successor's replacement), task B's body never entered its prompt, and the slot is
+            // empty because the refusal's own teardown drain cleared it.
+            Assert.Equal(1, plan.Runner.ResetCount);
+            Assert.False(
+                plan.Runner.PromptStarted("task-B").IsCompleted,
+                "No successor was ever started — its executor never entered a prompt.");
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+            Assert.Equal(1, plan.CurrentRequests.AssignmentReadyCount);
+            Assert.Single(plan.CurrentRequests.Completes);
+            AssertNoAssignmentWrites(
+                plan.Requests[0], "The retired first stream must receive nothing");
+        }
+        finally
+        {
+            hookRelease.TrySetResult();
+            plan.Service.CarriedBeforeReadyClaimHook = null;
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE PRODUCTION-CAUSED CANCELLATION MILESTONE: arms an observation of the retained
+    /// assignment's OWN <c>Cts</c> token that completes the instant PRODUCTION requests that
+    /// assignment's cancellation. It is armed on a LIVE token (the caller asserts that first), so it
+    /// can only ever complete from a later <c>CancelAsync</c> on that exact source.
+    /// </summary>
+    /// <remarks>
+    /// WHY THIS — AND NOT <c>Consumed(n)</c> — IS THE ORDERING PROOF. The reader's consumed counter
+    /// fires inside <c>ChannelResponseReader.MoveNext</c>, before the message is even returned to the
+    /// loop, so it proves nothing about the handler. The assignment's token, by contrast, is cancelled
+    /// ONLY by <c>DrainAssignmentAsync(cancelFirst: true)</c> — the matching-cancel drain and the
+    /// loop's teardown drain — as that drain's first action and BEFORE any of its joins. The linked
+    /// process token is never cancelled by these tests, and the successor replacement drain uses
+    /// <c>cancelFirst: false</c>. So while a test's gate is still HELD, this observation completing
+    /// proves the named drain is already running and is (or is about to be) parked joining the held
+    /// work — the cancellation happened at the required point, not after the gate was released.
+    /// </remarks>
+    /// <param name="ownerCts">The retained assignment's own cancellation source.</param>
+    /// <returns>The observation and its registration (dispose it when the test is done).</returns>
+    private static (Task Cancelled, CancellationTokenRegistration Registration) ObserveAssignmentCancellation(
+        CancellationTokenSource ownerCts)
+    {
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var registration = ownerCts.Token.Register(() => cancelled.TrySetResult());
+        return (cancelled.Task, registration);
+    }
+
+    /// <summary>
+    /// Awaits an <see cref="ObserveAssignmentCancellation"/> milestone with the bounded
+    /// <see cref="Failsafe"/> as a HANG GUARD ONLY — correct production raises it without any time
+    /// passing — and converts a missing cancellation into a failure that NAMES the expectation, so a
+    /// path that never requested the cancellation fails by name rather than as a bare timeout.
+    /// </summary>
+    /// <param name="cancelled">The observation.</param>
+    /// <param name="because">The failure message naming the production event that must cancel it.</param>
+    private static async Task WaitForAssignmentCancellationAsync(Task cancelled, string because)
+    {
+        try
+        {
+            await cancelled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            throw new Xunit.Sdk.XunitException(
+                $"{because} (the retained assignment's token was never cancelled within the failsafe bound).");
+        }
+    }
+
+    /// <summary>
+    /// THE "NOTHING WRITTEN" PREDICATE for one stream's fake: no Complete and no assignment Ready.
+    /// The run's own initial <c>WorkerReady</c> is deliberately NOT covered — the fake's
+    /// assignment-Ready accounting already excludes it — so the predicate holds for every accepted
+    /// run's stream.
+    /// </summary>
+    /// <param name="requests">The stream's write fake.</param>
+    /// <param name="because">The failure message naming the vector's expectation.</param>
+    private static void AssertNoAssignmentWrites(CarryRequestStream requests, string because)
+    {
+        Assert.True(
+            requests.Completes.Count == 0,
+            $"{because} — a Complete was written on a stream that must have received none.");
+        Assert.True(
+            requests.AssignmentReadyCount == 0,
+            $"{because} — an assignment Ready was written on a stream that must have received none.");
+    }
+
     // ── The multi-run reconnect plan ──────────────────────────────────────────
 
     /// <summary>
@@ -4376,8 +5378,17 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// </summary>
         internal int? PendingHoldCompletesFrom { get; set; }
 
+        /// <summary>
+        /// The ONE-SHOT assignment-Ready hold, consumed by the NEXT <see cref="StartNextRun"/> call.
+        /// It is the Ready counterpart of <see cref="PendingHoldCompletesFrom"/>: because the hold is
+        /// applied to the stream BEFORE the run starts, the run's carried Ready write is guaranteed
+        /// to park in the fake — the arm can never race the write it must hold.
+        /// </summary>
+        internal int? PendingHoldReadiesFrom { get; set; }
+
         /// <summary>Starts the FIRST run: a fresh service, the initial Ready expected.</summary>
-        internal static ReconnectPlan StartFresh(RegisterResponse firstResponse)
+        internal static ReconnectPlan StartFresh(
+            RegisterResponse firstResponse, WorkerConfigProvisioner? provisioner = null)
         {
             // THE CONFIG-REPO SEAM: the reconnect plan runs REAL assignment bodies on
             // connections whose production provisioner is live, so the config-repo
@@ -4390,6 +5401,14 @@ public sealed class WorkerServiceReconnectSurvivalTests
             var runner = new ObservingRunner();
             InstallRunner(service, runner);
             service.HeartbeatTaskFactory = (_, _) => Task.CompletedTask;
+
+            // THE PROVISIONER SEAM — installed BEFORE the first run's connection is constructed,
+            // because the connection CAPTURES it at construction and the assignment body reaches
+            // only that captured instance. A later assignment of the property therefore cannot
+            // change which provisioner the first run's body uses, which is what makes a fixture
+            // whose provisioner PARKS deterministic instead of racy. A null value is exactly the
+            // previous behavior (the connection's own production provisioner).
+            service.TestProvisioner = provisioner;
 
             var plan = new ReconnectPlan(service, runner, gitRestore);
             plan.StartNextRun(firstResponse);
@@ -4448,6 +5467,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
             PendingFailAdoptedReady = null;
             var holdCompletesFrom = PendingHoldCompletesFrom;
             PendingHoldCompletesFrom = null;
+            var holdReadiesFrom = PendingHoldReadiesFrom;
+            PendingHoldReadiesFrom = null;
 
             // An ADOPTED run sends NO initial Ready, so nothing is subtracted; every other run
             // subtracts exactly its own initial Ready.
@@ -4463,6 +5484,9 @@ public sealed class WorkerServiceReconnectSurvivalTests
 
             if (holdCompletesFrom is { } holdFrom)
                 requests.HoldCompletesFrom = holdFrom;
+
+            if (holdReadiesFrom is { } holdReadyFrom)
+                requests.HoldReadiesFrom = holdReadyFrom;
 
             var streamToken = CancellationToken.None;
             Service.CallInvokerFactory = () => invoker;
