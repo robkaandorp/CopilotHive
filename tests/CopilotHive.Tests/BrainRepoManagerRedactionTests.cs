@@ -1095,6 +1095,104 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     }
 
     /// <summary>
+    /// The squash-merge failure message carries BOTH git streams: <c>git merge --squash</c>
+    /// prints its <c>CONFLICT (…)</c> / <c>Automatic merge failed</c> lines on STDOUT (with an
+    /// EMPTY stderr), and that is the text
+    /// <c>PipelineDriver.HandleMergeFailureAsync</c> receives through <c>ex.Message</c> — so both
+    /// the re-plan and the craft prompt can name the conflicting files.
+    /// </summary>
+    /// <remarks>
+    /// Same setup shape as <see cref="MergeFeatureBranchAsync_RollbackPath_RunsAfterTheCredentialRefresh"/>:
+    /// the clone is a REAL repository (the <c>origin/{branch}</c> probe is a direct git process
+    /// outside the runner seam) while every git command under test is answered by the seam.
+    /// </remarks>
+    [Theory]
+    [InlineData("")] // git's real shape for a squash conflict: stdout only, stderr EMPTY
+    [InlineData("fatal: unable to write to branch ref\n")] // both streams populated
+    public async Task MergeFeatureBranchAsync_SquashFailure_MessageCarriesBothGitStreams(string stderr)
+    {
+        const string conflictStdout =
+            "CONFLICT (content): Merge conflict in src/Foo.cs\n"
+            + "Automatic merge failed; fix conflicts and then commit the result.";
+
+        var runner = new CredentialRunner(request =>
+            request.Arguments.Contains("--squash")
+                ? new BrainGitResult(1, conflictStdout, stderr)
+                : new BrainGitResult(0, string.Empty, string.Empty));
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), createClone: false);
+
+        CreateRealCloneWithOriginRefs(manager.GetClonePath(RepoName), "main", "feature");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => manager.MergeFeatureBranchAsync(
+            RepoName, "feature", "main", "msg", TestContext.Current.CancellationToken));
+
+        // The stdout follows the colon DIRECTLY when stderr is empty, so anything after it is
+        // stdout; with stderr populated it follows stderr. Either way the COMPLETE stdout is
+        // present, unmodified and uncut — the exact message is the documented `{stderr}{stdout}`
+        // shape, which also pins that stdout is NEVER dropped just because stderr had content.
+        Assert.Equal(
+            $"git merge --squash feature failed (exit 1): {stderr}{conflictStdout}", ex.Message);
+        Assert.Contains(
+            "CONFLICT (content): Merge conflict in src/Foo.cs", ex.Message, StringComparison.Ordinal);
+
+        // The rollback still ran around the (now message-bearing) failure.
+        var joined = runner.Joined();
+        Assert.Contains("merge --abort", joined);
+        Assert.Contains("clean -fd", joined);
+    }
+
+    /// <summary>
+    /// STDOUT can echo the credential-bearing remote URL and the stored token itself, so the
+    /// stdout now included in the failure message passes through the SAME
+    /// <c>Sanitize(text, credential)</c> redaction as everything else.
+    /// </summary>
+    [Fact]
+    public async Task MergeFeatureBranchAsync_SquashFailure_StdoutEchoingTheCredential_IsRedacted()
+    {
+        var runner = new CredentialRunner(request =>
+            request.Arguments.Contains("--squash")
+                ? new BrainGitResult(
+                    1,
+                    "CONFLICT (content): Merge conflict in src/Foo.cs\n"
+                    + $"Automatic merge failed against {CredentialOrigin}\n"
+                    + $"remote: Invalid credential supplied: {StoredToken} (rejected)",
+                    string.Empty)
+                : new BrainGitResult(0, string.Empty, string.Empty));
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), createClone: false);
+
+        CreateRealCloneWithOriginRefs(manager.GetClonePath(RepoName), "main", "feature");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => manager.MergeFeatureBranchAsync(
+            RepoName, "feature", "main", "msg", TestContext.Current.CancellationToken));
+
+        // The conflict detail survives the redaction…
+        Assert.Contains(
+            "CONFLICT (content): Merge conflict in src/Foo.cs", ex.Message, StringComparison.Ordinal);
+        // …while neither the token nor the credential-bearing URL survives it.
+        Assert.DoesNotContain(StoredToken, ex.Message);
+        Assert.DoesNotContain("x-access-token", ex.Message);
+        // The EXACT message pins WHERE the redaction happened. Redacting at the message-
+        // construction site leaves the original exception intact (the operation-level boundary
+        // declines an already-safe exception), so the message is exactly the sanitized form. An
+        // implementation that appended the RAW stdout and relied on the operation boundary would
+        // instead emit the boundary's REWRAPPED form, whose message is prefixed with the
+        // exception type name — this assertion fails for it.
+        Assert.Equal(
+            "git merge --squash feature failed (exit 1): "
+            + "CONFLICT (content): Merge conflict in src/Foo.cs\n"
+            + $"Automatic merge failed against {ConfiguredUrl}\n"
+            + "remote: Invalid credential supplied: [redacted] (rejected)",
+            ex.Message);
+
+        // The rollback still ran.
+        var joined = runner.Joined();
+        Assert.Contains("merge --abort", joined);
+        Assert.Contains("clean -fd", joined);
+    }
+
+    /// <summary>
     /// Creates a REAL git repository at <paramref name="clonePath"/> with one commit and a
     /// <c>refs/remotes/origin/{branch}</c> ref for each requested branch, so the manager's
     /// direct-process <c>rev-parse --verify origin/{branch}</c> probes resolve.

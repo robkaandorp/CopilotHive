@@ -878,7 +878,9 @@ internal sealed class PipelineDriver
         PlanResult mergePlanResult;
         try
         {
-            mergePlanResult = await _resolvePlan(pipeline, null, ct);
+            // The RE-PLAN must know the merge failed: the planning prompt renders this context in
+            // its `=== Additional context ===` block, exactly like the craft prompt below.
+            mergePlanResult = await _resolvePlan(pipeline, rebaseContext, ct);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {

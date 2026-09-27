@@ -873,8 +873,22 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             try
             {
-                await RunGitAsync(clonePath,
-                    ["merge", "--squash", $"origin/{featureBranch}"], ct, credential);
+                // `git merge --squash` reports its CONFLICT (...) / "Automatic merge failed" lines
+                // on STDOUT, which RunGitAsync discards — the message would be empty after the
+                // colon. Go through the raw core runner instead so BOTH streams reach the caller
+                // (the message travels to HandleMergeFailureAsync via ex.Message and names the
+                // conflicting files). Both streams are redacted with the operation's credential:
+                // stdout can echo the credential-bearing remote URL.
+                var (mergeExitCode, mergeStdout, mergeStderr) = await RunGitCoreAsync(
+                    clonePath, ["merge", "--squash", $"origin/{featureBranch}"], ct);
+
+                if (mergeExitCode != 0)
+                {
+                    throw new InvalidOperationException(Sanitize(
+                        $"git merge --squash {featureBranch} failed (exit {mergeExitCode}): "
+                        + $"{mergeStderr}{mergeStdout}",
+                        credential));
+                }
             }
             catch (Exception mergeEx)
             {

@@ -1115,6 +1115,54 @@ public sealed class PlanRejectContractTests
         Assert.Equal(iterationBefore, mergingEntry.Iteration);
     }
 
+    /// <summary>
+    /// The merge-failure RE-PLAN is told about the merge failure: the same <c>rebaseContext</c>
+    /// that reaches the craft prompt is passed as the planning <c>additionalContext</c>, so the
+    /// re-plan no longer happens without knowing a merge failed.
+    /// </summary>
+    /// <remarks>
+    /// The distinct merge error below is the discriminator: it exists ONLY in the rebase context,
+    /// so a planning call made with a <c>null</c>/empty context cannot satisfy any of these
+    /// assertions. It is deliberately NOT the string used by the phase-marking assertions above.
+    /// </remarks>
+    [Fact]
+    public async Task HandleMergeFailureAsync_RePlan_ReceivesTheRebaseContext_AndTheCraftPromptStillGetsIt()
+    {
+        const string mergeError = "git merge --squash feature failed (exit 1): CONFLICT (content): Merge conflict in src/Foo.cs";
+
+        var plan = IterationPlan.Default();
+        var planContexts = new List<string?>();
+        var promptContexts = new List<string?>();
+        var (driver, pipeline, _) = CreateDriver(
+            resolvePlan: (_, additionalContext, _) =>
+            {
+                planContexts.Add(additionalContext);
+                return Task.FromResult(PlanResult.Success(plan));
+            },
+            resolvePrompt: (_, _, additionalContext, _) =>
+            {
+                promptContexts.Add(additionalContext);
+                return Task.FromResult("rebase and fix the conflict");
+            });
+
+        await driver.HandleMergeFailureAsync(
+            pipeline, mergeError, TestContext.Current.CancellationToken);
+
+        // The RE-PLAN received the rebase context…
+        var planContext = Assert.Single(planContexts);
+        Assert.NotNull(planContext);
+        // …carrying the merge error text…
+        Assert.Contains(mergeError, planContext!, StringComparison.Ordinal);
+        // …and asking for a rebase onto the default branch.
+        Assert.Contains("Merge conflict", planContext!, StringComparison.Ordinal);
+        Assert.Contains("git rebase origin/main", planContext!, StringComparison.Ordinal);
+        Assert.Contains("rebase the feature branch onto the latest main", planContext!, StringComparison.Ordinal);
+
+        // …and the same context still reaches the craft prompt.
+        var promptContext = Assert.Single(promptContexts);
+        Assert.Equal(planContext, promptContext);
+    }
+
     // ── No assumed Coding phase before planning: the window is honestly Planning ──
 
     [Fact]
