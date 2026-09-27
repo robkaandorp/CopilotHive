@@ -121,7 +121,7 @@ public sealed class RestoredAttemptAdoptionTests : IDisposable
             var connection = new SqliteConnection(connectionString);
             connection.Open();
             return new CopilotHiveDbContext(
-                new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+                new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection, contextOwnsConnection: true).Options);
         }
     }
 

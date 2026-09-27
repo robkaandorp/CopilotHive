@@ -2109,7 +2109,7 @@ public sealed class GrpcWorkerGatewayEagerSendTests : IDisposable
         var connection = new SqliteConnection(ConnectionString);
         connection.Open();
         var context = new CopilotHiveDbContext(
-            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection, contextOwnsConnection: true).Options);
         context.Database.EnsureCreated();
         return context;
     }
@@ -2267,7 +2267,7 @@ public sealed class GrpcWorkerGatewayEagerSendTests : IDisposable
             var connection = new SqliteConnection(connectionString);
             connection.Open();
             return new CopilotHiveDbContext(
-                new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+                new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection, contextOwnsConnection: true).Options);
         }
     }
 

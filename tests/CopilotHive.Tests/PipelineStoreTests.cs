@@ -1870,7 +1870,7 @@ public sealed class PlainFactory : IDbContextFactory<CopilotHiveDbContext>
     {
         var connection = new SqliteConnection(_connectionString);
         connection.Open();
-        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection, contextOwnsConnection: true);
         if (_interceptor is not null)
             builder.AddInterceptors(_interceptor);
         return new CopilotHiveDbContext(builder.Options);
