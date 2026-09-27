@@ -2908,12 +2908,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
 
             // The successor finishes: its own Complete is PARKED too (run 2's hold covers ALL
             // completes on stream 2), so release it; its own ordinary Ready is NOT held and
-            // lands after the eligibility publishes.
+            // lands after the eligibility publishes. The count of 2 awaited below includes the
+            // failed carried Ready, so task-B's own Ready is the second.
             plan.Runner.Release("task-B");
             await plan.CurrentRequests.AssignmentCompleteEntered(1)
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             plan.CurrentRequests.ReleaseAll();
-            await plan.CurrentRequests.WaitForAssignmentReadyCountAsync(1)
+            await plan.CurrentRequests.WaitForAssignmentReadyCountAsync(2)
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             plan.CompleteStream();
             await plan.JoinRunAsync();
