@@ -197,6 +197,7 @@ public class CiMonitorService
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan? _timeoutOverride;
     private readonly TimeSpan _startupScanWindow;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Monitoring runs currently in flight, keyed by goal + commit + repository so the same
@@ -263,6 +264,10 @@ public class CiMonitorService
     /// <param name="pollInterval">Polling interval between check-run fetches; defaults to 30 seconds.</param>
     /// <param name="timeoutOverride">Optional CI timeout override for tests.</param>
     /// <param name="startupScanWindow">How far back the startup scan looks for merged goals; defaults to 60 minutes.</param>
+    /// <param name="timeProvider">
+    /// Clock used for the per-commit CI timeout and the delay between polls; defaults to
+    /// <see cref="TimeProvider.System"/>. Tests inject a manual clock so these waits are deterministic.
+    /// </param>
     public CiMonitorService(
         IGoalStore? goalStore = null,
         IIssueStore? issueStore = null,
@@ -273,7 +278,8 @@ public class CiMonitorService
         ILogger<CiMonitorService>? logger = null,
         TimeSpan? pollInterval = null,
         TimeSpan? timeoutOverride = null,
-        TimeSpan? startupScanWindow = null)
+        TimeSpan? startupScanWindow = null,
+        TimeProvider? timeProvider = null)
     {
         _goalStore = goalStore;
         _issueStore = issueStore;
@@ -285,6 +291,7 @@ public class CiMonitorService
         _pollInterval = pollInterval ?? DefaultPollInterval;
         _timeoutOverride = timeoutOverride;
         _startupScanWindow = startupScanWindow ?? DefaultStartupScanWindow;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -361,7 +368,7 @@ public class CiMonitorService
 
             // Timeout: linked token for all HTTP calls and delays.
             var timeout = _timeoutOverride ?? TimeSpan.FromMinutes(repoConfig.CiTimeoutMinutes);
-            using var timeoutCts = new CancellationTokenSource(timeout);
+            using var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
             var linkedToken = linkedCts.Token;
 
@@ -455,7 +462,7 @@ public class CiMonitorService
                 // Delay between polling iterations.
                 try
                 {
-                    await Task.Delay(delay, linkedToken);
+                    await Task.Delay(delay, _timeProvider, linkedToken);
                 }
                 catch (OperationCanceledException) when (linkedToken.IsCancellationRequested)
                 {

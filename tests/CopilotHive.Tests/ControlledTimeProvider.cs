@@ -59,6 +59,18 @@ internal sealed class ControlledTimeProvider : TimeProvider
     /// <summary>The due-times production requested at timer creation, in registration order.</summary>
     public TimeSpan[] RequestedDelays { get { lock (_lock) return [.. _requestedDelays]; } }
 
+    /// <summary>
+    /// Synchronous snapshot of the remaining due time of every PENDING timer (created, not
+    /// fired, not disposed), relative to the current manual <c>now</c>, in registration order.
+    /// Computed from each timer's absolute due time (<c>DueAt - now</c>), so a re-armed timer
+    /// reports its current remaining time; for a timer that was never re-armed and before any
+    /// <see cref="Advance"/> this equals its requested due time.
+    /// </summary>
+    public IReadOnlyList<TimeSpan> PendingDueTimes
+    {
+        get { lock (_lock) return [.. _timers.Where(t => !t.Fired).Select(t => t.DueAt - _now)]; }
+    }
+
     /// <summary>Total time advanced through <see cref="Advance"/>.</summary>
     public TimeSpan Elapsed { get { lock (_lock) return TimeSpan.FromTicks(_elapsedTicks); } }
 

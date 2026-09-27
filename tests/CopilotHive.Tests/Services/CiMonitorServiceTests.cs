@@ -24,8 +24,20 @@ namespace CopilotHive.Tests.Services;
 public sealed class CiMonitorServiceTests : IDisposable
 {
     private const string TestToken = "test-token";
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan Timeout = TimeSpan.FromMilliseconds(500);
+    /// <summary>Poll interval, a manual duration on the <see cref="ControlledTimeProvider"/>.</summary>
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(7);
+
+    /// <summary>
+    /// CI timeout, a manual duration on the <see cref="ControlledTimeProvider"/>: it only
+    /// expires when a test advances the clock past it, never on its own.
+    /// </summary>
+    private static readonly TimeSpan Timeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Manual CI timeout for the exhaustion tests: requests land at t = 0, 7, 14 and 21 s, and
+    /// advancing the final 3 s from the pending 7 s poll delay reaches t = 24 s, where the timeout fires.
+    /// </summary>
+    private static readonly TimeSpan ExhaustionTimeout = TimeSpan.FromSeconds(24);
 
     private readonly string? _origGhToken;
     private readonly string? _origGithubToken;
@@ -213,8 +225,10 @@ public sealed class CiMonitorServiceTests : IDisposable
         ILogger<CiMonitorService>? logger = null,
         IGoalStore? goalStore = null,
         TimeSpan? startupScanWindow = null,
-        TimeSpan? timeoutOverride = null)
+        TimeSpan? timeoutOverride = null,
+        ControlledTimeProvider? clock = null)
     {
+        clock ??= new ControlledTimeProvider();
         return new CiMonitorService(
             goalStore: goalStore,
             issueStore: issueStore,
@@ -224,7 +238,190 @@ public sealed class CiMonitorServiceTests : IDisposable
             logger: logger ?? NullLogger<CiMonitorService>.Instance,
             pollInterval: PollInterval,
             timeoutOverride: timeoutOverride ?? Timeout,
-            startupScanWindow: startupScanWindow);
+            startupScanWindow: startupScanWindow,
+            timeProvider: clock);
+    }
+
+    /// <summary>
+    /// Per-request handler gates for the manual-clock polling protocol. Request N (1-based)
+    /// completes <see cref="Entered"/>(N) the moment it reaches the handler and then parks on its
+    /// OWN response gate until <see cref="Release"/>(N) — so the first request's gate is distinct
+    /// from every later one, and the test decides exactly when each response is produced.
+    /// The handler never observes the request's cancellation token: cleanup must call
+    /// <see cref="ReleaseAll"/> before cancelling, or a parked request would never return.
+    /// </summary>
+    private sealed class RequestGates
+    {
+        private readonly object _lock = new();
+        private readonly List<TaskCompletionSource> _entered = [];
+        private readonly List<TaskCompletionSource> _responseGates = [];
+        private int _count;
+        private bool _releasedAll;
+
+        /// <summary>Number of requests that have reached the handler.</summary>
+        public int Count { get { lock (_lock) return _count; } }
+
+        /// <summary>Completes when request <paramref name="n"/> (1-based) has reached the handler.</summary>
+        public Task Entered(int n) { lock (_lock) return EnsureLocked(n).Entered.Task; }
+
+        /// <summary>Lets request <paramref name="n"/> (1-based) produce its response.</summary>
+        public void Release(int n)
+        {
+            TaskCompletionSource gate;
+            lock (_lock) gate = EnsureLocked(n).Gate;
+            gate.TrySetResult();
+        }
+
+        /// <summary>Opens every existing and future response gate (cleanup only).</summary>
+        public void ReleaseAll()
+        {
+            List<TaskCompletionSource> gates;
+            lock (_lock)
+            {
+                _releasedAll = true;
+                gates = [.. _responseGates];
+            }
+            foreach (var gate in gates) gate.TrySetResult();
+        }
+
+        /// <summary>
+        /// Handler body: records the arrival of the next request, parks on its response gate, then
+        /// produces the response for its 1-based sequence number (or throws, for transport faults).
+        /// </summary>
+        public async Task<HttpResponseMessage> EnterAsync(Func<int, HttpResponseMessage> respond)
+        {
+            int n;
+            TaskCompletionSource entered, gate;
+            lock (_lock)
+            {
+                n = ++_count;
+                (entered, gate) = EnsureLocked(n);
+            }
+            entered.TrySetResult();
+            await gate.Task;
+            return respond(n);
+        }
+
+        private (TaskCompletionSource Entered, TaskCompletionSource Gate) EnsureLocked(int n)
+        {
+            while (_entered.Count < n)
+            {
+                _entered.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (_releasedAll) gate.TrySetResult();
+                _responseGates.Add(gate);
+            }
+            return (_entered[n - 1], _responseGates[n - 1]);
+        }
+    }
+
+    /// <summary>Awaits the arrival of request <paramref name="n"/>, bounded by the hang-guard.</summary>
+    private static async Task AwaitRequestEnteredAsync(RequestGates gates, int n)
+    {
+        try
+        {
+            await gates.Entered(n).WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"request {n} never reached the handler");
+        }
+    }
+
+    /// <summary>
+    /// Protocol steps 1–2: request 1 has entered the handler while its response gate is still
+    /// closed, and at that instant the ONLY pending timer on the controlled clock is the CI
+    /// timeout with exactly <paramref name="expectedTimeout"/> remaining. This proves the timeout
+    /// CancellationTokenSource is registered with the injected clock (a real-time CTS leaves the
+    /// snapshot empty).
+    /// </summary>
+    private static async Task AwaitFirstRequestWithTimeoutArmedAsync(
+        RequestGates gates, ControlledTimeProvider clock, TimeSpan expectedTimeout)
+    {
+        await AwaitRequestEnteredAsync(gates, 1);
+        Assert.Equal([expectedTimeout], clock.PendingDueTimes);
+    }
+
+    /// <summary>
+    /// Rendezvous on the 7 s poll delay registered with the controlled clock. A poll delay that
+    /// bypasses the clock never registers this timer and fails with the named diagnostic.
+    /// </summary>
+    private static async Task AwaitPollTimerAsync(ControlledTimeProvider clock)
+    {
+        try
+        {
+            await clock.WaitForPendingTimerAsync(TimeSpan.FromSeconds(7), TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail("poll timer (7 s) never registered with the controlled clock");
+        }
+    }
+
+    /// <summary>
+    /// Protocol steps 3–4 for request <paramref name="n"/>: release its response, rendezvous on
+    /// the 7 s poll timer, advance the manual clock by exactly 7 s, and only once request
+    /// <c>n + 1</c> has entered the handler assert that exactly <c>n + 1</c> requests occurred.
+    /// </summary>
+    private static async Task ReleaseAndPollToNextRequestAsync(
+        RequestGates gates, ControlledTimeProvider clock, ScriptedHttpMessageHandler handler, int n)
+    {
+        gates.Release(n);
+        await AwaitPollTimerAsync(clock);
+        clock.Advance(TimeSpan.FromSeconds(7));
+        await AwaitRequestEnteredAsync(gates, n + 1);
+        Assert.Equal(n + 1, handler.Requests.Count);
+    }
+
+    /// <summary>
+    /// Drives a never-terminal monitor to its <see cref="ExhaustionTimeout"/>: request 1 at
+    /// t = 0 with only the 24 s timeout pending, requests 2-4 at t = 7, 14, 21 via the poll timer,
+    /// then - after response 4 and the rendezvous on the next 7 s poll timer - advance 3 s to
+    /// t = 24 so the timeout fires mid-delay. The monitor must then complete with exactly four
+    /// requests, a fifth request must never have been issued, and no timer may be left pending.
+    /// </summary>
+    private static async Task RunToTimeoutExhaustionAsync(
+        RequestGates gates, ControlledTimeProvider clock, ScriptedHttpMessageHandler handler, Task monitor)
+    {
+        await AwaitFirstRequestWithTimeoutArmedAsync(gates, clock, ExhaustionTimeout);
+        for (var n = 1; n <= 3; n++)
+            await ReleaseAndPollToNextRequestAsync(gates, clock, handler, n);
+
+        gates.Release(4);
+        await AwaitPollTimerAsync(clock);
+        clock.Advance(TimeSpan.FromSeconds(3));
+
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+        Assert.True(monitor.IsCompletedSuccessfully, "The monitor must return normally once the CI timeout fires.");
+        Assert.False(gates.Entered(5).IsCompleted, "A fifth request was issued after the CI timeout fired.");
+        Assert.Equal(0, clock.PendingTimerCount);
+        Assert.Equal(4, handler.Requests.Count);
+    }
+
+    /// <summary>
+    /// Best-effort teardown for a gated or parked monitor that never replaces an original test
+    /// failure: open every gate/barrier first (the handlers do not observe the request token),
+    /// then cancel the test-owned token, then await the monitor bounded by the hang-guard,
+    /// swallowing any cleanup exception or timeout.
+    /// </summary>
+    private static async Task CleanupMonitorAsync(Task? monitor, CancellationTokenSource cts, params Action[] releases)
+    {
+        foreach (var release in releases)
+        {
+            try { release(); } catch { /* best-effort cleanup */ }
+        }
+
+        try { await cts.CancelAsync(); } catch { /* best-effort cleanup */ }
+
+        if (monitor is null) return;
+        try
+        {
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, CancellationToken.None);
+        }
+        catch
+        {
+            // Best-effort: an original failure must never be replaced by a cleanup failure.
+        }
     }
 
     private static IHttpClientFactory CreateFactory(ScriptedHttpMessageHandler handler)
@@ -262,8 +459,10 @@ public sealed class CiMonitorServiceTests : IDisposable
         ILogger<CiMonitorService>? logger = null,
         IGoalStore? goalStore = null,
         TimeSpan? startupScanWindow = null,
-        TimeSpan? timeoutOverride = null)
+        TimeSpan? timeoutOverride = null,
+        ControlledTimeProvider? clock = null)
     {
+        clock ??= new ControlledTimeProvider();
         return new CiMonitorService(
             goalStore: goalStore,
             issueStore: issueStore,
@@ -273,7 +472,8 @@ public sealed class CiMonitorServiceTests : IDisposable
             logger: logger ?? NullLogger<CiMonitorService>.Instance,
             pollInterval: PollInterval,
             timeoutOverride: timeoutOverride ?? Timeout,
-            startupScanWindow: startupScanWindow);
+            startupScanWindow: startupScanWindow,
+            timeProvider: clock);
     }
 
     private static string CheckRunsJson(int totalCount, params (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] runs)
@@ -576,33 +776,60 @@ public sealed class CiMonitorServiceTests : IDisposable
     {
         var eventBus = new RecordingEventBus();
         var logger = new RecordingLogger<CiMonitorService>();
-        var handler = new ScriptedHttpMessageHandler(_ =>
-            OkResponse(CheckRunsJson(1, ("build", "in_progress", null, null, null))));
-        var service = CreateService(handler, eventBus: eventBus, logger: logger);
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "in_progress", null, null, null)))));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, logger: logger, timeoutOverride: ExhaustionTimeout, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        // A no-op would issue zero requests; a premature terminal-return would issue exactly one.
-        Assert.True(handler.Requests.Count > 1,
-            $"Timeout must be reached by polling; got {handler.Requests.Count} request(s).");
-        Assert.Empty(eventBus.Published);
-        // The timeout branch is distinct from the caller-cancellation branch.
-        Assert.Contains(logger.Snapshot(), e => e.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(logger.Snapshot(), e => e.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
+            // Four genuine polls (t = 0, 7, 14, 21) then the manual timeout at t = 24: a no-op
+            // issues zero requests and a premature terminal-return exactly one.
+            await RunToTimeoutExhaustionAsync(gates, clock, handler, monitor);
+
+            Assert.Empty(eventBus.Published);
+            // The timeout branch is distinct from the caller-cancellation branch.
+            Assert.Contains(logger.Snapshot(), e => e.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(logger.Snapshot(), e => e.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorMergeAsync_ZeroCheckRuns_PollsUntilTimeout()
     {
         var eventBus = new RecordingEventBus();
-        var handler = new ScriptedHttpMessageHandler(_ =>
-            OkResponse(CheckRunsJson(0)));
-        var service = CreateService(handler, eventBus: eventBus);
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(_ => OkResponse(CheckRunsJson(0))));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, timeoutOverride: ExhaustionTimeout, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        Assert.Empty(eventBus.Published);
-        Assert.True(handler.Requests.Count >= 2, $"Expected multiple polls, got {handler.Requests.Count}");
+            await RunToTimeoutExhaustionAsync(gates, clock, handler, monitor);
+
+            Assert.Empty(eventBus.Published);
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -713,9 +940,9 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
 
-        // Exactly one request proves 401 terminates immediately. The poll interval (50ms) is
-        // 10x smaller than the timeout (500ms), so a retry-until-timeout branch would issue
-        // many requests and fail this assertion.
+        // Exactly one request proves 401 terminates immediately: a retrying branch would park on
+        // the 7 s manual poll delay, which never fires because nothing advances the clock, so the
+        // monitor would never return.
         Assert.Single(handler.Requests);
         Assert.Empty(eventBus.Published);
     }
@@ -732,13 +959,18 @@ public sealed class CiMonitorServiceTests : IDisposable
                 return ErrorResponse(HttpStatusCode.Forbidden, retryAfter: "0", rateLimitRemaining: "0");
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
 
         Assert.Equal(2, callCount);
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.CiSucceeded, evt.Type);
+        // Retry-After: 0 waits zero time: the only timer ever registered is the CI timeout, and
+        // it is released once monitoring returns.
+        Assert.Equal([Timeout], clock.RequestedDelays);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -779,14 +1011,29 @@ public sealed class CiMonitorServiceTests : IDisposable
     public async Task MonitorMergeAsync_RetriedStatus_IssuesManyRequestsUnlikeTerminalBranches()
     {
         var eventBus = new RecordingEventBus();
-        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.InternalServerError));
-        var service = CreateService(handler, eventBus: eventBus);
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(_ => ErrorResponse(HttpStatusCode.InternalServerError)));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, timeoutOverride: ExhaustionTimeout, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        Assert.True(handler.Requests.Count > 1,
-            $"A retried status must poll repeatedly; got {handler.Requests.Count} request(s).");
-        Assert.Empty(eventBus.Published);
+            // A retried status polls on every 7 s tick until the manual timeout: exactly four
+            // requests, where each terminal branch above issues exactly one.
+            await RunToTimeoutExhaustionAsync(gates, clock, handler, monitor);
+
+            Assert.Empty(eventBus.Published);
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -801,76 +1048,129 @@ public sealed class CiMonitorServiceTests : IDisposable
                 return ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: "0");
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
 
         Assert.Equal(2, callCount);
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.CiSucceeded, evt.Type);
+        // Retry-After: 0 waits zero time: the only timer ever registered is the CI timeout, and
+        // it is released once monitoring returns.
+        Assert.Equal([Timeout], clock.RequestedDelays);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorMergeAsync_5xx_Retries()
     {
         var eventBus = new RecordingEventBus();
-        var callCount = 0;
-        var handler = new ScriptedHttpMessageHandler(_ =>
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(n =>
         {
-            callCount++;
-            if (callCount == 1)
+            if (n == 1)
                 return ErrorResponse(HttpStatusCode.InternalServerError);
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
-        });
-        var service = CreateService(handler, eventBus: eventBus);
+        }));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        Assert.Equal(2, callCount);
-        var evt = Assert.Single(eventBus.Published);
-        Assert.Equal(EventType.CiSucceeded, evt.Type);
+            await AwaitFirstRequestWithTimeoutArmedAsync(gates, clock, Timeout);
+            await ReleaseAndPollToNextRequestAsync(gates, clock, handler, 1);
+            gates.Release(2);
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, gates.Count);
+            var evt = Assert.Single(eventBus.Published);
+            Assert.Equal(EventType.CiSucceeded, evt.Type);
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorMergeAsync_MalformedJson_Retries()
     {
         var eventBus = new RecordingEventBus();
-        var callCount = 0;
-        var handler = new ScriptedHttpMessageHandler(_ =>
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(n =>
         {
-            callCount++;
-            if (callCount == 1)
+            if (n == 1)
                 return OkResponse("not valid json");
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
-        });
-        var service = CreateService(handler, eventBus: eventBus);
+        }));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        Assert.Equal(2, callCount);
-        var evt = Assert.Single(eventBus.Published);
-        Assert.Equal(EventType.CiSucceeded, evt.Type);
+            await AwaitFirstRequestWithTimeoutArmedAsync(gates, clock, Timeout);
+            await ReleaseAndPollToNextRequestAsync(gates, clock, handler, 1);
+            gates.Release(2);
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, gates.Count);
+            var evt = Assert.Single(eventBus.Published);
+            Assert.Equal(EventType.CiSucceeded, evt.Type);
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorMergeAsync_TransportException_Retries()
     {
         var eventBus = new RecordingEventBus();
-        var callCount = 0;
-        var handler = new ScriptedHttpMessageHandler(_ =>
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(n =>
         {
-            callCount++;
-            if (callCount == 1)
+            if (n == 1)
                 throw new HttpRequestException("Simulated transport failure");
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
-        });
-        var service = CreateService(handler, eventBus: eventBus);
+        }));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        Assert.Equal(2, callCount);
-        var evt = Assert.Single(eventBus.Published);
-        Assert.Equal(EventType.CiSucceeded, evt.Type);
+            await AwaitFirstRequestWithTimeoutArmedAsync(gates, clock, Timeout);
+            await ReleaseAndPollToNextRequestAsync(gates, clock, handler, 1);
+            gates.Release(2);
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, gates.Count);
+            var evt = Assert.Single(eventBus.Published);
+            Assert.Equal(EventType.CiSucceeded, evt.Type);
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Other ──────────────────────────────────────────────────────────────
@@ -943,34 +1243,50 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         var eventBus = new RecordingEventBus();
         var logger = new RecordingLogger<CiMonitorService>();
-        var callCount = 0;
-        var handler = new ScriptedHttpMessageHandler(_ =>
+        var gates = new RequestGates();
+        var handler = new ScriptedHttpMessageHandler(_ => gates.EnterAsync(n =>
         {
-            callCount++;
             // Force a retry so more than one request is inspected — the header must be
             // attached to every request, not only the first.
-            if (callCount == 1)
+            if (n == 1)
                 return ErrorResponse(HttpStatusCode.InternalServerError);
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
-        });
-        var service = CreateService(handler, eventBus: eventBus, logger: logger);
+        }));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, logger: logger, clock: clock);
 
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
-
-        Assert.Equal(2, handler.Captured.Count);
-        Assert.All(handler.Captured, c =>
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
         {
-            Assert.Equal("Bearer", c.AuthorizationScheme);
-            Assert.Equal(secret, c.AuthorizationParameter);
-        });
+            monitor = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        // The token must appear in no log message, no exception text, and no request URL.
-        foreach (var entry in logger.Snapshot())
-        {
-            Assert.DoesNotContain(secret, entry.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain(secret, entry.Exception?.ToString() ?? "", StringComparison.Ordinal);
+            await AwaitFirstRequestWithTimeoutArmedAsync(gates, clock, Timeout);
+            await ReleaseAndPollToNextRequestAsync(gates, clock, handler, 1);
+            gates.Release(2);
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, handler.Captured.Count);
+            Assert.All(handler.Captured, c =>
+            {
+                Assert.Equal("Bearer", c.AuthorizationScheme);
+                Assert.Equal(secret, c.AuthorizationParameter);
+            });
+
+            // The token must appear in no log message, no exception text, and no request URL.
+            foreach (var entry in logger.Snapshot())
+            {
+                Assert.DoesNotContain(secret, entry.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(secret, entry.Exception?.ToString() ?? "", StringComparison.Ordinal);
+            }
+            Assert.All(handler.Captured, c => Assert.DoesNotContain(secret, c.Url, StringComparison.Ordinal));
         }
-        Assert.All(handler.Captured, c => Assert.DoesNotContain(secret, c.Url, StringComparison.Ordinal));
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, gates.ReleaseAll);
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -1017,15 +1333,27 @@ public sealed class CiMonitorServiceTests : IDisposable
             await bothInFlight.Task.WaitAsync(TimeSpan.FromSeconds(5));
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        // The CI timeout must outlast the rendezvous budget: under full-suite load the second repo's request can arrive after the default 500 ms test-wide Timeout expires, so the first repo's linked probe token is already dead when the barrier releases and its success is misclassified as a terminal CI timeout that publishes no event — leaving only 1 of the expected 2 CiSucceeded events. Success returns immediately after the rendezvous, so the longer timeout adds no runtime, and the 5-second barrier still proves concurrency.
-        var service = CreateService(handler, config: config, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(30));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
-        await service.MonitorGoalAsync("goal-1", "sha1,sha2", ["repo-a", "repo-b"], TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            monitor = service.MonitorGoalAsync("goal-1", "sha1,sha2", ["repo-a", "repo-b"], cts.Token);
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
-        Assert.True(bothInFlight.Task.IsCompletedSuccessfully,
-            "Both repositories must be monitored concurrently; the rendezvous was never reached.");
-        Assert.Equal(2, eventBus.Published.Count);
-        Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiSucceeded, e.Type));
+            Assert.True(bothInFlight.Task.IsCompletedSuccessfully,
+                "Both repositories must be monitored concurrently; the rendezvous was never reached.");
+            Assert.Equal(2, eventBus.Published.Count);
+            Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiSucceeded, e.Type));
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, () => bothInFlight.TrySetResult(true));
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -1051,28 +1379,41 @@ public sealed class CiMonitorServiceTests : IDisposable
     {
         var eventBus = new RecordingEventBus();
         var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstRequestEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(async _ =>
         {
-            callCount++;
-            if (callCount == 1)
+            if (Interlocked.Increment(ref callCount) == 1)
             {
+                firstRequestEntered.TrySetResult();
                 await gate.Task;
                 return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
             }
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        var first = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
-        // Give the first call time to add to in-flight and start the HTTP request.
-        await Task.Delay(100, TestContext.Current.CancellationToken);
-        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
-        gate.SetResult(true);
-        await first;
+        using var cts = new CancellationTokenSource();
+        Task? first = null;
+        try
+        {
+            first = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
+            // The first call's request has reached the handler, so it holds the in-flight key.
+            await firstRequestEntered.Task.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
+            await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+            gate.SetResult(true);
+            await first.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
-        Assert.Equal(1, callCount);
-        Assert.Single(eventBus.Published);
+            Assert.Equal(1, callCount);
+            Assert.Single(eventBus.Published);
+        }
+        finally
+        {
+            await CleanupMonitorAsync(first, cts, () => gate.TrySetResult(true));
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -1097,23 +1438,34 @@ public sealed class CiMonitorServiceTests : IDisposable
             // A completely green response: only a caller-token check can suppress the event.
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        var service = CreateService(handler, eventBus: eventBus, logger: logger);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, logger: logger, clock: clock);
 
         using var cts = new CancellationTokenSource();
-        var monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
+        Task? monitorTask = null;
+        try
+        {
+            monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        // Rendezvous: proves the implementation actually issued a request (rules out a no-op).
-        Assert.True(await requestStarted.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken),
-            "The service never issued a request — cancellation would be vacuous.");
-        await cts.CancelAsync();
-        cancelObserved.SetResult(true);
-        await monitorTask;
+            // Rendezvous: proves the implementation actually issued a request (rules out a no-op).
+            Assert.True(await requestStarted.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken),
+                "The service never issued a request — cancellation would be vacuous.");
+            await cts.CancelAsync();
+            cancelObserved.SetResult(true);
+            await monitorTask.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
-        Assert.Empty(eventBus.Published);
-        Assert.Single(handler.Requests);
-        Assert.Contains(logger.Snapshot(), e => e.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
-        // Caller cancellation is authoritative — it must not be reported as a CI timeout.
-        Assert.DoesNotContain(logger.Snapshot(), e => e.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase));
+            Assert.Empty(eventBus.Published);
+            Assert.Single(handler.Requests);
+            Assert.Contains(logger.Snapshot(), e => e.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
+            // Caller cancellation is authoritative — it must not be reported as a CI timeout.
+            Assert.DoesNotContain(logger.Snapshot(), e => e.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitorTask, cts, () => cancelObserved.TrySetResult(true));
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -1141,20 +1493,31 @@ public sealed class CiMonitorServiceTests : IDisposable
         };
         var handler = new ScriptedHttpMessageHandler(_ =>
             OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "Build failed", null))));
-        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, logger: logger);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, logger: logger, clock: clock);
 
-        var monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
+        Task? monitorTask = null;
+        try
+        {
+            monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", cts.Token);
 
-        Assert.True(await issueCallStarted.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken),
-            "The failure path never reached the issue store — cancellation would be vacuous.");
-        await cts.CancelAsync();
-        cancelObserved.SetResult(true);
-        await monitorTask;
+            Assert.True(await issueCallStarted.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken),
+                "The failure path never reached the issue store — cancellation would be vacuous.");
+            await cts.CancelAsync();
+            cancelObserved.SetResult(true);
+            await monitorTask.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
-        // The OCE must NOT be swallowed as a store failure and turned into a CiFailed event.
-        Assert.Empty(eventBus.Published);
-        Assert.Empty(issueStore.Issues);
-        Assert.Contains(logger.Snapshot(), e => e.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
+            // The OCE must NOT be swallowed as a store failure and turned into a CiFailed event.
+            Assert.Empty(eventBus.Published);
+            Assert.Empty(issueStore.Issues);
+            Assert.Contains(logger.Snapshot(), e => e.Message.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitorTask, cts, () => cancelObserved.TrySetResult(true));
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -1281,7 +1644,19 @@ public sealed class CiMonitorServiceTests : IDisposable
             HiveConfigFile config,
             IHttpClientFactory httpClientFactory,
             IEventBus? eventBus = null,
-            TimeSpan? startupScanWindow = null)
+            TimeSpan? startupScanWindow = null,
+            ControlledTimeProvider? clock = null)
+            : this(clock ?? new ControlledTimeProvider(), goalStore, config, httpClientFactory, eventBus, startupScanWindow)
+        {
+        }
+
+        private MonitorRecordingService(
+            ControlledTimeProvider clock,
+            IGoalStore? goalStore,
+            HiveConfigFile config,
+            IHttpClientFactory httpClientFactory,
+            IEventBus? eventBus,
+            TimeSpan? startupScanWindow)
             : base(
                 goalStore: goalStore,
                 eventBus: eventBus,
@@ -1289,9 +1664,14 @@ public sealed class CiMonitorServiceTests : IDisposable
                 httpClientFactory: httpClientFactory,
                 pollInterval: PollInterval,
                 timeoutOverride: Timeout,
-                startupScanWindow: startupScanWindow)
+                startupScanWindow: startupScanWindow,
+                timeProvider: clock)
         {
+            Clock = clock;
         }
+
+        /// <summary>The manual clock this service was constructed with.</summary>
+        public ControlledTimeProvider Clock { get; }
 
         public ConcurrentBag<(string GoalId, string Repo, string Sha, CancellationToken Token)> Monitored { get; } = [];
 
@@ -1311,8 +1691,9 @@ public sealed class CiMonitorServiceTests : IDisposable
         IGoalStore? goalStore,
         HiveConfigFile? config = null,
         IEventBus? eventBus = null,
-        TimeSpan? startupScanWindow = null) =>
-        new(goalStore, config ?? CreateConfig(CreateRepo()), CreateFactory(handler), eventBus, startupScanWindow);
+        TimeSpan? startupScanWindow = null,
+        ControlledTimeProvider? clock = null) =>
+        new(goalStore, config ?? CreateConfig(CreateRepo()), CreateFactory(handler), eventBus, startupScanWindow, clock);
 
     private static Goal CompletedGoal(
         string id = "goal-1",
@@ -1744,9 +2125,9 @@ public sealed class CiMonitorServiceTests : IDisposable
 
     // ── Probe classification (internal ProbeCiStatusAsync) ─────────────────
 
-    private static async Task<CiProbeResult> ProbeAsync(ScriptedHttpMessageHandler handler)
+    private static async Task<CiProbeResult> ProbeAsync(ScriptedHttpMessageHandler handler, ControlledTimeProvider? clock = null)
     {
-        var service = CreateService(handler);
+        var service = CreateService(handler, clock: clock ?? new ControlledTimeProvider());
         using var client = new HttpClient(handler, disposeHandler: false);
         return await service.ProbeCiStatusAsync("org", "test-repo", "abc123", client, TestContext.Current.CancellationToken);
     }
@@ -2269,19 +2650,31 @@ public sealed class CiMonitorServiceTests : IDisposable
             await bothInFlight.Task.WaitAsync(TimeSpan.FromSeconds(5));
             return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
         });
-        // The CI timeout must outlast the rendezvous budget: under full-suite load the second repo's request can arrive after the default 500 ms test-wide Timeout expires, so the first repo's linked probe token is already dead when the barrier releases and its success is misclassified as a terminal CI timeout that publishes no event — leaving only 1 of the expected 2 CiSucceeded events. Success returns immediately after the rendezvous, so the longer timeout adds no runtime, and the 5-second barrier still proves concurrency and repository-aware dedup.
-        var service = CreateService(handler, config: config, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(30));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
-        // Identical SHA for both repositories — only the repository dimension separates them.
-        await service.MonitorGoalAsync("goal-1", "same-sha,same-sha", ["repo-a", "repo-b"], TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+        Task? monitor = null;
+        try
+        {
+            // Identical SHA for both repositories — only the repository dimension separates them.
+            monitor = service.MonitorGoalAsync("goal-1", "same-sha,same-sha", ["repo-a", "repo-b"], cts.Token);
+            await monitor.WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
-        Assert.True(bothInFlight.Task.IsCompletedSuccessfully,
-            "Both repositories must be monitored for the same SHA; the in-flight key is not repository-aware.");
-        Assert.Equal(2, handler.Requests.Count);
-        // Event dedup must also be repository-aware: one CiSucceeded per repository.
-        Assert.Equal(2, eventBus.Published.Count);
-        Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiSucceeded, e.Type));
-        Assert.Equal(["repo-a", "repo-b"], eventBus.Published.Select(e => e.Repository).Order().ToList());
+            Assert.True(bothInFlight.Task.IsCompletedSuccessfully,
+                "Both repositories must be monitored for the same SHA; the in-flight key is not repository-aware.");
+            Assert.Equal(2, handler.Requests.Count);
+            // Event dedup must also be repository-aware: one CiSucceeded per repository.
+            Assert.Equal(2, eventBus.Published.Count);
+            Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiSucceeded, e.Type));
+            Assert.Equal(["repo-a", "repo-b"], eventBus.Published.Select(e => e.Repository).Order().ToList());
+        }
+        finally
+        {
+            await CleanupMonitorAsync(monitor, cts, () => bothInFlight.TrySetResult(true));
+        }
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
