@@ -1,5 +1,29 @@
 ## [Unreleased]
 
+## [0.40.0] — 2026-09-27
+
+### Added
+
+- **First-restart work preservation** — During worker re-registration, `RegisterRequest.current_task_id` can claim a matching restored held attempt and `RegisterResponse.adopted_task` reports adoption. `RestoredAttemptAdopter` checks restored registry, assignment, worker, goal, slot, and phase evidence and fails closed; the synchronized commit changes the hold atomically among Held, Adopted, and Released states. A live worker carries its assignment only across a work-stream EOF/read fault, reconnects on `WorkStreamEnded`, and on successful adoption delivers the retained Complete before Ready on the adopting connection. Connection-bound progress, narrative, session, and lazy-provisioner calls retarget at call time after adoption. Unadopted attempts with a valid active-task pointer are released to ordinary reclaim/redispatch after the five-minute `CleanupDefaults.HeldAttemptAdoptionGraceMinutes` grace. Drain-callback failures are logged, and carried-delivery race/gating cases are hardened.
+
+### Changed
+
+- **Agent error results** — SharpCoder `Error` results now fail worker turns; orchestrator Brain, review, and clarification callers fault or follow their failure path via `AgentResultExtensions.IsError()`, and Composer handles `Completed/Error` results. Provider failure text is omitted from worker error stderr and diagnostics.
+- **Brain and pipeline behavior** — Brain session reset resets only the master session and preserves running goal sessions; Brain is required at startup. Planning retries stop after goal cancellation. Merge-failure replanning receives rebase context and git stdout; `BrainActor.Relay` forwards original exceptions; Brain git operations use a unified process runner with correct cancellation propagation. Plan-install/admission cleanup is hardened. A failed Improve worker records failure without failing the parent goal, which continues.
+- **Dependencies** — SharpCoder and SharpCoder.Providers moved from 0.20.2 to 0.21.0, adding per-account Copilot endpoint discovery, then to 0.21.1 for outbound tool-call name sanitization. This prevents persisted sessions with invalid tool-call names from failing with HTTP 400 on resume.
+- **Other fixes** — Corrected the GitHub OAuth avatar claim and shared constant; added `DOTNET_ROOT`/`PATH` for the on-demand .NET SDK in the worker image; removed unused `WorkTask.Iteration`; corrected Composer terminal-latch ordering.
+- **Test reliability** — Timing-dependent NuGet monitor, CI monitor, Actor dispose, and DistributedBrain tests now use injected `TimeProvider`/manual clocks, alongside deflake and test-isolation fixes.
+
+### Fixed
+
+- **Restore and cleanup reliability** — Restored-attempt adoption and carried delivery fail closed on stale or mismatched evidence; held-attempt release yields to a concurrent successful adoption. Failed cancellation/drain callbacks are recorded in guarded warning logs without masking the authoritative outcome.
+
+### Upgrade notes
+
+- **Breaking — Brain model required:** startup fails when `orchestrator.model` is missing or blank with: `orchestrator.model is not configured — CopilotHive requires a Brain. Start CopilotHive with --config-repo pointing at a hive-config.yaml that sets orchestrator.model.` There is no Brain-disabled mode.
+- Restart survival requires **both orchestrator and workers at 0.40.0**. A worker that does not send `current_task_id`, or a server that returns `adopted_task=false`, follows the ordinary path: the carried task is cancelled and drained, and no Complete is sent.
+- **Known limits:** Only the first restart is work-preserving. Pipelines restored after a restart remain checkpoint-ineligible; a task they dispatch cannot be adopted after a second restart, fails closed, and is released after the grace for redispatch (deferred issue: `restored-pipelines-never-become-ownership-checkpoint-eligible-so-tasks-they-dispatch-cannot-be-adopted-after-a-second-restart`). If the worker process dies or does not re-register within five minutes, the attempt is released and redispatched; a worker returning after release loses that attempt. A held restored pipeline with a blank active-task pointer is **not** released by the grace sweep: `StaleWorkerCleanupService` logs `held attempt for goal {GoalId} has a blank active-task pointer — left held; cancel or reset the goal manually`; it stays held until manually cancelled or reset. A Complete written but not processed when an adopted connection dies is not recovered worker-side. Worker gRPC identity remains trusted-network/anonymous; adoption adds no authentication. Semantic resolution of concurrent Improver guidance edits remains unimplemented. There is no exactly-once external-effect guarantee.
+
 ## [0.39.1] — 2026-09-24
 
 ### Fixed
