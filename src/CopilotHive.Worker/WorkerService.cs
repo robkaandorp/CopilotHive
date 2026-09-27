@@ -938,15 +938,40 @@ public sealed class WorkerService(
             // no task observes a released slot.
             if (_activeAssignment is { } retained && !retained.State.IsCarried)
             {
+                Exception? deferredCancellationFailure;
                 try
                 {
-                    await DrainAssignmentAsync(retained, cancelFirst: true);
+                    deferredCancellationFailure = await DrainAssignmentAsync(retained, cancelFirst: true);
                 }
                 finally
                 {
                     // The slot is cleared on EVERY path, including a deferred cancellation failure, so
                     // a follow-up run can never inherit a finished assignment.
                     ClearActiveAssignment();
+                }
+
+                // THE DISCARDED DEFERRED FAILURE IS REPORTED HERE, NOT PROPAGATED — and the report
+                // comes strictly AFTER the ownership clear above, so it can neither postpone nor
+                // replace it. Propagation is deliberately unavailable at this site: this `finally`
+                // must leave the run's outcome EXACTLY as it is today — the value RunCoreAsync
+                // returned, or the primary exception already in flight — so a throwing cancellation
+                // callback can never turn a finished run into a failed one. Silence is not acceptable
+                // either, so the failure is logged ONCE, at WARNING, rendered through the EXISTING
+                // SafeExceptionLog.Describe (exception TYPE NAMES and status codes only — the raw
+                // message is never read), and GUARDED like every other cleanup diagnostic, so a
+                // degraded sink can no more change the outcome than the discard could.
+                if (deferredCancellationFailure is not null)
+                {
+                    try
+                    {
+                        _log.Warn(
+                            "Deferred cancellation failure discarded by the exit re-check drain "
+                            + $"[{SafeExceptionLog.Describe(deferredCancellationFailure)}]");
+                    }
+                    catch
+                    {
+                        // A diagnostic must never mask the authoritative outcome.
+                    }
                 }
 
                 _currentTaskId = null;
@@ -989,13 +1014,34 @@ public sealed class WorkerService(
         // this boundary, and the reconnect path (round two) is what adopts and delivers it.
         if (_activeAssignment is { } inherited && !inherited.State.IsCarried)
         {
+            Exception? deferredCancellationFailure;
             try
             {
-                await DrainAssignmentAsync(inherited, cancelFirst: true);
+                deferredCancellationFailure = await DrainAssignmentAsync(inherited, cancelFirst: true);
             }
             finally
             {
                 ClearActiveAssignment();
+            }
+
+            // THE DISCARDED DEFERRED FAILURE IS REPORTED HERE, NOT PROPAGATED — the SAME rule the exit
+            // re-check applies, and for the same reason: this run has not started yet, so a throwing
+            // cancellation callback belonging to a finished predecessor must never abort it. The report
+            // is emitted AFTER the ownership clear, ONCE, at WARNING, rendered through the EXISTING
+            // SafeExceptionLog.Describe (type names and status codes only), and GUARDED like every
+            // other cleanup diagnostic.
+            if (deferredCancellationFailure is not null)
+            {
+                try
+                {
+                    _log.Warn(
+                        "Deferred cancellation failure discarded by the defensive entry drain "
+                        + $"[{SafeExceptionLog.Describe(deferredCancellationFailure)}]");
+                }
+                catch
+                {
+                    // A diagnostic must never mask the authoritative outcome.
+                }
             }
 
             _currentTaskId = null;

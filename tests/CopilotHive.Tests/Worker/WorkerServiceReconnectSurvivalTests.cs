@@ -1031,6 +1031,425 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // 7. The two DISCARDED deferred cancellation-callback failures — the exit
+    //    re-check drain and the defensive entry drain. Both drains must JOIN
+    //    their tasks, CLEAR the ownership slot, leave the run's outcome EXACTLY
+    //    as it would have been without the failure, and never propagate it —
+    //    but the failure may not stay SILENT: exactly one SANITIZED Warning,
+    //    naming its own site, is the whole of the new behavior.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE PRODUCTION DIAGNOSTIC OF THE EXIT RE-CHECK SITE — the WHOLE line, including the logger's
+    /// own category and <c>WARN</c> level and the EXACT sanitized classification, so the site name, the
+    /// level and the classification are all pinned by one literal.
+    /// </summary>
+    /// <remarks>
+    /// The classification is <c>AggregateException &lt;- NonCarriedDrainCallbackException</c>: the
+    /// runtime's own <c>CancellationTokenSource.CancelAsync</c> contract surfaces a throwing callback
+    /// aggregated, and <see cref="SafeExceptionLog.Describe"/> renders that wrapper plus the callback's
+    /// TYPE NAME (never its message).
+    /// </remarks>
+    private const string ExitRecheckDrainMessage =
+        "[Worker] WARN: Deferred cancellation failure discarded by the exit re-check drain "
+        + "[AggregateException <- NonCarriedDrainCallbackException]";
+
+    /// <summary>THE PRODUCTION DIAGNOSTIC OF THE DEFENSIVE-ENTRY SITE — the WHOLE line, likewise.</summary>
+    private const string DefensiveEntryDrainMessage =
+        "[Worker] WARN: Deferred cancellation failure discarded by the defensive entry drain "
+        + "[AggregateException <- NonCarriedDrainCallbackException]";
+
+    /// <summary>
+    /// THE EXIT RE-CHECK SITE. A run ends with its retained assignment DELIVERED (the carried delivery
+    /// completed on the adopted connection), so <see cref="WorkerService.RunAsync"/>'s exit re-check
+    /// drains it with <c>cancelFirst: true</c> — and that cancellation invokes a callback that THROWS.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE FOUR FACTS, ALL AT ONCE. (a) The failure is reported EXACTLY ONCE by the site that discarded
+    /// it — proved by counting that site's OWN whole expected line, which no other path emits; (b) the
+    /// distinctive RAW exception text appears NOWHERE in the log, so the sanitization genuinely holds;
+    /// (c) the ownership slot is CLEARED; and (d) the run's outcome is UNCHANGED — a CONTROL run of the
+    /// IDENTICAL two-run scenario, differing only in the absent throwing callback, returns the very
+    /// same <see cref="WorkerRunOutcome"/>, so the two are compared directly and no exception escapes
+    /// the failure run.
+    /// </para>
+    /// <para>
+    /// NO POLLING, NO SLEEP. The callback is armed while the assignment is already DELIVERED and its
+    /// token is provably UNCANCELLED, and the ONLY later act on that token is the exit re-check's own
+    /// cancellation request — so the assertion that the callback ran exactly once is positive proof
+    /// that the re-check, not some earlier transition, invoked it.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task ExitRecheckDrain_DiscardedCallbackFailure_IsLoggedOnceSanitizedAndRunOutcomeUnchanged()
+    {
+        const string RawMarker = "distinctive-exit-recheck-callback-failure-3b9e";
+        var callbackFailure = new NonCarriedDrainCallbackException(RawMarker);
+
+        // (d) THE CONTROL — THE SAME TWO-RUN SCENARIO WITHOUT THE FAILURE, driven through the SAME
+        // fixture and the SAME steps, so its outcome is what the failure run's outcome must equal.
+        var control = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        WorkerRunOutcome controlOutcome;
+        try
+        {
+            var controlExecution = await control.PushAssignmentAsync("task-A");
+            control.CompleteStream();
+            await control.JoinRunAsync();
+            Assert.Equal(
+                CarryStates.Carried, GetAssignmentState(GetActiveAssignment(control.Service)));
+
+            control.StartSecondRun(RegisterResponseFor(adopted: true));
+            var controlDelivery = await WaitForCarriedDeliveryAsync(
+                control.Service, "The carried delivery must run.");
+            control.Runner.Release("task-A");
+            await controlExecution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await controlDelivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(
+                CarryStates.Delivered, GetAssignmentState(GetActiveAssignment(control.Service)));
+
+            control.CompleteStream();
+            controlOutcome = await control.JoinRunAsync();
+            Assert.Equal(0, GetSlotOccupancy(control.Service));
+        }
+        finally
+        {
+            await control.TeardownAsync();
+        }
+
+        var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
+        var stdOut = Console.Out;
+        var stdErr = Console.Error;
+        var capture = new LogCapture(
+            line => line.Contains(ExitRecheckDrainMessage, StringComparison.Ordinal));
+        Console.SetOut(capture);
+        Console.SetError(capture);
+        var invocations = new int[1];
+        CancellationTokenRegistration registration = default;
+        try
+        {
+            // RUN 1: the body is still running at EOF, so the assignment is CARRIED with its delivery
+            // parked, and this run returns WITHOUT draining it.
+            var execution = await plan.PushAssignmentAsync("task-A");
+            plan.CompleteStream();
+            await plan.JoinRunAsync();
+            var owner = GetActiveAssignment(plan.Service);
+            Assert.Equal(CarryStates.Carried, GetAssignmentState(owner));
+
+            // RUN 2 (adopted): the retained result is delivered on connection 2, so the assignment is
+            // DELIVERED — a NON-carried state — when the run ends, which is exactly what makes this
+            // run's exit re-check drain it.
+            plan.StartSecondRun(RegisterResponseFor(adopted: true));
+            var delivery = await WaitForCarriedDeliveryAsync(
+                plan.Service, "The carried delivery must run.");
+            plan.Runner.Release("task-A");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await delivery.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(CarryStates.Delivered, GetAssignmentState(owner));
+
+            // ARM THE THROWING CALLBACK on the assignment's OWN source, in the window where the ONLY
+            // remaining act on that token is the exit re-check's cancellation request.
+            var ownerCts = GetOwnerCts(plan.Service);
+            Assert.False(
+                ownerCts.IsCancellationRequested,
+                "Nothing may have cancelled the delivered assignment before the exit re-check does.");
+            registration = ownerCts.Token.Register(() =>
+            {
+                Interlocked.Increment(ref invocations[0]);
+                throw callbackFailure;
+            });
+
+            // END RUN 2: the exit re-check drains the Delivered assignment, the callback throws, and the
+            // failure is DISCARDED — reported, never propagated.
+            plan.CompleteStream();
+            var outcome = await plan.JoinRunAsync();
+
+            // (d) THE OUTCOME IS UNCHANGED: the run still reports the SAME clean completion the
+            // identical control scenario reports WITHOUT any callback failure, and nothing escaped.
+            Assert.Equal(controlOutcome, outcome);
+
+            // THE CALLBACK REALLY RAN — the capture below is not vacuous.
+            Assert.Equal(1, Volatile.Read(ref invocations[0]));
+            Assert.True(ownerCts.IsCancellationRequested);
+
+            // (c) CLEARED: the exit re-check cleared the slot before the run returned.
+            Assert.Equal(0, GetSlotOccupancy(plan.Service));
+
+            // (a) AND (b): the WHOLE expected line — category, WARNING level, site name and the
+            // sanitized classification — appears EXACTLY ONCE, and the distinctive RAW message appears
+            // NOWHERE in the log.
+            var diagnostics = capture.ToString();
+            Assert.True(
+                capture.Signalled.IsCompleted,
+                "The discarded failure must have been reported before RunAsync returned.");
+            Assert.Equal(1, CountOccurrences(diagnostics, ExitRecheckDrainMessage));
+            Assert.DoesNotContain(RawMarker, diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(DefensiveEntryDrainMessage, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetOut(stdOut);
+            Console.SetError(stdErr);
+            registration.Dispose();
+            await plan.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE DEFENSIVE ENTRY SITE. This site cannot be reached by ordinary sequential runs — a previous
+    /// run's exit re-check always clears a non-Carried assignment first — so for THIS test ONLY a
+    /// non-Carried retained owner is installed directly (the same reflective construction the
+    /// <c>ReportingFinally_DoesNotResurrectNonCarriedHeartbeatState</c> test uses), and the REAL
+    /// <see cref="WorkerService.RunAsync"/> is then driven over it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE FOUR FACTS, ALL AT ONCE. (a) The failure is reported EXACTLY ONCE, at Warning, by the
+    /// DEFENSIVE-ENTRY site; (b) the raw exception text appears NOWHERE in the log; (c) the ownership
+    /// slot is CLEARED; and (d) the run's outcome is UNCHANGED — the identical fixture run WITHOUT the
+    /// failure (the control below, whose only difference is the absent throwing callback) produces the
+    /// very same outcome, so the two are compared directly rather than against a hardcoded expectation.
+    /// </para>
+    /// <para>
+    /// THE OWNERSHIP FACTS ARE THE PROOF THE DRAIN RAN. The armed callback's single invocation, the
+    /// cancelled source and its disposal are all produced by the defensive drain itself — a run that
+    /// skipped the drain could not fabricate any of them.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task DefensiveEntryDrain_DiscardedCallbackFailure_IsLoggedOnceSanitizedAndRunOutcomeUnchanged()
+    {
+        const string RawMarker = "distinctive-defensive-entry-callback-failure-7c4d";
+        var callbackFailure = new NonCarriedDrainCallbackException(RawMarker);
+
+        // (d) THE CONTROL — THE SAME RUN WITHOUT THE FAILURE. Identical fixture, identical registration
+        // answer; the ONLY difference from the failure run below is the absent throwing callback. Its
+        // outcome is what the failure run's outcome must equal.
+        var control = PrepareServiceWithRetainedNonCarriedOwner();
+        WorkerRunOutcome controlOutcome;
+        try
+        {
+            controlOutcome = await control.Service
+                .RunAsync(TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The control establishes the defensive CLEAR it shares with the failure run, so the clear
+            // asserted below can never be an artifact of the failure.
+            Assert.Equal(0, GetSlotOccupancy(control.Service));
+        }
+        finally
+        {
+            control.Dispose();
+        }
+
+        var stdOut = Console.Out;
+        var stdErr = Console.Error;
+        var capture = new LogCapture(
+            line => line.Contains(DefensiveEntryDrainMessage, StringComparison.Ordinal));
+        Console.SetOut(capture);
+        Console.SetError(capture);
+        var invocations = new int[1];
+        var prepared = PrepareServiceWithRetainedNonCarriedOwner();
+        CancellationTokenRegistration registration = default;
+        try
+        {
+            // ARM THE THROWING CALLBACK BEFORE THE RUN: the FIRST act of this run is the defensive
+            // entry drain, whose cancellation request is therefore the callback's only trigger.
+            registration = prepared.OwnerCts.Token.Register(() =>
+            {
+                Interlocked.Increment(ref invocations[0]);
+                throw callbackFailure;
+            });
+
+            var outcome = await prepared.Service
+                .RunAsync(TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // (d) THE OUTCOME IS UNCHANGED — exactly the control's.
+            Assert.Equal(controlOutcome, outcome);
+
+            // THE DRAIN RAN: the callback fired once, and the source was cancelled and DISPOSED.
+            Assert.Equal(1, Volatile.Read(ref invocations[0]));
+            Assert.True(prepared.OwnerCts.IsCancellationRequested);
+            Assert.True(IsDisposed(prepared.OwnerCts));
+
+            // (c) CLEARED: the ownership slot is empty by the time the run returns.
+            Assert.Equal(0, GetSlotOccupancy(prepared.Service));
+
+            // (a) AND (b): the WHOLE expected line — category, WARNING level, site name and the
+            // sanitized classification — appears EXACTLY ONCE, and the distinctive RAW message appears
+            // NOWHERE in the log.
+            var diagnostics = capture.ToString();
+            Assert.True(
+                capture.Signalled.IsCompleted,
+                "The discarded failure must have been reported before RunAsync returned.");
+            Assert.Equal(1, CountOccurrences(diagnostics, DefensiveEntryDrainMessage));
+            Assert.DoesNotContain(RawMarker, diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(ExitRecheckDrainMessage, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetOut(stdOut);
+            Console.SetError(stdErr);
+            registration.Dispose();
+            prepared.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// THE THROWING CANCELLATION CALLBACK these two vectors arm, as a type DISTINCT from every
+    /// competing failure so neither the reported classification nor the raw text can be misattributed.
+    /// The message it carries is the distinctive RAW MARKER the tests prove never reaches a log.
+    /// </summary>
+    private sealed class NonCarriedDrainCallbackException(string message) : Exception(message);
+
+    /// <summary>
+    /// THE DIRECT OWNERSHIP INJECTION for the defensive-entry vector — the ONLY state injection this
+    /// file performs besides <c>ReportingFinally_DoesNotResurrectNonCarriedHeartbeatState</c>'s: the
+    /// production <c>ActiveAssignment</c> is built through the production nested types (terminal-result
+    /// holder, Ready claim, receipt tracker, ordinary-readiness slot) and left in its OPEN,
+    /// NON-CARRIED state, which is exactly the state the defensive entry rule exists for.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY INJECTION IS UNAVOIDABLE HERE. A previous run's exit re-check always drains and clears a
+    /// non-Carried assignment before the next run begins, so the defensive entry drain is a second
+    /// guard that no ordinary sequential run can leave work for — the goal's own description says so.
+    /// The owner is therefore installed directly, and everything ELSE about the run stays real: the
+    /// REAL <c>WorkerService.RunAsync</c> over the REAL seams, so the drain, the joins, the ownership
+    /// clear and the diagnostic are all production code.
+    /// </para>
+    /// <para>
+    /// The connection is deliberately UNPUBLISHED and its reader EMPTY, and the registration answer is
+    /// REJECTED: nothing after the defensive drain is exercised, so the control run and the failure run
+    /// differ in exactly one fact — whether the armed callback throws.
+    /// </para>
+    /// </remarks>
+    private static RetainedNonCarriedOwner PrepareServiceWithRetainedNonCarriedOwner()
+    {
+        var requests = new CarryRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = BuildFaultingStream(requests, responses);
+        var connection = TestConnectionFactory.CreateUnpublished("worker-reconnect-a", stream);
+        var service = new WorkerService(
+            "http://localhost:9999", "worker-reconnect", ["coder"], "/config-repo");
+        InstallRunner(service, new CarryPromptRunner());
+        service.CallInvokerFactory =
+            () => new ScriptedInvoker(RegisterResponseFor(adopted: false, rejected: true));
+
+        var serviceType = typeof(WorkerService);
+        var holderType = serviceType.GetNestedType("TerminalResultHolder", BindingFlags.NonPublic)!;
+        var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+        var receiptType = serviceType.GetNestedType("CompletionReceiptTracker", BindingFlags.NonPublic)!;
+        var ownerType = serviceType.GetNestedType("ActiveAssignment", BindingFlags.NonPublic)!;
+        var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+        var readyClaim = Activator.CreateInstance(readyType, nonPublic: true)!;
+        var receipt = Activator.CreateInstance(
+            receiptType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [connection],
+            culture: null)!;
+        var ordinaryReady = NewOrdinaryReadySlot(connection, CancellationToken.None, readyClaim);
+        var ownerCts = new CancellationTokenSource();
+
+        // THE PRODUCTION CONSTRUCTOR SHAPE, with a null retry and a null carried delivery: exactly the
+        // owner the assignment handler installs for a legacy (ungated, un-retransmitted) assignment —
+        // and the owner is left OPEN, i.e. NOT Carried, which is the whole premise of this vector.
+        var owner = Activator.CreateInstance(
+            ownerType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args:
+            [
+                "task-A",
+                Task.CompletedTask,
+                Task.CompletedTask,
+                null,
+                ownerCts,
+                readyClaim,
+                holder,
+                receipt,
+                ordinaryReady,
+            ],
+            culture: null)!;
+
+        serviceType
+            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, owner);
+        serviceType
+            .GetField("_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, "task-A");
+        serviceType
+            .GetField("_currentRole", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, "coder");
+
+        return new RetainedNonCarriedOwner(service, connection, responses, requests, ownerCts);
+    }
+
+    /// <summary>
+    /// THE FIXTURE HANDLE of <see cref="PrepareServiceWithRetainedNonCarriedOwner"/>: the service, the
+    /// injected owner's ACTUAL cancellation source (the one the defensive drain cancels and disposes),
+    /// and the connection/reader/writer needed to release every seam on teardown.
+    /// </summary>
+    private sealed class RetainedNonCarriedOwner
+    {
+        private readonly WorkerConnection _connection;
+        private readonly ChannelResponseReader _responses;
+        private readonly CarryRequestStream _requests;
+
+        internal RetainedNonCarriedOwner(
+            WorkerService service,
+            WorkerConnection connection,
+            ChannelResponseReader responses,
+            CarryRequestStream requests,
+            CancellationTokenSource ownerCts)
+        {
+            Service = service;
+            _connection = connection;
+            _responses = responses;
+            _requests = requests;
+            OwnerCts = ownerCts;
+        }
+
+        internal WorkerService Service { get; }
+
+        /// <summary>The ACTUAL assignment-scoped source the injected owner was built with.</summary>
+        internal CancellationTokenSource OwnerCts { get; }
+
+        /// <summary>
+        /// TEARDOWN — the SAME shape the sibling injection test uses: retire the connection, end the
+        /// reader, release the writer, and dispose the service. IDEMPOTENT, because every exit path
+        /// calls it exactly once and a failure path must never leak the fixture.
+        /// </summary>
+        internal void Dispose()
+        {
+            _connection.Retire();
+            _responses.TryComplete();
+            _requests.ReleaseAll();
+            TryDispose(Service);
+        }
+    }
+
+    /// <summary>
+    /// Counts NON-OVERLAPPING occurrences of <paramref name="needle"/> in <paramref name="haystack"/>.
+    /// Used where mere presence is not enough: each discard report is required to appear EXACTLY ONCE
+    /// per discarded failure, which a <c>Contains</c> assertion would not detect.
+    /// </summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = haystack.IndexOf(needle, StringComparison.Ordinal);
+        while (index >= 0)
+        {
+            count++;
+            index = haystack.IndexOf(needle, index + needle.Length, StringComparison.Ordinal);
+        }
+
+        return count;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Harness.
     // ══════════════════════════════════════════════════════════════════════════
 
