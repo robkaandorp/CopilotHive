@@ -442,7 +442,7 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
         var actor = Assert.IsType<BrainActor>(actorField.GetValue(brain));
         var message = BrainActorMessages.CreateGetPipelineMessage(goalId);
         Assert.True(actor.Tell(message), "the concrete BrainActor mailbox must accept the query");
-        return await message.Reply.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+        return await message.Reply.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
     }
 
     // ═══════════════ Block A — classification, restore routes, persistence, startup ═══════════════
@@ -735,14 +735,17 @@ public sealed class RestoredActiveAttemptHoldTests : IDisposable
             await using var brain = new DistributedBrain(
                 "copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: stateDir,
-                chatClient: new Mock<Microsoft.Extensions.AI.IChatClient>().Object);
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                chatClient: new Mock<Microsoft.Extensions.AI.IChatClient>().Object,
+                timeProvider: new ControlledTimeProvider());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken)
+                .WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
             var restoreManager = new GoalPipelineManager(
                 CreateFactoryBackedStore(), NullLogger<GoalPipelineManager>.Instance);
             var maintenance = CreateMaintenance(restoreManager, brain: brain);
 
-            await maintenance.RestoreActivePipelinesAsync(TestContext.Current.CancellationToken);
+            await maintenance.RestoreActivePipelinesAsync(TestContext.Current.CancellationToken)
+                .WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
             var held = restoreManager.GetByGoalId(heldGoalId);
             var unheld = restoreManager.GetByGoalId(controlGoalId);

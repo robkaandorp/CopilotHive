@@ -874,8 +874,10 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                timeProvider: new ControlledTimeProvider());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken)
+                .WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
             var systemPromptField = typeof(DistributedBrain)
                 .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
@@ -883,7 +885,8 @@ public sealed class DistributedBrainTests
             var messageCountBefore = ActorMasterSession(brain).MessageHistory.Count;
 
             // Act: inject new orchestrator instructions
-            await brain.InjectOrchestratorInstructionsAsync("NEW_ORCHESTRATOR_RULES", TestContext.Current.CancellationToken);
+            await brain.InjectOrchestratorInstructionsAsync("NEW_ORCHESTRATOR_RULES", TestContext.Current.CancellationToken)
+                .WaitAsync(ControlledTimeProvider.HangGuard, TestContext.Current.CancellationToken);
 
             // Assert: system prompt updated with new instructions
             var updatedPrompt = (string)systemPromptField.GetValue(brain)!;

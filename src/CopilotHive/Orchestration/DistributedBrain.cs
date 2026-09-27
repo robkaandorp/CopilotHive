@@ -51,6 +51,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly IEventBus? _eventBus;
 
     /// <summary>
+    /// Clock seam for every time-bounded wait in this facade: the connect-reply wait, every
+    /// <see cref="AskActorAsync"/> timeout and the three 1-second synchronous query timeouts.
+    /// Defaults to <see cref="TimeProvider.System"/> so production behaviour is unchanged.
+    /// </summary>
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>
     /// Directory used for persistent Brain state (session files).
     /// </summary>
     public string StateDirectory => _stateDir;
@@ -84,7 +91,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private const string DefaultSystemPrompt = BrainPromptBuilder.DefaultSystemPrompt;
 
-    /// <summary>Initialises a new <see cref="DistributedBrain"/> that connects directly to an LLM provider.</summary>
+    /// <summary>
+    /// Initialises a new <see cref="DistributedBrain"/> that connects directly to an LLM provider.
+    /// The trailing <c>timeProvider</c> parameter is the clock for every time-bounded actor wait
+    /// (connect reply, ask timeouts, 1-second query timeouts) and defaults to
+    /// <see cref="TimeProvider.System"/>.
+    /// </summary>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
@@ -101,7 +113,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         ConfigRepoManager? configRepo = null,
         ReasoningEffort? reasoningEffort = null,
         IIssueStore? issueStore = null,
-        IEventBus? eventBus = null)
+        IEventBus? eventBus = null,
+        TimeProvider? timeProvider = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -121,6 +134,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _configRepo = configRepo;
         _issueStore = issueStore;
         _eventBus = eventBus;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _configuredReasoningEffort = reasoningEffort;
         _reasoningEffort = reasoningEffort;
 
@@ -208,7 +222,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 var statsMsg = BrainActorMessages.CreateGetStatsMessage();
                 if (actor.Tell(statsMsg))
                 {
-                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(1), _timeProvider);
                     var stats = statsMsg.Reply.Task.WaitAsync(timeoutCts.Token).GetAwaiter().GetResult();
                     if (stats is not null)
                     {
@@ -269,8 +283,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             if (!actor.Tell(connectMsg))
                 throw new InvalidOperationException("BrainActor mailbox closed");
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+            // The 5-second connect deadline runs on the injected clock (default: system) and is
+            // linked with the caller token, so caller cancellation and an elapsed deadline still
+            // surface distinctly to the catch blocks below.
+            using var connectTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5), _timeProvider);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct, connectTimeoutCts.Token);
             await connectMsg.Reply.Task.WaitAsync(timeoutCts.Token);
 
             Volatile.Write(ref _brainActor, actor);
@@ -367,12 +384,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (!actor.Tell(message))
             throw new InvalidOperationException("BrainActor mailbox closed.");
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeout);
+        // The timeout deadline is armed by a TimeProvider-backed CTS (default: system clock) linked
+        // with the caller token, so an elapsed deadline and caller cancellation remain distinct:
+        // only the deadline maps to TimeoutException below.
+        using var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
         try
         {
-            return await reply.Task.WaitAsync(timeoutCts.Token);
+            return await reply.Task.WaitAsync(linkedCts.Token);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
         {
@@ -536,7 +556,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1), _timeProvider);
             return msg.Reply.Task.WaitAsync(cts.Token).GetAwaiter().GetResult();
         }
         catch
@@ -1105,7 +1125,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1), _timeProvider);
             var stats = statsMsg.Reply.Task.WaitAsync(cts.Token).GetAwaiter().GetResult();
             if (stats is null) return null;
 
