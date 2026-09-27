@@ -20,8 +20,20 @@ namespace CopilotHive.Tests.Services;
 /// </summary>
 public sealed class NuGetPublishMonitorServiceTests
 {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(2);
+    /// <summary>
+    /// Poll interval requested on the CONTROLLED clock — 7 seconds, deliberately distinct from
+    /// <see cref="OverallTimeout"/> and from every Retry-After hint used below, so a due-time
+    /// rendezvous can tell the poll-delay timer apart from the overall-timeout timer. (Timer
+    /// counts alone could not.)
+    /// </summary>
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(7);
+
+    /// <summary>
+    /// Overall monitoring timeout requested on the CONTROLLED clock — 10 minutes, unmistakably
+    /// different from the 7-second poll interval. Its expiry is always driven by an explicit
+    /// <see cref="ControlledTimeProvider.Advance"/>, never by real elapsed time.
+    /// </summary>
+    private static readonly TimeSpan OverallTimeout = TimeSpan.FromMinutes(10);
 
     // ── Test infrastructure ────────────────────────────────────────────────
 
@@ -79,7 +91,8 @@ public sealed class NuGetPublishMonitorServiceTests
         HiveConfigFile? config = null,
         IEventBus? eventBus = null,
         TimeSpan? pollInterval = null,
-        TimeSpan? timeoutOverride = null)
+        TimeSpan? timeoutOverride = null,
+        ControlledTimeProvider? clock = null)
     {
         return new NuGetPublishMonitorService(
             config: config,
@@ -87,7 +100,44 @@ public sealed class NuGetPublishMonitorServiceTests
             httpClientFactory: CreateFactory(handler),
             logger: NullLogger<NuGetPublishMonitorService>.Instance,
             pollInterval: pollInterval ?? PollInterval,
-            timeoutOverride: timeoutOverride ?? Timeout);
+            timeoutOverride: timeoutOverride ?? OverallTimeout,
+            timeProvider: clock);
+    }
+
+    /// <summary>
+    /// Rendezvous on the pending delay timer that still has exactly <paramref name="delay"/> to run,
+    /// then advance the manual clock by that window so the producer resumes.
+    /// <para>
+    /// The rendezvous — not a sleep — is what makes this deterministic: when it returns, the
+    /// producer provably holds a timer with that exact due time, so the advance cannot miss it,
+    /// and no real time passes for anything to race against.
+    /// </para>
+    /// </summary>
+    private static async Task AdvanceAsync(
+        ControlledTimeProvider clock, TimeSpan delay, CancellationToken ct)
+    {
+        await clock.WaitForPendingTimerAsync(delay, ct);
+        clock.Advance(delay);
+    }
+
+    /// <summary>
+    /// Joins a task the test started, for use exclusively in <c>finally</c> blocks. The await is
+    /// bounded and its outcome is deliberately discarded: the purpose is only to prove that the
+    /// task ENDED before the test returned, so that an intermediate rendezvous or assertion failure
+    /// can never leak a live monitor. Swallowing here is what preserves the ORIGINAL failure — an
+    /// exception thrown out of a <c>finally</c> would replace it, and the success path keeps its own
+    /// strong <c>WaitAsync</c> assertion.
+    /// </summary>
+    private static async Task JoinQuietlyAsync(Task task)
+    {
+        try
+        {
+            await task.WaitAsync(ControlledTimeProvider.HangGuard, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            // Joining only: the test's own assertions decide the verdict.
+        }
     }
 
     private static HiveConfigFile CreateConfig(params RepositoryConfig[] repos) => new()
@@ -176,7 +226,8 @@ public sealed class NuGetPublishMonitorServiceTests
     {
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
@@ -185,6 +236,8 @@ public sealed class NuGetPublishMonitorServiceTests
         Assert.Equal("Package My.Package 1.2.3 published on NuGet (release v1.2.3)", evt.Message);
         Assert.Equal("test-repo", evt.Repository);
         Assert.Null(evt.ReleaseId);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -198,7 +251,8 @@ public sealed class NuGetPublishMonitorServiceTests
                 return OkResponse(PageJsonWithMatch("1.2.3"));
             return OkResponse(IndexJsonWithPage(pageUrl));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
@@ -207,22 +261,40 @@ public sealed class NuGetPublishMonitorServiceTests
         Assert.Equal("Package My.Package 1.2.3 published on NuGet (release v1.2.3)", evt.Message);
         Assert.Equal("test-repo", evt.Repository);
         Assert.Null(evt.ReleaseId);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
+    /// <summary>
+    /// Removal-proof for M2 and M6. M2: the overall timeout must be armed from the injected
+    /// clock's CTS — a real <c>CancelAfter</c> would leave the 10-minute rendezvous below
+    /// unsatisfiable. M6: the elapsed figure in the published message must be the manually
+    /// advanced time, exactly 600 s; a real <see cref="System.Diagnostics.Stopwatch"/> would
+    /// report 0 s.
+    /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_Timeout_PublishesPackagePublishTimedOut()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.NotFound));
-        var service = CreateService(handler, eventBus: eventBus, timeoutOverride: TimeSpan.FromMilliseconds(200));
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        // The caller token is NOT cancelled, so expiring the overall timeout must be classified as
+        // a timeout rather than as caller cancellation.
+        await clock.WaitForPendingTimerAsync(OverallTimeout, ct);
+        clock.Advance(OverallTimeout);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublishTimedOut, evt.Type);
-        Assert.Matches(@"^Package My\.Package 1\.2\.3 not found on NuGet after \d+s \(release v1\.2\.3\)$", evt.Message);
+        Assert.Equal("Package My.Package 1.2.3 not found on NuGet after 600s (release v1.2.3)", evt.Message);
         Assert.Equal("test-repo", evt.Repository);
         Assert.Null(evt.ReleaseId);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Version handling ───────────────────────────────────────────────────
@@ -232,12 +304,15 @@ public sealed class NuGetPublishMonitorServiceTests
     {
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.0.0")));
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.0", "v1.0", TestContext.Current.CancellationToken);
 
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -250,12 +325,15 @@ public sealed class NuGetPublishMonitorServiceTests
     {
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "v1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Theory]
@@ -270,13 +348,16 @@ public sealed class NuGetPublishMonitorServiceTests
         {
             Packages = [new NuGetPackageEntry { PackageId = "My.Package" }]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", releaseTag, TestContext.Current.CancellationToken);
 
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, evt.Type);
         Assert.Equal($"Package My.Package 1.2.3 published on NuGet (release {releaseTag})", evt.Message);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -288,12 +369,15 @@ public sealed class NuGetPublishMonitorServiceTests
         {
             Packages = [new NuGetPackageEntry { PackageId = "My.Package" }]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "vnot-a-version", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -305,12 +389,15 @@ public sealed class NuGetPublishMonitorServiceTests
         {
             Packages = [new NuGetPackageEntry { PackageId = "My.Package" }]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Dedup / multi-package ──────────────────────────────────────────────
@@ -318,26 +405,48 @@ public sealed class NuGetPublishMonitorServiceTests
     [Fact]
     public async Task MonitorPackageAsync_Dedup_SecondConcurrentCallSkipped()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var requestEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(async _ =>
         {
             callCount++;
             if (callCount == 1)
+            {
+                requestEntered.TrySetResult();
                 await gate.Task;
+            }
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        var first = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
-        await Task.Delay(100, TestContext.Current.CancellationToken);
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
-        gate.SetResult(true);
-        await first;
+        var first = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
 
-        Assert.Equal(1, callCount);
-        Assert.Single(eventBus.Published);
+        try
+        {
+            // Deterministic rendezvous replacing the old fixed sleep: the first monitor is INSIDE
+            // its request, so its in-flight dedup entry provably exists before the second call.
+            await requestEntered.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+            await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+            gate.SetResult(true);
+            await first.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+            Assert.Equal(1, callCount);
+            Assert.Single(eventBus.Published);
+            Assert.Equal(0, clock.PendingTimerCount);
+        }
+        finally
+        {
+            // ANY failure above (rendezvous timeout or assertion) must not leave the parked first
+            // monitor alive: release its request, then join it. The original failure is preserved
+            // because this join never throws.
+            gate.TrySetResult(true);
+            await JoinQuietlyAsync(first);
+        }
     }
 
     [Fact]
@@ -353,12 +462,15 @@ public sealed class NuGetPublishMonitorServiceTests
                 new NuGetPackageEntry { PackageId = "Other.Package" }
             ]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Equal(2, eventBus.Published.Count);
         Assert.All(eventBus.Published, e => Assert.Equal(EventType.PackagePublished, e.Type));
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Config / dependency validation ─────────────────────────────────────
@@ -368,17 +480,21 @@ public sealed class NuGetPublishMonitorServiceTests
     {
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var service = new NuGetPublishMonitorService(
             config: null,
             eventBus: eventBus,
             httpClientFactory: CreateFactory(handler),
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout,
+            timeProvider: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -390,12 +506,15 @@ public sealed class NuGetPublishMonitorServiceTests
         {
             Packages = [new NuGetPackageEntry { PackageId = "My.Package" }]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -407,12 +526,15 @@ public sealed class NuGetPublishMonitorServiceTests
         {
             Packages = [new NuGetPackageEntry { PackageId = "My.Package" }]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -421,12 +543,15 @@ public sealed class NuGetPublishMonitorServiceTests
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
         var config = CreateConfig(CreateRepo("test-repo", publishNuGet: null));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -435,42 +560,53 @@ public sealed class NuGetPublishMonitorServiceTests
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
         var config = CreateConfig(CreateRepo("test-repo", publishNuGet: new NuGetPublishConfig { Packages = [] }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync("test-repo", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_NullEventBus_ReturnsWithoutRequest()
     {
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var service = new NuGetPublishMonitorService(
             eventBus: null,
             httpClientFactory: CreateFactory(handler),
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout,
+            timeProvider: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_NullHttpClientFactory_ReturnsWithoutRequest()
     {
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var service = new NuGetPublishMonitorService(
             eventBus: eventBus,
             httpClientFactory: null,
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout,
+            timeProvider: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Theory]
@@ -491,13 +627,16 @@ public sealed class NuGetPublishMonitorServiceTests
     {
         var eventBus = new RecordingEventBus();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorPackageAsync(
             repoName!, packageId!, version!, releaseTag!, TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Theory]
@@ -515,20 +654,30 @@ public sealed class NuGetPublishMonitorServiceTests
         {
             Packages = [new NuGetPackageEntry { PackageId = "My.Package" }]
         }));
-        var service = CreateService(handler, config: config, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, config: config, eventBus: eventBus, clock: clock);
 
         await service.MonitorReleaseAsync(repoName!, releaseTag!, TestContext.Current.CancellationToken);
 
         Assert.Empty(eventBus.Published);
         Assert.Empty(handler.Urls);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── HTTP status handling ───────────────────────────────────────────────
 
+    /// <summary>
+    /// M1 removal-proof: the retry delay must be taken from the TimeProvider-aware overload. A
+    /// plain (non-TimeProvider) delay overload never registers a timer here, so the 7-second poll
+    /// rendezvous below never resolves.
+    /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_404_RetriesThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -537,19 +686,31 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.NotFound);
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        // The exact poll window, on the controlled clock — and the overall timeout is separately
+        // rendezvousable at 10 minutes, so neither can be mistaken for the other.
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
+    /// <summary>
+    /// A <c>Retry-After: 0</c> hint is not positive, so it must fall back to the poll interval —
+    /// asserted by the EXACT delay requested, not by timing.
+    /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_429WithRetryAfterZero_UsesPollInterval()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -558,18 +719,30 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: "0");
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+        Assert.Equal([OverallTimeout, PollInterval], clock.RequestedDelays);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
+    /// <summary>
+    /// Removal-proof for the Retry-After delta-seconds branch: the exact <c>Retry-After</c> value
+    /// must drive the requested delay — never the poll interval.
+    /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_429WithRetryAfterDeltaSeconds_DelaysThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -578,20 +751,39 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: "1");
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(5));
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        // 1 s exactly — the delta-seconds value, NOT the 7-second poll interval.
+        await AdvanceAsync(clock, TimeSpan.FromSeconds(1), ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+        Assert.Equal([OverallTimeout, TimeSpan.FromSeconds(1)], clock.RequestedDelays);
+        Assert.DoesNotContain(PollInterval, clock.RequestedDelays);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
+    /// <summary>
+    /// M5 removal-proof: an HTTP-date <c>Retry-After</c> in the PAST is measured against the
+    /// injected clock, so the delta is negative and the poll interval must be used. With a real
+    /// wall-clock subtraction (mutant M5) the delta depends on real time, so the exact
+    /// requested delay below would not be the poll interval.
+    /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_429WithRetryAfterPastDate_UsesPollInterval()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
-        var pastDate = DateTimeOffset.UtcNow.AddSeconds(-10).ToString("R", CultureInfo.InvariantCulture);
+
+        // Fixed fixture constant built from the controlled clock's now — 10 s in the past.
+        var pastDate = clock.GetUtcNow().AddSeconds(-10).ToString("R", CultureInfo.InvariantCulture);
+
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
             callCount++;
@@ -599,20 +791,36 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: pastDate);
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+        Assert.Equal([OverallTimeout, PollInterval], clock.RequestedDelays);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
+    /// <summary>
+    /// M5 removal-proof: an HTTP-date <c>Retry-After</c> in the FUTURE, computed from the
+    /// controlled clock, must yield exactly that delta as the requested delay.
+    /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_429WithRetryAfterFutureDate_DelaysThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
-        var futureDate = DateTimeOffset.UtcNow.AddSeconds(1).ToString("R", CultureInfo.InvariantCulture);
+
+        // Fixed fixture constant built from the controlled clock's now — 21 s in the future.
+        var retryAfter = TimeSpan.FromSeconds(21);
+        var futureDate = clock.GetUtcNow().Add(retryAfter).ToString("R", CultureInfo.InvariantCulture);
+
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
             callCount++;
@@ -620,18 +828,28 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: futureDate);
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(5));
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        // EXACT delta: neither the poll interval nor a wall-clock-dependent value.
+        await AdvanceAsync(clock, retryAfter, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+        Assert.Equal([OverallTimeout, retryAfter], clock.RequestedDelays);
+        Assert.DoesNotContain(PollInterval, clock.RequestedDelays);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_429WithoutRetryAfter_UsesPollInterval()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -640,31 +858,47 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.TooManyRequests);
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+        Assert.Equal([OverallTimeout, PollInterval], clock.RequestedDelays);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_Other4xx_TerminalReturn()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.BadRequest));
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct)
+            .WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
+        // A terminal result returns without ever arming a POLL delay — the only timer is the
+        // overall timeout armed up-front — and leaves nothing behind. Proven against the clock,
+        // not by timing.
         Assert.Empty(eventBus.Published);
         Assert.Single(handler.Urls);
+        Assert.Equal([OverallTimeout], clock.RequestedDelays);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_5xx_RetriesThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -673,18 +907,24 @@ public sealed class NuGetPublishMonitorServiceTests
                 return ErrorResponse(HttpStatusCode.InternalServerError);
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_MalformedJson_RetriesThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -693,18 +933,24 @@ public sealed class NuGetPublishMonitorServiceTests
                 return OkResponse("not json");
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task MonitorPackageAsync_TransportError_RetriesThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -713,12 +959,16 @@ public sealed class NuGetPublishMonitorServiceTests
                 throw new HttpRequestException("Simulated transport failure");
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Theory]
@@ -727,7 +977,9 @@ public sealed class NuGetPublishMonitorServiceTests
     [InlineData("https://api.nuget.org:8080/v3/page.json")] // wrong port
     public async Task MonitorPackageAsync_InvalidPageUrl_SkippedAndRetried(string pageUrl)
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -736,13 +988,17 @@ public sealed class NuGetPublishMonitorServiceTests
                 return OkResponse(IndexJsonWithPage(pageUrl));
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -752,7 +1008,9 @@ public sealed class NuGetPublishMonitorServiceTests
     [Fact]
     public async Task MonitorPackageAsync_PageError_SkippedAndRetried()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(req =>
@@ -764,50 +1022,57 @@ public sealed class NuGetPublishMonitorServiceTests
                 return OkResponse(IndexJsonWithPage(pageUrl));
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(3, callCount); // index + failed page + index again
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Removal-proof: timeout boundary ───────────────────────────────────
 
     /// <summary>
-    /// The handler blocks on a TCS; the timeout fires first, then the caller cancels.
-    /// When the handler is released, the service must observe the caller's cancellation
-    /// and publish NO event. Removing the <c>ct.IsCancellationRequested</c> check in the
-    /// timeout handler would publish <c>PackagePublishTimedOut</c> and fail this test.
+    /// The handler blocks on a TCS; the timeout fires on the CONTROLLED clock, then the caller
+    /// cancels. When the handler is released, the service must observe the caller's cancellation
+    /// and publish NO event. Removing the <c>ct.IsCancellationRequested</c> check in the timeout
+    /// handler would publish <c>PackagePublishTimedOut</c> and fail this test.
     /// </summary>
     [Fact]
     public async Task MonitorPackageAsync_CallerCancelledAfterTimeout_NoEvent()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
-        using var requestStarted = new SemaphoreSlim(0, 1);
+        var clock = new ControlledTimeProvider();
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var handler = new ScriptedHttpMessageHandler(async _ =>
         {
-            requestStarted.Release();
+            requestStarted.TrySetResult();
             await release.Task;
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus, timeoutOverride: TimeSpan.FromSeconds(1));
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         using var cts = new CancellationTokenSource();
         var monitorTask = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", cts.Token);
         try
         {
             // Rendezvous: proves the implementation actually issued a request (rules out a no-op).
-            Assert.True(await requestStarted.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken),
-                "The service never issued a request — cancellation would be vacuous.");
+            await requestStarted.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
-            // Let the 1s timeout fire, then cancel the caller.
-            await Task.Delay(1500, TestContext.Current.CancellationToken);
+            // Expire the OVERALL timeout on the controlled clock, then cancel the caller. The
+            // in-flight request is still parked, so the timeout surfaces only after it is released.
+            await clock.WaitForPendingTimerAsync(OverallTimeout, ct);
+            clock.Advance(OverallTimeout);
             await cts.CancelAsync();
             release.SetResult(true);
-            await monitorTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await monitorTask.WaitAsync(ControlledTimeProvider.HangGuard, ct);
         }
         finally
         {
@@ -815,6 +1080,8 @@ public sealed class NuGetPublishMonitorServiceTests
         }
 
         Assert.Empty(eventBus.Published);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Removal-proof: page-result precedence ──────────────────────────────
@@ -830,13 +1097,16 @@ public sealed class NuGetPublishMonitorServiceTests
         var eventBus = new RecordingEventBus();
         var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatchAndPage("1.2.3", pageUrl)));
-        var service = CreateService(handler, eventBus: eventBus);
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
         Assert.DoesNotContain(handler.Urls, u => u == pageUrl);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Removal-proof: malformed @id ───────────────────────────────────────
@@ -850,7 +1120,9 @@ public sealed class NuGetPublishMonitorServiceTests
     [Fact]
     public async Task MonitorPackageAsync_MalformedPageId_SkippedAndRetried()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -859,13 +1131,17 @@ public sealed class NuGetPublishMonitorServiceTests
                 return OkResponse(IndexJsonWithPage("./page.json"));
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Removal-proof: HTTP timeout retry ──────────────────────────────────
@@ -878,7 +1154,9 @@ public sealed class NuGetPublishMonitorServiceTests
     [Fact]
     public async Task MonitorPackageAsync_HttpTimeout_RetriesAndFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -887,13 +1165,17 @@ public sealed class NuGetPublishMonitorServiceTests
                 throw new TaskCanceledException("The request timed out.");
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Named client ───────────────────────────────────────────────────────
@@ -913,16 +1195,20 @@ public sealed class NuGetPublishMonitorServiceTests
             .Callback<string>(name => requestedNames.Add(name))
             .Returns(() => new HttpClient(handler, disposeHandler: false));
 
+        var clock = new ControlledTimeProvider();
         var service = new NuGetPublishMonitorService(
             eventBus: eventBus,
             httpClientFactory: factory.Object,
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout,
+            timeProvider: clock);
 
         await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
 
         Assert.Contains("nuget-api", requestedNames);
         Assert.Single(eventBus.Published);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── ProbePackageAsync: single-iteration probe ─────────────────────────
@@ -1106,7 +1392,7 @@ public sealed class NuGetPublishMonitorServiceTests
         var noBus = new NuGetPublishMonitorService(
             httpClientFactory: CreateFactory(handler),
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout);
         var noBusOutcome = await noBus.ProbePackageAsync(
             "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
         Assert.Equal(NuGetPublishMonitorService.ProbeResult.Terminal, noBusOutcome.Result);
@@ -1114,7 +1400,7 @@ public sealed class NuGetPublishMonitorServiceTests
         var noFactory = new NuGetPublishMonitorService(
             eventBus: new RecordingEventBus(),
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout);
         var noFactoryOutcome = await noFactory.ProbePackageAsync(
             "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
         Assert.Equal(NuGetPublishMonitorService.ProbeResult.Terminal, noFactoryOutcome.Result);
@@ -1203,13 +1489,16 @@ public sealed class NuGetPublishMonitorServiceTests
     [Fact]
     public async Task ProbePackageAsync_PageCancellation_Propagates()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
         var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
+        var pageRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var handler = new ScriptedHttpMessageHandler(async req =>
         {
             if (req.RequestUri!.ToString() == pageUrl)
             {
+                pageRequested.TrySetResult();
                 await release.Task;
                 return OkResponse(PageJsonWithMatch("1.2.3"));
             }
@@ -1219,11 +1508,15 @@ public sealed class NuGetPublishMonitorServiceTests
         using var cts = new CancellationTokenSource();
 
         var probe = service.ProbePackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", cts.Token);
-        await Task.Delay(100, TestContext.Current.CancellationToken);
+
+        // Deterministic rendezvous replacing the old fixed sleep: the page fetch is provably
+        // in flight before the caller token is cancelled.
+        await pageRequested.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
         await cts.CancelAsync();
         release.SetResult(true);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probe);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => probe.WaitAsync(ControlledTimeProvider.HangGuard, ct));
         Assert.Empty(eventBus.Published);
     }
 
@@ -1306,7 +1599,9 @@ public sealed class NuGetPublishMonitorServiceTests
     [Fact]
     public async Task MonitorPackageAsync_NotFound_DelayedThenFinds()
     {
+        var ct = TestContext.Current.CancellationToken;
         var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
         var callCount = 0;
         var handler = new ScriptedHttpMessageHandler(_ =>
         {
@@ -1315,13 +1610,21 @@ public sealed class NuGetPublishMonitorServiceTests
                 return OkResponse("{\"items\": []}");
             return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
         });
-        var service = CreateService(handler, eventBus: eventBus);
+        var service = CreateService(handler, eventBus: eventBus, clock: clock);
 
-        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        var monitor = service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
+
+        // The delay is proven to exist by the EXACT poll-window rendezvous: if NotFound skipped the
+        // delay, the second probe would already have run and no poll timer would ever be registered.
+        Assert.Equal(1, callCount);
+        await AdvanceAsync(clock, PollInterval, ct);
+        await monitor.WaitAsync(ControlledTimeProvider.HangGuard, ct);
 
         Assert.Equal(2, callCount);
         Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     // ── Handler factory: gzip decompression ────────────────────────────────

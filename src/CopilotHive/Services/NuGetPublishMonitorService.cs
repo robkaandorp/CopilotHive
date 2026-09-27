@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
@@ -58,6 +57,14 @@ public class NuGetPublishMonitorService
     private readonly TimeSpan _timeout;
 
     /// <summary>
+    /// Clock seam: every time dependency in this service (cancellation timeouts, poll delays,
+    /// elapsed-time reporting, the startup-scan cutoff, the 1-second startup probe timeout and
+    /// Retry-After date arithmetic) flows through this provider. Defaults to
+    /// <see cref="TimeProvider.System"/> so production behaviour is unchanged.
+    /// </summary>
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>
     /// Monitoring runs currently in flight, keyed by (repo, packageId, normalized version)
     /// so the same package is never monitored twice concurrently.
     /// </summary>
@@ -74,6 +81,8 @@ public class NuGetPublishMonitorService
     /// <param name="goalStore">Optional goal store, used by the startup release scan.</param>
     /// <param name="pollInterval">Polling interval between probes; defaults to 30 seconds.</param>
     /// <param name="timeoutOverride">Optional overall monitoring timeout; defaults to 30 minutes.</param>
+    /// <param name="timeProvider">Clock for timeouts, delays, elapsed time and date arithmetic;
+    /// defaults to <see cref="TimeProvider.System"/>.</param>
     public NuGetPublishMonitorService(
         HiveConfigFile? config = null,
         IEventBus? eventBus = null,
@@ -81,7 +90,8 @@ public class NuGetPublishMonitorService
         ILogger<NuGetPublishMonitorService>? logger = null,
         IGoalStore? goalStore = null,
         TimeSpan? pollInterval = null,
-        TimeSpan? timeoutOverride = null)
+        TimeSpan? timeoutOverride = null,
+        TimeProvider? timeProvider = null)
     {
         _config = config;
         _eventBus = eventBus;
@@ -90,6 +100,7 @@ public class NuGetPublishMonitorService
         _goalStore = goalStore;
         _pollInterval = pollInterval is { } p && p > TimeSpan.Zero ? p : DefaultPollInterval;
         _timeout = timeoutOverride is { } t && t > TimeSpan.Zero ? t : DefaultTimeout;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -118,22 +129,25 @@ public class NuGetPublishMonitorService
 
         try
         {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(_timeout);
-            var sw = Stopwatch.StartNew();
+            // The overall timeout is armed by a TimeProvider-backed CTS — the deadline is
+            // measured by the injected clock — and linked with the caller's token exactly as
+            // before, so either source cancels the monitor.
+            using var timeoutCts = new CancellationTokenSource(_timeout, _timeProvider);
+            using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+            var startTimestamp = _timeProvider.GetTimestamp();
 
             while (true)
             {
                 ProbeOutcome outcome;
                 try
                 {
-                    outcome = await ProbePackageAsync(repoName, packageId, version, releaseTag, timeoutCts.Token);
+                    outcome = await ProbePackageAsync(repoName, packageId, version, releaseTag, monitorCts.Token);
                 }
                 catch (OperationCanceledException)
                 {
                     if (ct.IsCancellationRequested)
                         return;
-                    PublishTimedOut(repoName, packageId, version, releaseTag, sw);
+                    PublishTimedOut(repoName, packageId, version, releaseTag, startTimestamp);
                     return;
                 }
 
@@ -155,13 +169,13 @@ public class NuGetPublishMonitorService
 
                 try
                 {
-                    await Task.Delay(delay, timeoutCts.Token);
+                    await Task.Delay(delay, _timeProvider, monitorCts.Token);
                 }
                 catch (OperationCanceledException)
                 {
                     if (ct.IsCancellationRequested)
                         return;
-                    PublishTimedOut(repoName, packageId, version, releaseTag, sw);
+                    PublishTimedOut(repoName, packageId, version, releaseTag, startTimestamp);
                     return;
                 }
             }
@@ -373,7 +387,7 @@ public class NuGetPublishMonitorService
             return;
         }
 
-        var cutoff = DateTime.UtcNow.AddMinutes(-60);
+        var cutoff = _timeProvider.GetUtcNow().UtcDateTime.AddMinutes(-60);
         var candidates = releases
             .Where(r => r.Status == ReleaseStatus.Released
                         && r.ReleasedAt.HasValue
@@ -407,13 +421,13 @@ public class NuGetPublishMonitorService
 
                     try
                     {
-                        using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                        probeCts.CancelAfter(TimeSpan.FromSeconds(1));
+                        using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(1), _timeProvider);
+                        using var probeLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, probeCts.Token);
 
                         ProbeOutcome outcome;
                         try
                         {
-                            outcome = await ProbePackageAsync(repoName, pkg.PackageId, version, release.Tag, probeCts.Token);
+                            outcome = await ProbePackageAsync(repoName, pkg.PackageId, version, release.Tag, probeLinkedCts.Token);
                         }
                         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                         {
@@ -484,14 +498,16 @@ public class NuGetPublishMonitorService
             Repository: repoName));
     }
 
-    private void PublishTimedOut(string repoName, string packageId, string version, string releaseTag, Stopwatch sw)
+    private void PublishTimedOut(
+        string repoName, string packageId, string version, string releaseTag, long startTimestamp)
     {
+        var elapsed = _timeProvider.GetElapsedTime(startTimestamp);
         _logger.LogWarning(
             "Package {PackageId} {Version} not found on NuGet after {Elapsed}s (release {ReleaseTag}) for repo {Repo}",
-            packageId, version, (int)Math.Floor(sw.Elapsed.TotalSeconds), releaseTag, repoName);
+            packageId, version, (int)Math.Floor(elapsed.TotalSeconds), releaseTag, repoName);
         _eventBus!.Publish(new SystemEvent(
             Type: EventType.PackagePublishTimedOut,
-            Message: $"Package {packageId} {version} not found on NuGet after {(int)Math.Floor(sw.Elapsed.TotalSeconds)}s (release {releaseTag})",
+            Message: $"Package {packageId} {version} not found on NuGet after {(int)Math.Floor(elapsed.TotalSeconds)}s (release {releaseTag})",
             Repository: repoName));
     }
 
@@ -605,7 +621,7 @@ public class NuGetPublishMonitorService
     /// Parses the <c>Retry-After</c> header: an integer delta-seconds value or an HTTP-date.
     /// Returns <c>null</c> when absent or unparseable.
     /// </summary>
-    private static TimeSpan? ParseRetryAfter(HttpResponseMessage response)
+    private TimeSpan? ParseRetryAfter(HttpResponseMessage response)
     {
         if (!response.Headers.TryGetValues("Retry-After", out var values))
             return null;
@@ -617,7 +633,7 @@ public class NuGetPublishMonitorService
             return TimeSpan.FromSeconds(seconds);
 
         if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
-            return date - DateTimeOffset.UtcNow;
+            return date - _timeProvider.GetUtcNow();
 
         return null;
     }

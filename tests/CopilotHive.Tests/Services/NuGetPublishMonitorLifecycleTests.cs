@@ -13,6 +13,7 @@ using CopilotHive.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -27,12 +28,42 @@ namespace CopilotHive.Tests.Services;
 /// reconciliation), <see cref="NuGetPublishMonitorService.LaunchBackgroundMonitor"/>
 /// (fire-and-forget monitoring), and <see cref="ApiEndpoints.LaunchNuGetMonitors"/>
 /// (release-completion trigger).
+/// <para>
+/// <b>Determinism contract.</b> Every test here that reaches a poll delay, the overall timeout, the
+/// 1-second startup probe timeout or the 60-minute cutoff drives a
+/// <see cref="ControlledTimeProvider"/>: the clock advances ONLY when the test advances it, and
+/// each advance is preceded by a <see cref="ControlledTimeProvider.WaitForPendingTimerAsync"/>
+/// rendezvous on the EXACT due time the service is parked on (7 s poll vs 10 min overall timeout vs
+/// 1 s probe, so the timers cannot be confused). No test sleeps, polls a real deadline, or races a
+/// short real timeout.
+/// </para>
+/// <para>
+/// <b>No background task or timer is left behind.</b> Tests that only assert WHETHER a background
+/// monitor is launched override the <c>internal virtual</c>
+/// <see cref="NuGetPublishMonitorService.LaunchBackgroundMonitor"/> with a recording double, which
+/// removes the background task entirely. The one test that deliberately runs a REAL background
+/// monitor owns its cancellation token, rendezvouses on the monitor's pending poll timer, cancels
+/// in a <c>finally</c>, and observes the monitor's completion before asserting
+/// <see cref="ControlledTimeProvider.PendingTimerCount"/> is zero.
+/// </para>
 /// </summary>
 [Collection("HiveIntegration")]
 public sealed class NuGetPublishMonitorLifecycleTests
 {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(2);
+    /// <summary>
+    /// Poll interval requested on the CONTROLLED clock — 7 seconds, deliberately distinct from
+    /// <see cref="OverallTimeout"/> and from the 1-second startup probe window.
+    /// </summary>
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(7);
+
+    /// <summary>
+    /// Overall monitoring timeout requested on the CONTROLLED clock — 10 minutes, unmistakably
+    /// different from the 7-second poll interval.
+    /// </summary>
+    private static readonly TimeSpan OverallTimeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>The startup scan's per-package probe window, mirrored from production.</summary>
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(1);
 
     private sealed class RecordingEventBus : IEventBus
     {
@@ -48,7 +79,7 @@ public sealed class NuGetPublishMonitorLifecycleTests
 
     private sealed class ScriptedHttpMessageHandler : HttpMessageHandler
     {
-        private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;
+        private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _responder;
         private readonly List<string> _urls = [];
         private readonly object _lock = new();
 
@@ -58,8 +89,8 @@ public sealed class NuGetPublishMonitorLifecycleTests
         }
 
         public ScriptedHttpMessageHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> responder)
+            : this((req, _) => responder(req))
         {
-            _responder = responder;
         }
 
         public ScriptedHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> responder)
@@ -67,11 +98,16 @@ public sealed class NuGetPublishMonitorLifecycleTests
         {
         }
 
+        public ScriptedHttpMessageHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> responder)
+        {
+            _responder = responder;
+        }
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             lock (_lock)
                 _urls.Add(request.RequestUri!.ToString());
-            return _responder(request);
+            return _responder(request, cancellationToken);
         }
     }
 
@@ -98,6 +134,11 @@ public sealed class NuGetPublishMonitorLifecycleTests
             PublishNuGet = publishNuGet,
         };
 
+    private static NuGetPublishConfig PkgConfig(params string[] packageIds) => new()
+    {
+        Packages = [.. packageIds.Select(id => new NuGetPackageEntry { PackageId = id })],
+    };
+
     private static HttpResponseMessage OkResponse(string body) => new(HttpStatusCode.OK)
     {
         Content = new StringContent(body, Encoding.UTF8, "application/json")
@@ -120,15 +161,37 @@ public sealed class NuGetPublishMonitorLifecycleTests
             }
         });
 
+    /// <summary>
+    /// An index listing several versions inline, so a scan over MULTIPLE candidate releases can
+    /// find each release's own version and therefore launch no background monitor at all.
+    /// </summary>
+    private static string IndexJsonWithInlineMatches(params string[] versions) =>
+        JsonSerializer.Serialize(new
+        {
+            items = new[]
+            {
+                new
+                {
+                    items = versions.Select(v => new { catalogEntry = new { version = v } }).ToArray()
+                }
+            }
+        });
+
+    /// <summary>
+    /// A Released release whose <c>ReleasedAt</c> is an exact offset from the CONTROLLED clock's
+    /// <c>GetUtcNow()</c>, so the 60-minute cutoff boundary is expressed in absolute terms rather
+    /// than relative to real elapsed time.
+    /// </summary>
     private static Release ReleasedRelease(
+        ControlledTimeProvider clock,
+        TimeSpan releasedAgo,
         string tag = "v1.2.3",
-        DateTime? releasedAt = null,
         params string[] repos) => new()
         {
             Id = tag,
             Tag = tag,
             Status = ReleaseStatus.Released,
-            ReleasedAt = releasedAt ?? DateTime.UtcNow.AddMinutes(-5),
+            ReleasedAt = clock.GetUtcNow().UtcDateTime - releasedAgo,
             RepositoryNames = [.. repos],
         };
 
@@ -137,14 +200,47 @@ public sealed class NuGetPublishMonitorLifecycleTests
         HiveConfigFile? config = null,
         IEventBus? eventBus = null,
         IGoalStore? goalStore = null,
-        ILogger<NuGetPublishMonitorService>? logger = null) => new(
+        ILogger<NuGetPublishMonitorService>? logger = null,
+        ControlledTimeProvider? clock = null) => new(
             config: config,
             eventBus: eventBus,
             httpClientFactory: CreateFactory(handler),
             logger: logger ?? NullLogger<NuGetPublishMonitorService>.Instance,
             goalStore: goalStore,
             pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+            timeoutOverride: OverallTimeout,
+            timeProvider: clock);
+
+    /// <summary>
+    /// Rendezvous on the pending delay timer that still has exactly <paramref name="delay"/> to run,
+    /// then advance the manual clock by that window so the producer resumes. The rendezvous — not a
+    /// sleep — guarantees the producer is parked on that exact timer before the advance.
+    /// </summary>
+    private static async Task AdvanceAsync(
+        ControlledTimeProvider clock, TimeSpan delay, CancellationToken ct)
+    {
+        await clock.WaitForPendingTimerAsync(delay, ct);
+        clock.Advance(delay);
+    }
+
+    /// <summary>
+    /// Joins a task the test started, for use exclusively in <c>finally</c> blocks. The await is
+    /// bounded and its outcome is deliberately discarded: the purpose is only to prove the task
+    /// ENDED before the test returned, so an intermediate rendezvous or assertion failure can never
+    /// leak a live background monitor. Swallowing here is what preserves the ORIGINAL failure — an
+    /// exception escaping a <c>finally</c> would replace it.
+    /// </summary>
+    private static async Task JoinQuietlyAsync(Task task)
+    {
+        try
+        {
+            await task.WaitAsync(ControlledTimeProvider.HangGuard, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            // Joining only: the test's own assertions decide the verdict.
+        }
+    }
 
     // ── StartupScanAsync ───────────────────────────────────────────────────
 
@@ -152,187 +248,137 @@ public sealed class NuGetPublishMonitorLifecycleTests
     public async Task StartupScanAsync_NullGoalStore_ReturnsImmediately()
     {
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var service = CreateService(handler, config: CreateConfig(CreateRepo("test-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] })));
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, clock: clock,
+            config: CreateConfig(CreateRepo("test-repo", publishNuGet: PkgConfig("My.Package"))));
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
 
         Assert.Empty(handler.Urls);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task StartupScanAsync_NullConfig_ReturnsImmediately()
     {
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var service = CreateService(handler, goalStore: new ReleaseStore());
+        var clock = new ControlledTimeProvider();
+        var service = CreateService(handler, goalStore: new ReleaseStore(), clock: clock);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
 
         Assert.Empty(handler.Urls);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
-    /// Only releases released within the last 60 minutes (exclusive cutoff) are scanned:
-    /// Planning releases, releases with no ReleasedAt, and releases older than the cutoff
-    /// are all skipped.
+    /// Removal-proof for M4. The 60-minute window is measured on the INJECTED clock: a release
+    /// exactly 60 minutes old is at the boundary and must be EXCLUDED (the comparison is strictly
+    /// greater), 59 minutes and 1 second is inside and included, and a Planning release with a
+    /// recent <c>ReleasedAt</c> is never scanned. Reverting the cutoff to
+    /// wall-clock cutoff (mutant M4) makes every fixture fall outside the window and the probe count
+    /// assertions fail.
     /// </summary>
     [Fact]
     public async Task StartupScanAsync_ExclusiveCutoff_FiltersReleases()
     {
-        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var ct = TestContext.Current.CancellationToken;
+
+        // Every candidate's version is present inline, so each probe resolves to Found and NO
+        // background monitor is launched — this test is purely about the cutoff.
+        var handler = new ScriptedHttpMessageHandler(
+            _ => OkResponse(IndexJsonWithInlineMatches("1.0.0", "1.1.0", "1.2.3")));
+        var clock = new ControlledTimeProvider();
         var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.0.0", DateTime.UtcNow.AddMinutes(-61), "pkg-repo"));
-        store.Releases.Add(ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-59), "pkg-repo"));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(), goalStore: store);
 
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        // Exactly 60 minutes → EXCLUDED (the comparison is strictly greater).
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(60), "v1.0.0", "pkg-repo"));
+        // One second inside the window → included.
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(60) - TimeSpan.FromSeconds(1), "v1.1.0", "pkg-repo"));
+        // 59 minutes → included.
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(59), "v1.2.3", "pkg-repo"));
 
-        // Only the recent release was probed; the 61-minute-old release was filtered out.
-        // The probe found the version inline (1.2.3 matches tag v1.2.3), so no background
-        // monitor was launched and no extra URLs appear.
-        Assert.Single(handler.Urls);
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(),
+            goalStore: store, clock: clock);
+
+        await service.StartupScanAsync(ct);
+
+        // EXACTLY two candidates were probed: the 61-minute-old release is out, the release at the
+        // exact 60-minute boundary is out (exclusive), and the two inside are in.
+        Assert.Equal(2, handler.Urls.Count);
         Assert.Contains(handler.Urls, u => u.Contains("my.package", StringComparison.OrdinalIgnoreCase));
-    }
-
-    [Fact]
-    public async Task StartupScanAsync_NotFound_LaunchesBackgroundMonitor()
-    {
-        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.NotFound));
-        var eventBus = new RecordingEventBus();
-        var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", repos: "pkg-repo"));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store);
-
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
-
-        // The background monitor keeps polling the index (NotFound → delay → probe again).
-        await WaitUntilAsync(() => handler.Urls.Count >= 2, TestContext.Current.CancellationToken);
-    }
-
-    [Fact]
-    public async Task StartupScanAsync_Found_DoesNotLaunchMonitor()
-    {
-        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var eventBus = new RecordingEventBus();
-        var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store);
-
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
-
-        Assert.Single(handler.Urls); // exactly one probe, no background monitor loop
-        var evt = Assert.Single(eventBus.Published);
-        Assert.Equal(EventType.PackagePublished, evt.Type);
-    }
-
-    [Fact]
-    public async Task StartupScanAsync_Terminal_DoesNotLaunchMonitor()
-    {
-        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.BadRequest));
-        var eventBus = new RecordingEventBus();
-        var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store);
-
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
-
-        Assert.Single(handler.Urls); // probe once, Terminal → no background monitor
-        Assert.Empty(eventBus.Published);
+        // Both probes found their version, so nothing was left to monitor and nothing is pending.
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
-    /// Only <see cref="ReleaseStatus.Released"/> releases are scanned: a release in
-    /// <see cref="ReleaseStatus.Planning"/> (or any non-Released status) with a recent
-    /// ReleasedAt must be skipped entirely.
+    /// A <see cref="ReleaseStatus.Planning"/> release with a recent <c>ReleasedAt</c> must be
+    /// skipped entirely — only <see cref="ReleaseStatus.Released"/> releases are reconciled.
     /// </summary>
     [Fact]
     public async Task StartupScanAsync_NonReleasedStatus_Skips()
     {
+        var ct = TestContext.Current.CancellationToken;
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var store = new ReleaseStore();
-        store.Releases.Add(new Release
-        {
-            Id = "v1.2.3",
-            Tag = "v1.2.3",
-            Status = ReleaseStatus.Planning,
-            ReleasedAt = DateTime.UtcNow.AddMinutes(-5),
-            RepositoryNames = ["pkg-repo"],
-        });
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(), goalStore: store);
+        var release = ReleasedRelease(clock, TimeSpan.FromMinutes(5), "v1.2.3", "pkg-repo");
+        release.Status = ReleaseStatus.Planning;
+        store.Releases.Add(release);
 
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(),
+            goalStore: store, clock: clock);
+
+        await service.StartupScanAsync(ct);
 
         Assert.Empty(handler.Urls);
-    }
-
-    /// <summary>
-    /// A <see cref="NuGetPublishMonitorService.ProbeResult.Retry"/> result (e.g. 404 on the
-    /// registration index) must launch a background monitor — the package may not be registered
-    /// yet but could land shortly.
-    /// </summary>
-    [Fact]
-    public async Task StartupScanAsync_Retry_LaunchesBackgroundMonitor()
-    {
-        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.NotFound));
-        var eventBus = new RecordingEventBus();
-        var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", repos: "pkg-repo"));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store);
-
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
-
-        // The background monitor keeps polling the index (404 → Retry → delay → probe again).
-        await WaitUntilAsync(() => handler.Urls.Count >= 2, TestContext.Current.CancellationToken);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task StartupScanAsync_TagStripping_ProbesStrippedVersion()
     {
+        var ct = TestContext.Current.CancellationToken;
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var eventBus = new RecordingEventBus();
         var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
-        var service = CreateService(handler,
-            config: CreateConfig(CreateRepo("pkg-repo",
-                publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] })),
-            eventBus: eventBus, goalStore: store);
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "v1.2.3", "pkg-repo"));
 
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        var service = CreateService(handler,
+            config: CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))),
+            eventBus: eventBus, goalStore: store, clock: clock);
+
+        await service.StartupScanAsync(ct);
 
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.PackagePublished, evt.Type);
         Assert.Contains("1.2.3", evt.Message);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task StartupScanAsync_BlankOrInvalidTag_Skips()
     {
+        var ct = TestContext.Current.CancellationToken;
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var eventBus = new RecordingEventBus();
         var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
-        store.Releases.Add(ReleasedRelease("vnot-a-version", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
-        var service = CreateService(handler,
-            config: CreateConfig(CreateRepo("pkg-repo",
-                publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] })),
-            eventBus: eventBus, goalStore: store);
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "v", "pkg-repo"));
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "vnot-a-version", "pkg-repo"));
 
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        var service = CreateService(handler,
+            config: CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))),
+            eventBus: eventBus, goalStore: store, clock: clock);
+
+        await service.StartupScanAsync(ct);
 
         Assert.Empty(handler.Urls);
         Assert.Empty(eventBus.Published);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
@@ -340,27 +386,29 @@ public sealed class NuGetPublishMonitorLifecycleTests
     {
         var logger = new CapturingLogger<NuGetPublishMonitorService>();
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var service = CreateService(handler,
-            config: CreateConfig(CreateRepo("pkg-repo",
-                publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] })),
-            goalStore: new ThrowingGetReleasesStore(), logger: logger);
+            config: CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))),
+            goalStore: new ThrowingGetReleasesStore(), logger: logger, clock: clock);
 
         await service.StartupScanAsync(TestContext.Current.CancellationToken);
 
         Assert.Empty(handler.Urls);
         Assert.Contains(logger.Entries, e => e.Contains("failed to load releases", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     [Fact]
     public async Task StartupScanAsync_CallerCancellation_Returns()
     {
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var clock = new ControlledTimeProvider();
         var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "v1.2.3", "pkg-repo"));
+
         var service = CreateService(handler,
-            config: CreateConfig(CreateRepo("pkg-repo",
-                publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] })),
-            goalStore: store);
+            config: CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))),
+            goalStore: store, clock: clock);
 
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
@@ -368,38 +416,227 @@ public sealed class NuGetPublishMonitorLifecycleTests
         await service.StartupScanAsync(cts.Token);
 
         Assert.Empty(handler.Urls);
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
-    /// Per-package isolation: a probe failure for one package must not stop the scan — the
-    /// next package is still probed.
+    /// Per-package isolation: a probe failure for one package must not stop the scan — the next
+    /// package is still probed.
     /// </summary>
     [Fact]
     public async Task StartupScanAsync_ProbeException_LogsAndContinues()
     {
+        var ct = TestContext.Current.CancellationToken;
         var logger = new CapturingLogger<NuGetPublishMonitorService>();
         Func<HttpRequestMessage, HttpResponseMessage> responder = _ =>
             throw new InvalidOperationException("Simulated probe failure");
         var handler = new ScriptedHttpMessageHandler(responder);
+        var clock = new ControlledTimeProvider();
         var store = new ReleaseStore();
-        store.Releases.Add(ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-1), "pkg-repo"));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig
-            {
-                Packages =
-                [
-                    new NuGetPackageEntry { PackageId = "Broken.Package" },
-                    new NuGetPackageEntry { PackageId = "My.Package" },
-                ]
-            }));
-        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(), goalStore: store, logger: logger);
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "v1.2.3", "pkg-repo"));
 
-        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        var config = CreateConfig(CreateRepo("pkg-repo",
+            publishNuGet: PkgConfig("Broken.Package", "My.Package")));
+        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(),
+            goalStore: store, logger: logger, clock: clock);
+
+        await service.StartupScanAsync(ct);
 
         // The first package's probe threw — logged. The scan continued and probed the
         // second package (which also threw against this handler).
         Assert.Contains(logger.Entries, e => e.Contains("scan probe failed", StringComparison.OrdinalIgnoreCase));
         Assert.Equal(2, handler.Urls.Count);
+        Assert.Equal(0, clock.PendingTimerCount);
+    }
+
+    // ── StartupScanAsync: background-monitor launches ──────────────────────
+
+    /// <summary>
+    /// A <see cref="NuGetPublishMonitorService.ProbeResult.NotFound"/> result must launch a
+    /// background monitor — the package may not be registered yet but could land shortly.
+    /// <para>
+    /// Uses the recording override of <see cref="NuGetPublishMonitorService.LaunchBackgroundMonitor"/>:
+    /// the launch decision is the behaviour under test here, and the real monitor's polling loop is
+    /// covered by <c>NuGetPublishMonitorServiceTests</c>. That removes the background task entirely,
+    /// so this test can never leave a timer or a task behind.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_NotFound_LaunchesBackgroundMonitor()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.NotFound));
+        var clock = new ControlledTimeProvider();
+        var store = new ReleaseStore();
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(5), "v1.2.3", "pkg-repo"));
+
+        var service = new RecordingBackgroundMonitorService(clock, handler,
+            CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))), store);
+
+        await service.StartupScanAsync(ct);
+
+        var launch = Assert.Single(service.Launches);
+        Assert.Equal("pkg-repo", launch.Repo);
+        Assert.Equal("My.Package", launch.PackageId);
+        Assert.Equal("1.2.3", launch.Version);
+        Assert.Equal("v1.2.3", launch.ReleaseTag);
+        Assert.Equal(0, clock.PendingTimerCount);
+    }
+
+    /// <summary>
+    /// A <see cref="NuGetPublishMonitorService.ProbeResult.Retry"/> result (e.g. 404 on the
+    /// registration index) must launch a background monitor. Same recording override as above.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_Retry_LaunchesBackgroundMonitor()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.ServiceUnavailable));
+        var clock = new ControlledTimeProvider();
+        var store = new ReleaseStore();
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(5), "v1.2.3", "pkg-repo"));
+
+        var service = new RecordingBackgroundMonitorService(clock, handler,
+            CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))), store);
+
+        await service.StartupScanAsync(ct);
+
+        var launch = Assert.Single(service.Launches);
+        Assert.Equal("My.Package", launch.PackageId);
+        Assert.Equal(0, clock.PendingTimerCount);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_Found_DoesNotLaunchMonitor()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var store = new ReleaseStore();
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "v1.2.3", "pkg-repo"));
+
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store, clock: clock);
+
+        await service.StartupScanAsync(ct);
+
+        Assert.Single(handler.Urls); // exactly one probe, no background monitor loop
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.PackagePublished, evt.Type);
+        Assert.Equal(0, clock.PendingTimerCount);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_Terminal_DoesNotLaunchMonitor()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.BadRequest));
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var store = new ReleaseStore();
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(1), "v1.2.3", "pkg-repo"));
+
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store, clock: clock);
+
+        await service.StartupScanAsync(ct);
+
+        Assert.Single(handler.Urls); // probe once, Terminal → no background monitor
+        Assert.Empty(eventBus.Published);
+        Assert.Equal(0, clock.PendingTimerCount);
+    }
+
+    /// <summary>
+    /// Removal-proof for M3 and proof of deterministic background-monitor cleanup. The startup
+    /// probe's 1-second window is a TimeProvider-backed CTS: the probe transport parks until
+    /// released and honours cancellation, so ONLY the manual clock can expire it. Restoring a real
+    /// <c>CancelAfter(TimeSpan.FromSeconds(1))</c> (M3) means no 1-second timer is ever registered
+    /// and the rendezvous below times out.
+    /// <para>
+    /// This is the one test that runs a REAL background monitor. Its lifecycle is fully owned: the
+    /// test supplies the cancellation token, rendezvouses on the monitor's pending POLL timer
+    /// (proving the monitor is running and parked on the controlled clock), cancels in
+    /// <c>finally</c>, awaits the monitor's completion — observed through the subclass's
+    /// <c>finally</c> — and then asserts that no timer is left pending.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_ProbeTimeout_LaunchesRealBackgroundMonitor_AndCleansUp()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var clock = new ControlledTimeProvider();
+        var store = new ReleaseStore();
+        store.Releases.Add(ReleasedRelease(clock, TimeSpan.FromMinutes(5), "v1.2.3", "pkg-repo"));
+
+        // First request (the startup probe) parks until the test cancels it; later requests (the
+        // background monitor's own probes) return NotFound immediately so it parks on its poll timer.
+        var probeParked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parkForever = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var requestCount = 0;
+        var handler = new ScriptedHttpMessageHandler(async (req, token) =>
+        {
+            if (Interlocked.Increment(ref requestCount) == 1)
+            {
+                probeParked.TrySetResult();
+                // No real delay: the request is released ONLY by cancellation, which is exactly the
+                // behaviour a hung transport exhibits. Awaiting cancellation directly keeps this
+                // independent of any clock.
+                await parkForever.Task.WaitAsync(token);
+            }
+            return ErrorResponse(HttpStatusCode.NotFound);
+        });
+
+        using var monitorLifetime = new CancellationTokenSource();
+        var service = new TrackedBackgroundMonitorService(clock, handler,
+            CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))), store);
+
+        // Declared OUTSIDE the try so the finally can join whatever actually started, even when a
+        // rendezvous or assertion failed before the later lines ran.
+        Task? scan = null;
+        try
+        {
+            scan = service.StartupScanAsync(monitorLifetime.Token);
+
+            // The probe is provably in flight, so the 1-second window is the only thing that can
+            // release it. Rendezvous on that exact due time — a poll or overall timeout could not
+            // satisfy it.
+            await probeParked.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+            await AdvanceAsync(clock, ProbeTimeout, ct);
+            await scan.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+            // The probe timed out → the package was handed to a REAL background monitor.
+            await service.MonitorStarted.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+            // Prove the monitor is genuinely running and parked on the controlled clock: its
+            // 7-second poll delay, distinct from both the 10-minute timeout and the 1-second probe.
+            await clock.WaitForPendingTimerAsync(PollInterval, ct);
+            Assert.Contains(PollInterval, clock.RequestedDelays);
+
+            // Release the monitor with the test-owned lifetime. No clock advance is involved, so no
+            // timer is left armed.
+            await monitorLifetime.CancelAsync();
+
+            // SUCCESS-path cleanup, asserted with full strength: MonitorPackageAsync's own finally
+            // has run, so the monitor provably ended and nothing is pending.
+            await service.MonitorFinished.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+            Assert.True(service.MonitorStarted.Task.IsCompleted,
+                "The 1-second startup probe timeout must have handed the package to a background monitor.");
+            Assert.Equal(0, clock.PendingTimerCount);
+        }
+        finally
+        {
+            // ANY failure above must not leave a live background task behind: cancel the
+            // test-owned lifetime FIRST, then join the scan and — only if it ever started — the
+            // monitor. Joining is bounded and exception-swallowing, so the ORIGINAL failure is
+            // preserved (an exception escaping this finally would replace it). `scan` is null only
+            // when the failure happened before the scan was started.
+            await monitorLifetime.CancelAsync();
+            if (scan is not null)
+                await JoinQuietlyAsync(scan);
+            if (service.MonitorStarted.Task.IsCompleted)
+                await JoinQuietlyAsync(service.MonitorFinished.Task);
+        }
     }
 
     // ── LaunchBackgroundMonitor ────────────────────────────────────────────
@@ -407,20 +644,25 @@ public sealed class NuGetPublishMonitorLifecycleTests
     [Fact]
     public async Task LaunchBackgroundMonitor_LogsExceptions()
     {
+        var ct = TestContext.Current.CancellationToken;
         var logger = new CapturingLogger<NuGetPublishMonitorService>();
-        var service = new ThrowingMonitorService(null, logger);
+        var clock = new ControlledTimeProvider();
+        var service = new ThrowingMonitorService(null, logger, clock);
 
-        service.LaunchBackgroundMonitor("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        service.LaunchBackgroundMonitor("test-repo", "My.Package", "1.2.3", "v1.2.3", ct);
 
-        await WaitUntilAsync(() => logger.Entries.Count > 0, TestContext.Current.CancellationToken);
+        // Deterministic signal from the logger itself — no polling loop, no real deadline.
+        await logger.FirstWrite.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
         Assert.Contains(logger.Entries, e => e.Contains("NuGet monitor failed", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
-    /// <summary>Subclass whose <see cref="MonitorPackageAsync"/> always throws.</summary>
+    /// <summary>Subclass whose <see cref="NuGetPublishMonitorService.MonitorPackageAsync"/> always throws.</summary>
     private sealed class ThrowingMonitorService : NuGetPublishMonitorService
     {
-        public ThrowingMonitorService(HiveConfigFile? config, ILogger<NuGetPublishMonitorService> logger)
-            : base(config: config, logger: logger)
+        public ThrowingMonitorService(
+            HiveConfigFile? config, ILogger<NuGetPublishMonitorService> logger, TimeProvider clock)
+            : base(config: config, logger: logger, timeProvider: clock)
         {
         }
 
@@ -429,48 +671,143 @@ public sealed class NuGetPublishMonitorLifecycleTests
             => throw new InvalidOperationException("Simulated monitor failure");
     }
 
-    /// <summary>Subclass that records <see cref="MonitorReleaseAsync"/> invocations.</summary>
+    /// <summary>Subclass that records <see cref="NuGetPublishMonitorService.MonitorReleaseAsync"/> invocations.</summary>
     private sealed class RecordingMonitorService : NuGetPublishMonitorService
     {
         public List<(string Repo, string Tag, CancellationToken Ct)> Calls { get; } = [];
+
+        /// <summary>Completes on the first recorded invocation, so callers never poll.</summary>
+        public TaskCompletionSource FirstCall { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public override Task MonitorReleaseAsync(string repoName, string releaseTag, CancellationToken ct)
         {
             lock (Calls)
                 Calls.Add((repoName, releaseTag, ct));
+            FirstCall.TrySetResult();
             return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// Records <see cref="NuGetPublishMonitorService.LaunchBackgroundMonitor"/> calls instead of
+    /// starting a background task, so launch-decision tests leave no task or timer behind.
+    /// </summary>
+    private sealed class RecordingBackgroundMonitorService : NuGetPublishMonitorService
+    {
+        public List<(string Repo, string PackageId, string Version, string ReleaseTag)> Launches { get; } = [];
+
+        public RecordingBackgroundMonitorService(
+            TimeProvider clock, HttpMessageHandler handler, HiveConfigFile config, IGoalStore store)
+            : base(config: config, eventBus: new RecordingEventBus(), httpClientFactory: CreateFactory(
+                handler as ScriptedHttpMessageHandler
+                    ?? throw new ArgumentException("handler must be a ScriptedHttpMessageHandler", nameof(handler))),
+                goalStore: store, pollInterval: PollInterval, timeoutOverride: OverallTimeout,
+                timeProvider: clock)
+        {
+        }
+
+        internal override void LaunchBackgroundMonitor(
+            string repoName, string packageId, string version, string releaseTag, CancellationToken ct)
+            => Launches.Add((repoName, packageId, version, releaseTag));
+    }
+
+    /// <summary>
+    /// Runs a REAL background monitor and reports its lifecycle: <see cref="MonitorStarted"/> when
+    /// <see cref="NuGetPublishMonitorService.MonitorPackageAsync"/> begins, and
+    /// <see cref="MonitorFinished"/> when its <c>finally</c> has run — the deterministic cleanup
+    /// signal, taken without polling.
+    /// </summary>
+    private sealed class TrackedBackgroundMonitorService : NuGetPublishMonitorService
+    {
+        public TrackedBackgroundMonitorService(
+            TimeProvider clock, HttpMessageHandler handler, HiveConfigFile config, IGoalStore store)
+            : base(config: config, eventBus: new RecordingEventBus(), httpClientFactory: CreateFactory(
+                handler as ScriptedHttpMessageHandler
+                    ?? throw new ArgumentException("handler must be a ScriptedHttpMessageHandler", nameof(handler))),
+                goalStore: store, pollInterval: PollInterval, timeoutOverride: OverallTimeout,
+                timeProvider: clock)
+        {
+        }
+
+        public TaskCompletionSource MonitorStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource MonitorFinished { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async Task MonitorPackageAsync(
+            string repoName, string packageId, string version, string releaseTag, CancellationToken ct)
+        {
+            MonitorStarted.TrySetResult();
+            try
+            {
+                await base.MonitorPackageAsync(repoName, packageId, version, releaseTag, ct);
+            }
+            finally
+            {
+                MonitorFinished.TrySetResult();
+            }
         }
     }
 
     // ── LaunchNuGetMonitors (release trigger) ──────────────────────────────
 
+    /// <summary>
+    /// Missing monitor or missing config must skip SYNCHRONOUSLY: no request is issued, and because
+    /// both guards precede the <c>Task.Run</c>, nothing is ever started. Proven with a real handler
+    /// (so a would-be launch is observable) rather than a sleep.
+    /// </summary>
     [Fact]
     public async Task LaunchNuGetMonitors_RequiredServicesMissing_Skips()
     {
+        var ct = TestContext.Current.CancellationToken;
         var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var monitor = CreateService(handler);
-        var release = ReleasedRelease("v1.2.3", DateTime.UtcNow.AddMinutes(-1), "pkg-repo");
+        var realMonitor = CreateService(handler);
+        var recording = new RecordingMonitorService();
+        var release = new Release
+        {
+            Id = "v1.2.3", Tag = "v1.2.3", Status = ReleaseStatus.Released,
+            RepositoryNames = ["pkg-repo"],
+        };
 
-        // No config → skip.
-        ApiEndpoints.LaunchNuGetMonitors(monitor, null, null, null, release);
-        await Task.Delay(100, TestContext.Current.CancellationToken);
-        Assert.Empty(handler.Urls);
+        // No config → the guard returns BEFORE Task.Run, so the real monitor is never invoked and
+        // the request handler is never reached. Both guards are synchronous, so no waiting is
+        // needed to observe the skip: the recording monitor proves the invocation count directly.
+        ApiEndpoints.LaunchNuGetMonitors(realMonitor, null, null, null, release);
 
-        // No monitor → skip.
-        ApiEndpoints.LaunchNuGetMonitors(null, CreateConfig(), null, null, release);
-        await Task.Delay(100, TestContext.Current.CancellationToken);
+        // No monitor → the other guard, same synchronous skip. Passing the recording double as the
+        // monitor here makes the assertion meaningful: if the guard were removed, the double WOULD
+        // have been called for the PublishNuGet repo.
+        ApiEndpoints.LaunchNuGetMonitors(null, CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))), null, null, release);
+        ApiEndpoints.LaunchNuGetMonitors(recording, null, null, null, release);
+
+        // A synchronous no-op cannot have issued a request — the real handler was never reached.
         Assert.Empty(handler.Urls);
+        // And neither guarded call invoked the monitor.
+        Assert.Empty(recording.Calls);
+        Assert.False(recording.FirstCall.Task.IsCompleted,
+            "LaunchNuGetMonitors must skip synchronously when the monitor or config is missing.");
+
+        // POSITIVE CONTROL: the same recording double IS invoked once both inputs are supplied, so
+        // the empty-Calls assertions above are a real skip rather than a double that never fires.
+        ApiEndpoints.LaunchNuGetMonitors(
+            recording, CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package"))),
+            null, null, release);
+
+        await recording.FirstCall.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+        Assert.Single(recording.Calls);
     }
 
     [Fact]
     public async Task LaunchNuGetMonitors_PrefiltersRepos()
     {
-        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var ct = TestContext.Current.CancellationToken;
         var config = CreateConfig(
-            CreateRepo("pkg-repo", publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }),
+            CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")),
             CreateRepo("no-pkg-repo"), // PublishNuGet null
             CreateRepo("empty-pkg-repo", publishNuGet: new NuGetPublishConfig { Packages = [] }));
-        var monitor = CreateService(handler, config: config, eventBus: new RecordingEventBus());
+        var monitor = new RecordingMonitorService();
         var release = new Release
         {
             Id = "v1.2.3",
@@ -481,22 +818,26 @@ public sealed class NuGetPublishMonitorLifecycleTests
 
         ApiEndpoints.LaunchNuGetMonitors(monitor, config, null, null, release);
 
-        await WaitUntilAsync(() => handler.Urls.Count >= 1, TestContext.Current.CancellationToken);
-        // Only the PublishNuGet repo with packages is monitored.
-        Assert.All(handler.Urls, u => Assert.Contains("my.package", u, StringComparison.OrdinalIgnoreCase));
+        // Deterministic signal from the recording double — no polling loop, no real deadline.
+        await monitor.FirstCall.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+        // Only the PublishNuGet repo with packages is monitored; the other two are skipped.
+        var call = Assert.Single(monitor.Calls);
+        Assert.Equal("pkg-repo", call.Repo);
+        Assert.Equal("v1.2.3", call.Tag);
     }
 
     /// <summary>
     /// When no application lifetime is registered the monitor must fall back to
-    /// <see cref="CancellationToken.None"/> (never tied to the request token).
+    /// <see cref="CancellationToken.None"/> (never tied to the request token). Asserted on the
+    /// token the recorder was actually handed — not by waiting for the monitor to finish.
     /// </summary>
     [Fact]
     public async Task LaunchNuGetMonitors_NoLifetime_FallsBackToCancellationTokenNone()
     {
-        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var monitor = CreateService(handler, config: config, eventBus: new RecordingEventBus());
+        var ct = TestContext.Current.CancellationToken;
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var monitor = new RecordingMonitorService();
         var release = new Release
         {
             Id = "v1.2.3",
@@ -507,19 +848,47 @@ public sealed class NuGetPublishMonitorLifecycleTests
 
         ApiEndpoints.LaunchNuGetMonitors(monitor, config, null, null, release);
 
-        // The background monitor runs to completion (Found → publishes) — proving the
-        // fallback token was not cancelled.
-        await WaitUntilAsync(() => handler.Urls.Count >= 1, TestContext.Current.CancellationToken);
-        await Task.Delay(200, TestContext.Current.CancellationToken);
+        await monitor.FirstCall.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+        var call = Assert.Single(monitor.Calls);
+        Assert.Equal(CancellationToken.None, call.Ct);
+        Assert.False(call.Ct.CanBeCanceled,
+            "A lifetime-less launch must bind the monitor to a token that can never be cancelled.");
+    }
+
+    [Fact]
+    public async Task LaunchNuGetMonitors_WithLifetime_UsesApplicationStoppingToken()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var monitor = new RecordingMonitorService();
+        var release = new Release
+        {
+            Id = "v1.2.3",
+            Tag = "v1.2.3",
+            Status = ReleaseStatus.Released,
+            RepositoryNames = ["pkg-repo"],
+        };
+        using var stopping = new CancellationTokenSource();
+        var lifetime = new FakeHostApplicationLifetime(stopping.Token);
+
+        ApiEndpoints.LaunchNuGetMonitors(monitor, config, lifetime, null, release);
+
+        await monitor.FirstCall.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+
+        // The test-owned lifetime token is handed through verbatim.
+        var call = Assert.Single(monitor.Calls);
+        Assert.Equal(stopping.Token, call.Ct);
     }
 
     [Fact]
     public async Task LaunchNuGetMonitors_Failure_LogsAndDoesNotThrow()
     {
+        var ct = TestContext.Current.CancellationToken;
         var logger = new CapturingLogger<Program>();
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
-        var monitor = new ThrowingMonitorService(config, NullLogger<NuGetPublishMonitorService>.Instance);
+        var clock = new ControlledTimeProvider();
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
+        var monitor = new ThrowingMonitorService(config, NullLogger<NuGetPublishMonitorService>.Instance, clock);
         var release = new Release
         {
             Id = "v1.2.3",
@@ -530,8 +899,9 @@ public sealed class NuGetPublishMonitorLifecycleTests
 
         ApiEndpoints.LaunchNuGetMonitors(monitor, config, null, logger, release);
 
-        await WaitUntilAsync(() => logger.Entries.Count > 0, TestContext.Current.CancellationToken);
+        await logger.FirstWrite.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
         Assert.Contains(logger.Entries, e => e.Contains("NuGet publish monitor failed", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(0, clock.PendingTimerCount);
     }
 
     /// <summary>
@@ -543,8 +913,7 @@ public sealed class NuGetPublishMonitorLifecycleTests
     {
         var ct = TestContext.Current.CancellationToken;
         var monitor = new RecordingMonitorService();
-        var config = CreateConfig(CreateRepo("pkg-repo",
-            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
+        var config = CreateConfig(CreateRepo("pkg-repo", publishNuGet: PkgConfig("My.Package")));
         var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
 
         var baseFactory = new HiveTestFactory { MockRepoManager = fake };
@@ -592,24 +961,27 @@ public sealed class NuGetPublishMonitorLifecycleTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        // The monitor was invoked for the PublishNuGet repo with the release tag.
-        await WaitUntilAsync(() => monitor.Calls.Count >= 1, ct);
-        Assert.Contains(monitor.Calls, c => c.Repo == "pkg-repo" && c.Tag == "v1.0.0");
+        // Deterministic signal from the recording double — the monitor was invoked for the
+        // PublishNuGet repo with the release tag.
+        await monitor.FirstCall.Task.WaitAsync(ControlledTimeProvider.HangGuard, ct);
+        var call = Assert.Single(monitor.Calls);
+        Assert.Equal("pkg-repo", call.Repo);
+        Assert.Equal("v1.0.0", call.Tag);
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────
-
-    private static async Task WaitUntilAsync(
-        Func<bool> condition, CancellationToken ct, TimeSpan? timeout = null)
+    /// <summary>
+    /// Minimal <see cref="IHostApplicationLifetime"/> whose <c>ApplicationStopping</c> the TEST owns,
+    /// so a launch-time token can be observed and cancelled without a real host.
+    /// </summary>
+    private sealed class FakeHostApplicationLifetime(CancellationToken stopping) : IHostApplicationLifetime
     {
-        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
-        while (!condition())
-        {
-            if (DateTime.UtcNow >= deadline)
-                throw new TimeoutException("Condition was not met within the timeout.");
-            await Task.Delay(10, ct);
-        }
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+        public CancellationToken ApplicationStopping => stopping;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+        public void StopApplication() { }
     }
+
+    // ── In-memory doubles ──────────────────────────────────────────────────
 
     /// <summary>
     /// In-memory <see cref="IGoalStore"/> that returns a configurable release list from
@@ -669,13 +1041,20 @@ public sealed class NuGetPublishMonitorLifecycleTests
         public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<Goal>>([]);
         public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
         public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
-        public Task<IReadOnlyList<(string, PersistedClarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
+        public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
     }
 
-    /// <summary>Logger that records formatted messages so tests can assert on diagnostics.</summary>
+    /// <summary>
+    /// Logger that records formatted messages AND signals the first write, so tests can rendezvous
+    /// on a diagnostic existing instead of polling for it.
+    /// </summary>
     private sealed class CapturingLogger<T> : ILogger<T>
     {
         public List<string> Entries { get; } = [];
+
+        /// <summary>Completes on the first recorded entry.</summary>
+        public TaskCompletionSource FirstWrite { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         public bool IsEnabled(LogLevel logLevel) => true;
@@ -689,6 +1068,7 @@ public sealed class NuGetPublishMonitorLifecycleTests
         {
             lock (Entries)
                 Entries.Add(formatter(state, exception));
+            FirstWrite.TrySetResult();
         }
     }
 }
