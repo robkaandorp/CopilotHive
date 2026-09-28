@@ -82,17 +82,17 @@ public sealed class SharpCoderRunner : IAgentRunner
     }
 
     /// <summary>
-    /// THE CONSTRUCTOR DEFAULT ROLE — the role the runner holds before any <c>UpdateAgents</c> has
-    /// been applied on a connection. <see cref="ConnectAsync"/> RESTORES it, so an idle runner never
-    /// keeps carrying the PREVIOUS run's last <c>UpdateAgents</c> role into a new connection's
+    /// THE CONSTRUCTOR DEFAULT ROLE — the role the runner holds before any <c>UpdateAgents</c> or
+    /// assignment role has been applied on a connection. <see cref="ConnectAsync"/> RESTORES it, so
+    /// an idle runner never keeps carrying the PREVIOUS run's last role into a new connection's
     /// preparation.
     /// </summary>
     private const WorkerRole DefaultRole = WorkerRole.Unspecified;
 
     /// <summary>
-    /// THE CONSTRUCTOR DEFAULT CUSTOM AGENT SYSTEM PROMPT — no per-connection guidance at all.
-    /// <see cref="ConnectAsync"/> restores it together with <see cref="DefaultRole"/>, so the two
-    /// per-connection preparation values are always reverted as ONE pair.
+    /// THE CONSTRUCTOR DEFAULT PER-ROLE GUIDANCE STATE — no per-role guidance at all (an EMPTY
+    /// map). <see cref="ConnectAsync"/> restores it together with <see cref="DefaultRole"/>, so the
+    /// two per-connection preparation values are always reverted as ONE pair.
     /// </summary>
     private const string? DefaultCustomAgentSystemPrompt = null;
 
@@ -100,7 +100,20 @@ public sealed class SharpCoderRunner : IAgentRunner
     private string? _currentTaskId;
     private string? _currentGoalId;
     private WorkerRole _currentRole;
-    private string? _customAgentSystemPrompt;
+
+    /// <summary>
+    /// GUIDANCE STORED PER ROLE — the AGENTS.md content delivered for each role by
+    /// <see cref="SetCustomAgent"/>. A single value would let one role's guidance leak into another
+    /// role's prompt (the role now comes from the ASSIGNMENT, and several roles run one after
+    /// another on the same runner within a connection), so the runner keeps one entry per role and
+    /// the prompt turn reads only the CURRENT role's entry — <c>null</c> when that role has none.
+    /// <para>
+    /// A plain <see cref="Dictionary{TKey,TValue}"/> is sufficient: runner calls are sequential and
+    /// the whole lifecycle is covered by the quiescent-use contract documented on
+    /// <see cref="ConnectAsync"/> (never called concurrently with a prompt turn, reset or disposal).
+    /// </para>
+    /// </summary>
+    private readonly Dictionary<WorkerRole, string> _customAgentSystemPromptsByRole = [];
     private int _maxContextTokens = 150_000;
     private string? _compactionModel;
     private int? _compactionMaxTokens;
@@ -132,9 +145,36 @@ public sealed class SharpCoderRunner : IAgentRunner
     public void SetCustomAgent(WorkerRole role, string agentsMdContent)
     {
         _currentRole = role;
-        _customAgentSystemPrompt = agentsMdContent;
+        _customAgentSystemPromptsByRole[role] = agentsMdContent;
         _testerReport = null;
     }
+
+    /// <summary>
+    /// Sets the role the CURRENT assignment runs as — the role travels ON the assignment, so this
+    /// is the authoritative per-assignment role (see <see cref="IAgentRunner.SetRole"/>).
+    /// <para>
+    /// It sets <c>_currentRole</c> ONLY: the per-role guidance map is deliberately left untouched
+    /// (a role's delivered guidance stays stored for that role) and the tester report field is
+    /// deliberately NOT cleared — <c>SetCustomAgent</c> keeps its own clearing behavior, and the
+    /// report lifecycle stays owned by <c>TaskExecutor</c>'s explicit tester-report block.
+    /// </para>
+    /// </summary>
+    /// <param name="role">The role carried by the current assignment.</param>
+    public void SetRole(WorkerRole role) => _currentRole = role;
+
+    /// <summary>
+    /// The guidance stored for <paramref name="role"/>, or the CONSTRUCTOR DEFAULT
+    /// (<see cref="DefaultCustomAgentSystemPrompt"/>) when that role has no stored guidance.
+    /// <para>
+    /// Reading PER ROLE is what keeps one role's delivered guidance out of another role's prompt:
+    /// an <c>UpdateAgents</c> for the tester must never be appended to a coder (or reviewer, or
+    /// doc-writer) prompt on the same connection.
+    /// </para>
+    /// </summary>
+    private string? CustomAgentSystemPromptFor(WorkerRole role) =>
+        _customAgentSystemPromptsByRole.TryGetValue(role, out var content)
+            ? content
+            : DefaultCustomAgentSystemPrompt;
 
     /// <inheritdoc/>
     public void SetMaxContextTokens(int maxTokens) =>
@@ -547,12 +587,15 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// </para>
     /// <para>
     /// <b>WHAT IT RESETS, AND WHAT IT DELIBERATELY DOES NOT.</b> It restores the CONSTRUCTOR
-    /// DEFAULTS of the per-connection role state — <c>_currentRole</c> and
-    /// <c>_customAgentSystemPrompt</c> — and clears <c>_testerReport</c>, so preparation for a new
-    /// connection never inherits the previous connection's <c>UpdateAgents</c> role/prompt or a stale
-    /// tester report. It is deliberately NOT a per-assignment reset: applying the constructor defaults
-    /// HERE only (never before each assignment) is what keeps a connection's delivered
-    /// <c>UpdateAgents</c> guidance authoritative for that connection's assignments.
+    /// DEFAULTS of the per-connection role state — <c>_currentRole</c> plus the PER-ROLE guidance
+    /// map <c>_customAgentSystemPromptsByRole</c> (cleared to the empty map) — and clears
+    /// <c>_testerReport</c>, so preparation for a new connection never inherits the previous
+    /// connection's <c>UpdateAgents</c> role/guidance or a stale tester report. It is deliberately
+    /// NOT a per-assignment reset: applying the constructor defaults HERE only (never before each
+    /// assignment) is what keeps a connection's delivered <c>UpdateAgents</c> guidance authoritative
+    /// for that connection's assignments, and it is why the per-assignment role
+    /// (<see cref="SetRole"/>) is applied later, by <c>TaskExecutor</c>, without reverting that
+    /// guidance.
     /// </para>
     /// <para>
     /// Everything else stays the per-assignment setup's responsibility — the existing
@@ -576,9 +619,10 @@ public sealed class SharpCoderRunner : IAgentRunner
         // constructor defaults of the per-connection role state and drop any stale tester report, so
         // this connection starts from the same role/prompt baseline a fresh runner would have. A
         // delivered UpdateAgents on this connection is applied later, by the message loop, and is
-        // never reverted — that is why this reset lives here and NOT before each assignment.
+        // never reverted — that is why this reset lives here and NOT before each assignment. The
+        // assignment's own role (SetRole) is likewise applied later, per assignment.
         _currentRole = DefaultRole;
-        _customAgentSystemPrompt = DefaultCustomAgentSystemPrompt;
+        _customAgentSystemPromptsByRole.Clear();
         _testerReport = null;
 
         _log.Info("SharpCoderRunner ready — the LLM client is created lazily on first prompt.");
@@ -712,7 +756,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             WorkDirectory = workDir,
             MaxSteps = 500,
             MaxContextTokens = _maxContextTokens,
-            SystemPrompt = BuildRoleSystemPrompt(_currentRole, _customAgentSystemPrompt),
+            SystemPrompt = BuildRoleSystemPrompt(_currentRole, CustomAgentSystemPromptFor(_currentRole)),
             CustomTools = BuildCustomTools(ct),
             EnableBash = _currentRole != WorkerRole.Improver,
             EnableFileWrites = _currentRole != WorkerRole.Reviewer,

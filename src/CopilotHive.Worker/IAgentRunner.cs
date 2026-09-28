@@ -40,6 +40,23 @@ public interface IAgentRunner : IAsyncDisposable
     void SetCustomAgent(WorkerRole role, string agentsMdContent);
 
     /// <summary>
+    /// Sets the role the CURRENT assignment runs as. THE ASSIGNMENT DECIDES THE ROLE: it already
+    /// carries its role, so the executor applies it here instead of relying on a role update
+    /// message — whose delivery is skipped for a role whose AGENTS.md is empty, which used to
+    /// leave the runner on its previous role (or on the <c>Unspecified</c> connection default)
+    /// with no report tools at all.
+    /// </summary>
+    /// <remarks>
+    /// <b>This default implementation is a deliberately empty NO-OP</b>, so the many existing
+    /// test doubles implementing <see cref="IAgentRunner"/> keep compiling and keep their
+    /// previous behavior unchanged; <see cref="SharpCoderRunner"/> (the production runner) is the
+    /// only implementation that overrides it. An override must set the ROLE ONLY: per-role
+    /// guidance belongs to <see cref="SetCustomAgent"/> and must never be mutated or cleared here.
+    /// </remarks>
+    /// <param name="role">The role carried by the current assignment.</param>
+    void SetRole(WorkerRole role) { }
+
+    /// <summary>
     /// Sets the agent session to resume in the next <see cref="SendPromptAsync"/> call.
     /// Pass <c>null</c> to start a fresh session.
     /// </summary>

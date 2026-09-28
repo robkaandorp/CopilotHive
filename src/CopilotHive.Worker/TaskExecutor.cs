@@ -281,6 +281,16 @@ public sealed class TaskExecutor(
         agentRunner.SetToolBridge(toolBridge);
         agentRunner.SetCurrentTaskId(task.TaskId);
         agentRunner.SetCurrentGoalId(task.GoalId);
+
+        // THE ASSIGNMENT DECIDES THE ROLE. The role travels ON the assignment, so it is applied on
+        // this ONE shared execution path (both executor branches below inherit it) BEFORE any
+        // role-dependent setup. It deliberately does NOT depend on an UpdateAgents message: the
+        // orchestrator skips that message for a role with empty AGENTS.md, which used to leave the
+        // runner on the connection default (Unspecified) with no report tools and the wrong prompt.
+        // Guidance is stored PER ROLE, so this call sets the role only — it never touches or clears
+        // any role's stored guidance, and the tester-report block below keeps its own semantics.
+        agentRunner.SetRole(task.Role);
+
         agentRunner.SetMaxContextTokens(task.MaxContextTokens);
         agentRunner.SetCompactionModel(
             task.Metadata.TryGetValue("compaction_model", out var compModel) ? compModel : null);
