@@ -60,6 +60,33 @@ public sealed class RetryBudget
     }
 
     /// <summary>
+    /// Atomically restores the remaining budget to the full allowance
+    /// (<see cref="Allowed"/>), so <see cref="Used"/> becomes <c>0</c> and
+    /// <see cref="Remaining"/> equals <see cref="Allowed"/>.
+    /// </summary>
+    /// <remarks>
+    /// THE EXHAUSTION OUTCOME DEPENDS ON THE ALLOWANCE, so it is NOT promised unconditionally.
+    /// For a POSITIVE allowance the budget is unexhausted afterwards
+    /// (<see cref="Remaining"/> == <see cref="Allowed"/> and <see cref="IsExhausted"/> is
+    /// <c>false</c>). For a ZERO allowance — <c>new RetryBudget(0)</c> is explicitly supported —
+    /// the budget is restored but STILL EXHAUSTED (<see cref="Remaining"/> ==
+    /// <see cref="Allowed"/> == <c>0</c> and <see cref="IsExhausted"/> remains <c>true</c>),
+    /// because this restores the original allowance rather than granting one.
+    /// <para>
+    /// THIS IS A RESET, NOT A TOP-UP: <see cref="Allowed"/> is left UNCHANGED — only
+    /// <c>_remaining</c> is exchanged for the current (possibly previously topped-up)
+    /// initial allowance. Thread-safe: the exchange is a single atomic
+    /// <see cref="Interlocked.Exchange(ref int, int)"/> of the initial allowance read with
+    /// <c>Volatile.Read(ref _initial)</c>, so a racing <see cref="TryConsume"/> can
+    /// neither lose the reset nor observe a torn value.
+    /// </para>
+    /// </remarks>
+    public void Reset()
+    {
+        Interlocked.Exchange(ref _remaining, Volatile.Read(ref _initial));
+    }
+
+    /// <summary>
     /// Atomically increases the budget by <paramref name="additional"/> units.
     /// Both <see cref="Allowed"/> and <see cref="Remaining"/> are updated via CAS loops
     /// with saturating arithmetic (capped at <see cref="MaxCap"/>).

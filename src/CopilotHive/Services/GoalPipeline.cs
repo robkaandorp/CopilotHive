@@ -827,6 +827,34 @@ public sealed class GoalPipeline
         IterationBudget.TopUp(additional);
     }
 
+    /// <summary>
+    /// Restores both task-level retry budgets (<see cref="ReviewRetryBudget"/> and
+    /// <see cref="TestRetryBudget"/>) to their full allowance.
+    /// </summary>
+    /// <remarks>
+    /// THE RESUME COMPANION OF <see cref="ExtendIterations"/>: a resumed goal gets a fresh
+    /// iteration top-up AND fresh test/review retries, so the first FAIL or REQUEST_CHANGES
+    /// verdict after a resume no longer fails the goal with budgets still exhausted from before
+    /// the failure. Both budgets are <see cref="RetryBudget.Reset"/> — a reset, NOT a top-up:
+    /// their <see cref="RetryBudget.Allowed"/> values are left unchanged, so
+    /// <see cref="MaxRetries"/> is unchanged and the pipeline snapshot's
+    /// <c>MaxRetries</c> invariant (both budgets share one allowance) still holds. Only the
+    /// reset state is mutated here; consume/fail semantics stay untouched.
+    /// <para>
+    /// THE EXHAUSTION OUTCOME IS QUALIFIED BY THE ALLOWANCE — the same contract as
+    /// <see cref="RetryBudget.Reset"/>. With a POSITIVE allowance both budgets are unexhausted
+    /// afterwards (<c>Remaining == Allowed</c>, <c>IsExhausted == false</c>); with a ZERO
+    /// allowance — <c>maxRetries: 0</c> is accepted by the constructor — each budget is restored
+    /// to <c>Remaining == Allowed == 0</c> and REMAINS EXHAUSTED (<c>IsExhausted == true</c>),
+    /// because this restores the original allowance rather than granting one.
+    /// </para>
+    /// </remarks>
+    public void ResetRetryBudgets()
+    {
+        ReviewRetryBudget.Reset();
+        TestRetryBudget.Reset();
+    }
+
     /// <summary>Clear the completed timestamp (used when resuming a failed goal).</summary>
     public void ClearCompletedAt()
     {

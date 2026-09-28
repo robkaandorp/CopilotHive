@@ -650,6 +650,16 @@ public sealed class GoalDispatcher : BackgroundService
             // Extend budget
             pipeline.ExtendIterations(additionalIterations);
 
+            // Restore the task-level retry budgets too: a resumed goal must get its test and
+            // review retries back alongside the fresh iteration top-up, otherwise the first FAIL
+            // or REQUEST_CHANGES verdict after the resume fails the goal again with budgets still
+            // exhausted from before the failure. The retries are restored to the original
+            // allowance, NOT raised — with a zero allowance the budgets legitimately stay
+            // exhausted. Placed AFTER every refusal check above (a refused resume mutates
+            // nothing) and BEFORE PersistFull below, so the persisted ReviewRetries/TestRetries
+            // become 0.
+            pipeline.ResetRetryBudgets();
+
             // Consume one iteration for the resumed iteration
             if (!pipeline.IterationBudget.TryConsume())
                 return false; // shouldn't happen after TopUp

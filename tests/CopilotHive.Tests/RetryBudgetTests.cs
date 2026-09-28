@@ -369,4 +369,87 @@ public sealed class RetryBudgetTests
         Assert.Equal(0, budget.Used);
         Assert.Equal(budget.Allowed, budget.Remaining + budget.Used);
     }
+
+    // ── Reset ────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Reset_AfterExhaustion_RestoresExactlyTheAllowedConsumes()
+    {
+        var budget = new RetryBudget(3);
+        Assert.True(budget.TryConsume());
+        Assert.True(budget.TryConsume());
+        Assert.True(budget.TryConsume());
+        Assert.True(budget.IsExhausted);
+
+        budget.Reset();
+
+        // PROVING ASSERTION: the reset restores the FULL allowance, not merely "not exhausted".
+        Assert.Equal(3, budget.Remaining);
+        Assert.Equal(0, budget.Used);
+        Assert.False(budget.IsExhausted);
+        Assert.Equal(3, budget.Allowed);
+
+        // Exactly Allowed further consumes succeed — the count is what a partial reset would break.
+        var successes = 0;
+        while (budget.TryConsume())
+            successes++;
+        Assert.Equal(3, successes);
+        Assert.True(budget.IsExhausted);
+        Assert.Equal(3, budget.Used);
+    }
+
+    [Fact]
+    public void Reset_AfterOverConsuming_RestoresExactlyAllowed()
+    {
+        var budget = new RetryBudget(3);
+        Assert.True(budget.TryConsume());
+        Assert.True(budget.TryConsume());
+        Assert.True(budget.TryConsume());
+        // TryConsume decrements unconditionally, so failed calls drive _remaining BELOW zero:
+        // after these two refusals the raw value is -2.
+        Assert.False(budget.TryConsume());
+        Assert.False(budget.TryConsume());
+
+        budget.Reset();
+
+        // PROVING ASSERTION: the reset assigns the initial allowance (0 + Allowed consumes survive).
+        // A reset implemented as "add back Used" would leave 3 - 2 = 1 consume instead.
+        var successes = 0;
+        while (budget.TryConsume())
+            successes++;
+        Assert.Equal(3, successes);
+        Assert.Equal(3, budget.Allowed);
+        Assert.Equal(0, budget.Remaining);
+        Assert.Equal(3, budget.Used);
+    }
+
+    [Fact]
+    public void Reset_AfterTopUp_RestoresTheToppedUpAllowed_AndLeavesAllowedUnchanged()
+    {
+        var budget = new RetryBudget(2);
+        budget.TopUp(3);
+
+        for (var i = 0; i < 5; i++)
+            Assert.True(budget.TryConsume());
+        Assert.False(budget.TryConsume());
+        Assert.True(budget.IsExhausted);
+
+        var allowedBeforeReset = budget.Allowed;
+        Assert.Equal(5, allowedBeforeReset);
+
+        budget.Reset();
+
+        // PROVING ASSERTION: a reset is NOT a top-up — Allowed is untouched, and the restored
+        // remaining budget is the (topped-up) allowance, so exactly 5 further consumes succeed.
+        Assert.Equal(allowedBeforeReset, budget.Allowed);
+        Assert.Equal(5, budget.Remaining);
+        Assert.Equal(0, budget.Used);
+        Assert.False(budget.IsExhausted);
+
+        var successes = 0;
+        while (budget.TryConsume())
+            successes++;
+        Assert.Equal(5, successes);
+        Assert.Equal(allowedBeforeReset, budget.Allowed);
+    }
 }

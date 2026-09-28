@@ -2,8 +2,10 @@ using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -1039,7 +1041,137 @@ public sealed class ResumeRestartGateTests
         Assert.Empty(gateway.SentTasks);
     }
 
+    // ── The retry-budget reset on resume ─────────────────────────────────────
+
+    /// <summary>
+    /// A successful resume restores BOTH task-level retry budgets to their full allowance — the
+    /// fresh test/review retries that accompany the fresh iteration top-up — and the persisted row
+    /// reflects the reset (<c>test_retries = 0</c>, <c>review_retries = 0</c>) with
+    /// <c>MaxRetries</c> unchanged.
+    /// </summary>
+    /// <remarks>
+    /// THE ANTI-VACUOUS PRECONDITION: both budgets are genuinely EXHAUSTED before the resume (this
+    /// is the production shape of an "Exceeded max test retries" failure), so the post-resume
+    /// <c>Used == 0</c>/<c>Remaining == 3</c> assertions cannot pass over budgets that were never
+    /// consumed.
+    /// <para>
+    /// REMOVAL-PROOF: delete the <c>pipeline.ResetRetryBudgets()</c> call from
+    /// <see cref="GoalDispatcher.ResumeGoalAsync"/> and this vector fails — the in-memory budgets
+    /// still report <c>Used == 3</c>/<c>IsExhausted == true</c> and the persisted row still carries
+    /// <c>test_retries = 3</c>/<c>review_retries = 3</c>.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Resume_ExhaustedRetryBudgets_AreRestoredInMemoryAndPersisted()
+    {
+        const string goalId = "gate-retry-reset";
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        await using var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var goalStore = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Exceeded max test retries");
+        goalStore.AddGoal(goal);
+
+        var pipeline = ExhaustedRetryPipeline(manager, goal, $"copilothive/{goalId}");
+
+        Assert.True(pipeline.TestRetryBudget.IsExhausted);
+        Assert.True(pipeline.ReviewRetryBudget.IsExhausted);
+        var maxRetriesBefore = pipeline.MaxRetries;
+        Assert.Equal(3, maxRetriesBefore);
+
+        var dispatcher = CreateDispatcher(goalStore, manager);
+        dispatcher.BranchListerForTest = (repo, ct) => Task.FromResult(new List<string> { $"copilothive/{goalId}" });
+
+        var resumed = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.True(resumed);
+        Assert.Equal(0, pipeline.TestRetryBudget.Used);
+        Assert.Equal(pipeline.MaxRetries, pipeline.TestRetryBudget.Remaining);
+        Assert.False(pipeline.TestRetryBudget.IsExhausted);
+        Assert.Equal(0, pipeline.ReviewRetryBudget.Used);
+        Assert.Equal(pipeline.MaxRetries, pipeline.ReviewRetryBudget.Remaining);
+        Assert.False(pipeline.ReviewRetryBudget.IsExhausted);
+        // A reset, not a top-up: MaxRetries derives from ReviewRetryBudget.Allowed and is unchanged.
+        Assert.Equal(maxRetriesBefore, pipeline.MaxRetries);
+        Assert.Equal(maxRetriesBefore, pipeline.ReviewRetryBudget.Allowed);
+        Assert.Equal(maxRetriesBefore, pipeline.TestRetryBudget.Allowed);
+
+        // The PERSISTED ROW carries the reset counters — read back through an INDEPENDENT channel
+        // (a no-tracking SQL query, not the identity-mapped instance the writes targeted), so this
+        // is the durable half of the fix rather than an echo of the in-memory state.
+        var row = dbContext.Pipelines.AsNoTracking().Single(p => p.GoalId == goalId);
+        Assert.Equal(0, row.TestRetries);
+        Assert.Equal(0, row.ReviewRetries);
+        Assert.Equal(maxRetriesBefore, row.MaxRetries);
+    }
+
+    /// <summary>
+    /// A REFUSED resume (branch mismatch) mutates NOTHING — the exhaustion state of both task-level
+    /// retry budgets, in memory and in the persisted row, survives the refusal.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF for the ORDERING half of the contract: move the
+    /// <c>pipeline.ResetRetryBudgets()</c> call above the refusal checks and this vector fails —
+    /// the refused resume would leave both budgets restored instead of untouched.
+    /// </remarks>
+    [Fact]
+    public async Task RefusedResume_BranchMismatch_LeavesRetryBudgetsUntouched()
+    {
+        const string goalId = "gate-refused-retry-reset";
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        await using var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var goalStore = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Review rejected the changes");
+        goalStore.AddGoal(goal);
+
+        var pipeline = ExhaustedRetryPipeline(manager, goal, "copilothive/some-other-goal");
+
+        Assert.True(pipeline.TestRetryBudget.IsExhausted);
+        Assert.True(pipeline.ReviewRetryBudget.IsExhausted);
+
+        var dispatcher = CreateDispatcher(goalStore, manager);
+        dispatcher.BranchListerForTest = (repo, ct) =>
+            throw new InvalidOperationException("the observation must never run for a rejected branch");
+
+        var resumed = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.False(resumed);
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Equal(3, pipeline.TestRetryBudget.Used);
+        Assert.Equal(0, pipeline.TestRetryBudget.Remaining);
+        Assert.True(pipeline.TestRetryBudget.IsExhausted);
+        Assert.Equal(3, pipeline.ReviewRetryBudget.Used);
+        Assert.Equal(0, pipeline.ReviewRetryBudget.Remaining);
+        Assert.True(pipeline.ReviewRetryBudget.IsExhausted);
+
+        // The durable exhaustion state survives the refusal, read back through the same
+        // no-tracking channel as the success vector.
+        var row = dbContext.Pipelines.AsNoTracking().Single(p => p.GoalId == goalId);
+        Assert.Equal(3, row.TestRetries);
+        Assert.Equal(3, row.ReviewRetries);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Builds a store-backed Failed pipeline whose BOTH task-level retry budgets are exhausted —
+    /// the production shape of a goal that failed on "Exceeded max test retries".
+    /// </summary>
+    private static GoalPipeline ExhaustedRetryPipeline(GoalPipelineManager manager, Goal goal, string? coderBranch)
+    {
+        var pipeline = manager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+        while (pipeline.TestRetryBudget.TryConsume()) { }
+        while (pipeline.ReviewRetryBudget.TryConsume()) { }
+        pipeline.CoderBranch = coderBranch;
+        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, 1, 1));
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        manager.PersistFull(pipeline);
+        return pipeline;
+    }
 
     private static string Snapshot(Goal goal, GoalPipeline pipeline) =>
         string.Join('|',
