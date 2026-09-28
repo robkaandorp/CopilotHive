@@ -1,5 +1,22 @@
 ## [Unreleased]
 
+## [0.40.1] — 2026-09-28
+
+### Fixed
+
+- **Workers without agents files:** Workers now take their role from each assignment (`IAgentRunner.SetRole`, called by `TaskExecutor`). Previously, the role was set only by an `UpdateAgents` message, which the orchestrator skips when a role's `agents/<role>.agents.md` is missing or empty. On a config repo without agents files, every worker then ran as Unspecified: it had no role prompt and no mandatory report tool (`report_code_changes`, `report_test_results`, `report_review_verdict`, `report_doc_changes`), so Coding/Testing/Review/DocWriting failed even when the work was correct. This also fixes role guidance leaking between roles on the same worker: guidance is now stored per role.
+- **Creating missing agents files:**
+  - The Improver may now create a missing agents file, but only one of the six role file names (`coder`, `tester`, `reviewer`, `improver`, `orchestrator`, `docwriter` + `.agents.md`). All other new files stay forbidden, and a missing file counts as empty under the same 8,000-character limit.
+  - An Improver run that changes nothing on a config repo with no agents files is now a no-change completion instead of a publication failure. A staged deletion, a file named `agents`, or a failed index check still report failures.
+  - The Composer's `update_agents_md` is documented as creating a missing file (and the `agents/` folder). `edit_agents_md` requires an existing file.
+  - Files are never seeded at startup.
+
+### Upgrade notes
+
+- Agents files in the config repo are optional; no manual workaround (placeholder agents files) is needed on 0.40.1.
+- The role fix, the Improver role prompt, and the Improver no-change publication fix are all worker-side (`CopilotHive.Worker`: `TaskExecutor`, `SharpCoderRunner`), so **workers must run 0.40.1**.
+- The Improver per-task instructions (`PipelineDriver`) and the Composer prompt/tool texts are orchestrator-side. **Upgrade orchestrator and workers together** to get all the changes.
+
 ## [0.40.0] — 2026-09-27
 
 ### Added

@@ -16,7 +16,7 @@ software development workflow. They define the behaviour of each worker role.
 
 ## Customising for Your Project
 
-Copy these templates rename them to `*.agents.md` and edit them to match your project's conventions:
+Copy these templates, rename them to `*.agents.md` and edit them to match your project's conventions:
 
 - **Tech stack**: Update the coder's documentation and thread-safety sections to match your language.
 - **Build & test tooling**: Update references to build/test skills to match your project's commands.
@@ -29,7 +29,9 @@ Copy these templates rename them to `*.agents.md` and edit them to match your pr
 
 At runtime, CopilotHive loads agent instructions from a config repository.
 The config repo's `agents/` folder takes precedence — any matching `*.agents.md` file
-in the config repo overrides the local template.
+in the config repo overrides the local template. The config repo may have no `agents/` files at all;
+workers still get their role prompt and report tools from each assignment. The Improver or Composer
+can create a missing role file later.
 
 ## Self-Improvement
 
