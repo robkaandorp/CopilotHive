@@ -1033,9 +1033,17 @@ internal sealed class PipelineDriver
         if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
             analysis = _improvementAnalyzer.BuildAnalysis(pipeline.Metrics, _metricsTracker.History);
 
+        // The allowed agents file names come from WorkerRoles.AgentRoles rendered with
+        // ToRoleName() — never hard-coded here, so the context can never drift from the role list.
+        var agentFileNames = string.Join(", ",
+            WorkerRoles.AgentRoles.Select(r => $"{r.ToRoleName()}.agents.md"));
+
         var improveContext = "Analyze the iteration and update the *.agents.md files directly.\n\n" + analysis + "\n\n"
             + "You have access to the agents/ folder containing *.agents.md files. "
             + "Read, edit, and save the files directly using the file tools. "
+            + $"The agents/ folder may be empty or may be missing some of these files: {agentFileNames}. "
+            + "A missing file counts as empty, so if a lesson belongs to a role whose file does not exist, "
+            + "create it with exactly that name — creating a missing role file is allowed. "
             + "Only modify files that need changes based on the evidence. "
             + "Do NOT modify any source code or tests — only *.agents.md files.";
         if (!string.IsNullOrEmpty(phaseInstructions))

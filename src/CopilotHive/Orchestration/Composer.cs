@@ -321,17 +321,23 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         Config repo tools:
         - list_config_files(path?) — list files under the config repo root (or a subdirectory)
         - read_config_file(path, offset?, limit?) — read a config file with line numbers
-        - update_agents_md(role, content) — replace the full content of agents/{role}.agents.md
-        - edit_agents_md(role, old_string, new_string) — exact string replacement in agents/{role}.agents.md
+        - update_agents_md(role, content) — replace the full content of agents/{role}.agents.md, or CREATE the file (and the agents/ folder) when it does not exist yet
+        - edit_agents_md(role, old_string, new_string) — exact string replacement in agents/{role}.agents.md; works only on an existing file (use update_agents_md to create a missing one)
         - commit_config_changes(message) — stage all changes, commit, and push to the remote
 
         Valid roles for update_agents_md / edit_agents_md:
         Coder, Tester, Reviewer, Improver, Orchestrator, DocWriter, MergeWorker
 
+        Creating a missing role file:
+        - A fresh config repo may have no agents/ folder or no file for a role that needs guidance.
+        - Check what exists with list_config_files("agents") first.
+        - If a role file does not exist, create it with update_agents_md — that tool writes the file (and the agents/ folder) itself.
+
         Guidelines for editing AGENTS.md files:
         - Always read the current file before making changes (read_config_file)
         - Make targeted, minimal edits — prefer edit_agents_md over full rewrites
         - Use update_agents_md only when the change is substantial or structural
+        - Exception to both rules above: when the file does not exist (confirmed with list_config_files("agents")), there is nothing to read — create it with update_agents_md even for a small first entry
         - Always commit changes with a clear message describing what was improved and why
         - One commit per logical change — do not bundle unrelated AGENTS.md updates
         """;
@@ -1081,9 +1087,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             tools.Add(AIFunctionFactory.Create(ReadConfigFileAsync, "read_config_file",
                 "Read a config repo file with line numbers. Validates that the path stays within the config repo."));
             tools.Add(AIFunctionFactory.Create(UpdateAgentsMdAsync, "update_agents_md",
-                "Replace the full content of agents/{role}.agents.md in the config repo."));
+                "Replace the full content of agents/{role}.agents.md in the config repo, or create the file (and the agents/ folder) when it does not exist."));
             tools.Add(AIFunctionFactory.Create(EditAgentsMdAsync, "edit_agents_md",
-                "Perform an exact string replacement in agents/{role}.agents.md in the config repo."));
+                "Perform an exact string replacement in an existing agents/{role}.agents.md in the config repo. The file must already exist — use update_agents_md to create a missing file."));
             tools.Add(AIFunctionFactory.Create(CommitConfigChangesAsync, "commit_config_changes",
                 "Stage all changes in the config repo, commit, and push to the remote."));
         }

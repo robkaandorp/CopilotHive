@@ -9475,6 +9475,33 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
         Assert.True(File.Exists(filePath));
     }
 
+    /// <summary>
+    /// FRESH-INSTALL case: the config repo has NO agents/ folder at all — the fixture creates that
+    /// folder in its constructor (around the config repo setup), so it is deleted here first.
+    /// <c>update_agents_md</c> must then succeed, re-create the folder, and write the role file
+    /// with exactly the requested content. That is the path the Composer needs on a config repo
+    /// where no role file exists yet.
+    /// Removal-proof: fails if update_agents_md stops creating the folder/file.
+    /// </summary>
+    [Fact]
+    public async Task UpdateAgentsMd_WithoutAgentsFolder_CreatesFolderAndFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var agentsDir = Path.Combine(_configRepoDir, "agents");
+        Directory.Delete(agentsDir, recursive: true);
+        Assert.False(Directory.Exists(agentsDir));
+
+        const string content = "# Reviewer\nAlways check the diff before approving.";
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("Reviewer", content, cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("reviewer.agents.md", result);
+        Assert.True(Directory.Exists(agentsDir), "update_agents_md must create the missing agents/ folder.");
+        var filePath = Path.Combine(agentsDir, "reviewer.agents.md");
+        Assert.True(File.Exists(filePath), "update_agents_md must create the missing role file.");
+        Assert.Equal(content, await File.ReadAllTextAsync(filePath, ct));
+    }
+
     // ── edit_agents_md ──
 
     [Fact]
@@ -9526,6 +9553,24 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
+    }
+
+    /// <summary>
+    /// The missing-file error from <c>edit_agents_md</c> must point the Composer at
+    /// <c>update_agents_md</c>, which is the tool that can create the file (and the agents/
+    /// folder). Without that hint a fresh config repo leaves the Composer with a dead end.
+    /// Removal-proof: fails if the create-hint is removed from the error message.
+    /// </summary>
+    [Fact]
+    public async Task EditAgentsMd_FileDoesNotExist_ErrorHintsAtUpdateAgentsMd()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Reviewer", "something", "else", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+        Assert.Contains("update_agents_md", result, StringComparison.Ordinal);
+        Assert.Contains("create it", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -9642,6 +9687,53 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
         Assert.DoesNotContain("commit_config_changes", names);
     }
 
+    /// <summary>
+    /// The REGISTERED descriptions are what the LLM actually sees in the tool list, so they must
+    /// advertise the create-if-missing capability of <c>update_agents_md</c> and the
+    /// file-must-already-exist requirement of <c>edit_agents_md</c> (including the pointer to
+    /// <c>update_agents_md</c> for creating it).
+    /// Removal-proof: fails if either capability is removed from the registered descriptions.
+    /// </summary>
+    [Fact]
+    public void BuildComposerTools_AgentsMdDescriptions_MentionCreationAndExistingFileRequirement()
+    {
+        var tools = _composerWithConfigRepo.BuildComposerTools();
+        var update = tools.OfType<AIFunction>().Single(t => t.Name == "update_agents_md");
+        var edit = tools.OfType<AIFunction>().Single(t => t.Name == "edit_agents_md");
+
+        Assert.NotNull(update.Description);
+        Assert.Contains("Replace the full content", update.Description, StringComparison.Ordinal);
+        Assert.Contains("create", update.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("does not exist", update.Description, StringComparison.OrdinalIgnoreCase);
+
+        Assert.NotNull(edit.Description);
+        Assert.Contains("existing", edit.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("must already exist", edit.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("update_agents_md", edit.Description, StringComparison.Ordinal);
+
+        // The runtime [Description] attributes on the tool methods carry the same contract, so
+        // any surface that reads the attribute instead of the registration stays correct.
+        var updateAttr = GetMethodDescriptionAttribute("UpdateAgentsMdAsync");
+        var editAttr = GetMethodDescriptionAttribute("EditAgentsMdAsync");
+        Assert.Contains("create the file (and the agents/ folder)", updateAttr, StringComparison.Ordinal);
+        Assert.Contains("does not exist", updateAttr, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("must already exist", editAttr, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("update_agents_md", editAttr, StringComparison.Ordinal);
+    }
+
+    /// <summary>Reads the single <see cref="DescriptionAttribute"/> of a private Composer tool method.</summary>
+    private static string GetMethodDescriptionAttribute(string methodName)
+    {
+        var method = typeof(Composer).GetMethod(
+            methodName,
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+        var attribute = method!.GetCustomAttributes(typeof(DescriptionAttribute), inherit: false)
+            .Cast<DescriptionAttribute>()
+            .Single();
+        return attribute.Description;
+    }
+
     // ── System prompt ──
 
     [Fact]
@@ -9665,6 +9757,42 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
         Assert.DoesNotContain("Config Repository", prompt);
         Assert.DoesNotContain("list_config_files", prompt);
         Assert.DoesNotContain("update_agents_md", prompt);
+    }
+
+    /// <summary>
+    /// FRESH-INSTALL prompt contract: the Composer must be told that <c>update_agents_md</c>
+    /// creates the file (and the agents/ folder) when it is missing, that <c>edit_agents_md</c>
+    /// only works on an existing file, and that the read-first / update-only-for-structural
+    /// guidelines have an explicit missing-file exception — check with
+    /// <c>list_config_files("agents")</c> and create even a small first entry with
+    /// <c>update_agents_md</c>.
+    /// Removal-proof: fails if the missing-file exception or the create/edit distinction is removed.
+    /// </summary>
+    [Fact]
+    public void SystemPrompt_WithConfigRepo_DocumentsCreatingMissingRoleFiles()
+    {
+        var prompt = _composerWithConfigRepo.GetSystemPrompt();
+        var normalizedPrompt = string.Join(' ',
+            prompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        // The two guidelines are kept for existing files...
+        Assert.Contains("Always read the current file before making changes (read_config_file)", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Use update_agents_md only when the change is substantial or structural", normalizedPrompt, StringComparison.Ordinal);
+
+        // ...with an explicit exception for a missing file.
+        Assert.Contains("Exception to both rules above", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("when the file does not exist", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("there is nothing to read", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("even for a small first entry", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("list_config_files(\"agents\")", normalizedPrompt, StringComparison.Ordinal);
+
+        // Creating a missing role file is documented, and the create/edit distinction is explicit.
+        Assert.Contains("create the file (and the agents/ folder)", normalizedPrompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("works only on an existing file", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Creating a missing role file", normalizedPrompt, StringComparison.Ordinal);
+
+        // The accepted-role list is unchanged (MergeWorker included).
+        Assert.Contains("Coder, Tester, Reviewer, Improver, Orchestrator, DocWriter, MergeWorker", normalizedPrompt, StringComparison.Ordinal);
     }
 }
 

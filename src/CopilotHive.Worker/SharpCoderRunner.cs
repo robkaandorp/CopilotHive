@@ -96,6 +96,24 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// </summary>
     private const string? DefaultCustomAgentSystemPrompt = null;
 
+    /// <summary>
+    /// The comma-separated AGENTS.md file names the Improver is allowed to edit or create:
+    /// the six role files (<c>coder.agents.md, tester.agents.md, reviewer.agents.md,
+    /// improver.agents.md, orchestrator.agents.md, docwriter.agents.md</c>).
+    /// <para>
+    /// Rendered from the role VALUES via <see cref="WorkerRoleExtensions.ToRoleName"/>, which is
+    /// the single source of truth for role file names — so these names are never spelled twice.
+    /// The worker assembly references only <c>CopilotHive.Shared</c>, so this is the same role set
+    /// the orchestrator exposes as <c>WorkerRoles.AgentRoles</c>.
+    /// </para>
+    /// </summary>
+    private static readonly string ImproverAgentFileNames = string.Join(", ",
+        new[]
+        {
+            WorkerRole.Coder, WorkerRole.Tester, WorkerRole.Reviewer,
+            WorkerRole.Improver, WorkerRole.Orchestrator, WorkerRole.DocWriter,
+        }.Select(r => $"{r.ToRoleName()}.agents.md"));
+
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
     private string? _currentGoalId;
@@ -489,7 +507,9 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 1. **Look before you edit.** Read the existing files and check their current sizes
                    first — call the `get_file_sizes` tool before making any edit, and call it again
-                   after you re-read a file you changed.
+                   after you re-read a file you changed. The agents/ folder may contain only a few
+                   files or none at all, and a missing file counts as empty (0 characters); the same
+                   {WorkerConstants.AgentsMdMaxCharacters}-character limit applies to a newly created file.
                 2. **Only genuinely new lessons.** Formulate only lessons that are genuinely new,
                    broadly applicable, and not already covered by an existing rule. Write them in
                    concise, readable Markdown.
@@ -530,8 +550,11 @@ public sealed class SharpCoderRunner : IAgentRunner
                 **Never remove or weaken safety constraints** — do not remove instructions about git workflow,
                 test requirements or output format compliance.
 
-                Only edit `*.agents.md` files — do not create new files, rename files, or touch anything
-                outside the agents/ folder.
+                Only edit files inside the agents/ folder, and only these six exact file names
+                (one per role): {ImproverAgentFileNames}. If the file for a role you have a
+                lesson for does not exist, create it with exactly that file name — creating a
+                missing role file is allowed. Do not create any other file, do not rename files,
+                and do not touch anything outside the agents/ folder.
                 """,
 
             WorkerRole.Unspecified => SharedPreamble,

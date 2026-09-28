@@ -208,8 +208,11 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("older guidance is still readable", prompt, StringComparison.Ordinal);
 
         Assert.Contains("cannot run shell commands", prompt.Replace("**", ""), StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("Only edit `*.agents.md` files", prompt, StringComparison.Ordinal);
-        Assert.Contains("do not create new files, rename files, or touch anything", prompt, StringComparison.Ordinal);
+        Assert.Contains("Only edit files inside the agents/ folder", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("create any other file, do not rename files, and do not touch anything outside", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("the agents/ folder.", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("creating a missing role file is allowed", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("missing file counts as empty", normalizedPrompt, StringComparison.Ordinal);
         Assert.Contains("enable_file_writes=true", prompt, StringComparison.Ordinal);
         Assert.Contains("do not duplicate it", prompt, StringComparison.Ordinal);
         Assert.Contains("must NOT be added", prompt, StringComparison.Ordinal);
@@ -247,6 +250,72 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("\"the TCS-block in ClassB\"", prompt);
         Assert.Contains("do not rewrite them into one-off", prompt);
         Assert.Contains("incident advice.", prompt);
+    }
+
+    /// <summary>
+    /// The Improver prompt must allow CREATING a missing role file for exactly the six AGENTS.md
+    /// roles (named explicitly, lowercase), while still forbidding any OTHER new file, renames,
+    /// and anything outside <c>agents/</c> — and must keep the mandatory <c>get_file_sizes</c>
+    /// look-before-you-edit rule that treats a missing file as empty.
+    /// Removal-proof: fails if the create-missing-files permission, the six-name allowlist, the
+    /// other-file/rename/outside-agents ban, or the size-check rule is removed.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Improver_AllowsCreatingOnlyTheSixRoleFilesAndKeepsSizeChecks()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Improver, null);
+        var normalizedPrompt = string.Join(' ',
+            prompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        // Permission to create a missing role file, with the exact name.
+        Assert.Contains("create any other file", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Do not create", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("rename files", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("touch anything outside", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("creating a missing role file is allowed", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("If the file for a role you have a lesson for does not exist, create it with exactly that file name",
+            normalizedPrompt, StringComparison.Ordinal);
+
+        // Every allowed file name is present, and the allowlist covers exactly the six roles.
+        var allowedFileNames = new[]
+        {
+            "coder.agents.md", "tester.agents.md", "reviewer.agents.md",
+            "improver.agents.md", "orchestrator.agents.md", "docwriter.agents.md",
+        };
+        foreach (var fileName in allowedFileNames)
+            Assert.Contains(fileName, normalizedPrompt, StringComparison.Ordinal);
+
+        // UNAMBIGUOUS wording: the six strings are introduced as EXACT FILE NAMES, in one list,
+        // with nothing that re-templates them.
+        Assert.Contains(
+            "only these six exact file names (one per role): " + string.Join(", ", allowedFileNames) + ".",
+            normalizedPrompt, StringComparison.Ordinal);
+
+        // DOUBLED-EXTENSION GUARD: no template can compose `<name>.agents.md` from a list entry.
+        // The placeholder template and its "role names" framing are gone, and no doubled
+        // extension appears anywhere — for any listed name or in general.
+        Assert.DoesNotContain("<role>", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("role names", normalizedPrompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".agents.md.agents.md", prompt, StringComparison.Ordinal);
+        foreach (var fileName in allowedFileNames)
+            Assert.DoesNotContain(fileName + ".agents.md", prompt, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"\{[^}]*\}\.agents\.md", prompt);
+
+        // No seventh role file is advertised by the Improver prompt.
+        Assert.DoesNotContain("mergeworker.agents.md", normalizedPrompt, StringComparison.Ordinal);
+
+        // A missing file counts as empty (0 characters) and the same cap applies to a new file.
+        Assert.Contains("missing file counts as empty (0 characters)", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("limit applies to a newly created file", normalizedPrompt, StringComparison.Ordinal);
+
+        // The mandatory size checks survive in rule 1.
+        Assert.Contains("call the `get_file_sizes` tool before making any edit", prompt, StringComparison.Ordinal);
+        Assert.Contains("call it again", prompt, StringComparison.Ordinal);
+        Assert.Contains("after you re-read a file you changed", prompt, StringComparison.Ordinal);
+
+        // The OLD blanket ban is gone.
+        Assert.DoesNotContain("only edit `*.agents.md` files", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("do not create new files, rename files", normalizedPrompt, StringComparison.OrdinalIgnoreCase);
     }
 
     // ── Learned heuristics appendix ───────────────────────────────────────────

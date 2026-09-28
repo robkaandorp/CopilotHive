@@ -4583,6 +4583,76 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
+    /// The fresh-install no-change classification is SIGNAL-GATED, and this is its exit-code
+    /// gate: an <c>add</c> that fails with the no-match MESSAGE but a NON-128 exit code (a
+    /// localized/future git spelling, or any other failure carrying that text) is NOT the
+    /// provable fresh-install rejection — it stays a REPORTED publication failure with its
+    /// sanitized stage reason. Dropping the exit-code comparison makes this test fail.
+    /// </summary>
+    [Fact]
+    public async Task Improver_NoMatchMessageWithNonFatalExit_IsStillATruthfulFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        // The agents working directory really holds no candidate file, so ONLY the exit code can
+        // be carrying this test — the classification's other two signals are satisfied.
+        Assert.Empty(Directory.GetFiles(Path.Combine(configRepoDir, "agents"), "*", SearchOption.AllDirectories));
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["add", ..]
+                ? new GitProcessResult(1, "", "error: pathspec 'agents/*.agents.md' did not match any files")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-nomatch-nonfatal", configRepoDir, seam, fake, git);
+
+        AssertSeamStoppedAfterAdd(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git add failed (exit 1)") && i.Contains("did not match any files"));
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The fresh-install no-change classification's MARKER gate: an <c>add</c> that fails with
+    /// git's fatal no-match EXIT CODE but WITHOUT the no-match message (any other fatal-class
+    /// failure — the localized-message case, or a future git that reports something else) is NOT
+    /// classified away. The fail-safe direction is chosen deliberately: an unrecognized failure is
+    /// REPORTED, never silently reduced to a no-change completion.
+    /// </summary>
+    [Fact]
+    public async Task Improver_FatalExitWithoutNoMatchMessage_IsStillATruthfulFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        Assert.Empty(Directory.GetFiles(Path.Combine(configRepoDir, "agents"), "*", SearchOption.AllDirectories));
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["add", ..]
+                ? new GitProcessResult(128, "", "fatal: something else went wrong")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-fatal-unrecognized", configRepoDir, seam, fake, git);
+
+        AssertSeamStoppedAfterAdd(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git add failed (exit 128)") && i.Contains("fatal: something else went wrong"));
+    }
+
+    /// <summary>
     /// SEAM path, non-zero git ADD: publication stops before the diff, the task fails
     /// truthfully, and no diagnostic paths are manufactured.
     /// </summary>
@@ -6962,11 +7032,30 @@ public sealed class TaskExecutorTests
         /// Builds the playground: a bare remote seeded through a staging clone with a committed
         /// <c>agents/</c> guidance file, then a worker clone of that remote.
         /// </summary>
+        /// <param name="label">The playground's unique directory-name label.</param>
+        /// <param name="remoteGuidanceContent">
+        /// The remote baseline's <c>agents/coder.agents.md</c> content. Unused when
+        /// <paramref name="seedAgentsGuidanceFile"/> is <c>false</c>.
+        /// </param>
+        /// <param name="workerDirName">The worker clone's directory name.</param>
+        /// <param name="seedIgnoreRuleAndStagedBaseline">
+        /// Whether to also commit the <c>.gitignore</c> rule and the tracked <c>staged.txt</c>
+        /// fixture file.
+        /// </param>
+        /// <param name="seedAgentsGuidanceFile">
+        /// <b>FRESH-INSTALL OPTION (defaults to <c>true</c>, so every pre-existing call site keeps
+        /// the original fixture behaviour byte-for-byte).</b> When set to <c>false</c> the remote
+        /// baseline is committed with NO <c>agents/</c> directory and NO
+        /// <c>agents/*.agents.md</c> file at all, which is the state of a fresh installation: the
+        /// worker clone then also holds no agents file, and preparation recreates only the empty
+        /// working directory.
+        /// </param>
         public static RealGitPlayground Create(
             string label,
             string remoteGuidanceContent,
             string workerDirName = "worker",
-            bool seedIgnoreRuleAndStagedBaseline = false)
+            bool seedIgnoreRuleAndStagedBaseline = false,
+            bool seedAgentsGuidanceFile = true)
         {
             var root = Path.Combine(
                 Path.GetTempPath(), $"cghive-realgit-{label}-{Guid.NewGuid():N}");
@@ -6984,9 +7073,20 @@ public sealed class TaskExecutorTests
 
             RealGit(stagingDir, "init", "-b", "main");
             ConfigureIdentity(stagingDir);
-            Directory.CreateDirectory(Path.Combine(stagingDir, "agents"));
-            File.WriteAllText(
-                Path.Combine(stagingDir, "agents", "coder.agents.md"), remoteGuidanceContent);
+            if (seedAgentsGuidanceFile)
+            {
+                Directory.CreateDirectory(Path.Combine(stagingDir, "agents"));
+                File.WriteAllText(
+                    Path.Combine(stagingDir, "agents", "coder.agents.md"), remoteGuidanceContent);
+            }
+            else
+            {
+                // The FRESH-INSTALL baseline still needs a committable remote baseline — git
+                // refuses to commit an empty tree — so a file UNRELATED to the agents folder is
+                // seeded instead. It is deliberately not under agents/, so the baseline tracks
+                // NO agents/*.agents.md file and the worker clone starts with no agents file.
+                File.WriteAllText(Path.Combine(stagingDir, "README.md"), "# Config repo\n");
+            }
 
             if (seedIgnoreRuleAndStagedBaseline)
             {
@@ -7056,6 +7156,25 @@ public sealed class TaskExecutorTests
             Directory.CreateDirectory(Path.Combine(pusherDir, "agents"));
             File.WriteAllText(
                 Path.Combine(pusherDir, "agents", "coder.agents.md"), newGuidanceContent);
+            RealGit(pusherDir, "add", "-A");
+            RealGit(pusherDir, "commit", "-m", message);
+            RealGit(pusherDir, "push", "origin", "main");
+            return RemoteMainSha();
+        }
+
+        /// <summary>
+        /// Advances the bare remote's baseline by one commit written by <paramref name="writeFiles"/>
+        /// into the staging clone's root. Used by tests whose precondition must live in the REMOTE
+        /// baseline — preparation restores the checkout to that baseline, so a locally created file
+        /// (for example a host <c>.gitignore</c>) would be discarded before the agent runs.
+        /// </summary>
+        public string AdvanceRemoteBaseline(Action<string> writeFiles, string message)
+        {
+            var pusherDir = Path.Combine(Root, $"pusher-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(pusherDir);
+            RealGit(Root, "clone", RemoteDir, pusherDir);
+            ConfigureIdentity(pusherDir);
+            writeFiles(pusherDir);
             RealGit(pusherDir, "add", "-A");
             RealGit(pusherDir, "commit", "-m", message);
             RealGit(pusherDir, "push", "origin", "main");
@@ -9599,6 +9718,533 @@ public sealed class TaskExecutorTests
             Assert.DoesNotContain(legacyCommands, command => command.StartsWith("pull", StringComparison.Ordinal));
             Assert.DoesNotContain(legacyCommands, command => command.StartsWith("push", StringComparison.Ordinal));
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // FRESH INSTALL — no agents file in the config repo
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// REAL GIT, the PREMISE of the fresh-install path, stated as an assertion rather than an
+    /// assumption: on this fixture's remote baseline <c>agents/</c> does not exist and no
+    /// <c>agents/*.agents.md</c> file is tracked or present, and real <c>git add
+    /// agents/*.agents.md</c> therefore exits 128 with git's no-match error and stages nothing.
+    /// <para>
+    /// This is the observed behaviour the production classification keys on (see
+    /// <c>TaskExecutor.NoMatchingPathspecMarker</c>). It fails loudly if a future git release
+    /// changes either half of it (exit code or message), which would silently turn the
+    /// fresh-install classification into dead code.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RealGit_FreshInstall_NoAgentsFileMeansGitAddRejectsThePathspec()
+    {
+        using var playground = RealGitPlayground.Create(
+            "fresh-premise", "UNUSED-CONTENT\n", seedAgentsGuidanceFile: false);
+        var worker = playground.WorkerDir;
+
+        // NON-VACUITY: the precondition really holds — no agents directory, no tracked path.
+        Assert.False(Directory.Exists(Path.Combine(worker, "agents")));
+        Assert.Equal("", RealGitOutput(worker, "ls-files", "agents"));
+        Assert.Equal("", playground.WorkerVerboseStatus());
+
+        var (exitCode, stdout, stderr) = RealGitResult(worker, "add", "agents/*.agents.md");
+
+        Assert.Equal(128, exitCode);
+        Assert.Equal("", stdout);
+        Assert.Contains("did not match any files", stderr, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("agents/*.agents.md", stderr, StringComparison.Ordinal);
+        // The rejected add staged NOTHING — the index is untouched.
+        Assert.Equal("", RealGitOutput(worker, "diff", "--cached", "--name-only"));
+
+        // The agent DID run through the full production path on this baseline and produced a
+        // genuine NO-CHANGE completion — not a publication failure.
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("No guidance changes were necessary"),
+        };
+
+        var (result, stderrOutput, _) = await RunRealGitImproverAsync(
+            "realgit-fresh-premise", playground, viaSeam: true, agentRunner);
+
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+        // No publication FAILURE was reported for the provably-empty publish attempt.
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("did not match any files", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("git add failed", stderrOutput, StringComparison.Ordinal);
+
+        // The remote never advanced, and the post-run tree is verified clean.
+        Assert.Equal(playground.RemoteMainSha(), playground.WorkerHeadSha());
+        Assert.Equal("", playground.WorkerVerboseStatus());
+    }
+
+    /// <summary>
+    /// REAL GIT (fresh install), the CORE fix: an Improver run on a baseline with NO agents file
+    /// and NO change made by the agent is a NO-CHANGE completion — never a publication failure.
+    /// <para>
+    /// Before the fix, <c>git add agents/*.agents.md</c> exited 128 with
+    /// <c>fatal: pathspec 'agents/*.agents.md' did not match any files</c>, which the publication
+    /// stage reported as <c>git add failed (exit 128)</c>: a fresh install turned every improver
+    /// no-change run into a reported failure. The classification therefore fails the test if the
+    /// failure path is restored.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF: the assertions below are EXACTLY the observable difference between the
+    /// no-change result and the stage failure — status, verdict, push/file counts, the issues
+    /// list, and the absence of the stage-failure diagnostic in BOTH retained sinks.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // tokenized seam route
+    [InlineData(false)]  // legacy opaque route
+    public async Task RealGit_FreshInstall_NoAgentsFileAndNoChange_IsANoChangeCompletion(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"fresh-nochange-{(viaSeam ? "seam" : "legacy")}",
+            "UNUSED-CONTENT\n",
+            seedAgentsGuidanceFile: false);
+        var worker = playground.WorkerDir;
+        var remoteShaBefore = playground.RemoteMainSha();
+
+        // The agent made NO change at all: it must NOT be prompted to repair anything, and the
+        // publication stage therefore finds nothing to stage.
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("No lessons to record this iteration"),
+        };
+
+        var (result, stderr, _) = await RunRealGitImproverAsync(
+            $"realgit-fresh-nochange-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // The agent ran exactly once: no size-enforcement retry, no repair prompt.
+        Assert.Single(agentRunner.PromptCalls);
+
+        // ── A GENUINE NO-CHANGE COMPLETION ────────────────────────────────────
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.Empty(result.Metrics.Issues);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Equal(0, result.GitStatus.Insertions);
+        Assert.Equal(0, result.GitStatus.Deletions);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+
+        // The stage-failure diagnostic is ABSENT from every retained sink — this is the exact
+        // text the pre-fix behaviour emitted.
+        Assert.DoesNotContain("git add failed", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("git add failed", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("[Config Repo Git Failure]", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "did not match any files", result.Output, StringComparison.OrdinalIgnoreCase);
+
+        // The agent's own output is preserved verbatim (never replaced by the reason).
+        Assert.Contains("No lessons to record this iteration", result.Output, StringComparison.Ordinal);
+
+        // ── NOTHING WAS PUBLISHED, AND NOTHING ELSE RAN ───────────────────────
+        // The remote is untouched and the checkout still sits on the baseline, verified clean.
+        Assert.Equal(remoteShaBefore, playground.RemoteMainSha());
+        Assert.Equal(remoteShaBefore, playground.WorkerHeadSha());
+        Assert.Equal(remoteShaBefore, playground.WorkerOriginMainSha());
+        Assert.Equal("", playground.WorkerVerboseStatus());
+        Assert.False(Directory.Exists(Path.Combine(worker, "agents")));
+    }
+
+    /// <summary>
+    /// REAL GIT, the CONVERSE of the fresh-install classification — the truthful-publication
+    /// guarantee is NOT weakened. An ignored candidate reaches the SAME exit code (128) AND the
+    /// SAME <c>did not match any files</c> stderr as the fresh-install case, so this cell proves
+    /// the classification's THIRD signal (a real candidate file in the worktree) carries the
+    /// distinction: the failure stays a REPORTED publication failure with its sanitized stage
+    /// reason, and the ignored lesson is never silently reported as a no-change run.
+    /// <para>
+    /// The ignore rule is committed to the REMOTE baseline (a local host <c>.gitignore</c> would be
+    /// discarded by preparation's restore), so the agent's freshly created
+    /// <c>agents/coder.agents.md</c> really is ignored when the publication stage stages it.
+    /// </para>
+    /// REFUTATION-PROOF: dropping the candidate-file signal makes this test fail, because the
+    /// identical exit code and message then classify this real failure as a no-change completion.
+    /// </summary>
+    [Fact]
+    public async Task RealGit_IgnoredAgentsFile_IsStillATruthfulPublicationFailure()
+    {
+        using var playground = RealGitPlayground.Create(
+            "fresh-ignored", "UNUSED-CONTENT\n", seedAgentsGuidanceFile: false);
+        var worker = playground.WorkerDir;
+
+        // REMOTE-baseline ignore rule: `agents/` is ignored, so the candidate file the agent
+        // creates cannot be staged without -f.
+        playground.AdvanceRemoteBaseline(
+            dir => File.WriteAllText(Path.Combine(dir, ".gitignore"), "agents/\n"),
+            "ignore agents");
+        var remoteShaBefore = playground.RemoteMainSha();
+
+        var seenCandidateDuringRun = false;
+        var seenProbeExitCode = -1;
+        string? seenProbeStdout = null;
+        string? seenProbeStderr = null;
+
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                Directory.CreateDirectory(Path.Combine(worker, "agents"));
+                File.WriteAllText(
+                    Path.Combine(worker, "agents", "coder.agents.md"), "# Coder lesson\n");
+                // OBSERVED AT THE CLASSIFICATION POINT: the candidate really is present here, and
+                // git's OWN answer for the exact production command in this state is the SAME
+                // exit code (128) and the SAME no-match stderr as the fresh-install case. Only the
+                // candidate-file signal separates the two.
+                seenCandidateDuringRun = File.Exists(Path.Combine(worker, "agents", "coder.agents.md"));
+                var (probeExit, probeStdout, probeStderr) =
+                    RealGitResult(worker, "add", "agents/*.agents.md");
+                seenProbeExitCode = probeExit;
+                seenProbeStdout = probeStdout;
+                seenProbeStderr = probeStderr;
+                return Task.FromResult("Recorded a lesson");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            "realgit-fresh-ignored", playground, viaSeam: true, agentRunner);
+
+        // NON-VACUITY, stated as an EXACT equivalence with the fresh-install cell: a candidate
+        // file existed, yet git answered 128 + the no-match message and staged nothing. The
+        // candidate-file signal is therefore the ONLY thing that can distinguish this case.
+        Assert.True(seenCandidateDuringRun, "the candidate agents file was not present at add time");
+        Assert.Equal(128, seenProbeExitCode);
+        Assert.Equal("", seenProbeStdout);
+        Assert.Contains("did not match any files", seenProbeStderr, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(agentRunner.PromptCalls);
+
+        // A REAL failure stays a REAL failure: Fail outcome, FAIL verdict, nothing pushed.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        // The sanitized stage reason names the stage and carries the exit code + git's diagnostic.
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git add failed"));
+        Assert.Contains("git add failed (exit 128)", issue, StringComparison.Ordinal);
+        Assert.Contains("did not match any files", issue, StringComparison.OrdinalIgnoreCase);
+        // The reason reaches the retained output as well.
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        // The remote never advanced — nothing was published.
+        Assert.Equal(remoteShaBefore, playground.RemoteMainSha());
+    }
+
+    /// <summary>
+    /// REAL GIT, the SECOND converse cell: a candidate file that is TRACKED but missing from the
+    /// worktree is a real staged DELETION, not a no-match. <c>git add agents/*.agents.md</c> exits
+    /// 0 for it, so the fresh-install classification is never consulted and the deletion is
+    /// committed and pushed as an ordinary publication — no file-presence heuristic may suppress
+    /// a genuine agents-file change.
+    /// </summary>
+    [Fact]
+    public async Task RealGit_TrackedAgentsFileDeletedFromWorktree_IsStillPublishedAsADeletion()
+    {
+        using var playground = RealGitPlayground.Create(
+            "fresh-deleted", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+
+        // The agent DELETES the tracked guidance file and creates no replacement.
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.Delete(playground.GuidancePath);
+                return Task.FromResult("Removed obsolete guidance");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            "realgit-fresh-deleted", playground, viaSeam: true, agentRunner);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal([RealGitPlayground.GuidanceRelativePath], result.GitStatus.ChangedFiles);
+
+        // The deletion really reached the remote: the path is gone from the remote tip.
+        var remoteShaAfter = playground.RemoteMainSha();
+        Assert.NotEqual(baselineSha, remoteShaAfter);
+        var (showExit, _, _) = RealGitResult(
+            playground.RemoteDir, "show", "main:" + RealGitPlayground.GuidanceRelativePath);
+        Assert.NotEqual(0, showExit);
+    }
+
+    /// <summary>
+    /// REAL GIT, the FRESH-INSTALL CREATION cell the goal explicitly requires: on a baseline with
+    /// NO <c>agents/</c> directory at all, a NEWLY CREATED (untracked)
+    /// <c>agents/coder.agents.md</c> is staged, committed and PUSHED by the publication stage.
+    /// This is the exact counterpart of <see
+    /// cref="RealGit_FreshInstall_NoAgentsFileAndNoChange_IsANoChangeCompletion"/>: the same
+    /// baseline, but this time the agent DOES produce a lesson, so the fresh-install path must
+    /// publish it like any other agents-file change.
+    /// <para>
+    /// REMOVAL-PROOF: fails if the fresh-install no-match classification is broadened to swallow
+    /// a real change (no push / no remote advance), or if publication ever rejects an untracked
+    /// first file.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RealGit_FreshInstall_NewlyCreatedUntrackedAgentsFile_IsStagedCommittedAndPushed()
+    {
+        using var playground = RealGitPlayground.Create(
+            "fresh-created", "UNUSED-CONTENT\n", seedAgentsGuidanceFile: false);
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+
+        // NON-VACUITY: the fresh-install precondition really holds.
+        Assert.False(Directory.Exists(Path.Combine(worker, "agents")));
+
+        const string lessonContent = "# Coder\nAlways check the diff before approving.\n";
+
+        // The agent CREATES the role file for the first time: the file is untracked, the
+        // agents/ directory does not exist yet, and it is the only change of the run.
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                Directory.CreateDirectory(playground.GuidancePath[..playground.GuidancePath.LastIndexOf(Path.DirectorySeparatorChar)]);
+                File.WriteAllText(playground.GuidancePath, lessonContent);
+                return Task.FromResult("Recorded the first coder lesson");
+            },
+        };
+
+        var (result, stderr, _) = await RunRealGitImproverAsync(
+            "realgit-fresh-created", playground, viaSeam: true, agentRunner);
+
+        Assert.Single(agentRunner.PromptCalls);
+
+        // A genuine successful publication — not a no-change completion and not a failure.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed, "the newly created agents file must be PUSHED");
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+        Assert.Equal(RealGitPlayground.GuidanceRelativePath, Assert.Single(result.GitStatus.ChangedFiles));
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("git add failed", stderr, StringComparison.Ordinal);
+
+        // The publication REALLY reached the remote: the remote advanced past the baseline and
+        // the created lesson content is readable from the remote tip (the remote is BARE, so the
+        // content must be read through git, not the filesystem).
+        var remoteShaAfter = playground.RemoteMainSha();
+        Assert.NotEqual(baselineSha, remoteShaAfter);
+        var (showExit, showStdout, _) = RealGitResult(
+            playground.RemoteDir, "show", "main:" + RealGitPlayground.GuidanceRelativePath);
+        Assert.Equal(0, showExit);
+        Assert.Equal(lessonContent, showStdout);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ITERATION 2 (review fixes) — the no-match classification must never discard
+    // a staged change or an invalid agents path
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// REAL GIT — FINDING 1 (staged-change gate). The agent STAGES the deletion of the tracked
+    /// guidance file with <c>git rm</c>, which also removes the worktree file (and the now-empty
+    /// <c>agents/</c> directory). Real <c>git add agents/*.agents.md</c> then exits 128 with the
+    /// no-match marker and no candidate file exists — every iteration-1 signal agrees — yet the
+    /// INDEX still carries the deletion. The run must NOT be a silent no-change completion (which
+    /// finalization would follow by discarding the staged deletion): it is a truthful,
+    /// stage-specific publication FAILURE that names the staged change.
+    /// <para>
+    /// Distinct from <see cref="RealGit_TrackedAgentsFileDeletedFromWorktree_IsStillPublishedAsADeletion"/>,
+    /// where the file is removed from the worktree WITHOUT staging, the add exits 0, and the
+    /// deletion is published.
+    /// </para>
+    /// REMOVAL-PROOF: dropping the staged-change gate turns this run into Completed/PASS.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // tokenized seam route
+    [InlineData(false)]  // legacy opaque route
+    public async Task RealGit_StagedAgentsFileDeletion_IsATruthfulFailureNotASilentNoChange(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"staged-rm-{(viaSeam ? "seam" : "legacy")}", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+        var remoteShaBefore = playground.RemoteMainSha();
+
+        string? seenStaged = null;
+        var seenAddExit = -1;
+        string? seenAddStderr = null;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                RealGit(worker, "rm", "--quiet", RealGitPlayground.GuidanceRelativePath);
+
+                // OBSERVED AT PUBLICATION TIME: the deletion is STAGED, and git's own answer for
+                // the production add is the no-match rejection. This is the exact unsound case.
+                seenStaged = RealGitOutput(worker, "diff", "--cached", "--name-status");
+                // The probe is a --dry-run so it cannot change the state the production add sees.
+                var (exit, _, err) = RealGitResult(worker, "add", "--dry-run", "agents/*.agents.md");
+                seenAddExit = exit;
+                seenAddStderr = err;
+                return Task.FromResult("Removed the obsolete coder guidance");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-staged-rm-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // NON-VACUITY: a real staged deletion, the no-match rejection, no candidate file.
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.Equal($"D\t{RealGitPlayground.GuidanceRelativePath}\n", seenStaged);
+        Assert.Equal(128, seenAddExit);
+        Assert.Contains("did not match any files", seenAddStderr, StringComparison.OrdinalIgnoreCase);
+
+        // NOT a silent no-change completion.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git add failed"));
+        Assert.Contains("git add failed (exit 128)", issue, StringComparison.Ordinal);
+        Assert.Contains("the index still holds 1 staged change(s)", issue, StringComparison.Ordinal);
+        Assert.Contains(RealGitPlayground.GuidanceRelativePath, issue, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+
+        // Nothing was published; the remote still carries the guidance file.
+        Assert.Equal(remoteShaBefore, playground.RemoteMainSha());
+        Assert.Equal("REMOTE-BASELINE-V1\n", RealGitOutput(
+            playground.RemoteDir, "show", "main:" + RealGitPlayground.GuidanceRelativePath));
+    }
+
+    /// <summary>
+    /// REAL GIT — FINDING 2 (path-validity gate). On a fresh install the agent replaces the empty
+    /// <c>agents/</c> working directory with an untracked regular FILE named <c>agents</c>. Real git
+    /// answers 128 + the no-match marker, the index is clean and no <c>*.agents.md</c> exists — yet
+    /// the path is not absent, it is INVALID. The run must fail safe to the truthful stage-specific
+    /// failure, with the git diagnostic retained — never PASS/no-change.
+    /// REMOVAL-PROOF: treating a non-directory path as absent turns this run into Completed/PASS.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // tokenized seam route
+    [InlineData(false)]  // legacy opaque route
+    public async Task RealGit_AgentsPathIsAFile_IsATruthfulFailureNotANoChange(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"agents-file-{(viaSeam ? "seam" : "legacy")}", "UNUSED-CONTENT\n", seedAgentsGuidanceFile: false);
+        var worker = playground.WorkerDir;
+        var agentsPath = Path.Combine(worker, "agents");
+        var remoteShaBefore = playground.RemoteMainSha();
+
+        var seenIsFile = false;
+        var seenAddExit = -1;
+        string? seenAddStderr = null;
+        string? seenStaged = null;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (Directory.Exists(agentsPath))
+                    Directory.Delete(agentsPath, recursive: true);
+                File.WriteAllText(agentsPath, "not a directory\n");
+
+                seenIsFile = File.Exists(agentsPath) && !Directory.Exists(agentsPath);
+                var (exit, _, err) = RealGitResult(worker, "add", "--dry-run", "agents/*.agents.md");
+                seenAddExit = exit;
+                seenAddStderr = err;
+                seenStaged = RealGitOutput(worker, "diff", "--cached", "--name-only");
+                return Task.FromResult("Wrote something odd");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-agents-file-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // NON-VACUITY: every OTHER signal agrees — only the path validity separates this case.
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.True(seenIsFile, "the agents path was not a regular file at publication time");
+        Assert.Equal(128, seenAddExit);
+        Assert.Contains("did not match any files", seenAddStderr, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("", seenStaged);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git add failed"));
+        Assert.Contains("git add failed (exit 128)", issue, StringComparison.Ordinal);
+        Assert.Contains("did not match any files", issue, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("the agents path is not a directory", issue, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Equal(remoteShaBefore, playground.RemoteMainSha());
+    }
+
+    /// <summary>
+    /// SEAM — the staged-change query FAILS SAFE: when every local signal agrees (128 + marker,
+    /// valid empty agents directory, no candidate) but the <c>diff --cached</c> query itself fails,
+    /// an empty index is NOT inferred. The run is the truthful add failure, the query diagnostic is
+    /// retained, and nothing after the query runs.
+    /// </summary>
+    [Fact]
+    public async Task Improver_NoMatchAdd_FailedStagedChangeQuery_IsATruthfulFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["add", ..] => new GitProcessResult(
+                    128, "", "fatal: pathspec 'agents/*.agents.md' did not match any files"),
+                ["diff", ..] => new GitProcessResult(1, "", "fatal: index file corrupt"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-staged-query-fail", configRepoDir, seam, fake, git);
+
+        Assert.Single(fake.Launched, t => t is ["diff", "--cached", "--name-only", "-z"]);
+        AssertSeamStoppedAfterDiff(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git add failed (exit 128)")
+                && i.Contains("the staged-change check failed (exit 1): fatal: index file corrupt"));
+    }
+
+    /// <summary>
+    /// SEAM — positive control for the gated classification: with every signal agreeing AND an
+    /// EMPTY staged-change answer, the failed add is the fresh-install no-change completion, and
+    /// the query is the ONLY command issued after the add (no commit, pull or push).
+    /// </summary>
+    [Fact]
+    public async Task Improver_NoMatchAdd_CleanIndex_IsANoChangeCompletion()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["add", ..] => new GitProcessResult(
+                    128, "", "fatal: pathspec 'agents/*.agents.md' did not match any files"),
+                ["diff", ..] => new GitProcessResult(0, "", ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-staged-query-clean", configRepoDir, seam, fake, git);
+
+        Assert.Single(fake.Launched, t => t is ["diff", "--cached", "--name-only", "-z"]);
+        AssertSeamStoppedAfterDiff(fake.Launched);
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.Empty(result.Metrics.Issues);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
     }
 
     // ══════════════════════════════════════════════════════════════════════════

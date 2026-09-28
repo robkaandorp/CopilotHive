@@ -1658,6 +1658,48 @@ public sealed class PipelineDriverImproveSkipTests
         Assert.Equal(summary, persisted.PhaseOutputs["improver-1-1"]);
     }
 
+    // ── Test 15: the Improve context advertises the create-missing-files permission ──
+
+    /// <summary>
+    /// The context built for the Improve dispatch must list EVERY allowed agents file name —
+    /// derived from <see cref="WorkerRoles.AgentRoles"/> rendered with
+    /// <see cref="WorkerRoleExtensions.ToRoleName"/>, never hard-coded in the driver — and must
+    /// state that a missing file for one of those roles may be created. That is exactly the
+    /// fresh-install case where the config repo has no agents/ folder at all, so the Improver must
+    /// know it may create the file rather than skip recording its lesson.
+    /// The capture happens through the driver's own <c>resolvePrompt</c> seam, so the asserted
+    /// text is the production context, not a test-side copy.
+    /// Removal-proof: fails if the file-name list or the create-missing-file permission is removed.
+    /// </summary>
+    [Fact]
+    public async Task DispatchPhaseAsync_Improve_ListsAllAgentFileNamesAndAllowsCreatingMissingOnes()
+    {
+        string? capturedContext = null;
+        var (driver, pipeline, _, _, _) = CreateImproveDriver(
+            capturePromptContext: context => capturedContext = context);
+
+        await driver.DispatchPhaseAsync(
+            pipeline, GoalPhase.Improve, null, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedContext);
+
+        // Every allowed role file name is present, rendered from the production role list.
+        foreach (var role in WorkerRoles.AgentRoles)
+            Assert.Contains($"{role.ToRoleName()}.agents.md", capturedContext, StringComparison.Ordinal);
+
+        // The list is exactly the six AGENT roles — no MergeWorker file is offered.
+        Assert.DoesNotContain("mergeworker.agents.md", capturedContext, StringComparison.Ordinal);
+
+        // The folder may be empty/missing files, and missing role files may be created.
+        Assert.Contains("may be empty or may be missing some of these files", capturedContext, StringComparison.Ordinal);
+        Assert.Contains("create it with exactly that name", capturedContext, StringComparison.Ordinal);
+        Assert.Contains("creating a missing role file is allowed", capturedContext, StringComparison.Ordinal);
+        Assert.Contains("counts as empty", capturedContext, StringComparison.Ordinal);
+
+        // The pre-existing source-code/tests ban is untouched.
+        Assert.Contains("Do NOT modify any source code or tests", capturedContext, StringComparison.Ordinal);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1669,7 +1711,7 @@ public sealed class PipelineDriverImproveSkipTests
     /// goal completion. Carries a counting <c>syncAgents</c> seam.
     /// </summary>
     internal static (PipelineDriver Driver, GoalPipeline Pipeline, PhaseResult Entry, int[] SyncCount, PipelineDriverNoOpRetryTests.IterationCapturingGoalStore Store)
-        CreateImproveDriver(GoalPhase phase = GoalPhase.Improve)
+        CreateImproveDriver(GoalPhase phase = GoalPhase.Improve, Action<string?>? capturePromptContext = null)
     {
         var goal = new Goal { Id = $"goal-improve-skip-{Guid.NewGuid():N}", Description = "Improve skip recording test" };
         var goalStore = new PipelineDriverNoOpRetryTests.IterationCapturingGoalStore(goal);
@@ -1703,7 +1745,14 @@ public sealed class PipelineDriverImproveSkipTests
             agentsManager: null,
             metricsTracker: null,
             dispatchToRole: (_, _, _, _) => Task.CompletedTask,
-            resolvePrompt: (_, _, _, _) => Task.FromResult("improve prompt"),
+            // The Improve dispatch resolves its prompt through this seam; capture the context the
+            // driver built (it contains the agents-file guidance) for assertions.
+            resolvePrompt: (_, promptPhase, promptContext, _) =>
+            {
+                if (promptPhase == GoalPhase.Improve)
+                    capturePromptContext?.Invoke(promptContext);
+                return Task.FromResult("improve prompt");
+            },
             resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
             resolveRepositories: _ => [],
             syncAgents: _ =>

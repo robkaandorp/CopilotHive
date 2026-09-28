@@ -2157,6 +2157,203 @@ public sealed class TaskExecutor(
         branch.Length > 0 && !branch.Contains('"') && !branch.Contains('\\');
 
     /// <summary>
+    /// git's own rejection text when a pathspec matched NOTHING — neither a worktree file nor a
+    /// tracked path. Observed behaviour on a real repository (git 2.43): with an EMPTY
+    /// <c>agents/</c> directory, and equally when <c>agents/</c> does not exist at all,
+    /// <c>git add agents/*.agents.md</c> exits <b>128</b> with
+    /// <c>fatal: pathspec 'agents/*.agents.md' did not match any files</c> on STDERR (stdout
+    /// empty), leaving the index untouched. The same command exits 0 and stages a DELETION for a
+    /// tracked <c>agents/coder.agents.md</c> that is missing from the worktree. It ALSO exits 128
+    /// with this marker when the deletion was already STAGED (<c>git rm</c>), when <c>agents</c>
+    /// is a regular FILE, and when the only candidate is IGNORED — so the marker alone never
+    /// proves "nothing to publish"; see <see cref="ClassifyFailedAgentsAddAsync"/>.
+    /// </summary>
+    private const string NoMatchingPathspecMarker = "did not match any files";
+
+    /// <summary>
+    /// The exact <c>git add</c> exit code for the no-match pathspec rejection (git's "fatal"
+    /// class). Requiring it — together with the marker, a valid agents path, the absent candidate
+    /// file and a clean index — keeps the fresh-install classification from ever capturing an
+    /// ordinary stage failure, which reports its own (usually 1-class) exit code.
+    /// </summary>
+    private const int NoMatchingPathspecExitCode = 128;
+
+    /// <summary>
+    /// Whether a FAILED <c>git add agents/*.agents.md</c> is the FRESH-INSTALL case: git rejected
+    /// the pathspec because NOTHING matched it, so there is provably nothing to publish and the
+    /// run is a genuine no-change completion rather than a publication failure.
+    /// <para>
+    /// FIVE signals must agree, so no other failure can be masked as a no-change result:
+    /// <list type="number">
+    ///   <item><description>git's fatal no-match EXIT code (128);</description></item>
+    ///   <item><description>git's no-match stderr MARKER (a localized git that translates it
+    ///   fails this check and stays a REPORTED FAILURE — the fail-safe direction);</description></item>
+    ///   <item><description>a VALID agents path: either genuinely ABSENT or an ordinary
+    ///   directory. An <c>agents</c> path that is a file, a symbolic link, or cannot be inspected
+    ///   is not evidence of absence (see <see cref="InspectAgentsPath"/>);</description></item>
+    ///   <item><description>a worktree that really holds no candidate <c>*.agents.md</c>
+    ///   file;</description></item>
+    ///   <item><description>an index with NO staged change, proven by the SAME
+    ///   <c>diff --cached --name-only -z</c> query the success path already uses. A staged
+    ///   <c>git rm agents/coder.agents.md</c> removes the worktree file AND makes the add exit 128
+    ///   with the no-match marker, yet the index still carries the deletion — classifying that as
+    ///   no-change would let finalization silently discard it.</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// The index query reuses an EXISTING allowed command form, so the config-repo seam's grammar
+    /// is unchanged. It is issued only after the four local signals already agree, so every other
+    /// add failure keeps its exact pre-existing command sequence. A failing or throwing query is
+    /// never evidence of an empty index: the classification then fails safe to the add failure. A
+    /// REQUESTED cancellation propagates unchanged.
+    /// </para>
+    /// </summary>
+    /// <returns>
+    /// <c>null</c> when the failed add is the fresh-install no-change case; otherwise the extra
+    /// diagnostic to append to the add failure reason (possibly empty).
+    /// </returns>
+    private async Task<string?> ClassifyFailedAgentsAddAsync(ConfigRepoOpResult addResult, CancellationToken ct)
+    {
+        if (addResult.ExitCode != NoMatchingPathspecExitCode
+            || !addResult.SanitizedError.Contains(NoMatchingPathspecMarker, StringComparison.OrdinalIgnoreCase))
+            return string.Empty;
+
+        var pathState = InspectAgentsPath();
+        if (pathState == AgentsPathState.Invalid)
+        {
+            _log.Error("Config repo publication: the agents path is not a directory (or could not be inspected) — " +
+                       "the failed add is NOT classified as a no-change run");
+            return " — the agents path is not a directory (or could not be inspected), so this is not a no-change run";
+        }
+
+        if (pathState == AgentsPathState.Directory && !AgentsWorktreeHasNoCandidateFile())
+            return string.Empty;
+
+        ConfigRepoOpResult stagedResult;
+        try
+        {
+            stagedResult = await RunConfigRepoCommandAsync(
+                ["diff", "--cached", "--name-only", "-z"], "diff --cached --name-only -z", ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _log.Error($"git diff (staged-change check) threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+            return $" — the staged-change check failed with an error [{SafeExceptionLog.Describe(ex)}]";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.Error($"git diff (staged-change check) threw [{SafeExceptionLog.Describe(ex)}]");
+            return $" — the staged-change check failed with an error [{SafeExceptionLog.Describe(ex)}]";
+        }
+
+        if (!stagedResult.Success)
+        {
+            _log.Error($"git diff (staged-change check) failed: {RenderForLog(stagedResult.SanitizedError)}");
+            return $" — the staged-change check failed (exit {stagedResult.ExitCode}): {RenderForLog(stagedResult.SanitizedError)}";
+        }
+
+        if (!string.IsNullOrWhiteSpace(stagedResult.Stdout))
+        {
+            var staged = stagedResult.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+            var display = staged.Length > ImproverLogMaxPaths ? staged[..ImproverLogMaxPaths] : staged;
+            var rendered = LogSanitizer.FormatPathList(display, staged.Length);
+            _log.Error($"Config repo publication: the index still holds {staged.Length} staged change(s) ({rendered}) — " +
+                       "the failed add is NOT classified as a no-change run");
+            return $" — the index still holds {staged.Length} staged change(s) ({rendered}), so this is not a no-change run";
+        }
+
+        return null;
+    }
+
+    /// <summary>The observed state of the agents working-directory path.</summary>
+    private enum AgentsPathState
+    {
+        /// <summary>Nothing exists at the path (not even a dangling link).</summary>
+        Absent,
+
+        /// <summary>An ordinary directory (not a link).</summary>
+        Directory,
+
+        /// <summary>A file, a link, or a path that could not be inspected.</summary>
+        Invalid,
+    }
+
+    /// <summary>
+    /// Classifies the agents path. Only a proven ABSENCE (git's own "not found" answers for the
+    /// path and no dangling link) or an ordinary non-link DIRECTORY is valid. A regular FILE named
+    /// <c>agents</c> — which also makes <c>git add agents/*.agents.md</c> exit 128 with the
+    /// no-match marker — a symbolic link, or any inspection error is <see cref="AgentsPathState.Invalid"/>,
+    /// which fails safe to the truthful add failure.
+    /// </summary>
+    private AgentsPathState InspectAgentsPath()
+    {
+        FileAttributes attributes;
+        try
+        {
+            attributes = File.GetAttributes(_configAgentsDir);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // Not found — but a DANGLING link also reports not-found through the target, so the
+            // link entry itself is checked before absence is accepted.
+            try
+            {
+                return new FileInfo(_configAgentsDir).LinkTarget is null
+                    ? AgentsPathState.Absent
+                    : AgentsPathState.Invalid;
+            }
+            catch (Exception linkEx) when (linkEx is not OperationCanceledException)
+            {
+                return AgentsPathState.Invalid;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return AgentsPathState.Invalid;
+        }
+
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+            return AgentsPathState.Invalid;
+
+        return (attributes & FileAttributes.Directory) != 0
+            ? AgentsPathState.Directory
+            : AgentsPathState.Invalid;
+    }
+
+    /// <summary>
+    /// Whether the agents working DIRECTORY holds NO candidate file for the
+    /// <c>agents/*.agents.md</c> pathspec — no file whose name ends with <c>.agents.md</c>
+    /// anywhere under the agents directory. The check follows git's own wildmatch for this
+    /// pathspec, where <c>*</c> ALSO matches path separators: a nested
+    /// <c>agents/sub/x.agents.md</c> and an empty stem <c>agents/.agents.md</c> both count as
+    /// candidates (verified against real git). Callers establish via
+    /// <see cref="InspectAgentsPath"/> that the path is an ordinary directory first.
+    /// <para>
+    /// A tree that cannot be fully enumerated is deliberately reported as HAVING a candidate:
+    /// an unreadable directory is not evidence of absence, and returning <c>false</c> here keeps
+    /// the stage failure visible instead of classifying it away.
+    /// </para>
+    /// </summary>
+    private bool AgentsWorktreeHasNoCandidateFile()
+    {
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(
+                _configAgentsDir, "*", SearchOption.AllDirectories))
+            {
+                if (file.EndsWith(".agents.md", StringComparison.Ordinal))
+                    return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Commits and pushes any changes the improver made to *.agents.md files in the config repo.
     /// Only stages files in the agents/ subfolder to prevent accidental changes elsewhere.
     /// <para>
@@ -2170,6 +2367,16 @@ public sealed class TaskExecutor(
     /// reason is returned in every such case, and Pushed is set only after a confirmed
     /// successful push. The summary preserves the diagnostic
     /// changed-file paths on failure so the orchestrator can log a useful warning.
+    /// </para>
+    /// <para>
+    /// FRESH-INSTALL NO-CHANGE: on a config repo whose baseline tracks no
+    /// <c>agents/*.agents.md</c> file, <c>git add</c> rejects the pathspec outright (see
+    /// <see cref="NoMatchingPathspecMarker"/>). That ONE rejection — and only that one, identified
+    /// by the no-match exit code, git's no-match marker, a valid (absent or directory) agents path,
+    /// a worktree that really holds no candidate file, and an index with no staged change — is a
+    /// genuine no-change completion: no commit, pull or push runs and the caller sees exactly the
+    /// empty-diff outcome. Every other add failure keeps its stage-specific FAILURE reporting, so
+    /// nothing is ever masked as success.
     /// </para>
     /// </summary>
     private async Task<ConfigRepoPublication> CommitAndPushConfigRepoAsync(
@@ -2203,10 +2410,27 @@ public sealed class TaskExecutor(
         }
         if (!addResult.Success)
         {
+            // FRESH-INSTALL no-change classification, checked BEFORE the failure return. The add
+            // is deliberately still ISSUED: it is the only way to discover whether the worktree
+            // holds a matching path (a tracked-but-deleted agents file stages its deletion with
+            // exit 0). Classification requires ALL five signals of ClassifyFailedAgentsAddAsync —
+            // including a valid agents path and an index with no staged change — so an ordinary
+            // stage failure (a bad path, an ignored candidate, an `agents` FILE, a staged
+            // `git rm`, a permission error, a localized no-match message) still stops publication
+            // and reports its sanitized stage reason.
+            var classification = await ClassifyFailedAgentsAddAsync(addResult, ct);
+            if (classification is null)
+            {
+                _log.Info(
+                    "No agents.md file present in the agents working directory and nothing staged — git " +
+                    "rejected the pathspec, so there is nothing to publish. Treating the run as a no-change completion.");
+                return new ConfigRepoPublication(new GitChangeSummary(), null);
+            }
+
             _log.Error($"git add failed: {RenderForLog(addResult.SanitizedError)}");
             return new ConfigRepoPublication(
                 new GitChangeSummary(),
-                $"git add failed (exit {addResult.ExitCode}): {RenderForLog(addResult.SanitizedError)}");
+                $"git add failed (exit {addResult.ExitCode}): {RenderForLog(addResult.SanitizedError)}{classification}");
         }
 
         // Check if there are staged changes.

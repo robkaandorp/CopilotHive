@@ -93,7 +93,7 @@ public sealed partial class Composer
     /// <summary>
     /// Writes full content to <c>agents/{role}.agents.md</c> in the config repo, after validating the role.
     /// </summary>
-    [Description("Replace the full content of agents/{role}.agents.md in the config repo. Use edit_agents_md for targeted changes.")]
+    [Description("Replace the full content of agents/{role}.agents.md in the config repo, or create the file (and the agents/ folder) when it does not exist. Use edit_agents_md for targeted changes to an existing file.")]
     internal async Task<string> UpdateAgentsMdAsync(
         [Description("Worker role name (e.g. Coder, Tester, Reviewer, Improver, Orchestrator, DocWriter, MergeWorker).")] string role,
         [Description("New full content for the AGENTS.md file.")] string content,
@@ -124,7 +124,7 @@ public sealed partial class Composer
     /// <summary>
     /// Performs an exact string replacement in <c>agents/{role}.agents.md</c> in the config repo.
     /// </summary>
-    [Description("Exact string replacement in agents/{role}.agents.md in the config repo. The old_string must match exactly.")]
+    [Description("Exact string replacement in an existing agents/{role}.agents.md in the config repo. The file must already exist — use update_agents_md to create a missing file. The old_string must match exactly.")]
     internal async Task<string> EditAgentsMdAsync(
         [Description("Worker role name (e.g. Coder, Tester, Reviewer, Improver, Orchestrator, DocWriter, MergeWorker).")] string role,
         [Description("The exact text to find and replace. Must match the file content exactly.")] string old_string,
@@ -147,7 +147,8 @@ public sealed partial class Composer
 
         var filePath = Path.Combine(_configRepo.LocalPath, "agents", $"{workerRole.ToRoleName()}.agents.md");
         if (!File.Exists(filePath))
-            return $"❌ File 'agents/{workerRole.ToRoleName()}.agents.md' not found in config repo.";
+            return $"❌ File 'agents/{workerRole.ToRoleName()}.agents.md' not found in config repo. "
+                + "Use update_agents_md to create it.";
 
         var current = await File.ReadAllTextAsync(filePath, cancellationToken);
         if (!current.Contains(old_string, StringComparison.Ordinal))
