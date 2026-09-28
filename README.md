@@ -4,7 +4,7 @@
 
 CopilotHive is a **self-improving multi-agent orchestration system** powered by **[SharpCoder](https://github.com/robkaandorp/SharpCoder)** 0.21.1 (an autonomous coding agent library) and **SharpCoder.Providers** 0.21.1 (the model-provider package), with per-account Copilot endpoint discovery and outbound tool-call name sanitization for resumable persisted sessions.
 
-**Current version: [0.40.1](CHANGELOG.md#0401--2026-09-28)**
+**Current version: [0.40.2](CHANGELOG.md#0402--2026-09-28)**
 
 A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention. A conversational **Composer** agent helps decompose high-level intent into actionable goals through a streaming chat interface.
 

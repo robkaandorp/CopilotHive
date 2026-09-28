@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+## [0.40.2] — 2026-09-28
+
+### Fixed
+
+- **Resuming a failed goal restores its retry budgets.**
+  - Resuming a failed goal (dashboard resume / Composer `extend_goal_iterations`) used to top up only the iteration budget. The test-retry and review-retry budgets stayed exhausted from before the failure.
+  - A goal that had failed with "Exceeded max test retries" (or "review retries") could therefore fail again with the same reason on its first FAIL / REQUEST_CHANGES verdict after the resume, instead of getting another iteration.
+  - Resume now resets both retry budgets to the pipeline's own stored retry allowance (the allowance the pipeline was created with) before the resumed pipeline is persisted. The allowance itself is not increased: a reset, not a top-up.
+    - A later FAIL / REQUEST_CHANGES can still end the goal when the iteration budget runs out.
+    - A retry allowance of 0 stays exhausted after the reset.
+  - A refused resume still changes nothing.
+
+### Upgrade notes
+
+- This is an orchestrator-only change (`GoalDispatcher`, `GoalPipeline`, `RetryBudget`); workers do not need to be upgraded for it.
+
 ## [0.40.1] — 2026-09-28
 
 ### Fixed
