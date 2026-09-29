@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+## [0.40.3] — 2026-09-29
+
+### Fixed
+
+- **Releases with a merge-only or tag-only repository.**
+  - A repository's release settings allow a merge target (`merge_to`) and a tag branch (`tag_branch`) independently; the Configuration page marks both branch fields as optional.
+  - Release execution nevertheless always ran both steps. A repository without a tag branch failed at the tag step with "Branch or tag name must not be null or whitespace" after its merge had already been pushed. The whole release then failed, and tags already created for other repositories were subject to rollback attempts.
+  - A repository without a merge target failed the same way at the merge step.
+  - Release execution now merges only when a merge target is configured and creates a tag only when a tag branch is configured. A repository whose release settings have neither is skipped. On the release page, missing merge/tag branch and merge SHA values show "—", and a tag not created shows "—".
+
+### Upgrade notes
+
+- Orchestrator-only change (`ReleaseExecutionService`); workers do not need to be upgraded for it.
+- A release that failed this way remains in Planning status and can be released again after the upgrade.
+- For a repository whose merge was already pushed, the retried merge is a no-op if the merge target still contains the default branch. If new commits landed on the default branch in the meantime, they are merged as usual.
+
 ## [0.40.2] — 2026-09-28
 
 ### Fixed
