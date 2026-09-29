@@ -394,6 +394,208 @@ public sealed class ReleaseExecutionServiceTests : IDisposable
         Assert.DoesNotContain(fake.MergeCalls, c => c.Repo == "repo3");
     }
 
+    // ── Optional merge/tag steps: each runs only when its branch is configured ──
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_MergeToOnly_SucceedsWithoutTagging()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // repo-m has only a merge target (TagBranch = null): release must succeed,
+        // merge exactly once into MergeTo, and never attempt CreateTagAsync.
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repo-m", Url = "https://github.com/test/repo-m", DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "release-merge", TagBranch = null },
+                },
+            ],
+        };
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo-m"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        var service = CreateService(config, fake);
+
+        var result = await service.ExecuteReleaseAsync(release, ct);
+
+        Assert.True(result.Success);
+        var repoResult = Assert.Single(result.Results, r => r.RepoName == "repo-m");
+        Assert.False(repoResult.Skipped);
+        Assert.True(repoResult.Success);
+        Assert.Equal("release-merge", repoResult.MergedTo);
+        Assert.Null(repoResult.TaggedBranch);
+        Assert.False(repoResult.TagCreated);
+
+        // Exactly one merge call, targeting the configured MergeTo branch.
+        var merge = Assert.Single(fake.MergeCalls, c => c.Repo == "repo-m");
+        Assert.Equal("main", merge.Source);
+        Assert.Equal("release-merge", merge.Target);
+        // No tag attempt whatsoever for this repo.
+        Assert.DoesNotContain(fake.CreateTagCalls, c => c.Repo == "repo-m");
+        // And nothing was created that could trigger a rollback.
+        Assert.Empty(fake.DeleteTagCalls);
+    }
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_TagBranchOnly_SucceedsWithoutMerging()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // repo-t has only a tag branch (MergeTo = null): release must succeed,
+        // tag exactly once on TagBranch, and never attempt MergeBranchAsync.
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repo-t", Url = "https://github.com/test/repo-t", DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = null, TagBranch = "release-tag" },
+                },
+            ],
+        };
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo-t"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        var service = CreateService(config, fake);
+
+        var result = await service.ExecuteReleaseAsync(release, ct);
+
+        Assert.True(result.Success);
+        var repoResult = Assert.Single(result.Results, r => r.RepoName == "repo-t");
+        Assert.False(repoResult.Skipped);
+        Assert.True(repoResult.Success);
+        Assert.Null(repoResult.MergedTo);
+        Assert.Equal("release-tag", repoResult.TaggedBranch);
+        Assert.True(repoResult.TagCreated);
+
+        // No merge attempt whatsoever for this repo.
+        Assert.DoesNotContain(fake.MergeCalls, c => c.Repo == "repo-t");
+        // Exactly one tag call on the configured TagBranch, with the stored release tag.
+        var tag = Assert.Single(fake.CreateTagCalls, c => c.Repo == "repo-t");
+        Assert.Equal("v1.0.0", tag.Tag);
+        Assert.Equal("release-tag", tag.Branch);
+        // Tag succeeded → tracked, but a successful run does no rollback.
+        Assert.Empty(fake.DeleteTagCalls);
+    }
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_WhitespaceTagBranch_SucceedsWithoutTaggingLikeNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // A whitespace-only TagBranch (e.g. " ") must behave exactly like the null
+        // case: releases succeed, merge runs, and the tag step is skipped entirely
+        // (no CreateTagCalls; TaggedBranch == null; TagCreated == false).
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repo-m", Url = "https://github.com/test/repo-m", DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "release-merge", TagBranch = " " },
+                },
+            ],
+        };
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo-m"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        var service = CreateService(config, fake);
+
+        var result = await service.ExecuteReleaseAsync(release, ct);
+
+        Assert.True(result.Success);
+        var repoResult = Assert.Single(result.Results, r => r.RepoName == "repo-m");
+        Assert.False(repoResult.Skipped);
+        Assert.True(repoResult.Success);
+        Assert.Equal("release-merge", repoResult.MergedTo);
+        Assert.Null(repoResult.TaggedBranch);
+        Assert.False(repoResult.TagCreated);
+
+        // Merge ran (same as the null TagBranch case)...
+        var merge = Assert.Single(fake.MergeCalls, c => c.Repo == "repo-m");
+        Assert.Equal("release-merge", merge.Target);
+        // ...and the whitespace TagBranch was never passed to CreateTagAsync.
+        Assert.DoesNotContain(fake.CreateTagCalls, c => c.Repo == "repo-m");
+        Assert.Empty(fake.DeleteTagCalls);
+    }
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_MixedRepos_MergesAndTagsEachPerConfig_NoRollback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Repo A ("repoA") has both MergeTo and TagBranch; repo B ("repoB") has only
+        // MergeTo. Release succeeds; A is merged AND tagged, B is merged only. No
+        // rollback runs (no DeleteTagCalls) because nothing failed.
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repoA", Url = "https://github.com/test/repoA", DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "release-main", TagBranch = "release-tag" },
+                },
+                new RepositoryConfig
+                {
+                    Name = "repoB", Url = "https://github.com/test/repoB", DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "release-merge", TagBranch = null },
+                },
+            ],
+        };
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repoA", "repoB"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        var service = CreateService(config, fake);
+
+        var result = await service.ExecuteReleaseAsync(release, ct);
+
+        Assert.True(result.Success);
+
+        var resultA = Assert.Single(result.Results, r => r.RepoName == "repoA");
+        Assert.False(resultA.Skipped);
+        Assert.True(resultA.Success);
+        Assert.Equal("release-main", resultA.MergedTo);
+        Assert.Equal("release-tag", resultA.TaggedBranch);
+        Assert.True(resultA.TagCreated);
+
+        var resultB = Assert.Single(result.Results, r => r.RepoName == "repoB");
+        Assert.False(resultB.Skipped);
+        Assert.True(resultB.Success);
+        Assert.Equal("release-merge", resultB.MergedTo);
+        Assert.Null(resultB.TaggedBranch);
+        Assert.False(resultB.TagCreated);
+
+        // Repo A: merged into release-main and tagged on release-tag.
+        Assert.Contains(fake.MergeCalls, c => c is { Repo: "repoA", Source: "main", Target: "release-main" });
+        Assert.Contains(fake.CreateTagCalls, c => c is { Repo: "repoA", Tag: "v1.0.0", Branch: "release-tag" });
+        // Repo B: merged-only, never tagged.
+        Assert.Contains(fake.MergeCalls, c => c is { Repo: "repoB", Source: "main", Target: "release-merge" });
+        Assert.DoesNotContain(fake.CreateTagCalls, c => c.Repo == "repoB");
+        // Merge-before-tag ordering held for repoA, checked against the real
+        // invocation sequence rather than per-call-list indices (which would be
+        // misleading when other repos contribute unrelated calls).
+        var mergeSeqIndex = fake.CallSequence.IndexOf("merge:repoA");
+        var tagSeqIndex = fake.CallSequence.IndexOf("tag:repoA");
+        Assert.True(mergeSeqIndex >= 0 && tagSeqIndex > mergeSeqIndex,
+            $"Expected merge before tag for repoA. Sequence=[{string.Join(" -> ", fake.CallSequence)}]");
+        // The release succeeded, so no rollback (tag deletion) ran at all.
+        Assert.Empty(fake.DeleteTagCalls);
+    }
+
     // ── Cancellation fix: Failed state persisted even with a cancelled token ──
 
     [Fact]
@@ -523,6 +725,9 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
     public bool MergeCalled { get; private set; }
     public List<(string Repo, string Source, string Target)> MergeCalls { get; } = [];
     public List<(string Repo, string Tag, string Branch)> CreateTagCalls { get; } = [];
+    // Every merge and tag call, in real invocation order — used for strict
+    // merge-before-tag ordering assertions.
+    public List<string> CallSequence { get; } = [];
     public List<(string Repo, string Tag)> DeleteTagCalls { get; } = [];
     public List<CancellationToken> DeleteTagTokens { get; } = [];
 
@@ -546,6 +751,7 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
     {
         MergeCalled = true;
         MergeCalls.Add((repoName, sourceBranch, targetBranch));
+        CallSequence.Add($"merge:{repoName}");
         var sha = MergeCallback?.Invoke(repoName, sourceBranch, targetBranch);
         return Task.FromResult(sha);
     }
@@ -553,6 +759,7 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
     public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default)
     {
         CreateTagCalls.Add((repoName, tag, branch));
+        CallSequence.Add($"tag:{repoName}");
         return Task.FromResult(CreateTagCallback?.Invoke(repoName) ?? CreateTagResult);
     }
 

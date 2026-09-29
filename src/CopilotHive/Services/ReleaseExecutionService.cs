@@ -41,12 +41,19 @@ public sealed record ReleaseExecutionResult(
 /// Result of executing the release for a single repository.
 /// </summary>
 /// <param name="RepoName">The repository name.</param>
-/// <param name="Skipped">Whether the repository was skipped (no release config).</param>
-/// <param name="Success">Whether the merge and tag operations succeeded.</param>
-/// <param name="MergedTo">The branch that was merged into, or <c>null</c>.</param>
-/// <param name="MergeSha">The resulting merge commit SHA, or <c>null</c> for a no-op merge.</param>
-/// <param name="TaggedBranch">The branch that was tagged, or <c>null</c>.</param>
-/// <param name="TagCreated">Whether a new tag was created (false = tag already existed).</param>
+/// <param name="Skipped">
+/// Whether the repository was skipped — either it has no release config, or its release config
+/// configures neither a merge target nor a tag branch.
+/// </param>
+/// <param name="Success">Whether the executed operations succeeded.</param>
+/// <param name="MergedTo">The branch that was merged into, or <c>null</c> when no merge ran.</param>
+/// <param name="MergeSha">
+/// The resulting merge commit SHA, or <c>null</c> for a no-op merge or when no merge ran.
+/// </param>
+/// <param name="TaggedBranch">The branch that was tagged, or <c>null</c> when no tag step ran.</param>
+/// <param name="TagCreated">
+/// Whether a new tag was created (false = tag already existed, or no tag step ran).
+/// </param>
 /// <param name="Error">An error message when the repository failed, or <c>null</c>.</param>
 public sealed record RepoReleaseResult(
     string RepoName,
@@ -133,8 +140,10 @@ public sealed class ReleaseExecutionService
 
     /// <summary>
     /// Executes a release: re-reads the current state, validates, then per-repository merges the
-    /// default branch into the configured target branch and creates a release tag. On failure,
-    /// created tags are rolled back (merges are NOT reverted).
+    /// default branch into the configured target branch and creates a release tag. Each step runs
+    /// only when its branch is configured — a repository with only <c>MergeTo</c> set is merged but
+    /// not tagged, and a repository with only <c>TagBranch</c> set is tagged but not merged. On
+    /// failure, created tags are rolled back (merges are NOT reverted).
     /// </summary>
     /// <param name="release">The release to execute.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -180,24 +189,51 @@ public sealed class ReleaseExecutionService
                     continue;
                 }
 
+                // Defensive: the config layer normally drops a release block whose fields are both
+                // blank, but if one reaches here, treat it like a missing block rather than
+                // attempting an unconfigured git operation.
+                if (string.IsNullOrWhiteSpace(repo.Release.MergeTo)
+                    && string.IsNullOrWhiteSpace(repo.Release.TagBranch))
+                {
+                    results.Add(new RepoReleaseResult(repoName, Skipped: true));
+                    continue;
+                }
+
                 try
                 {
-                    var mergeSha = await _repoManager.MergeBranchAsync(
-                        repoName, repo.DefaultBranch, repo.Release.MergeTo!, ct);
+                    string? mergeTo = string.IsNullOrWhiteSpace(repo.Release.MergeTo)
+                        ? null
+                        : repo.Release.MergeTo;
+                    string? tagBranch = string.IsNullOrWhiteSpace(repo.Release.TagBranch)
+                        ? null
+                        : repo.Release.TagBranch;
 
-                    var tagCreated = await _repoManager.CreateTagAsync(
-                        repoName, current.Tag, repo.Release.TagBranch!, $"Release {current.Tag}", ct);
+                    // Step 1 (optional): merge the default branch into the configured target branch.
+                    string? mergeSha = null;
+                    if (mergeTo is not null)
+                    {
+                        mergeSha = await _repoManager.MergeBranchAsync(
+                            repoName, repo.DefaultBranch, mergeTo, ct);
+                    }
 
-                    if (tagCreated)
-                        createdTags.Push((repoName, current.Tag));
+                    // Step 2 (optional): create the release tag on the configured tag branch.
+                    bool tagCreated = false;
+                    if (tagBranch is not null)
+                    {
+                        tagCreated = await _repoManager.CreateTagAsync(
+                            repoName, current.Tag, tagBranch, $"Release {current.Tag}", ct);
+
+                        if (tagCreated)
+                            createdTags.Push((repoName, current.Tag));
+                    }
 
                     results.Add(new RepoReleaseResult(
                         repoName,
                         Skipped: false,
                         Success: true,
-                        MergedTo: repo.Release.MergeTo,
+                        MergedTo: mergeTo,
                         MergeSha: mergeSha,
-                        TaggedBranch: repo.Release.TagBranch,
+                        TaggedBranch: tagBranch,
                         TagCreated: tagCreated));
                 }
                 catch (Exception ex)
