@@ -56,6 +56,13 @@ public sealed class ComposerStreamingServiceTests
             ?? throw new InvalidOperationException("_agentService was null");
     }
 
+    /// <summary>
+    /// Typed view of <see cref="GetAgentService"/>, for fixture premises that must observe the very
+    /// <see cref="CodingAgent"/> the Composer streams through.
+    /// </summary>
+    private static ComposerAgentService GetTypedAgentService(Composer composer) =>
+        (ComposerAgentService)GetAgentService(composer);
+
     /// <summary>Gets the private <c>_streamingService</c> instance from a <see cref="Composer"/>.</summary>
     private static ComposerStreamingService GetStreamingService(Composer composer)
     {
@@ -77,9 +84,17 @@ public sealed class ComposerStreamingServiceTests
     /// Creates a <see cref="Composer"/> along with the in-memory <see cref="CopilotHiveDbContext"/>
     /// backing its goal store. Callers own both and must dispose them via <see cref="CleanupAsync"/>.
     /// </summary>
+    /// <param name="tmpDir">Temp state directory owned by the caller.</param>
+    /// <param name="sessionRegistry">Optional session registry for the Composer.</param>
+    /// <param name="maxSteps">
+    /// Optional step limit forwarded to the <see cref="Composer"/> constructor. <c>null</c> (the
+    /// default) keeps the constructor's own default (<see cref="Constants.DefaultBrainMaxSteps"/>),
+    /// so existing callers are unaffected.
+    /// </param>
     private static (Composer Composer, CopilotHiveDbContext DbContext) CreateComposer(
         string tmpDir,
-        LlmSessionRegistry? sessionRegistry = null)
+        LlmSessionRegistry? sessionRegistry = null,
+        int? maxSteps = null)
     {
         var dbContext = CopilotHiveDbContext.CreateInMemory();
         try
@@ -89,6 +104,7 @@ public sealed class ComposerStreamingServiceTests
                 "test-model",
                 NullLogger<Composer>.Instance,
                 store,
+                maxSteps: maxSteps ?? Constants.DefaultBrainMaxSteps,
                 stateDir: tmpDir,
                 sessionRegistry: sessionRegistry);
             return (composer, dbContext);
@@ -1379,6 +1395,566 @@ public sealed class ComposerStreamingServiceTests
             Assert.Equal("Use JSON.", answer);
             Assert.Equal(ClarificationStatus.AwaitingComposer, queue.GetRequest(request.Id)!.Status);
             Assert.Equal(0, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    // ── 13d. Clarification answers must be the final reply, not the tool-call stream ──
+
+    /// <summary>
+    /// A streaming chat client scripted by REQUEST NUMBER: the Nth call to
+    /// <see cref="GetStreamingResponseAsync"/> yields the updates built by the Nth round factory.
+    /// Every request's messages are recorded, so a test can inspect the conversation the agent
+    /// actually sent for that round — including the assistant messages built by the PREVIOUS
+    /// round's <c>ToChatResponse()</c>, which are the very same instances SharpCoder also puts
+    /// into <c>AgentResult.Messages</c>.
+    /// <para>
+    /// With <c>repeatLastRound</c> the last factory serves every further round (needed for the
+    /// step-limit fixture, which never reaches a final text round). Otherwise an unscripted round
+    /// is a test bug and throws from inside the iterator, which SharpCoder surfaces as a
+    /// Completed/Error update rather than a real exception.
+    /// </para>
+    /// </summary>
+    private sealed class ScriptedRoundsChatClient : IChatClient
+    {
+        private readonly Func<IReadOnlyList<ChatResponseUpdate>>[] _rounds;
+        private readonly bool _repeatLastRound;
+        private readonly List<IReadOnlyList<ChatMessage>> _requests = [];
+
+        public ScriptedRoundsChatClient(
+            bool repeatLastRound,
+            params Func<IReadOnlyList<ChatResponseUpdate>>[] rounds)
+        {
+            _repeatLastRound = repeatLastRound;
+            _rounds = rounds;
+        }
+
+        /// <summary>Messages observed by each streaming request, in request order (round 1 first).</summary>
+        public IReadOnlyList<IReadOnlyList<ChatMessage>> Requests => _requests;
+
+        /// <summary>Number of streaming requests observed so far.</summary>
+        public int RequestCount => _requests.Count;
+
+        public ChatClientMetadata Metadata => new("scripted-rounds", null, "scripted-rounds-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Only the streaming path is scripted.");
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+
+            var requestIndex = _requests.Count;
+            _requests.Add(messages.ToList());
+
+            if (requestIndex >= _rounds.Length && !_repeatLastRound)
+            {
+                throw new InvalidOperationException(
+                    $"Unscripted streaming round {requestIndex + 1}: the script has {_rounds.Length} round(s).");
+            }
+
+            foreach (var update in _rounds[Math.Min(requestIndex, _rounds.Length - 1)]())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return update;
+            }
+        }
+
+        public void Dispose() { }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
+    /// <summary>
+    /// A real, side-effect-free Composer tool call: <c>get_current_time</c> with no arguments.
+    /// </summary>
+    private static FunctionCallContent TimeToolCall(string callId) =>
+        new(callId, "get_current_time", new Dictionary<string, object?>());
+
+    /// <summary>
+    /// Fixture A round 1: ONE assistant update carrying the preamble text AND the tool call, so
+    /// both share a single assistant message.
+    /// </summary>
+    private static IReadOnlyList<ChatResponseUpdate> CombinedToolCallRound() =>
+    [
+        new ChatResponseUpdate(ChatRole.Assistant, new AIContent[]
+        {
+            new TextContent("Let me check."),
+            TimeToolCall("call-combined"),
+        })
+        {
+            MessageId = "m-combined",
+            FinishReason = ChatFinishReason.ToolCalls,
+        },
+    ];
+
+    /// <summary>
+    /// Fixture B round 1: TWO updates with DIFFERENT <see cref="ChatResponseUpdate.MessageId"/>
+    /// values — the first text-only ("Let me check."), the second tool-call-only.
+    /// <c>ToChatResponse()</c> uses the message id to determine message boundaries, so this
+    /// genuinely produces a separate text-only assistant message FOLLOWED BY a tool-call message;
+    /// the consuming test asserts that boundary survived.
+    /// </summary>
+    private static IReadOnlyList<ChatResponseUpdate> SplitToolCallRound() =>
+    [
+        new ChatResponseUpdate(ChatRole.Assistant, new AIContent[] { new TextContent("Let me check.") })
+        {
+            MessageId = "m-pre",
+        },
+        new ChatResponseUpdate(ChatRole.Assistant, new AIContent[] { TimeToolCall("call-split") })
+        {
+            MessageId = "m-call",
+            FinishReason = ChatFinishReason.ToolCalls,
+        },
+    ];
+
+    /// <summary>Round that only requests the tool and carries no text.</summary>
+    private static Func<IReadOnlyList<ChatResponseUpdate>> ToolOnlyRound(string callId, string messageId) =>
+        () =>
+        [
+            new ChatResponseUpdate(ChatRole.Assistant, new AIContent[] { TimeToolCall(callId) })
+            {
+                MessageId = messageId,
+                FinishReason = ChatFinishReason.ToolCalls,
+            },
+        ];
+
+    /// <summary>The scripted final round: one assistant text update, no tool calls.</summary>
+    private static Func<IReadOnlyList<ChatResponseUpdate>> FinalTextRound(string text, string messageId) =>
+        () =>
+        [
+            new ChatResponseUpdate(ChatRole.Assistant, text)
+            {
+                MessageId = messageId,
+                FinishReason = ChatFinishReason.Stop,
+            },
+        ];
+
+    /// <summary>
+    /// A genuinely ZERO-update round: the provider streams no updates at all. SharpCoder combines
+    /// them into a <c>ChatResponse</c> with NO messages, finds no tool calls in it, and completes
+    /// the execution with <c>Status == "Success"</c> (the step budget is untouched). Because it
+    /// contributes no assistant message, the PREVIOUS round's assistant message stays the last one.
+    /// </summary>
+    private static IReadOnlyList<ChatResponseUpdate> EmptyRound() =>
+        Array.Empty<ChatResponseUpdate>();
+
+    /// <summary>
+    /// Executes the scripted shape directly through the Composer's own production agent on a forked
+    /// session and returns the terminal <see cref="AgentResult"/>, so a test can assert its
+    /// fixture's premise. <c>AnswerClarificationAsync</c> returns only the answer, so the terminal
+    /// result it produced is not observable from outside; the agent, its options and the scripted
+    /// client are the same, and only the session id and prompt text differ — neither affects the
+    /// messages/tool-call shape being observed.
+    /// </summary>
+    private static async Task<AgentResult> RunClarificationShapeProbeAsync(ComposerAgentService agentService)
+    {
+        AgentResult? terminal = null;
+
+        await foreach (var update in agentService.Agent!.ExecuteStreamingAsync(
+            agentService.Session.Fork("clarification-shape-probe"),
+            "probe: observe the terminal result shape",
+            TestContext.Current.CancellationToken))
+        {
+            if (update.Kind == StreamingUpdateKind.Completed)
+                terminal = update.Result;
+        }
+
+        return terminal
+            ?? throw new InvalidOperationException("The probe produced no Completed update.");
+    }
+
+    /// <summary>
+    /// The Composer agent is built with <c>ShowToolCallsInStream</c>, so a clarification turn that
+    /// uses a tool streams the mirrored call (<c>🔧 get_current_time()</c>), the first line of the
+    /// result (<c>&gt; …</c>) and the preamble narration as <c>TextDelta</c>s alongside the real
+    /// reply. <c>AnswerClarificationAsync</c> must return ONLY the last assistant message's
+    /// trimmed text — no wrench line, no result line, no narration.
+    /// <para>
+    /// DISCRIMINATOR: concatenating the <c>TextDelta</c>s (the old behaviour) yields
+    /// <c>"Let me check.\n\n`🔧 get_current_time()`\n&gt; …\nUse JSON."</c>, so every negative
+    /// assertion below fails.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_ToolCallRoundThenFinalText_ReturnsOnlyTheFinalReply()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            // Fixture A: combined preamble+tool-call round, then the final reply.
+            var client = new ScriptedRoundsChatClient(
+                repeatLastRound: false,
+                CombinedToolCallRound,
+                FinalTextRound("Use JSON.", "m-final"));
+            await InjectFakeChatClient(composer, client);
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-toolcall",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-toolcall",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            // Premise: the tool round really ran and the tool call really was part of the
+            // conversation the second round was asked about.
+            Assert.Equal(2, client.RequestCount);
+            Assert.Contains(client.Requests[1], m => m.Contents.OfType<FunctionCallContent>().Any());
+
+            Assert.Equal("Use JSON.", answer);
+            Assert.DoesNotContain("\uD83D\uDD27", answer, StringComparison.Ordinal);
+            Assert.DoesNotContain("> ", answer, StringComparison.Ordinal);
+            Assert.DoesNotContain("Let me check.", answer, StringComparison.Ordinal);
+            Assert.Equal(ClarificationStatus.AwaitingComposer, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(0, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Same tool-bearing turn, but the final reply is the escalation sentinel (with surrounding
+    /// whitespace): <c>AnswerClarificationAsync</c> must escalate and return <c>null</c>. The
+    /// sentinel is the LAST assistant message's text — the tool chatter streamed before it must
+    /// not hide it behind narration.
+    /// <para>
+    /// DISCRIMINATOR: with the <c>TextDelta</c> concatenation restored the accumulated text ends
+    /// with the narration preamble and the tool lines, so it is neither empty nor exactly
+    /// <c>ESCALATE_TO_HUMAN</c>: the tool chatter is returned as a "confident answer" and the
+    /// request stays <see cref="ClarificationStatus.AwaitingComposer"/>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_EscalateSentinelAfterToolCall_EscalatesToHuman()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            var client = new ScriptedRoundsChatClient(
+                repeatLastRound: false,
+                CombinedToolCallRound,
+                FinalTextRound("  ESCALATE_TO_HUMAN\n", "m-final"));
+            await InjectFakeChatClient(composer, client);
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-escalate",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-escalate",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, client.RequestCount);
+            Assert.Null(answer);
+            Assert.Equal(ClarificationStatus.AwaitingHuman, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(1, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Fixture B: the tool-call turn's preamble is a genuinely SEPARATE text-only assistant
+    /// message, and the final round replies with whitespace only. The answer must be <c>null</c>
+    /// and the request escalated — the earlier narration must never be promoted to the answer.
+    /// <para>
+    /// DISCRIMINATOR: selecting the last NON-whitespace assistant message (instead of the last
+    /// assistant message, whatever its text) would pick "Let me check." and return it without
+    /// escalating, so only this test's fixture can detect that mutation.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_WhitespaceFinalReplyAfterNarration_EscalatesWithoutReturningNarration()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            var client = new ScriptedRoundsChatClient(
+                repeatLastRound: false,
+                SplitToolCallRound,
+                FinalTextRound("   ", "m-final"));
+            await InjectFakeChatClient(composer, client);
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-whitespace",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-whitespace",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            // Premise: the two different MessageIds really produced TWO assistant messages in
+            // round 1 — an earlier text-only one AND a separate tool-call message. The second
+            // request carries those same message instances (SharpCoder adds the ToChatResponse()
+            // output to both the conversation and AgentResult.Messages), so this is production-path
+            // proof that the boundary survived rather than an assumption about the fixture.
+            Assert.Equal(2, client.RequestCount);
+            var roundTwoRequest = client.Requests[1];
+            Assert.Equal(2, roundTwoRequest.Count(m => m.Role == ChatRole.Assistant));
+            Assert.Contains(roundTwoRequest, m =>
+                m.Role == ChatRole.Assistant
+                && m.Text == "Let me check."
+                && !m.Contents.OfType<FunctionCallContent>().Any());
+
+            Assert.Null(answer);
+            Assert.Equal(ClarificationStatus.AwaitingHuman, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(1, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// A turn cut off by the step limit is not a confident answer: with <c>MaxSteps = 1</c> and a
+    /// client that keeps requesting tools, the agent's final result is <c>MaxStepsReached</c>, so
+    /// <c>AnswerClarificationAsync</c> must escalate and return <c>null</c>.
+    /// <para>
+    /// This fixture's LAST assistant message is tool-only, so its escalation is produced by
+    /// OVERLAPPING guards: the non-<c>Success</c> status, the tool-bearing message and the empty
+    /// text all reject it, and removing the status check alone still escalates through the other
+    /// two. It therefore does NOT discriminate the status rule. The status rule is pinned on its
+    /// own by <see cref="AnswerClarificationAsync_MaxStepsReachedWithTextFinalMessage_EscalatesInsteadOfAnswering"/>,
+    /// whose clean text-only "Use JSON." final message trips no other guard under a spent step
+    /// budget.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_MaxStepsReachedAfterToolCalls_EscalatesToHuman()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir, maxSteps: 1);
+
+            // Every round asks for the tool again, so the loop can only end at the step limit.
+            var client = new ScriptedRoundsChatClient(
+                repeatLastRound: true,
+                ToolOnlyRound("call-loop", "m-tool"));
+            await InjectFakeChatClient(composer, client);
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-maxsteps",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-maxsteps",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            // Premise: one tool call per round with MaxSteps=1 means exactly two rounds ran, so the
+            // loop exited because the step limit was reached — not because a final text round came.
+            Assert.Equal(2, client.RequestCount);
+
+            Assert.Null(answer);
+            Assert.Equal(ClarificationStatus.AwaitingHuman, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(1, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The status-rule companion to <see cref="AnswerClarificationAsync_MaxStepsReachedAfterToolCalls_EscalatesToHuman"/>.
+    /// There the loop ends on a tool-only message, so escalation happens through the overlapping
+    /// tool-bearing / empty-text guards and the <c>MaxStepsReached</c> status check is never
+    /// exercised. Here the LAST assistant message is a clean text-only reply ("Use JSON.") while
+    /// the step limit still makes the result <c>MaxStepsReached</c>: with <c>MaxSteps = 1</c> and
+    /// exactly one tool call in round 1, the agent's loop permits one more round, that round
+    /// returns the final text, and SharpCoder reports the result as <c>MaxStepsReached</c> because
+    /// the step budget is spent. Only the status check turns that into an escalation.
+    /// <para>
+    /// DISCRIMINATOR: dropping the <c>Status != "Success"</c> condition returns "Use JSON." and
+    /// leaves the request at <see cref="ClarificationStatus.AwaitingComposer"/>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_MaxStepsReachedWithTextFinalMessage_EscalatesInsteadOfAnswering()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir, maxSteps: 1);
+
+            // One tool call in round 1 spends the whole budget; round 2 still runs (the agent's loop
+            // admits it) and its clean text reply is the LAST assistant message of the result.
+            var client = new ScriptedRoundsChatClient(
+                repeatLastRound: false,
+                CombinedToolCallRound,
+                FinalTextRound("Use JSON.", "m-final"));
+            await InjectFakeChatClient(composer, client);
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-maxsteps-text",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-maxsteps-text",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            // Premise: the turn really did use its full step budget and really did end with a
+            // text-only final reply — otherwise this fixture would not discriminate the status rule.
+            Assert.Equal(2, client.RequestCount);
+
+            Assert.Null(answer);
+            Assert.Equal(ClarificationStatus.AwaitingHuman, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(1, queue.PendingHumanCount);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Pins the tool-bearing-final-message rule on its own: the turn ends with
+    /// <c>Status == "Success"</c> and a LAST assistant message that carries nonempty text AND a
+    /// <see cref="FunctionCallContent"/>, so neither the non-Success-status guard nor the empty-text
+    /// guard can produce the escalation. A combined tool-call round (preamble "Let me check." plus
+    /// the real <c>get_current_time</c> call) followed by a genuinely ZERO-update round gives that
+    /// shape: the empty round adds no assistant message and spends no step, so the result is
+    /// <c>Success</c> and the combined message stays the last assistant message.
+    /// <para>
+    /// DISCRIMINATOR: dropping ONLY the <c>FunctionCallContent</c> condition returns the narration
+    /// "Let me check." and leaves the request at <see cref="ClarificationStatus.AwaitingComposer"/>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AnswerClarificationAsync_ToolBearingFinalMessageWithSuccessStatus_EscalatesToHuman()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+            var agentService = GetTypedAgentService(composer);
+
+            // Premise probe: run the same scripted shape through the Composer's own production agent
+            // and assert on its terminal AgentResult. AnswerClarificationAsync returns only the
+            // answer, so the result it produced is not observable from outside; this replays the
+            // identical tool-call + zero-update shape on a forked session instead of assuming it.
+            await InjectFakeChatClient(composer,
+                new ScriptedRoundsChatClient(repeatLastRound: false, CombinedToolCallRound, EmptyRound));
+            var terminal = await RunClarificationShapeProbeAsync(agentService);
+
+            Assert.Equal("Success", terminal.Status);
+
+            // Exactly one assistant message, so it is also the LAST one.
+            var premiseAssistant = Assert.Single(terminal.Messages, m => m.Role == ChatRole.Assistant);
+            Assert.False(string.IsNullOrWhiteSpace(premiseAssistant.Text));
+            Assert.NotEqual("ESCALATE_TO_HUMAN", premiseAssistant.Text);
+            Assert.Contains(premiseAssistant.Contents, c => c is FunctionCallContent);
+
+            // The real call, with a freshly scripted client (the probe consumed its own rounds).
+            var client = new ScriptedRoundsChatClient(
+                repeatLastRound: false,
+                CombinedToolCallRound,
+                EmptyRound);
+            await InjectFakeChatClient(composer, client);
+
+            var queue = new ClarificationQueueService();
+            var request = new ClarificationRequest
+            {
+                GoalId = "goal-clarify-toolbearing-success",
+                WorkerRole = "coder",
+                Question = "Which format should the output use?",
+            };
+            queue.Enqueue(request);
+
+            var answer = await composer.AnswerClarificationAsync(
+                "goal-clarify-toolbearing-success",
+                "Which format should the output use?",
+                "context for the composer",
+                queue,
+                request,
+                TestContext.Current.CancellationToken);
+
+            // Premise: the zero-update round really ran, and it contributed no assistant message
+            // (the combined round's message is the only assistant message the agent ever sent).
+            Assert.Equal(2, client.RequestCount);
+            Assert.Equal(1, client.Requests[1].Count(m => m.Role == ChatRole.Assistant));
+
+            Assert.Null(answer);
+            Assert.Equal(ClarificationStatus.AwaitingHuman, queue.GetRequest(request.Id)!.Status);
+            Assert.Equal(1, queue.PendingHumanCount);
         }
         finally
         {

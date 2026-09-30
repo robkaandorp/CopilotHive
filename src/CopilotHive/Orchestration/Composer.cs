@@ -1309,9 +1309,23 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>
     /// Attempts to answer a worker's clarification question using the Composer LLM.
-    /// If the LLM is confident, returns the answer directly. If the LLM returns
-    /// <c>ESCALATE_TO_HUMAN</c> or times out, escalates the request to the human
-    /// queue and returns <c>null</c>.
+    /// If the LLM is confident, returns the answer directly.
+    /// <para>
+    /// The answer is the LAST assistant message of the completed streaming result, taken as plain
+    /// text. The streamed <c>TextDelta</c>s are deliberately NOT concatenated: the Composer agent
+    /// is built with <c>ShowToolCallsInStream</c>, so it mirrors every tool call
+    /// (<c>🔧 name(args)</c>), the first line of each tool result (<c>&gt; result</c>) and the
+    /// in-between narration into the text stream, which is display chatter rather than an answer.
+    /// </para>
+    /// <para>
+    /// Escalates the request to the human queue and returns <c>null</c> when no completed result
+    /// was received, when the result's status is not <c>Success</c> (including
+    /// <c>MaxStepsReached</c> — an answer cut off by the step limit is not a confident answer),
+    /// when there is no assistant message, when the final assistant message carries a
+    /// <c>FunctionCallContent</c> (tool-bearing narration, not a reply), when the answer is empty
+    /// or whitespace, when the answer is exactly <c>ESCALATE_TO_HUMAN</c>, when the Composer is
+    /// not connected, on a provider error, or on timeout.
+    /// </para>
     /// </summary>
     /// <param name="goalId">The goal that triggered the clarification.</param>
     /// <param name="question">The worker's question text.</param>
@@ -1357,7 +1371,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             // Use the agent to get a response via a fresh one-shot session
             // so we don't pollute the main Composer conversation
             var clarificationSession = _agentService.Session.Fork($"clarification-{request.Id}");
-            string responseText = "";
+            AgentResult? completed = null;
 
             await foreach (var update in _agentService.Agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
             {
@@ -1374,14 +1388,26 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                     throw new InvalidOperationException(clarificationResult.Message);
                 }
 
-                if (update.Kind == StreamingUpdateKind.TextDelta)
-                    responseText += update.Text;
+                // TextDeltas are NOT collected: with ShowToolCallsInStream the agent mirrors tool
+                // calls, tool results and narration into the text stream. Only the final result
+                // matters, and its LAST assistant message is the reply we want.
+                if (update.Kind == StreamingUpdateKind.Completed)
+                    completed = update.Result;
             }
 
-            responseText = responseText.Trim();
+            // Select the final reply FIRST and only then judge it: the LAST assistant message of
+            // the result, whatever its text — never an earlier (narration) message, never
+            // Result.Message (which joins all assistant texts and reports "No text response."
+            // when there is no text).
+            var finalAssistant = completed?.Messages.LastOrDefault(m => m.Role == ChatRole.Assistant);
+            var responseText = finalAssistant?.Text?.Trim() ?? string.Empty;
 
-            if (string.IsNullOrEmpty(responseText) ||
-                responseText == "ESCALATE_TO_HUMAN")
+            if (completed is null
+                || completed.Status != "Success"
+                || finalAssistant is null
+                || finalAssistant.Contents.OfType<FunctionCallContent>().Any()
+                || string.IsNullOrEmpty(responseText)
+                || responseText == "ESCALATE_TO_HUMAN")
             {
                 _logger.LogInformation(
                     "Composer escalating clarification to human for goal {GoalId}: {Question}",
