@@ -31,6 +31,34 @@ public sealed class CopilotHiveDbContextTests
         return (SqliteConnection)dbConn;
     }
 
+    // ── 0. Connection ownership ───────────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="CopilotHiveDbContext.CreateInMemory"/> returns a context that OWNS its in-memory
+    /// SQLite connection, so disposing the context disposes (closes) that connection — which is also
+    /// what destroys the in-memory database. Without ownership the connection is still
+    /// <see cref="System.Data.ConnectionState.Open"/> after the context has been disposed.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: reverting <c>UseSqlite(connection, contextOwnsConnection: true)</c> to the
+    /// caller-owns overload (<c>UseSqlite(connection)</c>) makes the final assertion fail, because
+    /// EF Core then leaves the externally opened connection untouched.
+    /// </remarks>
+    [Fact]
+    public void CreateInMemory_DisposingContext_DisposesItsConnection()
+    {
+        // Intentionally NOT a `using` local: the context is disposed explicitly in the middle of
+        // the test so the connection's state can be observed before and after that disposal.
+        var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        Assert.Equal(System.Data.ConnectionState.Open, conn.State);
+
+        ctx.Dispose();
+
+        Assert.Equal(System.Data.ConnectionState.Closed, conn.State);
+    }
+
     // ── 1. Goal round-trip ────────────────────────────────────────────────
 
     [Fact]

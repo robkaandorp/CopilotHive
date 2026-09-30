@@ -71,7 +71,9 @@ public sealed class CopilotHiveDbContext : DbContext
 
     /// <summary>
     /// Creates an in-memory SQLite context for testing. The caller owns the returned
-    /// instance and should dispose it when done.
+    /// instance and should dispose it when done: the context owns its in-memory
+    /// connection, so disposing the context also disposes (closes) that connection,
+    /// which destroys the in-memory database.
     /// </summary>
     internal static CopilotHiveDbContext CreateInMemory()
     {
@@ -79,7 +81,7 @@ public sealed class CopilotHiveDbContext : DbContext
         connection.Open();
 
         var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-            .UseSqlite(connection)
+            .UseSqlite(connection, contextOwnsConnection: true)
             .Options;
 
         var context = new CopilotHiveDbContext(options);
