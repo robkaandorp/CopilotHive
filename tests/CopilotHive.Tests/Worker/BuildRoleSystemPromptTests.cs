@@ -58,10 +58,32 @@ public sealed class BuildRoleSystemPromptTests
     public void BuildRoleSystemPrompt_AllRoles_ContainRaiseIssueGuidance(WorkerRole role)
     {
         var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
-
         Assert.Contains("raise_issue", prompt);
         Assert.Contains("code quality problems, bugs, suggestions, concerns, or workflow issues", prompt);
         Assert.Contains("Do not fix them yourself unless they directly block the goal", prompt);
+    }
+
+    /// <summary>
+    /// The shared preamble must point workers at <c>get_phase_report</c> — a system-level fact
+    /// about how the iteration works, so it belongs in the hardcoded prompt and reaches EVERY role:
+    /// an earlier phase's completed report may already hold the evidence the goal asks for, and
+    /// asking for it via <c>request_clarification</c> instead is a wasted round trip.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    [InlineData(WorkerRole.DocWriter)]
+    [InlineData(WorkerRole.Improver)]
+    public void BuildRoleSystemPrompt_AllRoles_ContainGetPhaseReportGuidance(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains(
+            "- Earlier phases of this iteration may have completed already: call `get_phase_report` to read "
+            + "their full reports (e.g. evidence the goal required in the coder's or doc-writer's report) "
+            + "before asking for it via `request_clarification`.",
+            prompt);
     }
 
     /// <summary>

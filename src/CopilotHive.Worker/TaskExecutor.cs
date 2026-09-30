@@ -321,6 +321,12 @@ public sealed class TaskExecutor(
             agentRunner.SetTesterReport(testerReport);
         }
 
+        // EVERY assignment carries the completed-phase reports of the current iteration, read
+        // through the shared contract (the worker never hand-parses a key). The empty case is
+        // passed as an empty list ON PURPOSE: a re-used runner must never keep showing the
+        // previous assignment's reports.
+        agentRunner.SetPhaseReports(PhaseReportMetadata.Read(task.Metadata));
+
         // Load persisted session (if any) so the agent can resume prior context
         if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
         {

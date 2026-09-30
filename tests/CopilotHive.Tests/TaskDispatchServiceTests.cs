@@ -1634,6 +1634,263 @@ public sealed class TaskDispatchServiceTests
         Assert.False(capturedTask!.Metadata.ContainsKey("tester_report"));
     }
 
+    // ── DispatchToRole: completed-phase reports of the current iteration ───
+
+    /// <summary>
+    /// The phase-report keys actually written onto <paramref name="task"/>, in metadata order — the
+    /// raw key set of the dispatched task, not a re-derived expectation.
+    /// </summary>
+    private static List<string> PhaseReportKeys(WorkTask task) =>
+        [.. task.Metadata.Keys.Where(k => k.StartsWith(PhaseReportMetadata.KeyPrefix, StringComparison.Ordinal))];
+
+    /// <summary>
+    /// THE HANDOFF. A pipeline whose current iteration has COMPLETED Coding and DocWriting entries
+    /// (plus an older-iteration Coding entry, a still-running entry and a completed Merging entry)
+    /// gives EVERY dispatched worker role exactly those two reports, verbatim, under the exact
+    /// contract keys — one metadata entry per report.
+    /// </summary>
+    /// <remarks>
+    /// EACH DECOY KILLS A DISTINCT MUTANT:
+    /// <list type="bullet">
+    ///   <item><description>drop the <c>e.Iteration == pipeline.Iteration</c> filter → the older
+    ///     iteration's Coding report is carried too, producing a third key;</description></item>
+    ///   <item><description>drop the <c>CompletedAt is not null</c> predicate → the still-running
+    ///     entry produces a key whose value is empty;</description></item>
+    ///   <item><description>drop the <c>WorkerOutput is not null</c> predicate → the
+    ///     completed-with-no-output entry produces a key whose value is empty;</description></item>
+    ///   <item><description>drop the <c>Name.ToRoleName()</c> non-empty condition → the completed
+    ///     Merging entry (which has no worker role) produces a <c>phase_report:Merging:1</c>
+    ///     key;</description></item>
+    ///   <item><description>gate the block on a role (e.g. reviewer-only, as the legacy
+    ///     tester_report block still is) → four of the five theory rows observe no reports at
+    ///     all;</description></item>
+    ///   <item><description>truncate or trim the value → the &gt;4,000-character Coding report
+    ///     loses its tail marker.</description></item>
+    /// </list>
+    /// </remarks>
+    [Theory]
+    [InlineData(GoalPhase.Coding, WorkerRole.Coder)]
+    [InlineData(GoalPhase.DocWriting, WorkerRole.DocWriter)]
+    [InlineData(GoalPhase.Testing, WorkerRole.Tester)]
+    [InlineData(GoalPhase.Review, WorkerRole.Reviewer)]
+    [InlineData(GoalPhase.Improve, WorkerRole.Improver)]
+    public async Task DispatchToRole_EveryRole_CarriesExactlyTheCompletedCurrentIterationReports(
+        GoalPhase dispatchPhase, WorkerRole role)
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+        config.Workers["reviewer"] = new WorkerConfig { Model = "reviewer-model" };
+        config.Workers["docwriter"] = new WorkerConfig { Model = "docwriter-model" };
+        config.Workers["improver"] = new WorkerConfig { Model = "improver-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            dispatchPhase, config, ModelTier.Default);
+
+        // Iteration 2, so an EARLIER iteration's entry is genuinely addressable.
+        Assert.True(pipeline.IterationBudget.TryConsume());
+        var currentIteration = pipeline.Iteration;
+        Assert.Equal(2, currentIteration);
+        var olderIteration = currentIteration - 1;
+
+        // A report longer than 4,000 characters, with its distinctive evidence at the very END:
+        // a truncating or trimming handoff loses the marker.
+        var coderReport = new string('C', 4_100) + "\nCODER-TAIL-MARKER: carried verbatim, never capped.";
+        const string DocWriterReport = "DOCWRITER-REPORT: updated docs/ARCHITECTURE.md and README.md.";
+
+        // (1) COMPLETED Coding of the CURRENT iteration — carried.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = coderReport,
+        });
+
+        // (2) COMPLETED DocWriting of the CURRENT iteration — carried. A FAILED phase is carried
+        // exactly like a passed one: the phase outcome never gates the handoff.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.DocWriting,
+            Result = PhaseOutcome.Fail,
+            Iteration = currentIteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = DocWriterReport,
+        });
+
+        // (3) An OLDER iteration's completed Coding entry — must never be carried (earlier
+        // iterations already reach the workers through the Brain's prompts).
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = olderIteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = "OLDER-ITERATION-REPORT: must not be carried.",
+        });
+
+        // (4) Still running: no CompletedAt and no WorkerOutput.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 1,
+        });
+
+        // (5) Completed but with NO worker output recorded.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Improve,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = null,
+        });
+
+        // (6) COMPLETED with output, but Merging has no worker role (ToRoleName is empty).
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Merging,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = "MERGING-REPORT: no worker role, must not be carried.",
+        });
+
+        // (7) An output recorded but NO completion stamped — the shape legacy persisted entries
+        // have (they carry WorkerOutput plus an explicit DurationSeconds, and no CompletedAt). Only
+        // an entry that is both completed AND carrying output is a completed report.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Review,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 1,
+            WorkerOutput = "LEGACY-UNSTAMPED-REPORT: output without a completion timestamp.",
+        });
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, role, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+
+        // THE RAW KEY SET: exactly the two current-iteration reports, nothing else.
+        Assert.Equal(
+            ["phase_report:Coding:1", "phase_report:DocWriting:1"],
+            PhaseReportKeys(capturedTask!));
+
+        // THE VALUES, verbatim — read through the shared contract, and read again from the raw
+        // metadata so a key-format drift cannot hide behind the reader.
+        Assert.Equal(
+            [new PhaseReport("Coding", 1, coderReport), new PhaseReport("DocWriting", 1, DocWriterReport)],
+            PhaseReportMetadata.Read(capturedTask!.Metadata));
+        Assert.Equal(coderReport, capturedTask.Metadata["phase_report:Coding:1"]);
+        Assert.Equal(DocWriterReport, capturedTask.Metadata["phase_report:DocWriting:1"]);
+        Assert.EndsWith("CODER-TAIL-MARKER: carried verbatim, never capped.", coderReport, StringComparison.Ordinal);
+        Assert.True(coderReport.Length > 4_000);
+    }
+
+    /// <summary>
+    /// Two occurrences of one phase in the current iteration produce two distinct keys, each
+    /// carrying its own occurrence's report.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_TwoOccurrencesOfOnePhase_ProduceTwoKeys()
+    {
+        var config = CreateConfig();
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        const string FirstCodingReport = "FIRST-CODING-REPORT: occurrence 1.";
+        const string SecondCodingReport = "SECOND-CODING-REPORT: occurrence 2, after a review.";
+
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = FirstCodingReport,
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 2,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = SecondCodingReport,
+        });
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(
+            ["phase_report:Coding:1", "phase_report:Coding:2"],
+            PhaseReportKeys(capturedTask!));
+        Assert.Equal(FirstCodingReport, capturedTask!.Metadata["phase_report:Coding:1"]);
+        Assert.Equal(SecondCodingReport, capturedTask.Metadata["phase_report:Coding:2"]);
+    }
+
+    /// <summary>
+    /// An iteration in which NOTHING has completed yet adds no phase-report key at all — not an
+    /// empty value, not a placeholder entry.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_NothingCompletedInCurrentIteration_AddsNoPhaseReportKeys()
+    {
+        var config = CreateConfig();
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        Assert.True(pipeline.IterationBudget.TryConsume());
+
+        // The ONLY completed entry belongs to the PREVIOUS iteration; the current iteration has a
+        // running entry with nothing recorded yet.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration - 1,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = "PREVIOUS-ITERATION-REPORT.",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+        });
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Empty(PhaseReportKeys(capturedTask!));
+        Assert.Empty(PhaseReportMetadata.Read(capturedTask!.Metadata));
+    }
+
     // ── THE CONTINUOUS FULL CHAIN: dispatch → completion → worker → tool ──
 
     /// <summary>
@@ -1751,6 +2008,366 @@ public sealed class TaskDispatchServiceTests
         Assert.Equal(report, modelFacingResult);
         Assert.EndsWith(TaskExecutorTesterReportTests.TrailingEvidence, modelFacingResult);
         Assert.Contains(TaskExecutorTesterReportTests.Beyond4000Marker, modelFacingResult);
+    }
+
+    // ── THE CONTINUOUS FULL CHAIN: get_phase_report, dispatch → worker → tool ──
+
+    /// <summary>
+    /// THE ONE UNBROKEN PROOF of the phase-report handoff (§Test-3). A single synthetic report
+    /// travels through EVERY real hop, never re-stated from an independently constructed value:
+    /// <list type="number">
+    ///   <item><description>the REAL <see cref="TaskDispatchService"/> dispatches a DOC-WRITER task
+    ///     over a pipeline whose PhaseLog already carries a COMPLETED Coding entry of the current
+    ///     iteration;</description></item>
+    ///   <item><description>the doc-writer <see cref="WorkTask"/> is CAPTURED FROM THE QUEUE — the
+    ///     production dispatch wrote its phase-report metadata, the test never writes
+    ///     it;</description></item>
+    ///   <item><description>that captured task round-trips through the REAL
+    ///     <see cref="GrpcMapper"/> (<c>ToGrpc</c> → <c>ToDomain</c>), the orchestrator↔worker
+    ///     transport;</description></item>
+    ///   <item><description>the round-tripped task runs through the REAL
+    ///     <see cref="TaskExecutor"/> with the no-op git transport, whose runner drives a REAL
+    ///     <see cref="SharpCoderRunner"/> prompt turn;</description></item>
+    ///   <item><description>the stub model's turn CALLS the ACTUAL <c>get_phase_report</c>
+    ///     <see cref="AIFunction"/>, and the result the model received is recorded;</description></item>
+    ///   <item><description>that observed result EQUALS the stored report exactly — the whole
+    ///     multi-line body beyond character 4,000 and the trailing marker included, so a truncated
+    ///     or prefixed answer cannot pass.</description></item>
+    /// </list>
+    /// </summary>
+    /// <remarks>
+    /// The report is asserted with <see cref="Assert.Equal(string, string)"/> against the complete
+    /// string, plus explicit prefix/marker/end checks that a substring-only assertion would miss.
+    /// Nothing is bypassed: the expected value is the same <c>report</c> local whose content the
+    /// dispatch read out of the PhaseLog, and every intermediate value is read back out of
+    /// production structures.
+    /// </remarks>
+    [Fact]
+    public async Task PhaseReport_FullChain_ReachesGetPhaseReportToolIntact()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Workers["docwriter"] = new WorkerConfig { Model = "docwriter-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.DocWriting, config, ModelTier.Default);
+
+        // THE ONE REPORT — longer than 4,000 characters, multi-line, with distinctive evidence at
+        // both ends and a trailing marker.
+        var report = new string('C', 4_100)
+            + "\nCODER-EVIDENCE-BEYOND-4000: mutant truncation removed → suite red.\n"
+            + new string('F', 3_000)
+            + "\nPHASE-REPORT-TRAILING-MARKER: the coder's full report.";
+        Assert.True(report.Length > 4_000);
+
+        // The COMPLETED Coding entry of the current iteration — the report the doc-writer must be
+        // able to read.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = report,
+        });
+
+        pipeline.CoderBranch = "feature/test-branch";
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        // ── HOP 1: the REAL dispatch admits the doc-writer task ──────────
+        await service.DispatchToRole(pipeline, WorkerRole.DocWriter, "Document it", TestContext.Current.CancellationToken);
+
+        var docWriterTask = Assert.Single(dispatched);
+        Assert.Equal(WorkerRole.DocWriter, docWriterTask.Role);
+
+        // ── HOP 2: the production dispatch itself must have written the metadata ──
+        Assert.Equal(
+            [new PhaseReport("Coding", 1, report)],
+            PhaseReportMetadata.Read(docWriterTask.Metadata));
+
+        // ── HOP 3: the REAL gRPC transport round-trip ────────────────────
+        var roundTripped = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(docWriterTask));
+        Assert.Equal(WorkerRole.DocWriter, roundTripped.Role);
+        Assert.Equal(
+            [new PhaseReport("Coding", 1, report)],
+            PhaseReportMetadata.Read(roundTripped.Metadata));
+
+        // ── HOPS 4–5: the REAL TaskExecutor + REAL SharpCoderRunner turn ─
+        using var configRepo = new PhaseReportConfigRepo();
+        await using var runner = new PhaseReportChainRunner(configRepo.Directory);
+        runner.RequestedPhase = "Coding";
+        runner.ArmToolCall();
+        var executor = new TaskExecutor(runner, gitOperations: new PhaseReportGit(), configRepoDir: configRepo.Directory);
+
+        var executionResult = await executor.ExecuteAsync(roundTripped, TestContext.Current.CancellationToken);
+
+        // The run SUCCEEDED (TaskExecutor swallows its own exceptions into a Failed result)…
+        Assert.True(
+            executionResult.Status == TaskOutcome.Completed,
+            $"the executor run failed: output={executionResult.Output} issues={string.Join("; ", executionResult.Metrics?.Issues ?? [])}");
+
+        // …AND the real agent loop really invoked the tool, so a pre-prompt failure cannot
+        // masquerade as a pass.
+        var modelFacingResult = Assert.Single(runner.ObservedGetPhaseReportResults);
+
+        // THE EXACT, COMPLETE MATCH — not a prefix, not a containment.
+        Assert.Equal(report, modelFacingResult);
+        Assert.StartsWith(new string('C', 4_100), modelFacingResult, StringComparison.Ordinal);
+        Assert.Contains("CODER-EVIDENCE-BEYOND-4000", modelFacingResult, StringComparison.Ordinal);
+        Assert.EndsWith("PHASE-REPORT-TRAILING-MARKER: the coder's full report.", modelFacingResult, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same chain for an EXPLICIT occurrence: two Coding occurrences of the current iteration
+    /// are stored, the stub model asks for occurrence 1, and the model receives exactly that
+    /// occurrence's report — never the latest one.
+    /// </summary>
+    [Fact]
+    public async Task PhaseReport_FullChain_ExplicitOccurrence_ReachesTheRequestedOne()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        const string FirstOccurrence = "FIRST-CODING-REPORT: occurrence 1 of this iteration.";
+        const string SecondOccurrence = "SECOND-CODING-REPORT: occurrence 2, after the review.";
+
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = FirstOccurrence,
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 2,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = SecondOccurrence,
+        });
+
+        pipeline.CoderBranch = "feature/test-branch";
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+        var testerTask = Assert.Single(dispatched);
+
+        var roundTripped = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(testerTask));
+        Assert.Equal(2, PhaseReportMetadata.Read(roundTripped.Metadata).Count);
+
+        await using var runner = new PhaseReportChainRunner();
+        runner.RequestedPhase = "coding"; // lower-case on purpose: the tool matches case-insensitively
+        runner.RequestedOccurrence = 1;
+        runner.ArmToolCall();
+        var executor = new TaskExecutor(runner, gitOperations: new PhaseReportGit());
+
+        var executionResult = await executor.ExecuteAsync(roundTripped, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TaskOutcome.Completed, executionResult.Status);
+        Assert.Equal(FirstOccurrence, Assert.Single(runner.ObservedGetPhaseReportResults));
+    }
+
+    /// <summary>
+    /// THE REVERSED-STORE FULL CHAIN. The dispatch writes one metadata entry per PhaseLog entry in
+    /// PhaseLog order, so a pipeline whose CURRENT-iteration entries carry occurrence 2 BEFORE
+    /// occurrence 1 produces phase-report keys in the reverse of the timeline. The captured task
+    /// round-trips through the REAL <see cref="GrpcMapper"/> (<c>ToGrpc</c> → <c>ToDomain</c>, so the
+    /// transport's own MapField ordering is in play) and the model's tool call OMITS the occurrence:
+    /// it must receive occurrence 2's report.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS THE FULL-CHAIN MUTANT KILL for a <c>LastOrDefault</c>-based selector, sharing the
+    /// production boundary with the fix: that version answers with occurrence 1 here. The reversed
+    /// premise is asserted on the task the dispatch actually built, before the round trip (a
+    /// Dictionary's enumeration order is its insertion order); the round trip may reorder the map,
+    /// and the assertion below is deliberately order-INDEPENDENT because the value must not depend
+    /// on it.
+    /// </remarks>
+    [Fact]
+    public async Task PhaseReport_FullChain_OccurrenceOmitted_ReturnsTheGreatestOccurrence()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        const string FirstOccurrence = "FIRST-CODING-REPORT: occurrence 1 of this iteration.";
+        const string SecondOccurrence = "SECOND-CODING-REPORT: occurrence 2, after the review.";
+
+        // PhaseLog order is the REVERSE of the timeline: occurrence 2 first.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 2,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = SecondOccurrence,
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = FirstOccurrence,
+        });
+
+        pipeline.CoderBranch = "feature/test-branch";
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+        var testerTask = Assert.Single(dispatched);
+
+        // PREMISE: the built metadata really carries the keys in the reversed insertion order.
+        var keys = testerTask.Metadata.Keys
+            .Where(k => k.StartsWith(PhaseReportMetadata.KeyPrefix, StringComparison.Ordinal))
+            .ToList();
+        Assert.Equal(["phase_report:Coding:2", "phase_report:Coding:1"], keys);
+
+        var roundTripped = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(testerTask));
+        Assert.Equal(2, PhaseReportMetadata.Read(roundTripped.Metadata).Count);
+
+        await using var runner = new PhaseReportChainRunner();
+        runner.RequestedPhase = "Coding"; // occurrence deliberately OMITTED
+        runner.ArmToolCall();
+        var executor = new TaskExecutor(runner, gitOperations: new PhaseReportGit());
+
+        var executionResult = await executor.ExecuteAsync(roundTripped, TestContext.Current.CancellationToken);
+
+        Assert.True(
+            executionResult.Status == TaskOutcome.Completed,
+            $"the executor run failed: output={executionResult.Output}");
+        Assert.Equal(SecondOccurrence, Assert.Single(runner.ObservedGetPhaseReportResults));
+    }
+
+    /// <summary>
+    /// The end-to-end NO-MATCH path: this task carries no phase reports at all (nothing completed
+    /// yet in the iteration), so the model's tool call receives the exact no-reports message.
+    /// </summary>
+    [Fact]
+    public async Task PhaseReport_FullChain_NoReports_ReachesTheNoReportsMessage()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        pipeline.CoderBranch = "feature/test-branch";
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+        var coderTask = Assert.Single(dispatched);
+        Assert.Empty(PhaseReportMetadata.Read(coderTask.Metadata));
+
+        var roundTripped = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(coderTask));
+
+        await using var runner = new PhaseReportChainRunner();
+        runner.RequestedPhase = "DocWriting";
+        runner.ArmToolCall();
+        var executor = new TaskExecutor(runner, gitOperations: new PhaseReportGit());
+
+        var executionResult = await executor.ExecuteAsync(roundTripped, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TaskOutcome.Completed, executionResult.Status);
+        Assert.Equal(
+            SharpCoderRunner.NoPhaseReportsAvailableMessage,
+            Assert.Single(runner.ObservedGetPhaseReportResults));
+    }
+
+    /// <summary>
+    /// THE RE-USE PATH, end to end: two REAL assignments run in sequence on ONE runner. The first
+    /// carries a completed Coding report and the model reads it; the second (an iteration where
+    /// nothing has completed yet) carries none, and the model's tool call receives the no-reports
+    /// message — the first assignment's report must never survive into the second.
+    /// </summary>
+    [Fact]
+    public async Task PhaseReport_FullChain_SecondAssignmentWithoutReports_SeesNoStaleReport()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        const string CoderReport = "CODER-REPORT-OF-THE-FIRST-ASSIGNMENT: must not leak forward.";
+
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            CompletedAt = DateTime.UtcNow,
+            WorkerOutput = CoderReport,
+        });
+        pipeline.CoderBranch = "feature/test-branch";
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        // ── ASSIGNMENT 1: a task that DOES carry the report ──────────────
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+        var firstTask = Assert.Single(dispatched);
+        Assert.Equal([new PhaseReport("Coding", 1, CoderReport)], PhaseReportMetadata.Read(firstTask.Metadata));
+
+        using var configRepo = new PhaseReportConfigRepo();
+        await using var runner = new PhaseReportChainRunner(configRepo.Directory);
+        runner.RequestedPhase = "Coding";
+        runner.ArmToolCall();
+        var executor = new TaskExecutor(
+            runner, gitOperations: new PhaseReportGit(), configRepoDir: configRepo.Directory);
+
+        var firstResult = await executor.ExecuteAsync(
+            GrpcMapper.ToDomain(GrpcMapper.ToGrpc(firstTask)), TestContext.Current.CancellationToken);
+
+        Assert.True(firstResult.Status == TaskOutcome.Completed,
+            $"the first run failed: output={firstResult.Output}");
+        Assert.Equal(CoderReport, Assert.Single(runner.ObservedGetPhaseReportResults));
+
+        // ── ASSIGNMENT 2: the SAME runner, a task with NO reports ────────
+        runner.ArmToolCall();
+        var secondTask = new WorkTask
+        {
+            TaskId = "task-second-assignment",
+            GoalId = pipeline.GoalId,
+            GoalDescription = pipeline.Description,
+            Prompt = "Test it again",
+            Role = WorkerRole.Tester,
+            Repositories = [],
+        };
+        Assert.Empty(PhaseReportMetadata.Read(secondTask.Metadata));
+
+        var secondResult = await executor.ExecuteAsync(
+            GrpcMapper.ToDomain(GrpcMapper.ToGrpc(secondTask)), TestContext.Current.CancellationToken);
+
+        Assert.True(secondResult.Status == TaskOutcome.Completed,
+            $"the second run failed: output={secondResult.Output}");
+        Assert.Equal(2, runner.ObservedGetPhaseReportResults.Count);
+        Assert.Equal(SharpCoderRunner.NoPhaseReportsAvailableMessage, runner.ObservedGetPhaseReportResults[1]);
+        Assert.DoesNotContain(CoderReport, runner.ObservedGetPhaseReportResults[1], StringComparison.Ordinal);
     }
 
     [Fact]

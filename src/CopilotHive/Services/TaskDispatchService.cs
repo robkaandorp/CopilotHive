@@ -367,6 +367,27 @@ internal sealed class TaskDispatchService
             }
         }
 
+        // Propagate the reports of every phase that ALREADY COMPLETED in the CURRENT iteration to
+        // EVERY worker role, one metadata entry per report (see PhaseReportMetadata for the key
+        // layout — both sides go through it and neither hand-builds a key). An earlier iteration's
+        // report is never included: those already reach the workers through the Brain's prompts.
+        // The phase's outcome (pass/fail/skip) deliberately does not gate the handoff, and the
+        // report is carried VERBATIM — never trimmed, truncated or capped.
+        var phaseReports = new List<PhaseReport>();
+        foreach (var entry in pipeline.PhaseLog)
+        {
+            if (entry.Iteration != pipeline.Iteration)
+                continue;
+            if (entry.CompletedAt is null || entry.WorkerOutput is null)
+                continue;
+            if (entry.Name.ToRoleName().Length == 0)
+                continue;
+
+            phaseReports.Add(new PhaseReport(entry.Name.ToString(), entry.Occurrence ?? 1, entry.WorkerOutput));
+        }
+
+        PhaseReportMetadata.Write(task.Metadata, phaseReports);
+
         // Propagate compaction model to the worker so it creates a separate IChatClient for context compaction.
         var compactionModel = _config?.GetCompactionModel();
         if (!string.IsNullOrEmpty(compactionModel))

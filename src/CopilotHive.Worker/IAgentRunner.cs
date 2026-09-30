@@ -57,6 +57,22 @@ public interface IAgentRunner : IAsyncDisposable
     void SetRole(WorkerRole role) { }
 
     /// <summary>
+    /// Sets the completed-phase reports of the CURRENT iteration for this assignment, or an empty
+    /// list/<c>null</c> when there are none.
+    /// </summary>
+    /// <remarks>
+    /// <b>This default implementation is a deliberately empty NO-OP</b>, so the many existing test
+    /// doubles implementing <see cref="IAgentRunner"/> keep compiling and keep their previous
+    /// behavior unchanged; <see cref="SharpCoderRunner"/> (the production runner) is the only
+    /// implementation that overrides it. An override must REPLACE the stored reports with exactly
+    /// what was passed — including the empty case, so a re-used runner never shows the previous
+    /// assignment's reports — and must never filter, trim or truncate them.
+    /// </remarks>
+    /// <param name="reports">The reports of the phases that already completed in the current
+    /// iteration, or <c>null</c> for none.</param>
+    void SetPhaseReports(IReadOnlyList<PhaseReport>? reports) { }
+
+    /// <summary>
     /// Starts a FRESH per-task usage accumulation. Call once at the start of every task, before the
     /// first <see cref="SendPromptAsync"/>, so a re-used runner never carries the previous task's
     /// usage into the next one.

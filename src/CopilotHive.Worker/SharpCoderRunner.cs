@@ -168,12 +168,40 @@ public sealed class SharpCoderRunner : IAgentRunner
     private WorkerReport? _lastWorkerReport;
     private string? _testerReport;
 
+    /// <summary>
+    /// The phase names <c>get_phase_report</c> accepts, in CANONICAL casing — the
+    /// <see cref="PhaseReport.Phase"/> values the orchestrator writes. The tool matches the
+    /// caller's argument against these case-insensitively and always renders a name in this
+    /// casing, so a tool result never echoes the model's own capitalization back at it.
+    /// </summary>
+    private static readonly string[] PhaseReportPhaseNames =
+        ["Coding", "Testing", "Review", "DocWriting", "Improve"];
+
+    /// <summary>The exact text <c>get_phase_report</c> returns when the runner holds no reports.</summary>
+    internal const string NoPhaseReportsAvailableMessage =
+        "No completed phase reports are available for this iteration yet.";
+
+    /// <summary>
+    /// The completed-phase reports of the CURRENT assignment's iteration, as handed over by
+    /// <c>TaskExecutor</c>. Empty when nothing was passed — replaced, never appended to, so a
+    /// re-used runner can never show a previous assignment's reports.
+    /// </summary>
+    private IReadOnlyList<PhaseReport> _phaseReports = [];
+
     public TestResultReport? LastTestReport => _lastTestReport;
     public WorkerReport? LastWorkerReport => _lastWorkerReport;
 
     public void ClearTestReport() => _lastTestReport = null;
     public void ClearWorkerReport() => _lastWorkerReport = null;
     public void SetTesterReport(string? report) => _testerReport = report;
+
+    /// <summary>
+    /// Sets the completed-phase reports of the current iteration for THIS assignment — replacing
+    /// whatever the previous assignment left behind, so the empty case really empties the runner
+    /// (see <see cref="IAgentRunner.SetPhaseReports"/>).
+    /// </summary>
+    /// <param name="reports">The reports to store, or <c>null</c> for none.</param>
+    public void SetPhaseReports(IReadOnlyList<PhaseReport>? reports) => _phaseReports = reports ?? [];
 
     public void SetToolBridge(IToolCallBridge? bridge) => _toolBridge = bridge;
     public void SetCurrentTaskId(string? taskId) => _currentTaskId = taskId;
@@ -358,6 +386,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             - Call `report_progress` at each meaningful step (e.g. "Reading files", "Building", "Tests passing", "Committing") so the user can follow your progress in real time.
             - Call `report_narrative` at the end of your work, before calling your report tool (report_code_changes, report_test_results, report_review_verdict, report_doc_changes). Write 2-5 sentences about what you tried, what worked, what you struggled with, and why. This helps the system learn and improve.
             - Call `raise_issue` when you notice code quality problems, bugs, suggestions, concerns, or workflow issues that are out of scope for the current goal. Do not fix them yourself unless they directly block the goal.
+            - Earlier phases of this iteration may have completed already: call `get_phase_report` to read their full reports (e.g. evidence the goal required in the coder's or doc-writer's report) before asking for it via `request_clarification`.
             """;
 
         var roleSpecific = role switch
@@ -683,10 +712,12 @@ public sealed class SharpCoderRunner : IAgentRunner
         // this connection starts from the same role/prompt baseline a fresh runner would have. A
         // delivered UpdateAgents on this connection is applied later, by the message loop, and is
         // never reverted — that is why this reset lives here and NOT before each assignment. The
-        // assignment's own role (SetRole) is likewise applied later, per assignment.
+        // assignment's own role (SetRole) is likewise applied later, per assignment, as are the
+        // assignment's own phase reports (SetPhaseReports).
         _currentRole = DefaultRole;
         _customAgentSystemPromptsByRole.Clear();
         _testerReport = null;
+        _phaseReports = [];
 
         _log.Info("SharpCoderRunner ready — the LLM client is created lazily on first prompt.");
         return Task.CompletedTask;
@@ -1238,6 +1269,11 @@ public sealed class SharpCoderRunner : IAgentRunner
         var taskId = _currentTaskId;
         var goalId = _currentGoalId;
 
+        // The SAME construction-time binding for the completed-phase reports: a tool set is built
+        // once per turn, and this turn's tools must answer from THIS assignment's reports even if
+        // the runner is repointed at another assignment before a retained tool is invoked.
+        var phaseReports = _phaseReports;
+
         if (bridge != null)
         {
             tools.Add(AIFunctionFactory.Create(
@@ -1333,8 +1369,127 @@ public sealed class SharpCoderRunner : IAgentRunner
         if (_currentRole == WorkerRole.Improver)
             tools.Add(BuildFileSizesTool());
 
+        // EVERY role gets the completed-phase reports of this iteration: an earlier phase's report
+        // can hold evidence a later phase needs to verify (the second Coding occurrence after a
+        // review, the tester's build evidence, the doc-writer's report, ...). Read-only, and
+        // deliberately ORTHOGONAL to get_test_report, which keeps its own reviewer-only contract.
+        tools.Add(AIFunctionFactory.Create(
+            ([Description("Phase name: Coding, Testing, Review, DocWriting or Improve (case-insensitive)")] string phase,
+             [Description("1-based occurrence of the phase within this iteration, or omitted for the latest one")] int? occurrence = null) =>
+            {
+                _log.Info($"Tool call: get_phase_report({phase}" + (occurrence is null ? "" : $", occurrence={occurrence}") + ")");
+                return ResolvePhaseReport(phaseReports, phase, occurrence);
+            },
+            "get_phase_report",
+            "Retrieve the full report of a phase that already completed in the CURRENT iteration (e.g. the coder's or doc-writer's report) — use it to verify evidence the goal asks for in an earlier phase's report."));
+
         return tools;
     }
+
+    /// <summary>
+    /// Resolves the <c>get_phase_report</c> tool's answer: the requested report VERBATIM, or a
+    /// message naming what is available instead.
+    /// </summary>
+    /// <remarks>
+    /// THE REQUESTED NAME IS NEVER ECHOED on the failure path: the message renders the CANONICAL
+    /// name when the argument is a known phase (matched case-insensitively) and the argument
+    /// verbatim when it is not, so an unknown phase is reported honestly while a mere casing
+    /// difference still resolves to the real report.
+    /// <para>
+    /// LATEST MEANS THE GREATEST <see cref="PhaseReport.Occurrence"/>, never the last ENUMERATED
+    /// match. The reports arrive in metadata order — <c>PhaseReportMetadata.Read</c> preserves the
+    /// dictionary's enumeration, and protobuf's <c>MapField</c> documents its iteration order as
+    /// undefined — so list position carries no timeline guarantee at all and a
+    /// <c>LastOrDefault</c> would answer with the wrong occurrence.
+    /// </para>
+    /// <para>
+    /// When the runner holds no reports at all, the message says exactly that — naming an empty
+    /// list would be noise. Otherwise every stored report is listed in the DETERMINISTIC order
+    /// defined by <see cref="OrderedForListing"/> (canonical phase sequence, then occurrence
+    /// ascending), so the same stored set always reads the same way regardless of enumeration
+    /// order and the model can retry with a name it can actually use.
+    /// </para>
+    /// </remarks>
+    /// <param name="reports">The reports this turn's tool set was built for.</param>
+    /// <param name="phase">The phase name supplied by the model.</param>
+    /// <param name="occurrence">The exact occurrence requested, or <c>null</c> for the latest one.</param>
+    /// <returns>The stored report verbatim, or the explanatory message.</returns>
+    private static string ResolvePhaseReport(
+        IReadOnlyList<PhaseReport> reports, string phase, int? occurrence)
+    {
+        var canonicalPhase = PhaseReportPhaseNames.FirstOrDefault(
+            name => string.Equals(name, phase, StringComparison.OrdinalIgnoreCase));
+
+        if (canonicalPhase is not null)
+        {
+            var matching = reports
+                .Where(r => string.Equals(r.Phase, canonicalPhase, StringComparison.OrdinalIgnoreCase));
+
+            // Omitted occurrence → the GREATEST numeric occurrence, independent of enumeration
+            // order. An explicit occurrence → exactly that one.
+            var selected = occurrence is { } requested
+                ? matching.FirstOrDefault(r => r.Occurrence == requested)
+                : matching.MaxBy(r => r.Occurrence);
+
+            if (selected is not null)
+                return selected.Report;
+        }
+
+        if (reports.Count == 0)
+            return NoPhaseReportsAvailableMessage;
+
+        var requestedName = canonicalPhase ?? phase;
+        var available = string.Join(", ",
+            OrderedForListing(reports).Select(r => $"{CanonicalPhaseName(r.Phase)} (occurrence {r.Occurrence})"));
+        return $"No {requestedName} report is available for this iteration. Available: {available}.";
+    }
+
+    /// <summary>
+    /// Orders the reports for the availability listing WITHOUT touching the caller's list: canonical
+    /// phase sequence first (Coding, Testing, Review, DocWriting, Improve), then occurrence ASCENDING
+    /// within each phase.
+    /// </summary>
+    /// <remarks>
+    /// The order is a property of THIS rendering, never of the stored data: the tool's answer must
+    /// not depend on metadata enumeration order, which is undefined across the transport.
+    /// <para>
+    /// A stored phase name that is not one of the five (only reachable through malformed input, since
+    /// a production report always carries a <c>GoalPhase</c> name) sorts AFTER every known phase; its
+    /// own ordering is occurrence ascending, then the name ordinal, so the result is total and
+    /// repeatable rather than whatever order a stable sort happened to inherit.
+    /// </para>
+    /// </remarks>
+    /// <param name="reports">The reports to order; the input sequence is left unmodified.</param>
+    /// <returns>A new, ordered sequence of the same reports.</returns>
+    private static IEnumerable<PhaseReport> OrderedForListing(IEnumerable<PhaseReport> reports) =>
+        reports.OrderBy(r => CanonicalPhaseIndex(r.Phase))
+            .ThenBy(r => r.Occurrence)
+            .ThenBy(r => r.Phase, StringComparer.Ordinal);
+
+    /// <summary>
+    /// The canonical position of a stored phase name, matched case-insensitively, or
+    /// <see cref="PhaseReportPhaseNames"/>.Length when the name is not one of the five — an
+    /// unknown name therefore sorts after every known phase.
+    /// </summary>
+    /// <param name="phase">A stored phase name.</param>
+    /// <returns>The canonical index, or the count of known names for an unrecognized one.</returns>
+    private static int CanonicalPhaseIndex(string phase)
+    {
+        var index = Array.FindIndex(
+            PhaseReportPhaseNames, name => string.Equals(name, phase, StringComparison.OrdinalIgnoreCase));
+        return index >= 0 ? index : PhaseReportPhaseNames.Length;
+    }
+
+    /// <summary>
+    /// Renders a stored phase name in CANONICAL casing when it names a known phase, and verbatim
+    /// otherwise — the same treatment <c>get_phase_report</c> gives the requested name, so neither
+    /// side of the tool result depends on how an individual name happened to be spelled.
+    /// </summary>
+    /// <param name="phase">A stored phase name.</param>
+    /// <returns>The canonical phase name, or <paramref name="phase"/> when it is not a known one.</returns>
+    private static string CanonicalPhaseName(string phase) =>
+        PhaseReportPhaseNames.FirstOrDefault(name => string.Equals(name, phase, StringComparison.OrdinalIgnoreCase))
+        ?? phase;
 
     private AITool BuildTestResultsTool() => AIFunctionFactory.Create(
         ([Description("PASS or FAIL")] string verdict,

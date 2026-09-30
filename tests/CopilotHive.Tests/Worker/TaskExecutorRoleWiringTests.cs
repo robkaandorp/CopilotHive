@@ -104,6 +104,70 @@ public sealed class TaskExecutorRoleWiringTests
     }
 
     /// <summary>
+    /// THE PHASE-REPORT TOOL IS FOR EVERY ASSIGNMENT ROLE — a later phase of the same iteration
+    /// (a second Coding occurrence after a review, the tester, the doc-writer) must be able to read
+    /// an earlier phase's completed report, so gating the tool on a role would silently hide the
+    /// evidence the goal asked for.
+    /// </summary>
+    /// <remarks>
+    /// NO <c>SetCustomAgent</c> call is made anywhere: only a real <see cref="SharpCoderRunner.ConnectAsync"/>
+    /// followed by a real assignment, exactly as the failing installation behaves.
+    /// </remarks>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    [InlineData(WorkerRole.DocWriter)]
+    [InlineData(WorkerRole.Improver)]
+    public async Task AssignmentRole_EveryRole_ExposesGetPhaseReport(WorkerRole role)
+    {
+        using var configRepo = new PhaseReportConfigRepo();
+        var (runner, observed) = BuildRealRunner(configRepo.Directory);
+        await using var _ = runner;
+
+        await runner.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var result = await ExecuteAsync(runner, role, TestContext.Current.CancellationToken, configRepo.Directory);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.NotEmpty(observed);
+        Assert.All(observed, options => Assert.Contains("get_phase_report", ToolNames(options)));
+    }
+
+    /// <summary>
+    /// The new tool is ADDITIVE: the Reviewer still exposes <c>get_test_report</c> (and the report
+    /// verdict tool), the two mechanisms stay orthogonal, and no OTHER role gains
+    /// <c>get_test_report</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    [InlineData(WorkerRole.DocWriter)]
+    [InlineData(WorkerRole.Improver)]
+    public async Task AssignmentRole_GetTestReportStaysReviewerOnly(WorkerRole role)
+    {
+        using var configRepo = new PhaseReportConfigRepo();
+        var (runner, observed) = BuildRealRunner(configRepo.Directory);
+        await using var _ = runner;
+
+        await runner.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var result = await ExecuteAsync(runner, role, TestContext.Current.CancellationToken, configRepo.Directory);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.NotEmpty(observed);
+        Assert.All(observed, options =>
+        {
+            Assert.Contains("get_phase_report", ToolNames(options));
+            if (role == WorkerRole.Reviewer)
+                Assert.Contains("get_test_report", ToolNames(options));
+            else
+                Assert.DoesNotContain("get_test_report", ToolNames(options));
+        });
+    }
+
+    /// <summary>
     /// THE REVIEWER'S FULL CONTRACT from the same no-<c>SetCustomAgent</c> chain: the review
     /// verdict tool AND <c>get_test_report</c> — and file writes DISABLED, because a reviewer must
     /// never modify the code it reviews.
@@ -207,9 +271,10 @@ public sealed class TaskExecutorRoleWiringTests
     /// client and the agent-options seam recording every options object the prompt turn builds. NO
     /// <c>SetCustomAgent</c> call is made here: the role must come from the assignment alone.
     /// </summary>
-    private static (SharpCoderRunner Runner, List<AgentOptions> Observed) BuildRealRunner()
+    private static (SharpCoderRunner Runner, List<AgentOptions> Observed) BuildRealRunner(
+        string configRepoDir = "/config-repo")
     {
-        var runner = new SharpCoderRunner("/config-repo");
+        var runner = new SharpCoderRunner(configRepoDir);
         var observed = new List<AgentOptions>();
 
         runner.ClientCreationSeam = _ => new RoleWiringStubClient();
@@ -220,14 +285,19 @@ public sealed class TaskExecutorRoleWiringTests
 
     /// <summary>
     /// Drives the real <see cref="TaskExecutor"/> (production constructor, no tool bridge) over an
-    /// assignment for <paramref name="role"/>. The NoOp git transport (the shared
-    /// <see cref="NoOpTesterReportGit"/> double, which reports a CLEAN worktree and no merge base)
-    /// and the repository-less task keep the run to the prompt path under test: no network, no
-    /// clone, no branch operation, and no extra auto-commit prompt.
+    /// assignment for <paramref name="role"/>. The git transport is the shared
+    /// <see cref="PhaseReportGit"/> double: a clean worktree, no merge base, and the EXPLICIT valid
+    /// answers the Improver's pre-run baseline preparation requires (its own path refuses to run
+    /// without them). Together with the repository-less task it keeps the run to the prompt path
+    /// under test: no network, no real clone, no branch operation, no extra auto-commit prompt.
+    /// <para>
+    /// <paramref name="configRepoDir"/> is the executor's config-repo path — the Improver needs a
+    /// real <c>.git</c>-bearing directory there, so the vectors that cover the Improver pass one.
+    /// </para>
     /// </summary>
     private static Task<TaskResult> ExecuteAsync(
-        SharpCoderRunner runner, WorkerRole role, CancellationToken ct) =>
-        new TaskExecutor(runner, gitOperations: new NoOpTesterReportGit())
+        SharpCoderRunner runner, WorkerRole role, CancellationToken ct, string configRepoDir = "/config-repo") =>
+        new TaskExecutor(runner, gitOperations: new PhaseReportGit(), configRepoDir: configRepoDir)
             .ExecuteAsync(MakeTask(role), ct);
 
     /// <summary>The custom tool names the prompt turn handed to the agent.</summary>
