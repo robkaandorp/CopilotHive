@@ -7,6 +7,9 @@ description: How to run tests and interpret the results. Use this when you need 
 
 ## How to Run Tests
 
+**Prerequisite:** if `command -v dotnet` fails, load and follow the `install-dotnet-sdk`
+skill first. Do not record the exit-127 run as a test result.
+
 First, locate the solution file:
 
 ```bash

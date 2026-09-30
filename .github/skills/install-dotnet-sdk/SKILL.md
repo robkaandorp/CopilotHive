@@ -1,38 +1,54 @@
 ---
 name: install-dotnet-sdk
-description: How to install the .NET SDK in a fresh environment. Use this when dotnet commands are not available.
+description: How to install the .NET SDK in a fresh environment. Use this when `dotnet` is not found (exit 127) before building or testing.
 ---
 
-# Install SDK Skill
+# Install .NET SDK Skill
 
-## .NET SDK Installation
+## Check
 
-Check if already installed:
+Run:
 
 ```bash
-dotnet --version
+command -v dotnet && dotnet --list-sdks
 ```
 
-If not installed:
+If an SDK for channel 10.0 is listed, stop — the prerequisite is satisfied.
+
+Also check `"$HOME/.dotnet/dotnet" --list-sdks`: an SDK may exist on disk but not be on
+`PATH`, in which case only the environment step below is needed.
 
 ```bash
-curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0
-export DOTNET_ROOT="$HOME/.dotnet"
-export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
+"$HOME/.dotnet/dotnet" --list-sdks
 ```
 
-## C# Language Server
+## Install Once Per Container
 
-Install `csharp-ls` for code intelligence (go-to-definition, diagnostics):
+Download the installer to a file with retries, then run it with an explicit install dir.
+This way a failed download is reported instead of silently piping nothing into bash:
 
 ```bash
-dotnet tool install --global csharp-ls
+curl -fsSL --retry 5 --retry-delay 2 -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh && bash /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet"
+```
+
+Never use `curl | bash`.
+
+## Environment
+
+CopilotHive worker images already set `DOTNET_ROOT`/`PATH` for `/root/.dotnet`, so no
+export is needed there. Each `execute_bash_command` call is a fresh shell, so in any other
+environment exports do not carry over — there, prefix every `dotnet` command within the
+same call with:
+
+```bash
+export DOTNET_ROOT="$HOME/.dotnet"; export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH";
 ```
 
 ## Verify
 
+Run in a new shell call:
+
 ```bash
 dotnet --version
 dotnet --list-sdks
-csharp-ls --version
 ```

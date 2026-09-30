@@ -7,6 +7,9 @@ description: How to build the project. Use this when you need to compile or buil
 
 ## How to Build
 
+**Prerequisite:** if `command -v dotnet` fails, load and follow the `install-dotnet-sdk`
+skill first. Do not record the exit-127 run as a build result.
+
 First, locate the solution file:
 
 ```bash
