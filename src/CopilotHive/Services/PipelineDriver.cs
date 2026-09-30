@@ -157,23 +157,34 @@ internal sealed class PipelineDriver
     }
 
     /// <summary>
-    /// Snapshots the narratives already received for the completing task, in chronological order
-    /// by <see cref="NarrativeEntry.Timestamp"/>, and attaches them to the LAST PhaseLog entry
-    /// matching the pre-transition <see cref="GoalPipeline.Phase"/> and
-    /// <see cref="GoalPipeline.Iteration"/> — the same idiom the failure and no-op branches use
-    /// for their finalization bookkeeping.
-    /// The captured collection is a detached <c>List</c> (never the live bag or a view over it):
-    /// NarrativeEntry records are immutable, so copying references into a fresh list in
+    /// Captures the completing task's phase evidence — the narratives it produced and its reported
+    /// token usage — on the LAST PhaseLog entry matching the pre-transition
+    /// <see cref="GoalPipeline.Phase"/> and <see cref="GoalPipeline.Iteration"/> — the same idiom
+    /// the failure and no-op branches use for their finalization bookkeeping.
+    /// <para>
+    /// NARRATIVES. The captured collection is a detached <c>List</c> (never the live bag or a view
+    /// over it): NarrativeEntry records are immutable, so copying references into a fresh list in
     /// chronological order is sufficient — later <see cref="GoalPipeline.AddNarrativeEntry"/>
-    /// calls into the live ConcurrentBag cannot mutate the already-captured set.
+    /// calls into the live ConcurrentBag cannot mutate the already-captured set. When an entry IS
+    /// selected but the task had no narratives, an EMPTY list is assigned (never left null) — see
+    /// <see cref="PhaseResult.Narratives"/>: empty positively records "captured, zero narratives",
+    /// distinct from null's "never captured".
+    /// </para>
+    /// <para>
+    /// USAGE. <c>result.Usage?.Snapshot()</c> is stored on that SAME selected entry: a DETACHED
+    /// deep copy, never the <see cref="TaskResult"/>'s own instance (completion receipts can hold
+    /// the same TaskResult, so aliasing would let a later mutation of the result reach the phase
+    /// record). <c>null</c> stays <c>null</c> (usage was not reported), while an empty summary is
+    /// stored as an empty non-null summary (usage WAS reported, zero model calls). An existing
+    /// value is only ever replaced by the value of THIS result — nothing else clears or resets it.
+    /// </para>
+    /// <para>
     /// No-op when no entry matches: no synthetic entry is created and no unrelated entry gains
-    /// evidence. When an entry IS selected but the task had no narratives, an EMPTY list is
-    /// assigned (never left null) — see <see cref="PhaseResult.Narratives"/>: empty positively
-    /// records "captured, zero narratives", distinct from null's "never captured".
-    /// Capture is independent of the knowledge graph, the progress document, and
+    /// evidence. Capture is independent of the knowledge graph, the progress document, and
     /// config-repo commit success, and performs no status writes or iteration summaries.
+    /// </para>
     /// </summary>
-    private static void CapturePhaseNarratives(GoalPipeline pipeline, TaskResult result)
+    private static void CapturePhaseEvidence(GoalPipeline pipeline, TaskResult result)
     {
         var entry = pipeline.PhaseLog
             .LastOrDefault(e => e.Name == pipeline.Phase && e.Iteration == pipeline.Iteration);
@@ -184,6 +195,8 @@ internal sealed class PipelineDriver
             .Where(n => n.TaskId == result.TaskId)
             .OrderBy(n => n.Timestamp)
             .ToList();
+
+        entry.Usage = result.Usage?.Snapshot();
     }
 
     public async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
@@ -203,10 +216,11 @@ internal sealed class PipelineDriver
             var truncatedOutput = result.Output.Length > 300 ? result.Output[..300] + "..." : result.Output;
             _logger.LogError("Worker for goal {GoalId} failed with output: {Output}", pipeline.GoalId, result.Output);
 
-            // Snapshot the narratives already received for this task and attach them to the
-            // matching phase entry — before finalization bookkeeping and before the terminal
-            // MarkGoalFailedAsync call. The pipeline phase is still the executing phase here.
-            CapturePhaseNarratives(pipeline, result);
+            // Snapshot the narratives already received for this task and its reported token usage
+            // onto the matching phase entry — before finalization bookkeeping and before the
+            // terminal MarkGoalFailedAsync call. The pipeline phase is still the executing phase
+            // here, so a failed worker's billed usage is retained even on the terminal path.
+            CapturePhaseEvidence(pipeline, result);
 
             // Select the LAST entry matching the pre-terminal phase and current iteration —
             // same idiom as the no-op retry path. The pipeline phase is still the phase that
@@ -312,12 +326,12 @@ internal sealed class PipelineDriver
                     : "Coder produced no file changes (no-op)\n\n" + noOpReport;
             }
 
-            // Snapshot the narratives already received for this task and attach them to the
-            // matching Coding entry — BEFORE the iteration snapshot (BuildIterationSummary) and
-            // before IterationBudget.TryConsume, so the archived entry carries the narratives
-            // for BOTH the retry exit and the terminal no-op exit (the terminal branch reuses
-            // the already-populated entry).
-            CapturePhaseNarratives(pipeline, result);
+            // Snapshot the narratives already received for this task and its reported token usage
+            // onto the matching Coding entry — BEFORE the iteration snapshot (BuildIterationSummary)
+            // and before IterationBudget.TryConsume, so the archived entry carries both for BOTH
+            // the retry exit and the terminal no-op exit (the terminal branch reuses the
+            // already-populated entry).
+            CapturePhaseEvidence(pipeline, result);
 
             // Attempt the progress-document narrative append on this early exit too — the
             // single attempt for this invocation (no branch-local duplicate). Narratives were
@@ -462,10 +476,10 @@ internal sealed class PipelineDriver
             pipeline.Phase == GoalPhase.Improve &&
             Verdict.Matches(verdict, Verdict.Skip);
 
-        // Snapshot the narratives already received for this task and attach them to the last
-        // matching phase entry — before the advancement/bookkeeping continues. This is the
-        // single append-attempt site for the normal completion path.
-        CapturePhaseNarratives(pipeline, result);
+        // Snapshot the narratives already received for this task, plus its reported token usage,
+        // onto the last matching phase entry — before the advancement/bookkeeping continues. This
+        // is the single capture site for the normal completion path.
+        CapturePhaseEvidence(pipeline, result);
 
         // Append worker narratives for the completed phase to the living progress document.
         await AppendPhaseNarrativesAsync(pipeline, result, workerRole, ct);

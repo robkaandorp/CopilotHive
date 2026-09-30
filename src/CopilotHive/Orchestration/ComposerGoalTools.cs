@@ -586,8 +586,17 @@ public sealed partial class Composer
                     var line = $"- {phase.Name}: {resultStr} ({durationStr})";
                     if (phase.Name == GoalPhase.Testing && iter.TestCounts is not null)
                         line += $" — {iter.TestCounts.Passed}/{iter.TestCounts.Total}";
+                    // A phase with no reported usage renders EXACTLY as before; only a reported
+                    // summary appends the compact token suffix.
+                    if (phase.Usage is not null)
+                        line += $" | {FormatUsageLine(phase.Usage.Total)}";
                     sb.AppendLine(line);
                 }
+
+                // The iteration total, only when at least one worker phase reported usage.
+                var iterationTotals = PhaseUsageTotals.Sum(iter.Phases);
+                if (iterationTotals.PhasesWithUsage > 0)
+                    sb.AppendLine($"- Iteration total: {FormatUsageLine(iterationTotals.Usage.Total)}{FormatMissingPhasesNote(iterationTotals)}");
 
                 if (iter.Clarifications is { Count: > 0 })
                 {
@@ -601,6 +610,17 @@ public sealed partial class Composer
             }
         }
 
+        // The per-goal usage section, only when ANY persisted phase reported usage. A goal whose
+        // data predates the usage property (or whose workers never reported) renders as before.
+        var goalTotals = PhaseUsageTotals.Sum(iterations.SelectMany(i => i.Phases));
+        if (goalTotals.PhasesWithUsage > 0)
+        {
+            sb.AppendLine("\n### Token Usage");
+            sb.AppendLine($"- Total: {FormatUsageLine(goalTotals.Usage.Total)}{FormatMissingPhasesNote(goalTotals)}");
+            foreach (var entry in goalTotals.Usage.Entries)
+                sb.AppendLine($"- {entry.Source} / {entry.Model ?? "(unknown model)"}: {FormatUsageLine(entry.Usage)}");
+        }
+
         if (goal.Notes.Count > 0)
         {
             sb.AppendLine($"\n### Notes");
@@ -610,6 +630,63 @@ public sealed partial class Composer
 
         return sb.ToString().Replace("\r\n", "\n");
     }
+
+    /// <summary>
+    /// Renders one usage bucket as a compact token line, e.g.
+    /// <c>input 12,345 / ≥1,234 (partial) cached input / output 5,678 / unknown reasoning / 7 calls</c>.
+    /// Every level of the <c>get_goal</c> report shares this helper — the per-phase suffix, the
+    /// per-iteration total, and the per-goal total and per-(source, model) lines — so the category
+    /// rules exist exactly once.
+    /// <para>
+    /// Counts are formatted with <c>N0</c> under <see cref="CultureInfo.InvariantCulture"/>, so the
+    /// returned markdown never depends on the ambient culture. Input and output tokens are always
+    /// measured, so they show their number. Cached input and reasoning tokens are optional provider
+    /// categories, so their reported-calls counter decides the rendering:
+    /// <list type="bullet">
+    ///   <item>counter equals <c>Calls</c> → every call reported the category, show the number;</item>
+    ///   <item>counter is zero (with calls made) → no call reported it, show <c>unknown</c>;</item>
+    ///   <item>counter is somewhere between → PARTIAL, show <c>≥{number} (partial)</c>.</item>
+    /// </list>
+    /// The call count is always shown.
+    /// </para>
+    /// </summary>
+    /// <param name="usage">The summed usage bucket to render; must not be <c>null</c>.</param>
+    /// <returns>The rendered token line, without a leading or trailing separator.</returns>
+    private static string FormatUsageLine(TokenUsage usage)
+    {
+        var calls = usage.Calls;
+        return $"input {FormatTokenCount(usage.InputTokens)}"
+            + $" / {FormatOptionalCategory(usage.CachedInputTokens, usage.CachedInputReportedCalls, calls)} cached input"
+            + $" / output {FormatTokenCount(usage.OutputTokens)}"
+            + $" / {FormatOptionalCategory(usage.ReasoningTokens, usage.ReasoningReportedCalls, calls)} reasoning"
+            + $" / {FormatTokenCount(calls)} calls";
+    }
+
+    /// <summary>Formats a token count with thousands separators, culture-independently.</summary>
+    private static string FormatTokenCount(long value) => value.ToString("N0", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Renders an optional provider category (cached input or reasoning tokens) according to how many
+    /// calls actually reported it — see <see cref="FormatUsageLine"/> for the three cases.
+    /// </summary>
+    private static string FormatOptionalCategory(long value, int reportedCalls, int calls)
+    {
+        if (reportedCalls >= calls)
+            return FormatTokenCount(value);
+        if (reportedCalls <= 0)
+            return "unknown";
+        return $"≥{FormatTokenCount(value)} (partial)";
+    }
+
+    /// <summary>
+    /// Renders the trailing note naming how many worker phases contributed no usage at all, or an
+    /// empty string when every worker phase reported. Totals never present "not reported" as zero,
+    /// so the count always travels with them.
+    /// </summary>
+    private static string FormatMissingPhasesNote(PhaseUsageTotals.Result totals) =>
+        totals.PhasesWithoutUsage > 0
+            ? $" ({totals.PhasesWithoutUsage} worker phase(s) without usage reported)"
+            : "";
 
     [Description("Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns ALL archived occurrences and ALL narrative records for the selected phase and iteration, complete and untruncated; max_lines applies ONLY to the output, brain_prompt, and worker_prompt modes. Completed phases of the goal's currently running iteration are also returned and marked as live data.")]
     internal async Task<string> GetPhaseOutputAsync(

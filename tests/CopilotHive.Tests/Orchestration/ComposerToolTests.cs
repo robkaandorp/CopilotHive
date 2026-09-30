@@ -2890,6 +2890,352 @@ public sealed class ComposerToolTests : IDisposable
         Assert.DoesNotContain(" — ", result);
     }
 
+    // ── get_goal — token usage formatting ──
+
+    /// <summary>
+    /// Builds an entry whose counts render every category case: cached input PARTIAL (some calls
+    /// reported it), reasoning UNKNOWN (no call reported it).
+    /// </summary>
+    private static SharpCoder.UsageEntry PartialAndUnknownEntry() => new(
+        SharpCoder.UsageSource.Agent,
+        "model-a",
+        new SharpCoder.TokenUsage
+        {
+            InputTokens = 12_345,
+            OutputTokens = 678,
+            CachedInputTokens = 1_234,
+            ReasoningTokens = 90,
+            Calls = 4,
+            CachedInputReportedCalls = 3,
+            ReasoningReportedCalls = 0,
+        });
+
+    /// <summary>A fully reported entry with a null model — the "(unknown model)" rendering.</summary>
+    private static SharpCoder.UsageEntry CompleteNullModelEntry() => new(
+        SharpCoder.UsageSource.SubAgent,
+        null,
+        new SharpCoder.TokenUsage
+        {
+            InputTokens = 100,
+            OutputTokens = 20,
+            CachedInputTokens = 5,
+            ReasoningTokens = 7,
+            Calls = 2,
+            CachedInputReportedCalls = 2,
+            ReasoningReportedCalls = 2,
+        });
+
+    /// <summary>
+    /// The per-phase suffix, the iteration total and the <c>### Token Usage</c> section, asserted
+    /// with the EXACT renderings — including <c>unknown</c>, <c>≥{n} (partial)</c>,
+    /// <c>(unknown model)</c> and the missing-phase note. The non-worker Merging phase carries usage
+    /// to prove it is excluded from BOTH totals.
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_GoalWithUsage_RendersPhaseSuffixIterationTotalAndTokenUsageSection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-render", "Goal with usage");
+
+        await _store.AddIterationAsync("usage-render", new IterationSummary
+        {
+            Iteration = 1,
+            // Deliberately non-null so the Testing Passed/Total suffix is proven to coexist with
+            // the appended usage suffix, in that order.
+            TestCounts = new TestCounts { Passed = 840, Total = 840, Failed = 0 },
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 45.2,
+                    Usage = new SharpCoder.UsageSummary([PartialAndUnknownEntry()]),
+                },
+                new PhaseResult
+                {
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 12.3,
+                    Usage = new SharpCoder.UsageSummary([CompleteNullModelEntry()]),
+                },
+                new PhaseResult
+                {
+                    // A WORKER phase with no report: counted as missing, contributing no tokens.
+                    Name = GoalPhase.DocWriting,
+                    Result = PhaseOutcome.Skip,
+                    DurationSeconds = 0.5,
+                    Usage = null,
+                },
+                new PhaseResult
+                {
+                    // Non-worker phase carrying usage: ignored entirely by the totals.
+                    Name = GoalPhase.Merging,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 1.0,
+                    Usage = new SharpCoder.UsageSummary([new SharpCoder.UsageEntry(
+                        SharpCoder.UsageSource.Compaction, "model-ignored", new SharpCoder.TokenUsage { InputTokens = 999_999, Calls = 1 })]),
+                },
+            ],
+        }, ct);
+
+        var result = await _composer.GetGoalAsync("usage-render");
+
+        // PHASE SUFFIX: partial cached input, unknown reasoning, plus the always-shown counts.
+        Assert.Contains(
+            "- Coding: pass (45.2s) | input 12,345 / ≥1,234 (partial) cached input / output 678 / unknown reasoning / 4 calls\n",
+            result);
+        // PHASE SUFFIX: a fully reported entry (cached 5, reasoning 7 of 2 calls reported — complete),
+        // appended AFTER the pre-existing Passed/Total suffix.
+        Assert.Contains(
+            "- Testing: pass (12.3s) — 840/840 | input 100 / 5 cached input / output 20 / 7 reasoning / 2 calls\n",
+            result);
+        // The phase with no report renders EXACTLY as before — no suffix at all.
+        Assert.Contains("- DocWriting: skip (0.5s)\n", result);
+        // A non-worker phase's OWN line still shows its report (the per-phase suffix is driven by
+        // the report alone) — but its tokens are excluded from BOTH totals, as the exact total
+        // lines below prove: 999,999 input never appears there.
+        Assert.Contains(
+            "- Merging: pass (1.0s) | input 999,999 / unknown cached input / output 0 / unknown reasoning / 1 calls\n",
+            result);
+
+        // ITERATION TOTAL: Merging's Compaction entry is EXCLUDED (its 999,999 input is absent),
+        // partial categories stay partial, and the one missing worker phase is named.
+        Assert.Contains(
+            "- Iteration total: input 12,445 / ≥1,239 (partial) cached input / output 698 / ≥97 (partial) reasoning / 6 calls (1 worker phase(s) without usage reported)\n",
+            result);
+
+        // GOAL SECTION: total line, one line per (source, model) with (unknown model) for a null
+        // model, and the same missing-phase note (counted once across the goal's iterations).
+        Assert.Contains("\n### Token Usage\n", result);
+        Assert.Contains(
+            "- Total: input 12,445 / ≥1,239 (partial) cached input / output 698 / ≥97 (partial) reasoning / 6 calls (1 worker phase(s) without usage reported)\n",
+            result);
+        Assert.Contains(
+            "- Agent / model-a: input 12,345 / ≥1,234 (partial) cached input / output 678 / unknown reasoning / 4 calls\n",
+            result);
+        Assert.Contains(
+            "- SubAgent / (unknown model): input 100 / 5 cached input / output 20 / 7 reasoning / 2 calls\n",
+            result);
+        // The section carries NO per-iteration duplication and no entry for the ignored source.
+        Assert.DoesNotContain("model-ignored", result);
+
+        // The section sits after the iterations and before the notes.
+        var tokenIndex = result.IndexOf("### Token Usage", StringComparison.Ordinal);
+        var iterationsIndex = result.IndexOf("### Iterations", StringComparison.Ordinal);
+        Assert.True(iterationsIndex < tokenIndex, "The token section must follow the iterations.");
+    }
+
+    /// <summary>
+    /// A goal whose phases ALL report usage gets no missing-phase note, and a goal with no usage at
+    /// all gets neither a suffix nor the section.
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_AllPhasesReported_OmitsMissingPhaseNote()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-complete", "Goal with complete usage");
+        await _store.AddIterationAsync("usage-complete", new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 1.0,
+                    Usage = new SharpCoder.UsageSummary([PartialAndUnknownEntry()]),
+                },
+            ],
+        }, ct);
+
+        var result = await _composer.GetGoalAsync("usage-complete");
+
+        Assert.Contains("### Token Usage", result);
+        Assert.DoesNotContain("worker phase(s) without usage reported", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_NoUsageAnywhere_RendersExactlyTheLegacyOutput()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // A goal seeded DIRECTLY with a pinned creation timestamp so the golden string is stable.
+        await _store.CreateGoalAsync(new Goal
+        {
+            Id = "usage-legacy-golden",
+            Description = "A legacy goal with no usage anywhere",
+            Status = GoalStatus.Draft,
+            CreatedAt = new DateTime(2025, 6, 15, 10, 0, 0, DateTimeKind.Utc),
+            Notes = ["improver skipped: timeout"],
+        }, ct);
+
+        await _store.AddIterationAsync("usage-legacy-golden", new IterationSummary
+        {
+            Iteration = 1,
+            ReviewVerdict = "reject",
+            TestCounts = new TestCounts { Passed = 840, Total = 840, Failed = 0 },
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.2 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 120.1 },
+                new PhaseResult { Name = GoalPhase.Review, Result = PhaseOutcome.Fail, DurationSeconds = 30.5 },
+            ],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                    Phase = "Coding",
+                    WorkerRole = "coder",
+                    Question = "Which branch?",
+                    Answer = "feature/x",
+                    AnsweredBy = "brain",
+                },
+            ],
+        }, ct);
+
+        var result = await _composer.GetGoalAsync("usage-legacy-golden");
+
+        // BYTE-FOR-BYTE golden: no suffix, no iteration total, no token section, and the
+        // Passed/Total Testing suffix and clarification block exactly as before.
+        const string expected =
+            "## Goal: usage-legacy-golden\n"
+            + "- **Status:** Draft\n"
+            + "- **Review Status:** None\n"
+            + "- **Priority:** Normal\n"
+            + "- **Created:** 2025-06-15 10:00\n"
+            + "- **Repositories:** (none)\n"
+            + "- target_repositories: all\n"
+            + "- **Description:** A legacy goal with no usage anywhere\n"
+            + "\n### Iterations (1)\n"
+            + "\n### Iteration 1 (review: reject)\n"
+            + "- Coding: pass (45.2s)\n"
+            + "- Testing: pass (120.1s) — 840/840\n"
+            + "- Review: fail (30.5s)\n"
+            + "  Clarifications:\n"
+            + "  - [brain] coder (Coding): Q: Which branch?\n"
+            + "    A: feature/x\n"
+            + "\n### Notes\n"
+            + "- improver skipped: timeout\n";
+
+        Assert.Equal(expected, result);
+
+        // The distinguishing markers are explicitly absent and the newlines are LF-only.
+        Assert.DoesNotContain("### Token Usage", result);
+        Assert.DoesNotContain("Iteration total", result);
+        Assert.DoesNotContain("input ", result);
+        Assert.DoesNotContain("\r", result);
+    }
+
+    /// <summary>
+    /// THE <c>Calls == 0</c> BOUNDARY — the exact edge of the optional-category rule. With ZERO calls
+    /// there is no call that failed to report a category, so nothing is unmeasured: the rule is
+    /// <c>reportedCalls &gt;= calls</c> and <c>0 &gt;= 0</c> holds, so BOTH optional categories render
+    /// their (zero) NUMBER — <c>unknown</c> requires <c>Calls &gt; 0</c> with 0 reported calls, and
+    /// <c>≥n (partial)</c> requires some-but-not-all calls reported. The line is asserted in FULL, so
+    /// shifting the comparison (<c>&gt;=</c> vs <c>&gt;</c>), or a swapped partial/unknown rendering,
+    /// fails here. The companion case below pins the other side of the boundary.
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_ZeroCallUsage_RendersNumericZeroRatherThanUnknown()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-zero-calls", "Goal whose task made no model calls");
+        await _store.AddIterationAsync("usage-zero-calls", new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 0.1,
+                    // Reported, zero calls: every category is a real (zero) measurement, not unknown.
+                    Usage = new SharpCoder.UsageSummary([new SharpCoder.UsageEntry(
+                        SharpCoder.UsageSource.Agent,
+                        "model-zero",
+                        new SharpCoder.TokenUsage
+                        {
+                            Calls = 0,
+                            CachedInputReportedCalls = 0,
+                            ReasoningReportedCalls = 0,
+                        })]),
+                },
+            ],
+        }, ct);
+
+        var result = await _composer.GetGoalAsync("usage-zero-calls");
+
+        // Exactly the boundary rendering: numeric zeros everywhere, never unknown or partial.
+        Assert.Contains(
+            "- Coding: pass (0.1s) | input 0 / 0 cached input / output 0 / 0 reasoning / 0 calls\n",
+            result);
+        Assert.Contains(
+            "- Iteration total: input 0 / 0 cached input / output 0 / 0 reasoning / 0 calls\n",
+            result);
+        Assert.Contains("### Token Usage", result);
+        Assert.Contains(
+            "- Agent / model-zero: input 0 / 0 cached input / output 0 / 0 reasoning / 0 calls\n",
+            result);
+        // The unmeasured-category renderings are explicitly absent: with zero calls nothing is
+        // unmeasured, so the boundary must NOT drift to unknown here.
+        Assert.DoesNotContain("unknown", result);
+        Assert.DoesNotContain("(partial)", result);
+    }
+
+    /// <summary>
+    /// THE OTHER SIDE OF THE BOUNDARY: the SAME zero reported calls on a bucket that DID make calls
+    /// renders <c>unknown</c> for that category — so the boundary is driven by <c>Calls</c>, not by
+    /// the counter alone. Together with the zero-call case above this pins the <c>&gt;=</c> edge.
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_ZeroReportedCallsWithRealCalls_RendersUnknown()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-zero-reported", "Goal whose calls reported no categories");
+        await _store.AddIterationAsync("usage-zero-reported", new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 0.2,
+                    Usage = new SharpCoder.UsageSummary([new SharpCoder.UsageEntry(
+                        SharpCoder.UsageSource.Agent,
+                        "model-quiet",
+                        new SharpCoder.TokenUsage
+                        {
+                            InputTokens = 40,
+                            OutputTokens = 4,
+                            Calls = 3,
+                            CachedInputReportedCalls = 0,
+                            ReasoningReportedCalls = 0,
+                        })]),
+                },
+            ],
+        }, ct);
+
+        var result = await _composer.GetGoalAsync("usage-zero-reported");
+
+        Assert.Contains(
+            "- Coding: pass (0.2s) | input 40 / unknown cached input / output 4 / unknown reasoning / 3 calls\n",
+            result);
+        Assert.Contains(
+            "- Agent / model-quiet: input 40 / unknown cached input / output 4 / unknown reasoning / 3 calls\n",
+            result);
+        Assert.DoesNotContain("(partial)", result);
+    }
+
     [Fact]
     public async Task GetGoal_WithClarifications_DisplaysClarificationsInIteration()
     {

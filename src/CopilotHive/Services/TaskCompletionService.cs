@@ -173,6 +173,19 @@ internal sealed class TaskCompletionService
                     : result.Output;
             }
 
+            // THE NO-BRAIN USAGE COPY — the same admitted completion's reported token usage. It
+            // sits beside the output copy for the same ownership reason (nothing else would record
+            // it on this path), and it is stored as a DETACHED snapshot: completion receipts can
+            // hold the same TaskResult, so aliasing would let a later mutation reach the record.
+            //
+            // DELIBERATELY UNLIKE THE OUTPUT COPY: a FAILED result is included. Usage is billed
+            // even when the task failed, so the failed attempt's spend must be recorded; the
+            // output copy's non-Failed predicate is about which REPORT is authoritative, not about
+            // whether the phase ran. A null Usage stores null (usage was not reported), an empty
+            // summary stores an empty non-null summary. No phase entry → no-op.
+            if (pipeline.CurrentPhaseEntry is { } noBrainUsageEntry)
+                noBrainUsageEntry.Usage = result.Usage?.Snapshot();
+
             // THE NO-BRAIN PATH — the degenerate single-phase mode. It completes the goal WITHOUT
             // recording the slot, deliberately: the goal reaches Done and its pipeline is removed,
             // so the admitted slot's terminal state is irrelevant. The terminal AdvanceTo abandons

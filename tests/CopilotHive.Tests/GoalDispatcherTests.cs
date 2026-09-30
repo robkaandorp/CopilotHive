@@ -2454,6 +2454,216 @@ public sealed class TaskCompletionServiceGuardTests
         Assert.Equal(GoalPhase.Done, pipeline.Phase);
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  THE NO-BRAIN USAGE COPY — the admitted completion's reported token usage, stamped on the
+    //  current phase entry as a detached snapshot, INCLUDING Failed results (unlike the output
+    //  copy). Guarded/dropped completions stamp nothing: every guard returns before this site.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Both admitted statuses stamp the usage: a Completed result and — DELIBERATELY, unlike the
+    /// output copy — a Failed result, because usage is billed even when the task failed.
+    /// </summary>
+    [Theory]
+    [InlineData(TaskOutcome.Completed)]
+    [InlineData(TaskOutcome.Failed)]
+    public async Task HandleTaskCompletionAsync_NoBrainAdmitted_StampsDetachedUsage(TaskOutcome status)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-usage-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+        var result = CompletionWith(taskId, status, "RAW-OUTPUT", summary: null) with
+        {
+            Usage = PhaseUsageFixtures.BuildFullUsage(),
+        };
+
+        await service.HandleTaskCompletionAsync(result, TestContext.Current.CancellationToken);
+
+        PhaseUsageFixtures.AssertFullUsage(entry.Usage);
+
+        // DETACHED: replacing the result's entries afterwards cannot reach the stored summary.
+        Assert.NotSame(result.Usage, entry.Usage);
+        result.Usage!.Entries = [];
+        PhaseUsageFixtures.AssertFullUsage(entry.Usage);
+    }
+
+    /// <summary>
+    /// NULL AND EMPTY VECTORS for BOTH admitted statuses, each SEEDED with a pre-existing populated
+    /// usage so a stamp skipped on a null/empty result fails instead of passing vacuously: the seed
+    /// must be REPLACED — with null for the null vector, with an empty non-null summary for the empty
+    /// vector. The two outcomes stay distinguishable.
+    /// </summary>
+    /// <param name="status"><see cref="TaskOutcome.Completed"/> or <see cref="TaskOutcome.Failed"/>.</param>
+    /// <param name="usageKind">0 = result.Usage is null, 1 = result.Usage is an empty summary.</param>
+    [Theory]
+    [InlineData(TaskOutcome.Completed, 0)]
+    [InlineData(TaskOutcome.Completed, 1)]
+    [InlineData(TaskOutcome.Failed, 0)]
+    [InlineData(TaskOutcome.Failed, 1)]
+    public async Task HandleTaskCompletionAsync_NoBrainAdmitted_NullAndEmptyUsageReplaceTheSeededValue(
+        TaskOutcome status, int usageKind)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-usage-null-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        // The pre-existing value a skipped stamp would leave behind.
+        entry.Usage = PhaseUsageFixtures.BuildFullUsage();
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, status, "RAW-OUTPUT", summary: null)
+                with { Usage = usageKind == 1 ? new SharpCoder.UsageSummary() : null },
+            TestContext.Current.CancellationToken);
+
+        // The admitted completion ran (the goal reached Done) …
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+        // … and the seeded value was replaced, not left in place.
+        if (usageKind == 1)
+            PhaseUsageFixtures.AssertEmptySummary(entry.Usage);
+        else
+            Assert.Null(entry.Usage);
+    }
+
+    /// <summary>
+    /// GUARDED COMPLETIONS STAMP NOTHING. Every guard/admission refusal returns BEFORE the usage
+    /// copy, so a drop carrying usage leaves every phase entry's usage exactly as it was. The
+    /// entries are seeded with an identifiable pre-existing value so a write would be visible, and
+    /// each vector asserts the EXACT drop classification, so the test cannot pass by refusing for
+    /// an unrelated reason.
+    /// </summary>
+    [Theory]
+    [InlineData("stale")]
+    [InlineData("duplicate")]
+    [InlineData("abandoned")]
+    [InlineData("planning-window")]
+    [InlineData("terminal")]
+    public async Task HandleTaskCompletionAsync_DroppedCompletion_LeavesEveryEntryUsageUntouched(string vector)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var ct = TestContext.Current.CancellationToken;
+
+        GoalPipelineManager pipelineManager;
+        GoalPipeline pipeline;
+        string taskId;
+        Func<CollectingLogger<TaskCompletionService>, bool> sawExpectedDrop;
+
+        switch (vector)
+        {
+            case "stale":
+                // The pipeline advanced: the completion's task is no longer the active one.
+                (pipelineManager, pipeline, taskId) =
+                    SlotGuardFixture($"goal-usage-stale-{Guid.NewGuid():N}", WorkSlotState.Pending);
+                pipeline.SetActiveTask("task-newer-active");
+                sawExpectedDrop = l => l.Logs.Any(x => x.Message.Contains("ignoring stale completion"));
+                break;
+
+            case "duplicate":
+                // The attempt was already admitted — replayed completion.
+                (pipelineManager, pipeline, taskId) =
+                    SlotGuardFixture($"goal-usage-dup-{Guid.NewGuid():N}", WorkSlotState.Recorded);
+                Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, pipeline.AdmitCompletion(taskId));
+                sawExpectedDrop = l => l.Logs.Any(x => x.Message.Contains("duplicate-completion"));
+                break;
+
+            case "abandoned":
+                (pipelineManager, pipeline, taskId) =
+                    SlotGuardFixture($"goal-usage-abandoned-{Guid.NewGuid():N}", WorkSlotState.Abandoned);
+                sawExpectedDrop = l => l.Logs.Any(x => x.Message.Contains("slot-state=abandoned"));
+                break;
+
+            case "planning-window":
+                var goal = new Goal { Id = $"goal-usage-window-{Guid.NewGuid():N}", Description = "Test" };
+                pipelineManager = new GoalPipelineManager();
+                pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+                var plan = IterationPlan.Default();
+                pipeline.SetPlan(plan);
+                pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
+                Assert.Equal(TransitionEffect.NewIteration, pipeline.StateMachine.Transition(PhaseInput.Failed).Effect);
+                pipeline.AdvanceTo(GoalPhase.Planning);
+                taskId = $"task-{Guid.NewGuid():N}";
+                pipelineManager.RegisterTask(taskId, goal.Id);
+                pipeline.SetActiveTask(taskId);
+                sawExpectedDrop = l => l.Logs.Any(x => x.Message.Contains("reason=planning-window"));
+                break;
+
+            case "terminal":
+                (pipelineManager, pipeline, taskId) =
+                    SlotGuardFixture($"goal-usage-terminal-{Guid.NewGuid():N}", WorkSlotState.Pending);
+                pipeline.AdvanceTo(GoalPhase.Done);
+                sawExpectedDrop = l => l.Logs.Any(x => x.Message.Contains("ignoring duplicate"));
+                break;
+
+            default:
+                throw new InvalidOperationException($"Unhandled drop vector: {vector}");
+        }
+
+        // The pre-existing usage on the entry that a wrong write would overwrite.
+        var existingUsageEntry = SeedPhaseEntry(pipeline, output: PhaseOutputSentinel);
+        existingUsageEntry.Usage = PhaseUsageFixtures.BuildFullUsage();
+        var usageInstanceBefore = existingUsageEntry.Usage;
+
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        // Before-state: the goal status and the pipeline phase a wrong write would move.
+        var goalStatusBefore = pipeline.Goal.Status;
+        var phaseBefore = pipeline.Phase;
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "DROPPED-OUTPUT", "DROPPED-SUMMARY")
+                with { Usage = new SharpCoder.UsageSummary() },
+            ct);
+
+        // THE VECTOR REALLY HIT ITS GUARD — the drop is classified as intended, so the absence of a
+        // stamp cannot be mistaken for the completion having failed for an unrelated reason.
+        Assert.True(sawExpectedDrop(logger),
+            $"Expected the '{vector}' drop classification. Logs: {string.Join(" | ", logger.Logs.Select(l => l.Message))}");
+
+        // The drop left the seeded value untouched — same instance, same counts, and no empty
+        // summary was written in its place.
+        Assert.Same(usageInstanceBefore, existingUsageEntry.Usage);
+        Assert.Equal(3, existingUsageEntry.Usage!.Entries.Count);
+        PhaseUsageFixtures.AssertFullUsage(existingUsageEntry.Usage);
+        Assert.Equal(PhaseOutputSentinel, existingUsageEntry.WorkerOutput);
+        // And nothing else moved either: the drop did not complete the goal.
+        Assert.Equal(goalStatusBefore, pipeline.Goal.Status);
+        Assert.Equal(phaseBefore, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// The no-brain path really does complete the goal (so the vector above is not vacuous): the
+    /// same fixture WITHOUT a guard reaches the stamp site and completes the goal.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainUnguardedCompletion_ReachesTheStampSite()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-usage-admitted-control-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "ADMITTED-OUTPUT", "ADMITTED-SUMMARY")
+                with { Usage = PhaseUsageFixtures.BuildFullUsage() },
+            TestContext.Current.CancellationToken);
+
+        // POSITIVE CONTROL: the unguarded path stamps and completes.
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+        Assert.Equal("ADMITTED-SUMMARY", entry.WorkerOutput);
+        PhaseUsageFixtures.AssertFullUsage(entry.Usage);
+    }
+
     /// <summary>
     /// THE NORMALIZATION, pinned. <see cref="TaskResult"/> carries NO worker role, so a DIRECT
     /// domain caller — the vector the old transport block could never produce — receives exactly

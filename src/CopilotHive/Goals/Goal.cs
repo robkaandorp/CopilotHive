@@ -240,6 +240,25 @@ public sealed class PhaseResult
     public List<NarrativeEntry>? Narratives { get; set; }
 
     /// <summary>
+    /// The provider-reported token usage of the worker task that produced this phase, stored as a
+    /// detached snapshot. Same semantics as <see cref="TaskResult.Usage"/>:
+    /// <para>
+    /// <c>null</c> means usage was NOT reported — legacy persisted data that predates this
+    /// property, a legacy worker or test double that reports no usage, a non-worker phase, or a
+    /// phase that is still running. An EMPTY, non-null summary means usage WAS reported and the
+    /// task made zero model calls; the two cases are deliberately distinguishable.
+    /// </para>
+    /// <para>
+    /// A per-(source, model) category is only a real measurement when its reported-calls counter
+    /// (<see cref="SharpCoder.TokenUsage.CachedInputReportedCalls"/> for cached input tokens,
+    /// <see cref="SharpCoder.TokenUsage.ReasoningReportedCalls"/> for reasoning tokens) equals
+    /// <see cref="SharpCoder.TokenUsage.Calls"/>. Otherwise the category is incomplete/partial and
+    /// its summed value is "unknown" — not zero.
+    /// </para>
+    /// </summary>
+    public SharpCoder.UsageSummary? Usage { get; set; }
+
+    /// <summary>
     /// Creates a new <see cref="PhaseResult"/> entry for a phase that is about to start.
     /// Sets sensible defaults: <see cref="Result"/> = <see cref="PhaseOutcome.Pass"/>,
     /// <see cref="StartedAt"/> = <see cref="DateTime.UtcNow"/>, and populates
