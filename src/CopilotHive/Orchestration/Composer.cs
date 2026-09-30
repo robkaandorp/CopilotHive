@@ -1019,7 +1019,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             AIFunctionFactory.Create(GetGoalAsync, "get_goal",
                 "Get full details for a goal including iteration history."),
             AIFunctionFactory.Create(GetPhaseOutputAsync, "get_phase_output",
-                "Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns all archived occurrences and records for the selected phase and iteration, complete and untruncated; max_lines applies only to the output, brain_prompt, and worker_prompt modes."),
+                "Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns all archived occurrences and records for the selected phase and iteration, complete and untruncated; max_lines applies only to the output, brain_prompt, and worker_prompt modes. Completed phases of the goal's currently running iteration are also returned and marked as live data."),
             AIFunctionFactory.Create(ListGoalsAsync, "list_goals",
                 "List goals, optionally filtered by status and release. Default release filter is 'unreleased'. Use 'all' for all goals or a release ID for a specific release (selects all releases sharing its tag and status). Output always names the active filter."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",

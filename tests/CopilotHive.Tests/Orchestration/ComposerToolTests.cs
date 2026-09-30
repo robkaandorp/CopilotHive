@@ -7893,6 +7893,407 @@ public sealed class ComposerToolTests : IDisposable
         Assert.DoesNotContain("Your task: test the code", result);
     }
 
+    // ── get_phase_output — live-phase fallback (currently running iteration) ──
+
+    /// <summary>The exact first line every successful live (not-yet-persisted) response starts with.</summary>
+    private static string LiveMarker(int iteration) =>
+        $"(in-progress iteration {iteration} — live data, not yet persisted)";
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_CompletedPhase_ReturnsMarkerAndFullOutput_WithMaxLinesTruncation()
+    {
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-out");
+
+        var liveOutput = "live coder output line 1\nlive coder output line 2";
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true, workerOutput: liveOutput));
+
+        // No persisted summary exists, so the completed live Coding entry is returned in full,
+        // preceded by exactly one marker line.
+        var result = await composer.GetPhaseOutputAsync("live-out", 1, "Coding");
+        Assert.Equal(LiveMarker(1) + "\n" + liveOutput, result);
+
+        // max_lines truncation still applies to live output.
+        var longOutput = string.Join("\n", Enumerable.Range(1, 300).Select(i => $"Live guard line {i}"));
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Testing, 1, 1, completed: true, workerOutput: longOutput));
+
+        var truncated = await composer.GetPhaseOutputAsync("live-out", 1, "Testing", max_lines: 10);
+        Assert.StartsWith(LiveMarker(1) + "\n", truncated, StringComparison.Ordinal);
+        Assert.Contains("Live guard line 1", truncated, StringComparison.Ordinal);
+        Assert.DoesNotContain("Live guard line 300", truncated, StringComparison.Ordinal);
+        Assert.Contains("... (truncated, 300 lines total)", truncated, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_InProgressPhase_StillInProgressMessage()
+    {
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-inprogress");
+
+        // A dispatched-but-not-completed phase can already carry prompts (set at dispatch) but
+        // has no worker output and no narrative snapshot yet.
+        pipeline.PhaseLog.Add(LiveEntry(
+            GoalPhase.Coding, 1, 1, completed: false,
+            brainPrompt: "dispatch-time live brain prompt", workerPrompt: "dispatch-time live worker prompt"));
+
+        Assert.Equal("Phase 'Coding' is still in progress in iteration 1",
+            await composer.GetPhaseOutputAsync("live-inprogress", 1, "Coding"));
+        Assert.Equal("Phase 'Coding' is still in progress in iteration 1",
+            await composer.GetPhaseOutputAsync("live-inprogress", 1, "Coding", content: "narratives"));
+
+        // Prompts are set at dispatch, so the running entry DOES supply them — after the marker.
+        Assert.Equal(LiveMarker(1) + "\ndispatch-time live brain prompt",
+            await composer.GetPhaseOutputAsync("live-inprogress", 1, "Coding", content: "brain_prompt"));
+        Assert.Equal(LiveMarker(1) + "\ndispatch-time live worker prompt",
+            await composer.GetPhaseOutputAsync("live-inprogress", 1, "Coding", content: "worker_prompt"));
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_TinyMaxLines_TruncatesOutputAndPromptsAfterMarker()
+    {
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-truncate");
+
+        var longLivePrompt = string.Join("\n", Enumerable.Range(1, 120).Select(i => $"Live prompt line {i}"));
+        pipeline.PhaseLog.Add(LiveEntry(
+            GoalPhase.Coding, 1, 1, completed: true,
+            workerOutput: longLivePrompt,
+            brainPrompt: longLivePrompt,
+            workerPrompt: longLivePrompt));
+
+        foreach (var mode in new[] { "output", "brain_prompt", "worker_prompt" })
+        {
+            var result = await composer.GetPhaseOutputAsync("live-truncate", 1, "Coding", max_lines: 5, content: mode);
+            Assert.StartsWith(LiveMarker(1) + "\n", result, StringComparison.Ordinal);
+            Assert.Contains("Live prompt line 1", result, StringComparison.Ordinal);
+            Assert.DoesNotContain("Live prompt line 120", result, StringComparison.Ordinal);
+            Assert.Contains("... (truncated, 120 lines total)", result, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_Narratives_ReturnsCompletedMatchesInOrderAfterMarker()    {
+        var t1 = new DateTime(2025, 7, 1, 9, 0, 0, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 7, 1, 9, 5, 0, DateTimeKind.Utc);
+
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-narr");
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true,
+            narratives: [MakeNarrative(t1, "worker-live-a", "task-live-1", "first live narrative")]));
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 2, completed: true,
+            narratives: [MakeNarrative(t2, "worker-live-b", "task-live-2", "second live narrative")]));
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 3, completed: false,
+            narratives: [MakeNarrative(t2, "worker-live-c", "task-live-3", "running narrative must not appear")]));
+
+        var result = await composer.GetPhaseOutputAsync("live-narr", 1, "Coding", content: "narratives");
+
+        // Records verbatim, completed entries only, after the single marker line.
+        var expected =
+            LiveMarker(1) + "\n" +
+            "--- Iteration 1 / phase Coding / occurrence 1 / match 1 of 2 ---\n" +
+            $"[{t1.ToString("o", CultureInfo.InvariantCulture)}] worker-live-a (task-live-1):\n" +
+            "first live narrative\n" +
+            "--- end of record ---\n" +
+            "--- Iteration 1 / phase Coding / occurrence 2 / match 2 of 2 ---\n" +
+            $"[{t2.ToString("o", CultureInfo.InvariantCulture)}] worker-live-b (task-live-2):\n" +
+            "second live narrative\n" +
+            "--- end of record ---\n";
+        Assert.Equal(expected, result, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+        Assert.DoesNotContain("running narrative must not appear", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_MixedOccurrences_OutputFirstCompleted_NarrativesCompletedOnly_PromptsLastMatch()
+    {
+        var t1 = new DateTime(2025, 7, 2, 10, 0, 0, DateTimeKind.Utc);
+
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-mixed");
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true,
+            workerOutput: "live-completed-occurrence-one-output",
+            brainPrompt: "live brain prompt occurrence one",
+            workerPrompt: "live worker prompt occurrence one",
+            narratives: [MakeNarrative(t1, "worker-one", "task-one", "live-narrative-occurrence-one")]));
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 2, completed: false,
+            workerOutput: "live-running-occurrence-two-output",
+            brainPrompt: "live brain prompt occurrence two",
+            workerPrompt: "live worker prompt occurrence two",
+            narratives: [MakeNarrative(t1, "worker-two", "task-two", "live-narrative-occurrence-two")]));
+
+        // output: FIRST COMPLETED match — the running occurrence 2 is excluded before selection.
+        var output = await composer.GetPhaseOutputAsync("live-mixed", 1, "Coding");
+        Assert.Equal(LiveMarker(1) + "\nlive-completed-occurrence-one-output", output);
+        Assert.DoesNotContain("live-running-occurrence-two-output", output, StringComparison.Ordinal);
+
+        // narratives: completed occurrence 1 only — nothing from running occurrence 2.
+        var narratives = await composer.GetPhaseOutputAsync("live-mixed", 1, "Coding", content: "narratives");
+        Assert.Contains("live-narrative-occurrence-one", narratives, StringComparison.Ordinal);
+        Assert.DoesNotContain("live-narrative-occurrence-two", narratives, StringComparison.Ordinal);
+        Assert.Contains("match 1 of 1", narratives, StringComparison.Ordinal);
+
+        // prompts: LAST match overall — the still-running occurrence 2 supplies them.
+        Assert.Equal(LiveMarker(1) + "\nlive brain prompt occurrence two",
+            await composer.GetPhaseOutputAsync("live-mixed", 1, "Coding", content: "brain_prompt"));
+        Assert.Equal(LiveMarker(1) + "\nlive worker prompt occurrence two",
+            await composer.GetPhaseOutputAsync("live-mixed", 1, "Coding", content: "worker_prompt"));
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_PersistedSummaryForSameIterationWinsOverLivePhaseLog()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var narrativeTime = new DateTime(2025, 7, 3, 11, 0, 0, DateTimeKind.Utc);
+
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-persisted-wins");
+
+        await _store.AddIterationAsync("live-persisted-wins", new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 1,
+                WorkerOutput = "persisted-summary-output",
+                BrainPrompt = "persisted summary brain prompt",
+                WorkerPrompt = "persisted summary worker prompt",
+                Narratives = [MakeNarrative(narrativeTime, "worker-persisted", "task-persisted", "persisted-summary-narrative")],
+            }],
+        }, ct);
+
+        // Distinct live text proves which source was read.
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true,
+            workerOutput: "live-phase-log-output",
+            brainPrompt: "live phase log brain prompt",
+            workerPrompt: "live phase log worker prompt",
+            narratives: [MakeNarrative(narrativeTime, "worker-live", "task-live", "live-phase-log-narrative")]));
+
+        // Stored data wins: no marker and only the persisted payloads.
+        var output = await composer.GetPhaseOutputAsync("live-persisted-wins", 1, "Coding");
+        Assert.Equal("persisted-summary-output", output);
+
+        var brainPrompt = await composer.GetPhaseOutputAsync("live-persisted-wins", 1, "Coding", content: "brain_prompt");
+        Assert.Equal("persisted summary brain prompt", brainPrompt);
+
+        var workerPrompt = await composer.GetPhaseOutputAsync("live-persisted-wins", 1, "Coding", content: "worker_prompt");
+        Assert.Equal("persisted summary worker prompt", workerPrompt);
+
+        var narratives = await composer.GetPhaseOutputAsync("live-persisted-wins", 1, "Coding", content: "narratives");
+        Assert.Contains("persisted-summary-narrative", narratives, StringComparison.Ordinal);
+        Assert.DoesNotContain("live-phase-log-narrative", narratives, StringComparison.Ordinal);
+        Assert.DoesNotContain(LiveMarker(1), narratives, StringComparison.Ordinal);
+        Assert.DoesNotContain("live-phase-log-output", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_OtherIterationWithNothingPersisted_ReturnsPerModeMessages()
+    {
+        var (composer, pipeline, _) = await BuildLivePipelineComposerAsync("live-other-iter");
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true, workerOutput: "live iteration one output"));
+
+        // The pipeline's current iteration is 1; iteration 2 has nothing persisted.
+        Assert.Equal("Iteration 2 not found", await composer.GetPhaseOutputAsync("live-other-iter", 2, "Coding"));
+        Assert.Equal("Iteration 2 not found", await composer.GetPhaseOutputAsync("live-other-iter", 2, "Coding", content: "narratives"));
+        Assert.Equal(
+            "No brain prompt is available for phase 'Coding' in iteration 2 of goal 'live-other-iter'.",
+            await composer.GetPhaseOutputAsync("live-other-iter", 2, "Coding", content: "brain_prompt"));
+        Assert.Equal(
+            "No worker prompt is available for phase 'Coding' in iteration 2 of goal 'live-other-iter'.",
+            await composer.GetPhaseOutputAsync("live-other-iter", 2, "Coding", content: "worker_prompt"));
+
+        // A pipeline that has moved on to its NEXT iteration never serves an older iteration's
+        // log entries: the iteration number must match the pipeline's current iteration.
+        var (advancedComposer, advancedPipeline, advancedManager) = await BuildLivePipelineComposerAsync("live-advanced");
+        advancedPipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true, workerOutput: "stale iteration one live output"));
+        Assert.True(advancedPipeline.IterationBudget.TryConsume());
+        Assert.Equal(2, advancedPipeline.Iteration);
+        Assert.Same(advancedPipeline, advancedManager.GetByGoalId("live-advanced"));
+
+        Assert.Equal("Iteration 1 not found", await advancedComposer.GetPhaseOutputAsync("live-advanced", 1, "Coding"));
+        Assert.Equal("Iteration 1 not found", await advancedComposer.GetPhaseOutputAsync("live-advanced", 1, "Coding", content: "narratives"));
+        Assert.Equal(
+            "No worker prompt is available for phase 'Coding' in iteration 1 of goal 'live-advanced'.",
+            await advancedComposer.GetPhaseOutputAsync("live-advanced", 1, "Coding", content: "worker_prompt"));
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_NoPipelineManagerOrNoPipelineForGoal_ExistingMessagesUnchanged()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // (a) No GoalPipelineManager registered at all.
+        await _composer.CreateGoalAsync("live-none-registered", "No live source registered");
+        Assert.Equal("Iteration 1 not found", await _composer.GetPhaseOutputAsync("live-none-registered", 1, "Coding"));
+        Assert.Equal("Iteration 1 not found", await _composer.GetPhaseOutputAsync("live-none-registered", 1, "Coding", content: "narratives"));
+        Assert.Equal(
+            "No brain prompt is available for phase 'Coding' in iteration 1 of goal 'live-none-registered'.",
+            await _composer.GetPhaseOutputAsync("live-none-registered", 1, "Coding", content: "brain_prompt"));
+
+        // (b) A registered GoalPipelineManager that has NO pipeline for the requested goal.
+        await _composer.CreateGoalAsync("live-absent-goal", "No pipeline exists for this goal");
+        var manager = new GoalPipelineManager();
+        var otherGoal = await _store.GetGoalAsync("live-none-registered", ct);
+        Assert.NotNull(otherGoal);
+        manager.CreatePipeline(otherGoal!);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            serviceProvider: BuildServiceProvider(manager));
+
+        Assert.Equal("Iteration 1 not found", await composer.GetPhaseOutputAsync("live-absent-goal", 1, "Coding"));
+        Assert.Equal("Iteration 1 not found", await composer.GetPhaseOutputAsync("live-absent-goal", 1, "Coding", content: "narratives"));
+        Assert.Equal(
+            "No worker prompt is available for phase 'Coding' in iteration 1 of goal 'live-absent-goal'.",
+            await composer.GetPhaseOutputAsync("live-absent-goal", 1, "Coding", content: "worker_prompt"));
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_IterationExistsButPhaseAbsent_PhaseNotFoundMessages()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("live-empty-log", "Live iteration with an empty phase log");
+        var goal = await _store.GetGoalAsync("live-empty-log", ct);
+        Assert.NotNull(goal);
+
+        var manager = new GoalPipelineManager();
+        manager.CreatePipeline(goal!);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            serviceProvider: BuildServiceProvider(manager));
+
+        // The live iteration exists (pipeline.Iteration == 1) but has no Coding entry yet:
+        // the per-mode not-found messages are returned with NO live marker.
+        var output = await composer.GetPhaseOutputAsync("live-empty-log", 1, "Coding");
+        var narratives = await composer.GetPhaseOutputAsync("live-empty-log", 1, "Coding", content: "narratives");
+
+        Assert.Equal("Phase 'Coding' not found in iteration 1", output);
+        Assert.Equal("Phase 'Coding' not found in iteration 1", narratives);
+        Assert.Equal(
+            "No brain prompt is available for phase 'Coding' in iteration 1 of goal 'live-empty-log'.",
+            await composer.GetPhaseOutputAsync("live-empty-log", 1, "Coding", content: "brain_prompt"));
+        Assert.DoesNotContain(LiveMarker(1), output, StringComparison.Ordinal);
+        Assert.DoesNotContain(LiveMarker(1), narratives, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Live_DeletedGoalWithPipelineInMemory_ReturnsNoLiveData()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var (composer, pipeline, manager) = await BuildLivePipelineComposerAsync("live-deleted");
+        pipeline.PhaseLog.Add(LiveEntry(GoalPhase.Coding, 1, 1, completed: true,
+            workerOutput: "deleted-goal-live-output-must-not-leak",
+            brainPrompt: "deleted-goal-brain-prompt-must-not-leak",
+            workerPrompt: "deleted-goal-worker-prompt-must-not-leak"));
+
+        Assert.True(await _store.DeleteGoalAsync("live-deleted", ct));
+
+        // The pipeline is STILL in memory and its iteration still matches the request — the
+        // deleted-goal gate must nevertheless refuse live data.
+        Assert.Same(pipeline, manager.GetByGoalId("live-deleted"));
+        Assert.Equal(1, pipeline.Iteration);
+
+        var output = await composer.GetPhaseOutputAsync("live-deleted", 1, "Coding");
+        var narratives = await composer.GetPhaseOutputAsync("live-deleted", 1, "Coding", content: "narratives");
+        var brainPrompt = await composer.GetPhaseOutputAsync("live-deleted", 1, "Coding", content: "brain_prompt");
+        var workerPrompt = await composer.GetPhaseOutputAsync("live-deleted", 1, "Coding", content: "worker_prompt");
+
+        Assert.Equal("Goal not found", output);
+        Assert.Equal("Goal not found", narratives);
+        Assert.Equal("No brain prompt is available for phase 'Coding' in iteration 1 of goal 'live-deleted'.", brainPrompt);
+        Assert.Equal("No worker prompt is available for phase 'Coding' in iteration 1 of goal 'live-deleted'.", workerPrompt);
+
+        foreach (var response in new[] { output, narratives, brainPrompt, workerPrompt })
+        {
+            Assert.DoesNotContain(LiveMarker(1), response, StringComparison.Ordinal);
+            Assert.DoesNotContain("must-not-leak", response, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void GetPhaseOutputTool_Live_RegisteredAndMethodDescriptionsAdvertiseLiveData()
+    {
+        var tools = _composer.BuildComposerTools();
+        var tool = tools.OfType<AIFunction>().Single(t => t.Name == "get_phase_output");
+        var methodDescription = (string)tool.UnderlyingMethod!.GetCustomAttributesData()
+            .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute")
+            .ConstructorArguments[0].Value!;
+        var registeredDescription = Assert.IsType<string>(tool.Description);
+
+        static void AssertLiveSentence(string description)
+        {
+            // The appended live-data sentence, present in BOTH descriptions.
+            Assert.Contains("Completed phases of the goal's currently running iteration are also returned and marked as live data.",
+                description, StringComparison.Ordinal);
+            // Every phrase the pre-existing description tests assert stays intact.
+            Assert.Contains("all archived occurrences", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("complete and untruncated", description, StringComparison.OrdinalIgnoreCase);
+        }
+
+        AssertLiveSentence(methodDescription);
+        AssertLiveSentence(registeredDescription);
+    }
+
+    /// <summary>
+    /// Creates a goal, registers a LIVE pipeline for it in a fresh <see cref="GoalPipelineManager"/>
+    /// and returns a <see cref="Composer"/> whose service provider resolves that manager — the
+    /// harness for the live-phase-output fallback tests.
+    /// </summary>
+    private async Task<(Composer Composer, GoalPipeline Pipeline, GoalPipelineManager Manager)> BuildLivePipelineComposerAsync(
+        string goalId)
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync(goalId, $"Live phase output harness goal '{goalId}'");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        Assert.NotNull(goal);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = manager.CreatePipeline(goal!);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            serviceProvider: BuildServiceProvider(manager));
+
+        return (composer, pipeline, manager);
+    }
+
+    /// <summary>
+    /// Builds a deterministic <see cref="PhaseResult"/> for a live pipeline's phase log.
+    /// <paramref name="completed"/> controls <c>CompletedAt</c>: <c>true</c> marks the phase as
+    /// completed, <c>false</c> leaves it null (still running). No wall-clock time is consulted.
+    /// </summary>
+    private static PhaseResult LiveEntry(
+        GoalPhase phase,
+        int iteration,
+        int occurrence,
+        bool completed,
+        string? workerOutput = null,
+        string? brainPrompt = null,
+        string? workerPrompt = null,
+        List<NarrativeEntry>? narratives = null)
+    {
+        var startedAt = new DateTime(2025, 6, 1, 12, 0, 0, DateTimeKind.Utc).AddMinutes(occurrence);
+        return new PhaseResult
+        {
+            Name = phase,
+            Result = PhaseOutcome.Pass,
+            DurationSeconds = 1.0,
+            Iteration = iteration,
+            Occurrence = occurrence,
+            StartedAt = startedAt,
+            CompletedAt = completed ? startedAt.AddSeconds(5) : null,
+            WorkerOutput = workerOutput,
+            BrainPrompt = brainPrompt,
+            WorkerPrompt = workerPrompt,
+            Narratives = narratives,
+        };
+    }
+
     /// <summary>
     /// Builds a minimal <see cref="IServiceProvider"/> that resolves the given
     /// <see cref="GoalDispatcher"/> — used to break the circular DI in tests.
@@ -7901,6 +8302,17 @@ public sealed class ComposerToolTests : IDisposable
     {
         var services = new ServiceCollection();
         services.AddSingleton(dispatcher);
+        return services.BuildServiceProvider();
+    }
+
+    /// <summary>
+    /// Builds a minimal <see cref="IServiceProvider"/> that resolves the given
+    /// <see cref="GoalPipelineManager"/> — the live-pipeline source for get_phase_output.
+    /// </summary>
+    private static IServiceProvider BuildServiceProvider(GoalPipelineManager pipelineManager)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(pipelineManager);
         return services.BuildServiceProvider();
     }
 

@@ -611,7 +611,7 @@ public sealed partial class Composer
         return sb.ToString().Replace("\r\n", "\n");
     }
 
-    [Description("Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns ALL archived occurrences and ALL narrative records for the selected phase and iteration, complete and untruncated; max_lines applies ONLY to the output, brain_prompt, and worker_prompt modes.")]
+    [Description("Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns ALL archived occurrences and ALL narrative records for the selected phase and iteration, complete and untruncated; max_lines applies ONLY to the output, brain_prompt, and worker_prompt modes. Completed phases of the goal's currently running iteration are also returned and marked as live data.")]
     internal async Task<string> GetPhaseOutputAsync(
         [Description("Goal ID")] string id,
         [Description("Iteration number (1-based)")] int iteration,
@@ -649,20 +649,29 @@ public sealed partial class Composer
             if (narrativeGoal is null)
                 return "Goal not found";
 
-            var iterationsForNarratives = await _goalStore.GetIterationsAsync(id);
-            var iterSummaryForNarratives = iterationsForNarratives.FirstOrDefault(i => i.Iteration == iteration);
-            if (iterSummaryForNarratives is null)
+            var narrativesSource = await ResolvePhaseIterationSourceAsync(id, iteration);
+            if (narrativesSource is not { } narrativesIteration)
                 return $"Iteration {iteration} not found";
 
-            // Select ALL matching PhaseResult entries in persisted list order — earlier
+            // Select matching PhaseResult entries in list order — earlier
             // coding/testing rounds must stay accessible even when a later round exists.
-            var phaseEntries = iterSummaryForNarratives.Phases
+            // On LIVE data only COMPLETED entries count: a still-running phase has no
+            // narrative snapshot yet, so it is excluded before selection.
+            var narrativeMatches = narrativesIteration.Phases
                 .Where(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase))
                 .ToList();
-            if (phaseEntries.Count == 0)
+            if (narrativeMatches.Count == 0)
                 return $"Phase '{phase}' not found in iteration {iteration}";
 
+            var phaseEntries = narrativesIteration.IsLive
+                ? narrativeMatches.Where(p => p.CompletedAt is not null).ToList()
+                : narrativeMatches;
+            if (phaseEntries.Count == 0)
+                return $"Phase '{phase}' is still in progress in iteration {iteration}";
+
             var sb = new System.Text.StringBuilder();
+            if (narrativesIteration.IsLive)
+                sb.Append($"(in-progress iteration {iteration} — live data, not yet persisted)").Append('\n');
             for (var sequence = 0; sequence < phaseEntries.Count; sequence++)
             {
                 var entry = phaseEntries[sequence];
@@ -714,13 +723,15 @@ public sealed partial class Composer
             if (promptGoal is null)
                 return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 
-            // Look for the prompt in persisted iteration summaries
-            var iterationsForPrompt = await _goalStore.GetIterationsAsync(id);
-            var iterSummaryForPrompt = iterationsForPrompt.FirstOrDefault(i => i.Iteration == iteration);
+            // Look for the prompt in the persisted iteration summary, falling back to the
+            // live phase log of the goal's currently running iteration.
+            var promptIteration = await ResolvePhaseIterationSourceAsync(id, iteration);
             PhaseResult? phaseEntry = null;
-            if (iterSummaryForPrompt is not null)
+            if (promptIteration is { } promptSource)
             {
-                phaseEntry = iterSummaryForPrompt.Phases
+                // LIVE and PERSISTED data share the selection rule: the LAST matching entry.
+                // Prompts are set at dispatch time, so a still-running entry may supply them.
+                phaseEntry = promptSource.Phases
                     .LastOrDefault(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase));
             }
 
@@ -731,12 +742,13 @@ public sealed partial class Composer
             if (string.IsNullOrEmpty(promptText))
                 return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 
+            var promptPrefix = promptIteration!.Value.IsLive ? $"(in-progress iteration {iteration} — live data, not yet persisted)\n" : string.Empty;
             var promptLines = promptText.Split('\n');
             if (promptLines.Length <= max_lines)
-                return promptText;
+                return promptPrefix + promptText;
 
             var truncatedPrompt = string.Join('\n', promptLines.Take(max_lines));
-            return truncatedPrompt + $"\n... (truncated, {promptLines.Length} lines total)";
+            return promptPrefix + truncatedPrompt + $"\n... (truncated, {promptLines.Length} lines total)";
         }
 
         // 5. Fetch goal (output mode)
@@ -744,36 +756,86 @@ public sealed partial class Composer
         if (goal is null)
             return "Goal not found";
 
-        // 6. Fetch iterations and find the requested iteration
-        var iterations = await _goalStore.GetIterationsAsync(id);
-        var iterSummary = iterations.FirstOrDefault(i => i.Iteration == iteration);
-        if (iterSummary is null)
+        // 6. Fetch the requested iteration — persisted summary first, live phase log as fallback
+        var outputIteration = await ResolvePhaseIterationSourceAsync(id, iteration);
+        if (outputIteration is not { } outputSource)
             return $"Iteration {iteration} not found";
 
-        // 7. Find the phase in the iteration
-        var phaseResult = iterSummary.Phases
-            .FirstOrDefault(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase));
-        if (phaseResult is null)
+        // 7. Find the phase in the iteration. On LIVE data only COMPLETED entries count:
+        //    a still-running phase's WorkerOutput is not yet recorded, so it is excluded
+        //    before selection (output takes the FIRST completed match).
+        var outputMatches = outputSource.Phases
+            .Where(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (outputMatches.Count == 0)
             return $"Phase '{phase}' not found in iteration {iteration}";
 
-        // 8. Check worker output, then fall back to PhaseOutputs dictionary
+        PhaseResult? phaseResult = outputSource.IsLive
+            ? outputMatches.FirstOrDefault(p => p.CompletedAt is not null)
+            : outputMatches[0];
+        if (phaseResult is null)
+            return $"Phase '{phase}' is still in progress in iteration {iteration}";
+
+        // 8. Check worker output; live data has no persisted PhaseOutputs dictionary fallback
         string? output = phaseResult.WorkerOutput;
 
-        if (string.IsNullOrEmpty(output))
+        if (string.IsNullOrEmpty(output) && !outputSource.IsLive)
         {
             var outputKey = $"{rolePrefix}-{iteration}";
-            iterSummary.PhaseOutputs.TryGetValue(outputKey, out output);
+            outputSource.PhaseOutputs.TryGetValue(outputKey, out output);
         }
 
         if (string.IsNullOrEmpty(output))
             return $"No output recorded for phase {phase} in iteration {iteration}";
 
+        var outputPrefix = outputSource.IsLive ? $"(in-progress iteration {iteration} — live data, not yet persisted)\n" : string.Empty;
         var lines = output.Split('\n');
         if (lines.Length <= max_lines)
-            return output;
+            return outputPrefix + output;
 
         var truncated = string.Join('\n', lines.Take(max_lines));
-        return truncated + $"\n... (truncated, {lines.Length} lines total)";
+        return outputPrefix + truncated + $"\n... (truncated, {lines.Length} lines total)";
+    }
+
+    /// <summary>
+    /// Resolves the phase entries of one goal iteration. The STORED data always wins: when the
+    /// goal store holds the iteration summary, it is returned unchanged. Only when nothing is
+    /// persisted AND the goal still exists does a LIVE fallback apply: the goal's currently
+    /// running pipeline supplies a snapshot of its phase log for that iteration, flagged as live.
+    /// A goal that no longer exists in the store never yields live data, even while its pipeline
+    /// remains in memory. Returns <c>null</c> when neither source has the iteration.
+    /// </summary>
+    /// <param name="id">Goal ID.</param>
+    /// <param name="iteration">1-based iteration number.</param>
+    /// <returns>
+    /// A tuple carrying (a) the iteration's phase entries — a persisted summary's phase list, or a
+    /// live snapshot of the running pipeline's <see cref="GoalPipeline.PhaseLog"/>; (b) the
+    /// persisted <c>{role}-{iteration}</c> output dictionary, which is EMPTY for live data because
+    /// a running iteration has no persisted dictionary; and (c) <c>isLive</c>, <c>true</c> only for
+    /// the in-memory snapshot, which is never persisted and always marked as live in responses.
+    /// </returns>
+    private async Task<(IReadOnlyList<PhaseResult> Phases, IReadOnlyDictionary<string, string> PhaseOutputs, bool IsLive)?> ResolvePhaseIterationSourceAsync(string id, int iteration)
+    {
+        var iterations = await _goalStore.GetIterationsAsync(id);
+        var persisted = iterations.FirstOrDefault(i => i.Iteration == iteration);
+        if (persisted is not null)
+            return (persisted.Phases, persisted.PhaseOutputs, false);
+
+        // No persisted summary: a live fallback is legal ONLY for a goal that still exists.
+        var goal = await _goalStore.GetGoalAsync(id);
+        if (goal is null)
+            return null;
+
+        var pipeline = _serviceProvider?.GetService<GoalPipelineManager>()?.GetByGoalId(id);
+        if (pipeline is null || pipeline.Iteration != iteration)
+            return null;
+
+        // Snapshot the live entries without locking, exactly like the dashboard's view builder:
+        // a read-only enumeration of the append-only phase log for the requested iteration.
+        var liveEntries = pipeline.PhaseLog
+            .Where(e => e.Iteration == iteration)
+            .ToList();
+        return (liveEntries, new Dictionary<string, string>(), true);
     }
 
     /// <summary>
