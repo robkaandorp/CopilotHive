@@ -145,6 +145,25 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// <summary>Current agent session; set via <see cref="SetSession"/> before <see cref="SendPromptAsync"/>.</summary>
     private AgentSession? _session;
 
+    /// <summary>
+    /// THE PER-TASK USAGE SINK — the accumulation every model call of the CURRENT task reports into
+    /// through <c>AgentOptions.OnUsage</c>. Never <c>null</c> once a task has been reset into.
+    /// <para>
+    /// <see cref="ResetTaskUsage"/> REPLACES this reference with a fresh instance instead of
+    /// clearing the existing one. That is deliberate: SharpCoder may invoke a recorded call's
+    /// <c>OnUsage</c> handler concurrently with, or even after, <c>ExecuteAsync</c> has returned
+    /// (a sub-agent forwards its calls to the parent live). The handler bound to the PREVIOUS turn
+    /// holds the OLD instance, so its late event lands in a sink nobody reads any more and can
+    /// never leak into the next task's numbers.
+    /// </para>
+    /// <para>
+    /// <see cref="SharpCoder.UsageSummary.Add"/> is thread-safe, so the field is only reassigned on
+    /// the caller's sequential task boundary (the quiescent-use contract) while concurrent
+    /// additions go to the instance captured by the running turn.
+    /// </para>
+    /// </summary>
+    private UsageSummary _taskUsage = new();
+
     private TestResultReport? _lastTestReport;
     private WorkerReport? _lastWorkerReport;
     private string? _testerReport;
@@ -179,6 +198,27 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// </summary>
     /// <param name="role">The role carried by the current assignment.</param>
     public void SetRole(WorkerRole role) => _currentRole = role;
+
+    /// <summary>
+    /// Starts a fresh per-task usage accumulation by REPLACING the sink with a new instance (see
+    /// <see cref="_taskUsage"/> for why the old one is deliberately not cleared).
+    /// </summary>
+    /// <remarks>
+    /// Called once at the start of every task by <c>TaskExecutor</c>, before the first prompt turn.
+    /// The OLD sink object stays untouched: a late <c>OnUsage</c> event from the previous task
+    /// (SharpCoder may fire it concurrently with, or after, <c>ExecuteAsync</c> returns — a
+    /// sub-agent forwards its calls live) lands there and is unreachable from
+    /// <see cref="GetTaskUsage"/> ever after.
+    /// </remarks>
+    public void ResetTaskUsage() => _taskUsage = new UsageSummary();
+
+    /// <summary>
+    /// Returns a DETACHED snapshot of the usage accumulated since the last
+    /// <see cref="ResetTaskUsage"/> — never <c>null</c>, and never the live accumulation itself, so
+    /// later model calls cannot change a value already handed out.
+    /// </summary>
+    /// <returns>The accumulated usage of the current task; an empty summary means "no model calls yet".</returns>
+    public UsageSummary GetTaskUsage() => _taskUsage.Snapshot();
 
     /// <summary>
     /// The guidance stored for <paramref name="role"/>, or the CONSTRUCTOR DEFAULT
@@ -796,6 +836,17 @@ public sealed class SharpCoderRunner : IAgentRunner
 
         if (_compactionMaxTokens.HasValue)
             options.CompactionMaxTokens = _compactionMaxTokens.Value;
+
+        // THE PER-TASK USAGE WIRING. The sink is captured HERE, in a local, and bound to OnUsage:
+        // every model call of this turn — agent, compaction and sub-agent calls alike — reports
+        // itself through this handler, so recording needs no per-path code and covers a turn that
+        // ends with status Error (AgentTurnFailedException), MaxStepsReached or an exception.
+        // UsageSummary.Add is thread-safe (SharpCoder may invoke the handler concurrently, and even
+        // after ExecuteAsync returns).
+        //
+        // Set BEFORE OnAgentOptionsCreated so the test seam can observe the wired handler.
+        var taskUsage = _taskUsage;
+        options.OnUsage = taskUsage.Add;
 
         OnAgentOptionsCreated?.Invoke(options);
 

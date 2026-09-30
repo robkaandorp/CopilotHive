@@ -57,6 +57,37 @@ public interface IAgentRunner : IAsyncDisposable
     void SetRole(WorkerRole role) { }
 
     /// <summary>
+    /// Starts a FRESH per-task usage accumulation. Call once at the start of every task, before the
+    /// first <see cref="SendPromptAsync"/>, so a re-used runner never carries the previous task's
+    /// usage into the next one.
+    /// </summary>
+    /// <remarks>
+    /// <b>This default implementation is a deliberately empty NO-OP</b>, so the many existing test
+    /// doubles implementing <see cref="IAgentRunner"/> keep compiling and keep their previous
+    /// behavior unchanged (their <see cref="GetTaskUsage"/> keeps returning <c>null</c>, i.e. "usage
+    /// not reported"); <see cref="SharpCoderRunner"/> (the production runner) is the only
+    /// implementation that overrides it. An override must START A NEW ACCUMULATION only — it must
+    /// never mutate or clear state that callbacks already handed out (see
+    /// <see cref="SharpCoderRunner.ResetTaskUsage"/> for the reason).
+    /// </remarks>
+    void ResetTaskUsage() { }
+
+    /// <summary>
+    /// Returns a DETACHED snapshot of the provider-reported token usage accumulated since the last
+    /// <see cref="ResetTaskUsage"/>, or <c>null</c> when the implementation does not report usage.
+    /// </summary>
+    /// <remarks>
+    /// <b>This default implementation returns <c>null</c></b> ("usage not reported"), which is how a
+    /// legacy runner or a test double is recognized downstream; an empty summary means the opposite —
+    /// usage WAS reported and the task made zero model calls. The snapshot must be independent of the
+    /// live accumulation, so later calls never change a value that was already returned.
+    /// </remarks>
+    /// <returns>
+    /// The accumulated usage of the current task, or <c>null</c> when usage is not reported.
+    /// </returns>
+    SharpCoder.UsageSummary? GetTaskUsage() => null;
+
+    /// <summary>
     /// Sets the agent session to resume in the next <see cref="SendPromptAsync"/> call.
     /// Pass <c>null</c> to start a fresh session.
     /// </summary>

@@ -325,6 +325,67 @@ message TaskComplete {
   // Additive and backward compatible: an old server ignores this field and keeps its
   // existing behavior, and no new handshake is required.
   optional string model = 7;
+
+  // The provider-reported token usage of every model call the worker made for this task,
+  // grouped per (source, model), carried by an upgraded worker. Message fields have native
+  // presence, which is the ONLY trustworthy signal here:
+  //   * ABSENT      → a legacy sender, or a sender that reports no usage at all. The receiver
+  //                   must treat the usage as "not reported" (null), NOT as zero.
+  //   * PRESENT     → the upgraded sender's usage. It may have ZERO entries, which is a real
+  //                   measurement: the task made no model calls at all.
+  // Additive and backward compatible: an old server ignores this field and keeps its
+  // existing behavior, and no new handshake is required.
+  TaskUsage usage = 8;
+}
+
+// The domain-side source of a usage bucket: which kind of model call the recorded tokens came
+// from. The values are deliberately named differently from SharpCoder's own enum so the two
+// can never collide.
+enum UsageSourceKind {
+  USAGE_SOURCE_KIND_UNSPECIFIED = 0;
+  USAGE_SOURCE_KIND_AGENT = 1;
+  USAGE_SOURCE_KIND_COMPACTION = 2;
+  USAGE_SOURCE_KIND_SUB_AGENT = 3;
+  USAGE_SOURCE_KIND_SUB_AGENT_COMPACTION = 4;
+}
+
+// A task's complete usage report: one entry per (source, model) pair. Zero entries is a valid,
+// PRESENT report meaning the task made no model calls.
+message TaskUsage {
+  repeated TaskUsageEntry entries = 1;
+}
+
+// One (source, model) usage bucket. Token counts and call counters come from the
+// provider-reported sums; the estimate is SharpCoder's approximate split of them.
+message TaskUsageEntry {
+  UsageSourceKind source = 1;
+  optional string model = 2;            // absent = SharpCoder UsageEntry.Model null
+  int64 input_tokens = 3;
+  int64 output_tokens = 4;
+  int64 cached_input_tokens = 5;
+  int64 reasoning_tokens = 6;
+  int32 calls = 7;
+  int32 cached_input_reported_calls = 8;
+  int32 reasoning_reported_calls = 9;
+  EstimatedTokenCounts estimated = 10;
+}
+
+// An ESTIMATED per-category split of the exact input/output counts of one usage entry. This is
+// the only estimated part of the usage report; every other count is provider-reported.
+message EstimatedTokenCounts {
+  int64 system_prompt = 1;
+  int64 tool_definitions = 2;
+  int64 user_text = 3;
+  int64 assistant_text = 4;
+  int64 tool_calls = 5;
+  int64 tool_results = 6;
+  int64 reasoning = 7;
+  int64 images = 8;
+  int64 output_text = 9;
+  int64 output_tool_calls = 10;
+  int64 output_reasoning = 11;
+  int32 input_estimated_calls = 12;
+  int32 output_estimated_calls = 13;
 }
 
 message WorkerReady {

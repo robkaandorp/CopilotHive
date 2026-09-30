@@ -12,7 +12,13 @@ using DomainTaskMetrics = CopilotHive.Services.TaskMetrics;
 using DomainWorkerRole = CopilotHive.Workers.WorkerRole;
 using GrpcBranchAction = CopilotHive.Shared.Grpc.BranchAction;
 using GrpcTaskMetrics = CopilotHive.Shared.Grpc.TaskMetrics;
+using GrpcUsageSourceKind = CopilotHive.Shared.Grpc.UsageSourceKind;
 using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
+using SharpEstimatedTokenBreakdown = SharpCoder.EstimatedTokenBreakdown;
+using SharpTokenUsage = SharpCoder.TokenUsage;
+using SharpUsageEntry = SharpCoder.UsageEntry;
+using SharpUsageSource = SharpCoder.UsageSource;
+using SharpUsageSummary = SharpCoder.UsageSummary;
 
 namespace CopilotHive.Tests;
 
@@ -1033,6 +1039,11 @@ public sealed class GrpcMapperTests
     /// The wire number is part of the cross-process contract: field 7 must not be renumbered,
     /// and it must not collide with any of the pre-existing completion fields. Old/new
     /// compatibility derives from additive optional protobuf semantics — not a handshake.
+    /// <para>
+    /// Field 8 (<c>usage</c>) is asserted to be exactly 8 and to be an ADDITION: fields 1–7 keep
+    /// their numbers, so an old server still reads the pre-existing fields and simply ignores
+    /// the usage it does not know.
+    /// </para>
     /// </summary>
     [Fact]
     public void TaskComplete_Model_UsesWireFieldNumberSevenWithoutRenumberingExistingFields()
@@ -1051,6 +1062,22 @@ public sealed class GrpcMapperTests
 
         Assert.Equal([1, 2, 3, 4, 5, 6], existing);
         Assert.DoesNotContain(TaskComplete.ModelFieldNumber, existing);
+
+        Assert.Equal(8, TaskComplete.UsageFieldNumber);
+
+        int[] fieldsOneToSeven =
+        [
+            TaskComplete.TaskIdFieldNumber,
+            TaskComplete.StatusFieldNumber,
+            TaskComplete.OutputFieldNumber,
+            TaskComplete.GitStatusFieldNumber,
+            TaskComplete.MetricsFieldNumber,
+            TaskComplete.IterationStartShaFieldNumber,
+            TaskComplete.ModelFieldNumber,
+        ];
+
+        Assert.Equal([1, 2, 3, 4, 5, 6, 7], fieldsOneToSeven);
+        Assert.DoesNotContain(TaskComplete.UsageFieldNumber, fieldsOneToSeven);
     }
 
     /// <summary>
@@ -1204,5 +1231,397 @@ public sealed class GrpcMapperTests
         Assert.Equal(original.GitStatus.Insertions, restored.GitStatus.Insertions);
         Assert.Equal(original.GitStatus.Deletions, restored.GitStatus.Deletions);
         Assert.Equal(original.GitStatus.Pushed, restored.GitStatus.Pushed);
+    }
+
+    // ── TaskComplete.usage (field 8) ──────────────────────────────────────────
+    //
+    // These tests go through the REAL wire path — ToGrpc → ToByteArray → Parser.ParseFrom →
+    // ToDomain — so every assertion is made on values that survived binary serialization of the
+    // generated message, not on the in-memory object the mapper happened to build. A mapper that
+    // assigned the wrong field number, dropped a count or lost the entry-model presence bit fails
+    // here.
+
+    /// <summary>
+    /// Builds a fully populated entry: DISTINCT non-zero values in every TokenUsage field, both
+    /// reported-calls counters and all 13 estimated fields, so a dropped or mis-numbered wire field
+    /// is always visible.
+    /// </summary>
+    private static SharpUsageEntry BuildFullUsageEntry(SharpUsageSource source, string? model)
+        => new(source, model, new SharpTokenUsage
+        {
+            InputTokens = 101,
+            OutputTokens = 202,
+            CachedInputTokens = 303,
+            ReasoningTokens = 404,
+            Calls = 7,
+            // Deliberately BELOW Calls: at least one call did not report this category, so the
+            // category is "unknown" rather than a measurement.
+            CachedInputReportedCalls = 5,
+            ReasoningReportedCalls = 7,
+            Estimated = new SharpEstimatedTokenBreakdown
+            {
+                SystemPrompt = 11,
+                ToolDefinitions = 12,
+                UserText = 13,
+                AssistantText = 14,
+                ToolCalls = 15,
+                ToolResults = 16,
+                Reasoning = 17,
+                Images = 18,
+                OutputText = 19,
+                OutputToolCalls = 20,
+                OutputReasoning = 21,
+                InputEstimatedCalls = 22,
+                OutputEstimatedCalls = 23,
+            },
+        });
+
+    private static TaskResult RoundTripThroughWire(TaskResult original)
+    {
+        var complete = GrpcMapper.ToGrpc(original);
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        return GrpcMapper.ToDomain(decoded);
+    }
+
+    /// <summary>
+    /// The FULL payload survives the wire: two entries with different (source, model) pairs keep
+    /// every TokenUsage field, both reported-calls counters — including one deliberately below
+    /// <c>Calls</c>, the incomplete/"unknown" case — and all 13 estimated fields with their exact
+    /// distinct values.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_TwoEntries_RoundTripKeepsEveryCount()
+    {
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary(
+            [
+                BuildFullUsageEntry(SharpUsageSource.Agent, "model-a"),
+                BuildFullUsageEntry(SharpUsageSource.SubAgent, "model-b"),
+            ]),
+        };
+
+        var restored = RoundTripThroughWire(original);
+
+        Assert.NotNull(restored.Usage);
+        Assert.Equal(2, restored.Usage.Entries.Count);
+
+        var agent = Assert.Single(restored.Usage.Entries, e => e.Source == SharpUsageSource.Agent);
+        Assert.Equal("model-a", agent.Model);
+        AssertTokenUsageIsFullyPreserved(agent.Usage);
+
+        var subAgent = Assert.Single(restored.Usage.Entries, e => e.Source == SharpUsageSource.SubAgent);
+        Assert.Equal("model-b", subAgent.Model);
+        AssertTokenUsageIsFullyPreserved(subAgent.Usage);
+    }
+
+    /// <summary>
+    /// Asserts every exact count of a fully populated usage entry: the four token sums, the call
+    /// count, both reported-calls counters and all 13 estimated fields.
+    /// </summary>
+    private static void AssertTokenUsageIsFullyPreserved(SharpTokenUsage usage)
+    {
+        Assert.Equal(101, usage.InputTokens);
+        Assert.Equal(202, usage.OutputTokens);
+        Assert.Equal(303, usage.CachedInputTokens);
+        Assert.Equal(404, usage.ReasoningTokens);
+        Assert.Equal(7, usage.Calls);
+        Assert.Equal(5, usage.CachedInputReportedCalls);
+        Assert.Equal(7, usage.ReasoningReportedCalls);
+
+        // The counters say which categories were actually reported by every call.
+        Assert.NotEqual(usage.CachedInputReportedCalls, usage.Calls);
+        Assert.Equal(usage.ReasoningReportedCalls, usage.Calls);
+
+        var estimated = usage.Estimated;
+        Assert.Equal(11, estimated.SystemPrompt);
+        Assert.Equal(12, estimated.ToolDefinitions);
+        Assert.Equal(13, estimated.UserText);
+        Assert.Equal(14, estimated.AssistantText);
+        Assert.Equal(15, estimated.ToolCalls);
+        Assert.Equal(16, estimated.ToolResults);
+        Assert.Equal(17, estimated.Reasoning);
+        Assert.Equal(18, estimated.Images);
+        Assert.Equal(19, estimated.OutputText);
+        Assert.Equal(20, estimated.OutputToolCalls);
+        Assert.Equal(21, estimated.OutputReasoning);
+        Assert.Equal(22, estimated.InputEstimatedCalls);
+        Assert.Equal(23, estimated.OutputEstimatedCalls);
+    }
+
+    /// <summary>
+    /// An entry whose model is <c>null</c> must come back <c>null</c> — NOT the empty string.
+    /// Unlike the completion's assigned model (field 7), this field's presence carries the
+    /// difference between "model unknown" and "model reported as empty".
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_NullModel_StaysNullNotEmptyString()
+    {
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary([BuildFullUsageEntry(SharpUsageSource.Agent, null)]),
+        };
+
+        var complete = GrpcMapper.ToGrpc(original);
+        Assert.False(complete.Usage.Entries[0].HasModel, "A null entry model must be absent on the wire.");
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.False(decoded.Usage.Entries[0].HasModel);
+
+        var restored = RoundTripThroughWire(original);
+        var entry = Assert.Single(restored.Usage!.Entries);
+        Assert.Null(entry.Model);
+    }
+
+    /// <summary>
+    /// An entry with an EMPTY (non-null) model keeps that empty string with explicit presence —
+    /// the value is never upgraded into absence, nor is a null ever coerced to empty.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_EmptyModel_StaysPresentEmpty()
+    {
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary([BuildFullUsageEntry(SharpUsageSource.Agent, "")]),
+        };
+
+        var complete = GrpcMapper.ToGrpc(original);
+        Assert.True(complete.Usage.Entries[0].HasModel);
+        Assert.Equal("", complete.Usage.Entries[0].Model);
+
+        var restored = RoundTripThroughWire(original);
+        var entry = Assert.Single(restored.Usage!.Entries);
+        Assert.Equal("", entry.Model);
+    }
+
+    /// <summary>
+    /// ABSENT usage — a legacy sender, or a test double that never reports usage — maps to
+    /// <c>Usage == null</c>, which is NOT the same as an empty summary.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_Absent_BecomesNull()
+    {
+        // A legacy message that never touched field 8, round-tripped through raw bytes.
+        var legacy = new TaskComplete
+        {
+            TaskId = "t",
+            Status = Shared.Grpc.TaskStatus.Completed,
+            Output = "done",
+        };
+        Assert.Null(legacy.Usage);
+
+        var decoded = TaskComplete.Parser.ParseFrom(legacy.ToByteArray());
+        Assert.Null(decoded.Usage);
+        Assert.Null(GrpcMapper.ToDomain(decoded).Usage);
+
+        // And a domain result without usage writes no field 8 at all.
+        var complete = GrpcMapper.ToGrpc(BuildFullTaskResult() with { Usage = null });
+        Assert.Null(complete.Usage);
+        Assert.Null(TaskComplete.Parser.ParseFrom(complete.ToByteArray()).Usage);
+        Assert.Null(GrpcMapper.ToDomain(TaskComplete.Parser.ParseFrom(complete.ToByteArray())).Usage);
+    }
+
+    /// <summary>
+    /// PRESENT-but-empty usage is a REAL measurement: "usage was reported and the task made zero
+    /// model calls". It must decode as an empty, non-null summary — never as absence, never as a
+    /// null. The presence survives the wire because the mapper assigns the message.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_PresentButEmpty_BecomesEmptyNonNullSummary()
+    {
+        var original = BuildFullTaskResult() with { Usage = new SharpUsageSummary() };
+
+        var complete = GrpcMapper.ToGrpc(original);
+        Assert.NotNull(complete.Usage);
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.NotNull(decoded.Usage);
+        Assert.Empty(decoded.Usage.Entries);
+
+        var restored = GrpcMapper.ToDomain(decoded);
+        Assert.NotNull(restored.Usage);
+        Assert.Empty(restored.Usage.Entries);
+        Assert.Equal(0, restored.Usage.Total.Calls);
+    }
+
+    /// <summary>
+    /// Every usage source maps both ways across the wire and back, so no source can be silently
+    /// collapsed onto another (or onto Unspecified).
+    /// </summary>
+    [Theory]
+    [InlineData(SharpUsageSource.Agent, GrpcUsageSourceKind.Agent)]
+    [InlineData(SharpUsageSource.Compaction, GrpcUsageSourceKind.Compaction)]
+    [InlineData(SharpUsageSource.SubAgent, GrpcUsageSourceKind.SubAgent)]
+    [InlineData(SharpUsageSource.SubAgentCompaction, GrpcUsageSourceKind.SubAgentCompaction)]
+    public void TaskComplete_Usage_EachSource_RoundTripsBothWays(SharpUsageSource source, GrpcUsageSourceKind wire)
+    {
+        Assert.Equal(wire, GrpcMapper.ToGrpc(source));
+        Assert.Equal(source, GrpcMapper.ToDomain(wire));
+
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary([BuildFullUsageEntry(source, "model-x")]),
+        };
+
+        var restored = RoundTripThroughWire(original);
+
+        var entry = Assert.Single(restored.Usage!.Entries);
+        Assert.Equal(source, entry.Source);
+        Assert.Equal("model-x", entry.Model);
+        AssertTokenUsageIsFullyPreserved(entry.Usage);
+    }
+
+    /// <summary>
+    /// An UNSPECIFIED source is a mapping failure, exactly like an unknown <c>TaskStatus</c>: it is
+    /// never silently resolved to a default source. An unknown NUMERIC value (a source added by a
+    /// newer sender than this receiver) fails the same way.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(5)]
+    [InlineData(-1)]
+    public void TaskComplete_Usage_UnspecifiedOrUnknownSource_Throws(int rawSource)
+    {
+        var complete = BuildFullTaskResultWithWireUsage((GrpcUsageSourceKind)rawSource);
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.Equal((GrpcUsageSourceKind)rawSource, decoded.Usage.Entries[0].Source);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => GrpcMapper.ToDomain(decoded));
+        Assert.Contains(((GrpcUsageSourceKind)rawSource).ToString(), ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Builds a completion with a single wire usage entry whose source is the raw value supplied by
+    /// the caller, bypassing the mapper's own source conversion so an invalid source can be put on
+    /// the wire on purpose.
+    /// </summary>
+    private static TaskComplete BuildFullTaskResultWithWireUsage(GrpcUsageSourceKind rawSource)
+    {
+        var complete = GrpcMapper.ToGrpc(BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary([BuildFullUsageEntry(SharpUsageSource.Agent, "model-a")]),
+        });
+        complete.Usage.Entries[0].Source = rawSource;
+        return complete;
+    }
+
+    /// <summary>
+    /// The EXISTING orchestrator caller path is unchanged: <c>GrpcMapper.ToDomain(complete) with
+    /// { Model = ... }</c> keeps the usage the mapper produced, because <c>with</c> copies every
+    /// other property. This is the path HiveOrchestratorService uses to substitute the assigned
+    /// model, and it must not silently drop the usage report.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_SurvivesTheOrchestratorModelSubstitution()
+    {
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary(
+            [
+                BuildFullUsageEntry(SharpUsageSource.Agent, "model-a"),
+                BuildFullUsageEntry(SharpUsageSource.Compaction, null),
+            ]),
+        };
+
+        var decoded = TaskComplete.Parser.ParseFrom(GrpcMapper.ToGrpc(original).ToByteArray());
+        var substituted = GrpcMapper.ToDomain(decoded) with { Model = "active-queue-model" };
+
+        Assert.Equal("active-queue-model", substituted.Model);
+        Assert.NotNull(substituted.Usage);
+        Assert.Equal(2, substituted.Usage.Entries.Count);
+        var agent = Assert.Single(substituted.Usage.Entries, e => e.Source == SharpUsageSource.Agent);
+        AssertTokenUsageIsFullyPreserved(agent.Usage);
+        var compaction = Assert.Single(substituted.Usage.Entries, e => e.Source == SharpUsageSource.Compaction);
+        Assert.Null(compaction.Model);
+    }
+
+    /// <summary>
+    /// Bucketing is per (source, MODEL) pair, not per source alone: two entries that share the same
+    /// source but differ in model, and that carry DIFFERENT counts, both survive the wire with their
+    /// own values. A mapper that collapsed same-source entries, or mixed one entry's counts into the
+    /// other, fails here. Each field also uses a seed-distinct value per entry so token counts cannot
+    /// masquerade as each other.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_SameSourceDifferentModels_StayDistinctWithOwnCounts()
+    {
+        static SharpUsageEntry SeededEntry(string model, long seed) => new(
+            SharpUsageSource.Agent,
+            model,
+            new SharpTokenUsage
+            {
+                InputTokens = 100 + seed,
+                OutputTokens = 200 + seed,
+                CachedInputTokens = 300 + seed,
+                ReasoningTokens = 400 + seed,
+                Calls = 1,
+                CachedInputReportedCalls = 1,
+                ReasoningReportedCalls = 0,
+            });
+
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary(
+            [
+                SeededEntry("model-1", seed: 1),
+                SeededEntry("model-2", seed: 2),
+            ]),
+        };
+
+        var restored = RoundTripThroughWire(original);
+
+        Assert.NotNull(restored.Usage);
+        Assert.Equal(2, restored.Usage.Entries.Count);
+
+        var first = Assert.Single(restored.Usage.Entries, e => e.Model == "model-1");
+        var second = Assert.Single(restored.Usage.Entries, e => e.Model == "model-2");
+        Assert.Equal(SharpUsageSource.Agent, first.Source);
+        Assert.Equal(SharpUsageSource.Agent, second.Source);
+
+        Assert.Equal(101, first.Usage.InputTokens);
+        Assert.Equal(201, first.Usage.OutputTokens);
+        Assert.Equal(301, first.Usage.CachedInputTokens);
+        Assert.Equal(401, first.Usage.ReasoningTokens);
+        Assert.Equal(102, second.Usage.InputTokens);
+        Assert.Equal(202, second.Usage.OutputTokens);
+        Assert.Equal(302, second.Usage.CachedInputTokens);
+        Assert.Equal(402, second.Usage.ReasoningTokens);
+        // Counter semantics survive per entry: calls that did not report a category are NOT added,
+        // so here ReasoningReportedCalls (0) < Calls (1) — the incomplete/"unknown" case per entry.
+        Assert.Equal(1, first.Usage.Calls);
+        Assert.Equal(0, first.Usage.ReasoningReportedCalls);
+        Assert.NotEqual(first.Usage.ReasoningReportedCalls, first.Usage.Calls);
+        Assert.Equal(0, second.Usage.ReasoningReportedCalls);
+    }
+
+    /// <summary>
+    /// The restored usage is a REAL functioning <see cref="SharpUsageSummary"/>, not just a filled
+    /// entries list: its <c>Total</c> aggregates the token sums and the call counter across every
+    /// entry, exactly as UsageSummary.Add would accumulate them.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Usage_RestoredSummary_TotalAggregatesAcrossEntries()
+    {
+        var original = BuildFullTaskResult() with
+        {
+            Usage = new SharpUsageSummary(
+            [
+                BuildFullUsageEntry(SharpUsageSource.Agent, "model-a"),
+                BuildFullUsageEntry(SharpUsageSource.SubAgent, "model-b"),
+            ]),
+        };
+
+        var restored = RoundTripThroughWire(original);
+
+        Assert.NotNull(restored.Usage);
+        var total = restored.Usage.Total;
+        Assert.Equal(202, total.InputTokens);            // 101 + 101
+        Assert.Equal(404, total.OutputTokens);           // 202 + 202
+        Assert.Equal(606, total.CachedInputTokens);      // 303 + 303
+        Assert.Equal(808, total.ReasoningTokens);        // 404 + 404
+        Assert.Equal(14, total.Calls);                   // 7 + 7
+        Assert.Equal(10, total.CachedInputReportedCalls); // 5 + 5 — below Calls
+        Assert.Equal(14, total.ReasoningReportedCalls);
     }
 }

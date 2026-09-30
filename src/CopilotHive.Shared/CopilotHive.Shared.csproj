@@ -11,6 +11,7 @@
     </PackageReference>
     <PackageReference Include="Google.Protobuf" />
     <PackageReference Include="Microsoft.Extensions.AI" />
+    <PackageReference Include="SharpCoder" />
   </ItemGroup>
 
   <ItemGroup>

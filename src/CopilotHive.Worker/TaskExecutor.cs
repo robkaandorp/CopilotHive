@@ -235,6 +235,12 @@ public sealed class TaskExecutor(
     /// <returns>A <see cref="TaskResult"/> with status, output, and git metrics.</returns>
     public async Task<TaskResult> ExecuteAsync(WorkTask task, CancellationToken ct)
     {
+        // THE PER-TASK USAGE BOUNDARY, first thing. Resetting here — before ANY branch or early
+        // return of the execution body runs — guarantees this task's usage starts at zero on a
+        // re-used runner and that no late report from the previous task can still be counted.
+        // A runner that does not report usage keeps the default no-op implementation.
+        agentRunner.ResetTaskUsage();
+
         // Invocation-local state: the trusted restore evidence plus the confirmed publication
         // SHA. Never persisted, never a dirty flag — created fresh per call and discarded.
         var finalization = new ConfigRepoFinalization();
@@ -254,9 +260,16 @@ public sealed class TaskExecutor(
         // trimmed or normalized. A runtime-null assigned model becomes the empty string
         // ("unknown/empty"), which the wire mapping still transmits with explicit presence.
         //
+        // The task's token usage is stamped at the same single boundary, for the same reason: it
+        // covers Completed, Failed AND Cancelled results from every branch, and it includes the
+        // usage of EVERY prompt turn of this task — the main prompt plus the cleanup, metrics and
+        // condense follow-ups — because they are all model calls billed to this phase. A runner
+        // that does not report usage returns null, which the wire mapping keeps ABSENT (as
+        // opposed to an empty summary, which means "reported, zero model calls").
+        //
         // No result is synthesized here: when execution or finalization throws, this boundary
         // is never reached and the exception propagates exactly as before.
-        return finalized with { Model = task.Model ?? "" };
+        return finalized with { Model = task.Model ?? "", Usage = agentRunner.GetTaskUsage() };
     }
 
     /// <summary>

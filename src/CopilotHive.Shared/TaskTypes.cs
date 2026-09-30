@@ -98,6 +98,36 @@ public sealed record TaskResult
     /// Passed back so the orchestrator can store it on the pipeline for subsequent reviewer tasks.
     /// </summary>
     public string? IterationStartSha { get; init; }
+    /// <summary>
+    /// The provider-reported token usage of EVERY model call the worker made for this task, grouped
+    /// per (source, model) — agent, compaction and sub-agent calls alike.
+    /// <para>
+    /// A task's worker makes several prompt turns: the main prompt plus the cleanup, metrics and
+    /// condense follow-up turns in <c>TaskExecutor</c>. All of them are included here, because all
+    /// of them are model calls billed to this task.
+    /// </para>
+    /// <para>
+    /// <c>null</c> means the sender did not report usage at all (a legacy worker or a test double
+    /// that keeps the default <c>IAgentRunner</c> implementation). An EMPTY, non-null summary means
+    /// usage WAS reported and the task made zero model calls — the two cases are deliberately
+    /// distinguishable.
+    /// </para>
+    /// <para>
+    /// A per-(source, model) category is only a real measurement when its reported-calls counter
+    /// (<see cref="SharpCoder.TokenUsage.CachedInputReportedCalls"/> for cached input tokens,
+    /// <see cref="SharpCoder.TokenUsage.ReasoningReportedCalls"/> for reasoning tokens) equals
+    /// <see cref="SharpCoder.TokenUsage.Calls"/>. Otherwise the category is incomplete and its
+    /// summed value is "unknown" — not zero. A counter below <c>Calls</c> means some of the calls
+    /// did not report that category at all.
+    /// </para>
+    /// <para>
+    /// <see cref="TaskResult"/> is a record, but <see cref="SharpCoder.UsageSummary"/> is a
+    /// reference type with no value equality: two summaries with identical counts are NOT equal.
+    /// Do not rely on record equality (or on <c>with</c>-expression comparisons) for
+    /// <see cref="Usage"/>. Compare the entries and their counts explicitly.
+    /// </para>
+    /// </summary>
+    public SharpCoder.UsageSummary? Usage { get; init; }
 }
 
 /// <summary>Domain-level task completion status.</summary>
