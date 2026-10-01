@@ -50,6 +50,10 @@ namespace CopilotHive.Orchestration;
 /// <item><see cref="GetStats"/> — reads the live session; during streaming it is stale by at
 /// most the message currently being produced (the in-flight delta is not yet in the history),
 /// which is acceptable for a stats panel.</item>
+/// <item><see cref="GetUsage"/> — reads the live session's usage summary plus the in-memory
+/// per-turn and clarification/manual-compaction accumulations, all as detached snapshots; like
+/// <see cref="GetStats"/> it can lag the model call currently in flight, which is acceptable for a
+/// usage panel.</item>
 /// <item><see cref="GetChatHistory"/> — intended to be called after streaming completes; the
 /// terminal handler has already committed the full response to the session by then, so the
 /// returned snapshot is stable for the rendered view.</item>
@@ -73,6 +77,44 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private volatile bool _isStreaming;
     private volatile string _streamingContent = "";
     private volatile int _lastToolCalls;
+
+    /// <summary>
+    /// The detached <c>AgentResult.TokenUsage</c> of the most recent COMPLETED chat turn, or
+    /// <c>null</c> when no turn has completed since the current stream started (and since orchestrator
+    /// start). Written by the actor's usage tap, which invokes its callback from the streaming task,
+    /// and read from arbitrary threads by <see cref="GetUsage"/> — hence a reference assignment
+    /// through a volatile field, so a reader never observes a torn or stale reference.
+    /// <para>
+    /// REPLACED, never merged: it is this turn's usage, not an accumulation. The assignment is the
+    /// whole write — the summary behind it is already a detached snapshot, so publishing the
+    /// reference is all that is needed.
+    /// </para>
+    /// </summary>
+    private volatile UsageSummary? _lastTurnUsage;
+
+    /// <summary>
+    /// Summed usage of every manual compaction since orchestrator start — a Composer-owned
+    /// accumulation, in memory only. Its <see cref="UsageSummary.Add(UsageEvent)"/> method IS the
+    /// actor's manual-compaction tap, so each summary call of a manual compaction lands here as one
+    /// event. <see cref="UsageSummary.Add(UsageEvent)"/> is thread-safe by itself (it holds the
+    /// summary's internal lock and loses no update), which is what makes it a valid tap: the callback
+    /// can fire concurrently, and even after the compaction returned.
+    /// </summary>
+    private readonly UsageSummary _manualCompactionUsage = new();
+
+    /// <summary>
+    /// Summed usage of every clarification answer since orchestrator start — a Composer-owned
+    /// accumulation, in memory only. Clarification answers run on FORKED sessions whose usage is
+    /// reset, so their calls reach no session total and must be tracked here instead.
+    /// <para>
+    /// Guarded by <see cref="_clarificationUsageLock"/>: the answer is recorded by folding a whole
+    /// summary into the accumulator with <see cref="PhaseUsageTotals.Merge"/>, and that
+    /// read-merge-write is not atomic on its own — two clarification answers can be answered
+    /// concurrently, and <see cref="GetUsage"/> snapshots this accumulator from an arbitrary thread.
+    /// </para>
+    /// </summary>
+    private readonly object _clarificationUsageLock = new();
+    private UsageSummary _clarificationUsage = new();
 
     /// <summary>
     /// Facade cache of whether the current session was loaded from disk during connection.
@@ -559,6 +601,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 _isStreaming = true;
                 _streamingContent = "";
                 _lastToolCalls = 0;
+                // A new stream starts a new turn: the previous turn's usage must not survive as if it
+                // were this turn's. Cleared BEFORE the streaming task starts, so a reader can never
+                // see a stale value attributed to the turn in flight.
+                _lastTurnUsage = null;
                 OnStreamingUpdate?.Invoke();
             },
             (toolCalls, keepStreaming) =>
@@ -604,7 +650,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             loadedFromDisk => _sessionLoadedFromDisk = loadedFromDisk,
             SubmitAnswerInternal,
             CancelQuestionInternal,
-            _logger);
+            _logger,
+            // Usage tap 1: the completed turn's detached per-execution summary. A reference
+            // assignment of an already-detached snapshot — the memory barrier is the volatile field.
+            usage => _lastTurnUsage = usage,
+            // Usage tap 2: one event per manual-compaction summary call. UsageSummary.Add is
+            // thread-safe, so the accumulation needs no lock of its own.
+            _manualCompactionUsage.Add);
         _actor.Start();
     }
 
@@ -635,6 +687,45 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>Returns the system prompt used by the Composer.</summary>
     internal string GetSystemPrompt() => _systemPrompt;
+
+    /// <summary>
+    /// Returns the Composer's LLM usage — per-turn, session, clarification and manual-compaction
+    /// views — or <c>null</c> when the Composer is not connected.
+    /// <para>
+    /// Every member of the returned snapshot is a DETACHED copy: the session summary is taken with
+    /// <see cref="UsageSummary.Snapshot"/>, the per-turn summary is snapshotted as well, and the two
+    /// accumulators are snapshotted under their own guard. Adding to, or otherwise mutating, a
+    /// returned summary can therefore never change a later <see cref="GetUsage"/> result. Staleness is
+    /// the same as <see cref="GetStats"/>: the actor-side writes are asynchronous with respect to this
+    /// read, so a value may lag the newest model call by the call currently in flight.
+    /// </para>
+    /// </summary>
+    public ComposerUsageSnapshot? GetUsage()
+    {
+        // Same guard shape as GetStats: the agent exists only in the connected state, and there is no
+        // session usage to report without it.
+        if (_agentService.Agent is null) return null;
+
+        UsageSummary clarifications;
+        lock (_clarificationUsageLock)
+        {
+            clarifications = _clarificationUsage.Snapshot();
+        }
+
+        return new ComposerUsageSnapshot
+        {
+            // The actor reports an already-detached per-execution summary, but the field keeps
+            // REFERENCING it until the next turn replaces it: snapshotting here is what makes the
+            // returned value independent, so a caller mutating the result cannot alter the value a
+            // later GetUsage() will produce (nor the turn value a concurrent reader sees).
+            LastTurn = _lastTurnUsage?.Snapshot(),
+            Session = _agentService.Session.Usage.Snapshot(),
+            Clarifications = clarifications,
+            // UsageSummary.Snapshot is thread-safe against the actor's concurrent Add, so the
+            // manual-compaction accumulation needs no extra lock.
+            ManualCompactions = _manualCompactionUsage.Snapshot(),
+        };
+    }
 
     /// <summary>Returns current Composer session statistics.</summary>
     public BrainStats? GetStats()
@@ -1375,6 +1466,16 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
             await foreach (var update in _agentService.Agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
             {
+                // USAGE TAP — every Completed update with a result is recorded BEFORE the error check
+                // below, so a failed or escalated clarification still counts: the fork's calls were
+                // billed whether or not the reply is usable. The folded value is the result's detached
+                // per-execution summary, merged per (source, model) entry — NOT through
+                // UsageSummary.Add(UsageEvent), which would count the whole summary as one call.
+                if (update.Kind == StreamingUpdateKind.Completed && update.Result is { } usageResult)
+                {
+                    RecordClarificationUsage(usageResult.TokenUsage);
+                }
+
                 // SharpCoder reports most provider failures as a FINAL Completed update whose
                 // Result.Status is "Error" (Result.Message carries the provider text); only
                 // OperationCanceledException, HttpRequestException and ObjectDisposedException
@@ -1435,6 +1536,27 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "Composer clarification failed for goal {GoalId} — escalating to human", goalId);
             clarificationQueue.EscalateToHuman(request.Id);
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Folds one clarification answer's usage into <see cref="_clarificationUsage"/>.
+    /// <para>
+    /// The merge REPLACES the accumulator with the merged result under
+    /// <see cref="_clarificationUsageLock"/>, because <see cref="PhaseUsageTotals.Merge"/> sums entry
+    /// usages with <see cref="TokenUsage.Add"/> on fresh accumulators: that read-merge-write must be
+    /// atomic for two overlapping clarification answers (or a concurrent <see cref="GetUsage"/>) to
+    /// never lose or tear an accumulation. <c>UsageSummary.Add(UsageEvent)</c> is deliberately NOT
+    /// used to fold the whole summary in: it records ONE model call per event and would collapse a
+    /// multi-round clarification into a single call.
+    /// </para>
+    /// </summary>
+    /// <param name="usage">The completed clarification execution's detached usage summary.</param>
+    private void RecordClarificationUsage(UsageSummary usage)
+    {
+        lock (_clarificationUsageLock)
+        {
+            _clarificationUsage = PhaseUsageTotals.Merge([_clarificationUsage, usage]);
         }
     }
 

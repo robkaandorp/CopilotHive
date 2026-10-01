@@ -31,6 +31,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     private readonly Action<bool> _onSessionLoaded;
     private readonly Action<string> _onSubmitAnswer;
     private readonly Action _onCancelQuestion;
+    private readonly Action<UsageSummary>? _onTurnUsage;
+    private readonly Action<UsageEvent>? _onManualCompactionUsage;
     private readonly ILogger _logger;
 
     // Cross-thread state. The mailbox loop and the streaming task both read/write these, so
@@ -67,7 +69,19 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     /// </summary>
     private readonly Queue<string> _pendingNotifications = new();
 
-    /// <summary>Creates a composer actor bound to the given agent service and callbacks.</summary>
+    /// <summary>
+    /// Creates a composer actor bound to the given agent service and callbacks.
+    /// <para>
+    /// The two optional trailing callbacks are the Composer's LLM usage taps and are <c>null</c> for
+    /// callers that do not measure usage: <c>onTurnUsage</c> receives the detached
+    /// <c>AgentResult.TokenUsage</c> of every chat turn that completes (an error result included);
+    /// <c>onManualCompactionUsage</c> receives one <c>UsageEvent</c> per manual-compaction summary
+    /// call. BOTH are invoked through <see cref="TryInvoke"/> like every other facade callback — the
+    /// turn tap directly from the streaming loop, the compaction tap from the handler installed on the
+    /// compaction-only <see cref="AgentOptions"/> clone — so a failing tap can never fail the stream or
+    /// the compaction.
+    /// </para>
+    /// </summary>
     internal ComposerActor(
         ComposerAgentService agentService,
         Func<CancellationToken, Task> saveSession,
@@ -82,7 +96,9 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         Action<bool> onSessionLoaded,
         Action<string> onSubmitAnswer,
         Action onCancelQuestion,
-        ILogger logger)
+        ILogger logger,
+        Action<UsageSummary>? onTurnUsage = null,
+        Action<UsageEvent>? onManualCompactionUsage = null)
     {
         _agentService = agentService;
         _saveSession = saveSession;
@@ -97,6 +113,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         _onSessionLoaded = onSessionLoaded;
         _onSubmitAnswer = onSubmitAnswer;
         _onCancelQuestion = onCancelQuestion;
+        _onTurnUsage = onTurnUsage;
+        _onManualCompactionUsage = onManualCompactionUsage;
         _logger = logger;
     }
 
@@ -666,6 +684,20 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 // update with a non-null Result is affected; a TextDelta carries a null Result,
                 // and a NORMAL completion (Success/MaxStepsReached) that races cancellation is
                 // still classified as cancelled exactly as before.
+                //
+                // USAGE TAP — runs BEFORE the error re-throw below and before the Completed branch,
+                // so EVERY Completed update with a result reports its usage: a normal completion, a
+                // MaxStepsReached result and an error result alike. The value is the result's DETACHED
+                // per-execution summary (all tool rounds, compaction during the turn and forwarded
+                // sub-agent calls); reporting it here keeps the error check, the cancellation
+                // short-circuit and the terminal messages below in their existing order. A stream that
+                // ends by cancellation or by a pre-Completed exception carries no result at all and
+                // therefore reports nothing.
+                if (update.Kind == StreamingUpdateKind.Completed && update.Result is { } usageResult && _onTurnUsage is { } onTurnUsage)
+                {
+                    TryInvoke(() => onTurnUsage(usageResult.TokenUsage), nameof(_onTurnUsage));
+                }
+
                 if (update.Kind == StreamingUpdateKind.Completed
                     && update.Result is { } errorResult
                     && errorResult.IsError())
@@ -976,7 +1008,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
 
     /// <summary>
     /// Copies every property of <paramref name="original"/> into a fresh <see cref="AgentOptions"/>
-    /// with <c>OnCompacting</c> and <c>OnCompacted</c> cleared. <see cref="AgentOptions"/> is a
+    /// with <c>OnCompacting</c>, <c>OnCompacted</c> and <c>OnUsage</c> overridden. <see cref="AgentOptions"/> is a
     /// sealed class (not a record), so this manual clone is the only way to get a callback-free
     /// copy. Manual compaction (full and partial) passes this clone to
     /// <see cref="ContextCompactor"/> so the agent service's wired callbacks — which are also the
@@ -984,8 +1016,17 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     /// <c>_onCompactingStarted</c>/<c>_onCompactingFinished</c> are the sole source for manual
     /// compaction state. Automatic compaction (during streaming) is unchanged and still uses the
     /// service's original options.
+    /// <para>
+    /// <c>OnUsage</c> is set to a guarded wrapper around <c>_onManualCompactionUsage</c>, and to
+    /// <c>null</c> when the host supplied no handler — in which case the clone behaves exactly as
+    /// before this tap existed. The clone is only ever used for MANUAL compaction, so this tap receives
+    /// exactly the manual compactions' summary calls and nothing else; the service's own
+    /// <see cref="AgentOptions"/> keeps its <c>OnUsage</c> unset (chat turns and automatic compaction
+    /// are measured through <c>AgentResult.TokenUsage</c> instead), so a manual compaction can never be
+    /// counted twice.
+    /// </para>
     /// </summary>
-    private static AgentOptions CloneOptionsWithoutCompactionCallbacks(AgentOptions original) => new()
+    private AgentOptions CloneOptionsWithoutCompactionCallbacks(AgentOptions original) => new()
     {
         WorkDirectory = original.WorkDirectory,
         MaxSteps = original.MaxSteps,
@@ -1003,6 +1044,12 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         EnableAutoCompaction = original.EnableAutoCompaction,
         OnCompacting = null,
         OnCompacted = null,
+        // The manual-compaction usage tap, guarded exactly like every other facade callback: a
+        // throwing tap is logged and swallowed instead of escaping into the compaction. NULL when no
+        // handler was supplied, so a host that measures nothing gets the pre-tap clone unchanged.
+        OnUsage = _onManualCompactionUsage is null
+            ? null
+            : usageEvent => TryInvoke(() => _onManualCompactionUsage(usageEvent), nameof(_onManualCompactionUsage)),
         Logger = original.Logger,
         ReasoningEffort = original.ReasoningEffort,
         ShowToolCallsInStream = original.ShowToolCallsInStream,

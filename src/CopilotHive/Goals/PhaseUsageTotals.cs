@@ -68,11 +68,9 @@ internal static class PhaseUsageTotals
     /// <returns>The merged usage plus the worker-phase report counts.</returns>
     internal static Result Sum(IEnumerable<PhaseResult> phases)
     {
-        // Insertion order is preserved so the rendered entry order is deterministic.
-        var order = new List<(SharpCoder.UsageSource Source, string? Model)>();
-        var merged = new Dictionary<(SharpCoder.UsageSource Source, string? Model), SharpCoder.TokenUsage>(SourceModelComparer.Instance);
         var phasesWithUsage = 0;
         var phasesWithoutUsage = 0;
+        var reported = new List<SharpCoder.UsageSummary?>();
 
         foreach (var phase in phases)
         {
@@ -87,8 +85,50 @@ internal static class PhaseUsageTotals
             }
 
             phasesWithUsage++;
+            reported.Add(phase.Usage);
+        }
 
-            foreach (var entry in phase.Usage.Entries)
+        return new Result
+        {
+            Usage = Merge(reported),
+            PhasesWithUsage = phasesWithUsage,
+            PhasesWithoutUsage = phasesWithoutUsage,
+        };
+    }
+
+    /// <summary>
+    /// Merges the entries of the given summaries by <c>(source, model)</c> with an ORDINAL model
+    /// comparison, summing each entry's usage into one bucket per key.
+    /// <para>
+    /// The merge is per ENTRY, never per summary: each entry's <see cref="SharpCoder.TokenUsage"/> is
+    /// added with <see cref="SharpCoder.TokenUsage.Add(SharpCoder.TokenUsage)"/> onto a fresh
+    /// accumulator, which sums <c>Calls</c>, both <c>*ReportedCalls</c> counters and the estimated
+    /// breakdown. <see cref="SharpCoder.UsageSummary.Add(SharpCoder.UsageEvent)"/> is deliberately NOT
+    /// used: it records ONE model call per event and would count each summed entry as a single call.
+    /// </para>
+    /// <para>
+    /// <c>null</c> summaries are skipped. The inputs are never mutated — reading <c>Entries</c> yields
+    /// detached copies and every count is summed onto a new accumulator — and the result is a detached
+    /// summary (its ctor deep-copies each entry it is given).
+    /// </para>
+    /// </summary>
+    /// <param name="summaries">The summaries to merge; may be empty, may contain <c>null</c>s.</param>
+    /// <returns>
+    /// One entry per distinct <c>(source, model)</c> pair seen in the input, each carrying the summed
+    /// counts; an empty summary (never <c>null</c>) when nothing was reported.
+    /// </returns>
+    internal static SharpCoder.UsageSummary Merge(IEnumerable<SharpCoder.UsageSummary?> summaries)
+    {
+        // Insertion order is preserved so the rendered entry order is deterministic.
+        var order = new List<(SharpCoder.UsageSource Source, string? Model)>();
+        var merged = new Dictionary<(SharpCoder.UsageSource Source, string? Model), SharpCoder.TokenUsage>(SourceModelComparer.Instance);
+
+        foreach (var summary in summaries)
+        {
+            if (summary is null)
+                continue;
+
+            foreach (var entry in summary.Entries)
             {
                 var key = (entry.Source, entry.Model);
                 if (!merged.TryGetValue(key, out var accumulator))
@@ -104,15 +144,8 @@ internal static class PhaseUsageTotals
         }
 
         // The ctor deep-copies each entry, so the returned summary is detached from the accumulators.
-        var summary = new SharpCoder.UsageSummary(
+        return new SharpCoder.UsageSummary(
             order.Select(key => new SharpCoder.UsageEntry(key.Source, key.Model, merged[key])));
-
-        return new Result
-        {
-            Usage = summary,
-            PhasesWithUsage = phasesWithUsage,
-            PhasesWithoutUsage = phasesWithoutUsage,
-        };
     }
 
     /// <summary>
