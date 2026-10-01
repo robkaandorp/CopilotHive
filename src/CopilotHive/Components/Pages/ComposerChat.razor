@@ -1,5 +1,6 @@
 @page "/composer"
 @using CopilotHive.Dashboard
+@using CopilotHive.Goals
 @using CopilotHive.Orchestration
 @using CopilotHive.Services
 @using Markdig
@@ -309,10 +310,20 @@
                         var ctxClass = stats is not null
                             ? (stats.ContextUsagePercent >= 90 ? "chat-ctx-danger" : stats.ContextUsagePercent >= 70 ? "chat-ctx-warn" : "chat-ctx-ok")
                             : "";
+                        // Computed DURING RENDER from the Composer's current usage snapshot, so the
+                        // figures refresh on the re-renders the page already performs (a stream ends:
+                        // HandleStreamingUpdate; a compaction finishes: HandleCompacted) — no new
+                        // events, timers or polling. A disconnected Composer reports no usage and the
+                        // span below simply does not render.
+                        var usageStatus = BuildUsageStatus(Composer.GetUsage());
                     }
                     @if (stats is not null)
                     {
                         <text> · ctx <span class="@ctxClass">@stats.ContextUsagePercent%</span></text>
+                    }
+                    @if (usageStatus.Text.Length > 0)
+                    {
+                        <span title="@usageStatus.Tooltip">@usageStatus.Text</span>
                     }
                     @if (Composer.IsCompacting)
                     {
@@ -366,6 +377,98 @@
         Placeholder: ModelSelectPlaceholder);
 
     private ComposerChatViewState ViewState => ComputeViewState(Composer.IsConnected);
+
+    /// <summary>
+    /// Internal immutable usage view the Razor markup reads DIRECTLY: the SHORT text appended to the
+    /// chat status bar plus the TOOLTIP lines carrying the full breakdown. Tests construct it from
+    /// mock snapshots and assert its text — never markup tokens or an HTML string. This is the
+    /// production seam.
+    /// </summary>
+    /// <param name="Text">The status-bar text (empty when there is nothing to show), including its leading separator.</param>
+    /// <param name="TooltipLines">The tooltip's lines, in render order; empty when there is nothing to show.</param>
+    internal sealed record ComposerChatUsageStatus(string Text, IReadOnlyList<string> TooltipLines)
+    {
+        /// <summary>
+        /// The tooltip as the markup's <c>title</c> attribute needs it: the lines joined with
+        /// newlines, so every figure occupies its own line in the browser's tooltip.
+        /// </summary>
+        internal string Tooltip => string.Join("\n", TooltipLines);
+    }
+
+    /// <summary>
+    /// Builds the chat status bar's token-usage view from the Composer's usage snapshot, or an empty
+    /// view when the Composer is disconnected (a <c>null</c> snapshot) — in which case the status bar
+    /// keeps exactly its previous content.
+    /// <para>
+    /// The snapshot's members are DELIBERATELY overlapping views of the same model calls, and this
+    /// method NEVER sums them: <c>Session</c> already contains the manual compactions (shown as their
+    /// own "included in session" line) and does NOT contain the clarifications (which run on forked
+    /// sessions and get their own line), so each figure is rendered exactly once, from the member that
+    /// answers its own question.
+    /// </para>
+    /// <para>
+    /// Pure and side-effect free: the snapshot is only read, so calling this during a render can never
+    /// perturb the usage state the next read reports.
+    /// </para>
+    /// </summary>
+    /// <param name="usage">The Composer's usage snapshot, or <c>null</c> while disconnected.</param>
+    /// <returns>The status text plus the tooltip lines for the current snapshot.</returns>
+    internal static ComposerChatUsageStatus BuildUsageStatus(ComposerUsageSnapshot? usage)
+    {
+        // Disconnected: the Composer reports no usage at all, so the status bar contributes nothing —
+        // neither text nor a tooltip.
+        if (usage is null) return new ComposerChatUsageStatus("", []);
+
+        var text = "";
+
+        // The most recent completed turn: the freshest figure. Null until a turn completes, and
+        // cleared when a new stream starts, so an in-flight turn contributes no turn figure at all.
+        var lastTurn = usage.LastTurn;
+
+        // The live session's cumulative usage. A zero-call session has nothing to show in the bar
+        // (its tooltip line still renders, so the breakdown is never ambiguous).
+        var session = usage.Session;
+
+        if (lastTurn is not null)
+        {
+            text += $" · turn {UsageFormat.FormatCompactTotal(lastTurn.Total)}";
+        }
+
+        if (session.Total.Calls > 0)
+        {
+            text += $" · session {UsageFormat.FormatCompactTotal(session.Total)}";
+        }
+
+        var lines = new List<string>();
+
+        // Per-turn line first (only once a turn completed), then the session total with its
+        // per-(source, model) breakdown. The session line and its entries are unconditional: they are
+        // the anchor the other figures are read against.
+        if (lastTurn is not null)
+        {
+            lines.Add($"Last turn: {UsageFormat.FormatUsageLine(lastTurn.Total)}");
+        }
+
+        lines.Add($"Session: {UsageFormat.FormatUsageLine(session.Total)}");
+        lines.AddRange(UsageFormat.FormatEntryLines(session));
+
+        // Clarifications are NOT part of Session (forked sessions whose usage is reset), so their
+        // calls reach no session total: the line is shown only when clarifications were actually
+        // answered, and it is never folded into another number.
+        if (usage.Clarifications.Total.Calls > 0)
+        {
+            lines.Add($"Clarifications (since start): {UsageFormat.FormatUsageLine(usage.Clarifications.Total)}");
+        }
+
+        // Manual compactions ARE a subset of Session: the label states that, so the two lines can
+        // never be mistaken for figures to add up.
+        if (usage.ManualCompactions.Total.Calls > 0)
+        {
+            lines.Add($"Manual compactions (since start, included in session): {UsageFormat.FormatUsageLine(usage.ManualCompactions.Total)}");
+        }
+
+        return new ComposerChatUsageStatus(text, lines);
+    }
 
     private sealed class ChatMessage
     {

@@ -789,8 +789,12 @@ public sealed class ComposerUsageTests
     /// <para>
     /// DISCRIMINATOR: without the unconditional <c>finally</c> release, the held stream never ends;
     /// <c>Composer.DisposeAsync</c> would hit its 5-second actor timeout and defer agent cleanup, and
-    /// <c>Assert.False(IsStreaming)</c> below would fail. Removing the drain would likewise leave the
-    /// fixture disposing the database while the stream is still running.
+    /// <c>Assert.False(IsStreaming)</c> below would fail. Removing the drain would likewise fail: the
+    /// <c>Assert.False(composer.IsStreaming…)</c> and the <c>LastTurn</c> assertions below it would run
+    /// while the held turn was still finishing — before the released gate let the stream reach its
+    /// terminal sequence — and fail there. (The fixture's teardown needs no help from this drain: its
+    /// <c>TeardownAsync</c> arms its own completion observer, releases the gate, joins the turn and
+    /// defers database disposal and directory deletion until the actor really completes.)
     /// </para>
     /// </summary>
     [Fact]
