@@ -70,6 +70,53 @@ public sealed class Goal
     public ReviewStatus ReviewStatus { get; set; } = ReviewStatus.None;
 
     /// <summary>
+    /// Cumulative, provider-reported token usage of every per-goal Brain call of this goal (planning,
+    /// worker-prompt crafting, clarification answers, commit message, merge summary) — including any
+    /// compaction calls made inside those calls. Stored as the <c>brain_usage</c> JSON column.
+    /// <para>
+    /// <c>null</c> means nothing was recorded: a goal persisted before this property existed (legacy
+    /// row), or a goal whose Brain has not completed a call yet. An EMPTY summary (zero entries) is
+    /// NEVER written — a summary with no entries would be indistinguishable from "measured, zero
+    /// model calls" — so <c>null</c> is the single "no usage recorded" marker. Usage that WAS
+    /// reported is a non-null summary with at least one <c>(source, model)</c> entry.
+    /// </para>
+    /// <para>
+    /// The accumulated value is written ONLY as a MERGE of one completed call's usage by
+    /// <see cref="IGoalStore.AddGoalUsageAsync"/> (per <c>(source, model)</c>), and cleared by
+    /// <see cref="IGoalStore.ResetGoalIterationDataAsync"/> together with the rest of the discarded
+    /// run's data on the Failed → Draft path. The goal UPDATE paths
+    /// (<see cref="IGoalStore.UpdateGoalAsync"/>, <see cref="IGoalSource.UpdateGoalStatusAsync"/>)
+    /// deliberately never copy this property, so a stale in-memory <see cref="Goal"/> instance cannot
+    /// overwrite (or erase) usage that has already been recorded.
+    /// </para>
+    /// </summary>
+    public SharpCoder.UsageSummary? BrainUsage { get; set; }
+
+    /// <summary>
+    /// Cumulative, provider-reported token usage of every pre-execution review of this goal that
+    /// completed a model call. Stored as the <c>review_usage</c> JSON column.
+    /// <para>
+    /// <c>null</c> means nothing was recorded: a goal persisted before this property existed (legacy
+    /// row), a goal that was never reviewed, or a review that has not completed a model call yet. An
+    /// EMPTY summary (zero entries) is NEVER written — a summary with no entries would be
+    /// indistinguishable from "measured, zero model calls" — so <c>null</c> is the single "no usage
+    /// recorded" marker. Usage that WAS reported is a non-null summary with at least one
+    /// <c>(source, model)</c> entry.
+    /// </para>
+    /// <para>
+    /// The accumulated value is written ONLY as a MERGE of one completed review's usage by
+    /// <see cref="IGoalStore.AddGoalUsageAsync"/> (per <c>(source, model)</c>). Unlike
+    /// <see cref="BrainUsage"/> it is NOT cleared by
+    /// <see cref="IGoalStore.ResetGoalIterationDataAsync"/>: a review is not part of a run, so a retry
+    /// of the goal keeps the reviews already paid for. The goal UPDATE paths
+    /// (<see cref="IGoalStore.UpdateGoalAsync"/>, <see cref="IGoalSource.UpdateGoalStatusAsync"/>)
+    /// deliberately never copy this property, so a stale in-memory <see cref="Goal"/> instance cannot
+    /// overwrite (or erase) usage that has already been recorded.
+    /// </para>
+    /// </summary>
+    public SharpCoder.UsageSummary? ReviewUsage { get; set; }
+
+    /// <summary>
     /// Resolves the effective target repository names for a goal.
     /// Parses <paramref name="targetRepositoryNames"/> as comma-separated, trims each entry,
     /// and removes empty/whitespace entries. Zero parsed entries → returns all
@@ -341,4 +388,20 @@ public enum ReviewStatus
     Approved,
     /// <summary>Review found issues that need to be addressed.</summary>
     NeedsChanges,
+}
+
+/// <summary>
+/// The kind of per-goal token usage a call is being recorded for. Selects WHICH accumulated column
+/// <see cref="IGoalStore.AddGoalUsageAsync"/> merges into, so the two kinds can never contaminate
+/// each other: Brain usage accumulates in <see cref="Goal.BrainUsage"/> (and is cleared on the
+/// Failed → Draft reset), review usage accumulates in <see cref="Goal.ReviewUsage"/> (and survives
+/// that reset).
+/// </summary>
+public enum GoalUsageKind
+{
+    /// <summary>Usage of this goal's Brain calls (<see cref="Goal.BrainUsage"/>).</summary>
+    Brain,
+
+    /// <summary>Usage of this goal's pre-execution reviews (<see cref="Goal.ReviewUsage"/>).</summary>
+    PreExecutionReview,
 }

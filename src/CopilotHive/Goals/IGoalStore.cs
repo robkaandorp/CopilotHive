@@ -79,10 +79,42 @@ public interface IGoalStore : IGoalSource
     Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default);
 
     /// <summary>
+    /// Records the token usage of ONE completed Brain call or pre-execution review of a goal by
+    /// merging it into the accumulated value for <paramref name="kind"/>.
+    /// <para>
+    /// The merge is per <c>(source, model)</c> entry and keeps every accumulated count — the token
+    /// sums, <c>Calls</c>, both <c>*ReportedCalls</c> counters and the estimated breakdown — so a
+    /// category that was partial stays partial in the accumulated value.
+    /// </para>
+    /// <para>
+    /// The two kinds are stored independently: a call for <see cref="GoalUsageKind.Brain"/> never
+    /// touches <see cref="Goal.ReviewUsage"/> and vice versa.
+    /// </para>
+    /// <para>
+    /// Usage recording is best-effort by contract and must NEVER fail the call it measures: an
+    /// unknown goal id is logged and ignored rather than thrown, and an EMPTY summary (zero entries)
+    /// is a no-op, so a goal with nothing recorded yet stays <c>null</c> rather than becoming an
+    /// empty summary. Implementations must serialise concurrent adds so no add is lost.
+    /// </para>
+    /// <para>
+    /// A DEFAULT implementation does nothing, so existing stores and test doubles compile and run
+    /// unchanged; stores that persist goals override it.
+    /// </para>
+    /// </summary>
+    /// <param name="goalId">The goal whose usage is being recorded.</param>
+    /// <param name="kind">Which accumulated usage the call belongs to.</param>
+    /// <param name="usage">The usage of the completed call; may be an empty summary (a no-op).</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task AddGoalUsageAsync(string goalId, GoalUsageKind kind, SharpCoder.UsageSummary usage, CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>
     /// Resets all iteration data for a goal so it can be retried from scratch.
     /// Clears: <c>FailureReason</c>, <c>Iterations</c> (reset to 0), <c>IterationSummaries</c>,
-    /// phase outputs, <c>TotalDurationSeconds</c>, and <c>StartedAt</c>.
-    /// Preserves: ID, Description, Priority, Scope, DependsOn, ReleaseId, RepositoryNames, CreatedAt.
+    /// phase outputs, <c>TotalDurationSeconds</c>, <c>StartedAt</c>, and <c>BrainUsage</c> (Brain
+    /// usage belongs to the discarded run, exactly like the iteration summaries).
+    /// Preserves: ID, Description, Priority, Scope, DependsOn, ReleaseId, RepositoryNames, CreatedAt,
+    /// and <see cref="Goal.ReviewUsage"/> (a pre-execution review is not part of a run, so the reviews
+    /// already paid for are kept).
     /// </summary>
     /// <param name="goalId">The ID of the goal to reset.</param>
     /// <param name="ct">Cancellation token.</param>

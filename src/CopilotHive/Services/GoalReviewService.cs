@@ -213,6 +213,29 @@ public class GoalReviewService
                 cts.CancelAfter(TimeSpan.FromMinutes(5));
                 var result = await agent.ExecuteAsync(reviewPrompt, cts.Token);
 
+                // Record this review's provider-reported usage against the reviewed goal, BEFORE the
+                // IsError check below: an Error-status result carries the usage of every call that
+                // already ran, and the review was paid for just the same. Recording is strictly
+                // BEST-EFFORT — it is wrapped in its own try/catch so a persistence failure can never
+                // change the verdict, the persisted ReviewStatus, the review document or the returned
+                // ReviewResult. The store no-ops on an empty summary and ignores an unknown goal id.
+                //
+                // Known, accepted limitation: when ExecuteAsync itself THROWS (the five-minute timeout,
+                // caller cancellation, HTTP failure), there is no AgentResult and therefore no
+                // TokenUsage to read, so that review's usage is not recorded. There is deliberately no
+                // reconciliation or session-delta logic to recover it.
+                if (_goalStore is not null)
+                {
+                    try
+                    {
+                        await _goalStore.AddGoalUsageAsync(goal.Id, GoalUsageKind.PreExecutionReview, result.TokenUsage, CancellationToken.None);
+                    }
+                    catch (Exception usageEx)
+                    {
+                        _logger.LogWarning(usageEx, "Failed to record pre-execution review usage for goal {GoalId}", goal.Id);
+                    }
+                }
+
                 // SharpCoder reports most provider failures as a non-throwing completion whose
                 // Result.Status is "Error" (Result.Message carries the provider text); only
                 // OperationCanceledException, HttpRequestException and ObjectDisposedException

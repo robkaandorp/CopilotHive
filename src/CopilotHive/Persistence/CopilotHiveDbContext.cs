@@ -228,6 +228,15 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.MergeCommitHash).HasColumnName("merge_commit_hash");
         entity.Property(e => e.ReleaseId).HasColumnName("release_id");
 
+        // Nullable by design: SQL NULL is the "nothing recorded" marker (a legacy row, or no call of
+        // that kind yet) and must stay distinct from a stored summary with zero entries. Both kinds
+        // accumulate independently, so they get one column each. No default value is configured, so
+        // ordinary newly-inserted rows leave both columns SQL NULL, and an existing database gains
+        // them through DatabaseMigration.EnsureSchemaUpToDate → ReconcileColumns (nullable, so
+        // ALTER TABLE ADD COLUMN works without a migration).
+        entity.Property(e => e.BrainUsage).HasColumnName("brain_usage").HasJsonConversion<SharpCoder.UsageSummary?>();
+        entity.Property(e => e.ReviewUsage).HasColumnName("review_usage").HasJsonConversion<SharpCoder.UsageSummary?>();
+
         // Derived collection loaded separately by GoalStore.
         entity.Ignore(e => e.IterationSummaries);
 

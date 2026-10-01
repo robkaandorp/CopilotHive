@@ -25,6 +25,13 @@ public sealed class GoalStore : IGoalStore
     private readonly PipelineStore? _pipelineStore;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
+    /// <summary>
+    /// Serialises <see cref="AddGoalUsageAsync"/> so two adds for the same goal can never lose an
+    /// update: the read-merge-write of an accumulated usage column is not atomic on its own, so
+    /// concurrent Brain calls (or a Brain call racing a review) must queue here.
+    /// </summary>
+    private readonly SemaphoreSlim _goalUsageGate = new(1, 1);
+
     /// <inheritdoc />
     public string Name => "sqlite";
 
@@ -205,6 +212,10 @@ public sealed class GoalStore : IGoalStore
             var oldStatus = goal.Status;
             _logger.LogInformation("GoalStore: updating goal '{GoalId}' status from {OldStatus} to {NewStatus}", goalId, oldStatus, status);
 
+            // BrainUsage and ReviewUsage are deliberately NOT updated here (and GoalUpdateMetadata
+            // carries no usage field): the accumulated usage is written ONLY by AddGoalUsageAsync, so
+            // a status update — which may come from a stale in-memory pipeline goal — can never
+            // overwrite or erase it.
             goal.Status = status;
 
             if (metadata is not null)
@@ -254,6 +265,86 @@ public sealed class GoalStore : IGoalStore
     }
 
     // ── IGoalStore CRUD ──────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The stored usage for <paramref name="kind"/> is merged with the incoming usage through
+    /// <see cref="PhaseUsageTotals.Merge"/> (per-entry, keeping every call count, both reported-calls
+    /// counters and the estimated breakdown), then written back under a semaphore so two concurrent
+    /// adds cannot lose an update.
+    /// <para>
+    /// Recording is best-effort by contract and never fails the Brain call or the review it measures:
+    /// an unknown goal id is logged as a warning and ignored, a persistence failure is logged as an
+    /// error and swallowed, and an empty summary (zero entries) is a no-op so a <c>null</c> column is
+    /// never replaced by an empty summary.
+    /// </para>
+    /// </remarks>
+    public async Task AddGoalUsageAsync(string goalId, GoalUsageKind kind, SharpCoder.UsageSummary usage, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(usage);
+
+        // An empty summary records nothing: writing it would turn "nothing recorded" (null) into an
+        // empty summary and make the two states indistinguishable. No-op before taking the gate.
+        if (usage.Entries.Count == 0)
+            return;
+
+        // The kind is validated BEFORE any database work: an unknown kind is a programming error that
+        // fails fast, and is never mistaken for (or hidden by) a recording failure.
+        switch (kind)
+        {
+            case GoalUsageKind.Brain:
+            case GoalUsageKind.PreExecutionReview:
+                break;
+            default:
+                throw new InvalidOperationException($"Unknown goal usage kind '{kind}'.");
+        }
+
+        await _goalUsageGate.WaitAsync(ct);
+        try
+        {
+            CopilotHiveDbContext? db = null;
+            var ownsContext = false;
+            try
+            {
+                (db, ownsContext) = ResolveDbContext();
+
+                var goal = await db.Goals.FirstOrDefaultAsync(g => g.Id == goalId, ct);
+                if (goal is null)
+                {
+                    _logger.LogWarning(
+                        "GoalStore: cannot record {Kind} usage for unknown goal '{GoalId}'; ignoring.",
+                        kind, goalId);
+                    return;
+                }
+
+                // One column per kind, and ONLY that column is written: the merge starts from the
+                // stored value, so an add for one kind can never touch the other.
+                if (kind == GoalUsageKind.Brain)
+                    goal.BrainUsage = PhaseUsageTotals.Merge([goal.BrainUsage, usage]);
+                else
+                    goal.ReviewUsage = PhaseUsageTotals.Merge([goal.ReviewUsage, usage]);
+
+                await db.SaveChangesAsync(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // Best-effort by contract: a persistence failure — the context could not even be
+                // created, or the save failed — is logged and swallowed so recording can never fail
+                // the Brain call or the review that produced the usage. A cancellation the caller
+                // requested still propagates.
+                _logger.LogError(ex, "GoalStore: failed to record {Kind} usage for goal '{GoalId}'.", kind, goalId);
+            }
+            finally
+            {
+                if (ownsContext && db is not null)
+                    await db.DisposeAsync();
+            }
+        }
+        finally
+        {
+            _goalUsageGate.Release();
+        }
+    }
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default)
@@ -355,6 +446,10 @@ public sealed class GoalStore : IGoalStore
                 _logger.LogWarning("GoalStore: UpdateGoalAsync overwriting goal '{GoalId}' status from {OldStatus} to {NewStatus}. Call stack: {StackTrace}", goal.Id, oldStatus, goal.Status, callStack);
             }
 
+            // BrainUsage and ReviewUsage are deliberately NOT copied here. The passed-in instance may
+            // be stale (e.g. pipeline.Goal, or the instance GoalReviewService persists ReviewStatus
+            // with), and the accumulated usage is written ONLY by AddGoalUsageAsync — copying it here
+            // would let a stale instance overwrite (or erase) usage that has already been recorded.
             existing.Description = goal.Description;
             existing.Status = goal.Status;
             existing.Priority = goal.Priority;
@@ -781,6 +876,11 @@ public sealed class GoalStore : IGoalStore
             goal.TotalDurationSeconds = null;
             goal.StartedAt = null;
             goal.CompletedAt = null;
+
+            // Brain usage belongs to the discarded run, exactly like the iteration summaries, so it is
+            // cleared with them. ReviewUsage is deliberately KEPT: a pre-execution review happens
+            // before the run and is not part of it, so the reviews already paid for survive a retry.
+            goal.BrainUsage = null;
 
             var iterations = await db.IterationSummaries
                 .Where(i => i.GoalId == goalId)

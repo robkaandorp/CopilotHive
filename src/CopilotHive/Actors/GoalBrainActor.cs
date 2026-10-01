@@ -226,6 +226,28 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         {
             var result = await CodingAgent.ExecuteAsync(sessionRef, message.Prompt, linkedCts.Token);
 
+            // Record this call's provider-reported usage against the goal, BEFORE the IsError check
+            // below: an Error-status result carries the usage of every call that already ran, and that
+            // work was paid for just the same. Recording is strictly BEST-EFFORT — it is wrapped in
+            // its own try/catch so a persistence failure can never change the Brain reply, the session
+            // save, the registry status or the exception path. The store no-ops on an empty summary and
+            // ignores an unknown goal id, so a usage-less or unknown-goal call is harmless.
+            //
+            // Known, accepted limitation: when ExecuteAsync itself THROWS (cancellation, HTTP failure),
+            // there is no AgentResult and therefore no TokenUsage to read, so that call's usage is not
+            // recorded. There is deliberately no reconciliation or session-delta logic to recover it.
+            if (_goalStore is not null)
+            {
+                try
+                {
+                    await _goalStore.AddGoalUsageAsync(GoalId, GoalUsageKind.Brain, result.TokenUsage, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to record Brain usage for goal {GoalId}", GoalId);
+                }
+            }
+
             // SharpCoder reports most provider failures as a non-throwing completion whose
             // Result.Status is "Error" (Result.Message carries the provider text); only
             // OperationCanceledException, HttpRequestException and ObjectDisposedException
