@@ -43,4 +43,15 @@ public sealed class PhaseViewInfo
     public List<ClarificationEntry> Clarifications { get; init; } = [];
     /// <summary>1-based occurrence index when the same phase appears multiple times in a multi-round plan.</summary>
     public int Occurrence { get; init; } = 1;
+    /// <summary>
+    /// The provider-reported token usage of this phase, or <c>null</c> when nothing was reported.
+    /// <para>
+    /// <c>null</c> means NOT REPORTED: a non-worker phase (Planning), a phase that has not run yet
+    /// (pending), legacy persisted data that predates the usage property, or a legacy worker/test
+    /// double that reports no usage. An EMPTY, non-null summary means usage WAS reported and the
+    /// worker task made zero model calls — the two cases are deliberately distinguishable, and
+    /// renderers must show a label for an empty summary but none for <c>null</c>.
+    /// </para>
+    /// </summary>
+    public SharpCoder.UsageSummary? Usage { get; init; }
 }

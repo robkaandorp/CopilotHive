@@ -49,4 +49,20 @@ public sealed class GoalDetailInfo
     public List<string> RepositoryNames { get; init; } = [];
     /// <summary>Reason the goal failed, if applicable.</summary>
     public string? FailureReason { get; init; }
+    /// <summary>
+    /// The summed token usage across ALL of the goal's iterations — the union of exactly the phase
+    /// records each <see cref="IterationViewInfo"/> was built from, with every iteration counted
+    /// exactly once — or <c>null</c> when no worker phase reported usage.
+    /// <para>
+    /// INTERNAL because <see cref="PhaseUsageTotals.Result"/> is internal — a public property would
+    /// be a CS0053 error. The dashboard page and <see cref="GoalDetailViewBuilder"/> live in the same
+    /// assembly, so both read it directly.
+    /// </para>
+    /// <para>
+    /// <c>null</c> means "render no Token Usage card at all", so a legacy goal without usage renders
+    /// exactly as it did before. An EMPTY (non-null) summary from a worker phase is a real zero-call
+    /// measurement and therefore counts as reported, exactly like <see cref="PhaseUsageTotals.Sum"/>.
+    /// </para>
+    /// </summary>
+    internal PhaseUsageTotals.Result? UsageTotals { get; init; }
 }

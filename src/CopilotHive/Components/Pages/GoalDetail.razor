@@ -363,6 +363,29 @@
                         </table>
                     </div>
                 }
+                @* Token Usage — the goal total, only when a worker phase reported usage *@
+                @{
+                    // The _detail path uses the builder's goal total (the union of exactly the phase
+                    // sets the timeline was built from); the stored path sums the stored iterations.
+                    var goalUsageTotals = _detail is not null
+                        ? _detail.UsageTotals
+                        : _storedGoal is not null
+                            ? GoalDetailViewBuilder.SumWorkerUsage(_storedIterations.SelectMany(i => i.Phases))
+                            : null;
+                }
+                @if (goalUsageTotals is { } storedOrDetailUsageTotals)
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="label">Token Usage</div>
+                        <div style="margin-top:0.5rem;font-size:0.85rem;color:var(--text-muted)">
+                            <div>Total: @UsageFormat.FormatUsageLine(storedOrDetailUsageTotals.Usage.Total)@UsageFormat.FormatMissingPhasesNote(storedOrDetailUsageTotals)</div>
+                            @foreach (var goalUsageEntryLine in UsageFormat.FormatEntryLines(storedOrDetailUsageTotals.Usage))
+                            {
+                                <div>@goalUsageEntryLine</div>
+                            }
+                        </div>
+                    </div>
+                }
             </div>
 
             @* RIGHT PANEL — iterations *@
@@ -404,6 +427,10 @@
                                             {
                                                 <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds.Value)</span>
                                             }
+                                            @if (UsageFormat.FormatPhaseBoxLabel(phase.Usage) is { } phaseUsageLabel)
+                                            {
+                                                <span class="phase-box-duration">@phaseUsageLabel</span>
+                                            }
                                         </button>
                                     }
                                 </div>
@@ -411,6 +438,12 @@
                                 {
                                     <div class="plan-reason">
                                         📋 @iter.PlanReason
+                                    </div>
+                                }
+                                @if (iter.UsageTotals is { } iterationUsage)
+                                {
+                                    <div style="margin-bottom:0.5rem;font-size:0.85rem;color:var(--text-muted)">
+                                        Iteration total: @UsageFormat.FormatUsageLine(iterationUsage.Usage.Total)@UsageFormat.FormatMissingPhasesNote(iterationUsage)
                                     </div>
                                 }
                                 <div class="iter-content" @ref="_iterContentRef">
@@ -434,6 +467,17 @@
                                                 }
                                                 <button class="phase-detail-close" @onclick="ClearSelectedPhase" title="Close">✕</button>
                                             </div>
+
+                                            @if (phase.Usage is not null)
+                                            {
+                                                <div style="margin-bottom:0.5rem;font-size:0.85rem;color:var(--text-muted)">
+                                                    <div>Tokens: @UsageFormat.FormatUsageLine(phase.Usage.Total)</div>
+                                                    @foreach (var usageEntryLine in UsageFormat.FormatEntryLines(phase.Usage))
+                                                    {
+                                                        <div>@usageEntryLine</div>
+                                                    }
+                                                </div>
+                                            }
 
                                             @if (phase.TotalTests > 0)
                                             {
@@ -630,6 +674,10 @@
                                             {
                                                 <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds)</span>
                                             }
+                                            @if (UsageFormat.FormatPhaseBoxLabel(phase.Usage) is { } storedPhaseUsageLabel)
+                                            {
+                                                <span class="phase-box-duration">@storedPhaseUsageLabel</span>
+                                            }
                                         </button>
                                     }
                                 </div>
@@ -637,6 +685,12 @@
                                 {
                                     <div class="plan-reason">
                                         📋 @iter.PlanReason
+                                    </div>
+                                }
+                                @if (IterationUsageTotals(iter.Phases) is { } storedIterationUsage)
+                                {
+                                    <div style="margin-bottom:0.5rem;font-size:0.85rem;color:var(--text-muted)">
+                                        Iteration total: @UsageFormat.FormatUsageLine(storedIterationUsage.Usage.Total)@UsageFormat.FormatMissingPhasesNote(storedIterationUsage)
                                     </div>
                                 }
                                 <div class="iter-content">
@@ -694,6 +748,17 @@
                                                 }
                                                 <button class="phase-detail-close" @onclick="ClearSelectedPhase" title="Close">✕</button>
                                             </div>
+
+                                            @if (phase.Usage is not null)
+                                            {
+                                                <div style="margin-bottom:0.5rem;font-size:0.85rem;color:var(--text-muted)">
+                                                    <div>Tokens: @UsageFormat.FormatUsageLine(phase.Usage.Total)</div>
+                                                    @foreach (var usageEntryLine in UsageFormat.FormatEntryLines(phase.Usage))
+                                                    {
+                                                        <div>@usageEntryLine</div>
+                                                    }
+                                                </div>
+                                            }
 
                                             @if (!string.IsNullOrEmpty(phase.WorkerOutput))
                                             {
@@ -1146,6 +1211,15 @@ else
         if (seconds >= 60) return $"{seconds / 60:F1}m";
         return $"{seconds:F0}s";
     }
+
+    /// <summary>
+    /// The token-usage total of ONE stored iteration's phase records, or <c>null</c> when no worker
+    /// phase of that iteration reported usage. Delegates to the builder so the stored path applies
+    /// exactly the same convention as the <c>_detail</c> path (which reads the pre-computed
+    /// <see cref="IterationViewInfo.UsageTotals"/>): a legacy iteration renders no line at all.
+    /// </summary>
+    private static PhaseUsageTotals.Result? IterationUsageTotals(IEnumerable<PhaseResult> phases) =>
+        GoalDetailViewBuilder.SumWorkerUsage(phases);
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";

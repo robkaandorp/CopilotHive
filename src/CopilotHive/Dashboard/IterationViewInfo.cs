@@ -1,3 +1,5 @@
+using CopilotHive.Goals;
+
 namespace CopilotHive.Dashboard;
 
 /// <summary>Detail for a single iteration in the goal timeline.</summary>
@@ -15,4 +17,20 @@ public sealed class IterationViewInfo
     public string? PlanningBrainPrompt { get; init; }
     /// <summary>Brain response (assistant message) from the planning phase, or null if not available.</summary>
     public string? PlanningBrainResponse { get; init; }
+    /// <summary>
+    /// The summed token usage of exactly the phase records this iteration was built from, or
+    /// <c>null</c> when NO worker phase in scope reported usage.
+    /// <para>
+    /// INTERNAL because <see cref="PhaseUsageTotals.Result"/> is internal — a public property would
+    /// be a CS0053 error. The dashboard page and <see cref="GoalDetailViewBuilder"/> live in the same
+    /// assembly, so both read it directly.
+    /// </para>
+    /// <para>
+    /// <c>null</c> means "render no usage line at all", so legacy data and non-worker-only
+    /// iterations render exactly as they did before usage reporting existed. A worker phase with an
+    /// EMPTY (non-null) summary is a real zero-call measurement and therefore counts as reported,
+    /// exactly like <see cref="PhaseUsageTotals.Sum"/> counts it — so it yields a non-null result.
+    /// </para>
+    /// </summary>
+    internal PhaseUsageTotals.Result? UsageTotals { get; init; }
 }

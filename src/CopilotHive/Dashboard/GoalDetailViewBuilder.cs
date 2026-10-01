@@ -39,7 +39,14 @@ internal static class GoalDetailViewBuilder
         // The authoritative goal is used for ALL view-model fields (not just Iterations).
         var effectiveGoal = fullGoalWithSummaries ?? goal;
 
-        var iterations = BuildIterationTimeline(effectiveGoal, goalId, pipeline);
+        var iterationSources = BuildIterationSources(effectiveGoal, goalId, pipeline);
+        var iterations = iterationSources.Select(s => s.View).ToList();
+
+        // The goal total sums the union of exactly the phase records each iteration was built from.
+        // Every iteration contributes exactly once: a summarised iteration contributes its chosen
+        // summary's phases, the live iteration contributes its own PhaseLog entries, and the two sets
+        // can never overlap (the live branch runs only when no summary exists for its number).
+        var goalUsage = SumWorkerUsage(iterationSources.SelectMany(s => s.Phases));
 
         // Derive effective status from pipeline phase
         var effectiveStatus = pipeline?.Phase switch
@@ -73,6 +80,7 @@ internal static class GoalDetailViewBuilder
             RepositoryUrl = ResolveRepositoryUrl(effectiveGoal, config),
             RepositoryNames = effectiveGoal.RepositoryNames,
             FailureReason = effectiveGoal.FailureReason,
+            UsageTotals = goalUsage,
         };
     }
 
@@ -83,12 +91,32 @@ internal static class GoalDetailViewBuilder
     /// covering both summarised (completed) iterations and the live pipeline iteration.
     /// </summary>
     public static List<IterationViewInfo> BuildIterationTimeline(
+        Goal goal, string goalId, GoalPipeline? pipeline) =>
+        BuildIterationSources(goal, goalId, pipeline).Select(s => s.View).ToList();
+
+    /// <summary>
+    /// The phase records ONE iteration view was built from, paired with that view. The phase list is
+    /// the EXACT set the iteration's <see cref="IterationViewInfo.UsageTotals"/> are summed over —
+    /// never a wider one — so the goal total can union these lists without counting a phase twice.
+    /// </summary>
+    private sealed record IterationSource(IterationViewInfo View, IReadOnlyList<PhaseResult> Phases);
+
+    /// <summary>
+    /// Builds the iteration views together with the exact phase records each one was built from.
+    /// A summarised iteration is built from its chosen summary's phases; the live iteration is built
+    /// from its own <see cref="GoalPipeline.PhaseLog"/> entries. The two sets never overlap: the live
+    /// branch runs only when NO summary exists for the pipeline's current iteration, so a summarised
+    /// current iteration never also contributes its PhaseLog usage.
+    /// </summary>
+    private static List<IterationSource> BuildIterationSources(
         Goal goal, string goalId, GoalPipeline? pipeline)
     {
-        var iterations = new List<IterationViewInfo>();
+        var sources = new List<IterationSource>();
 
         // Build views for completed iterations from IterationSummaries.
         // Merge persisted summaries (from goal source) with in-memory summaries (from pipeline).
+        // A PERSISTED summary wins for a given iteration number: the in-memory one is added only
+        // when no summary with that number exists, so the iteration is counted EXACTLY once.
         var allSummaries = new List<IterationSummary>(goal.IterationSummaries);
         if (pipeline is not null)
         {
@@ -107,18 +135,21 @@ internal static class GoalDetailViewBuilder
 
             var phases = BuildPhasesFromSummary(goalId, summary, pipeline);
 
-            iterations.Add(new IterationViewInfo
-            {
-                Number = summary.Iteration,
-                Phases = phases,
-                IsCurrent = false,
-                PlanningBrainPrompt = firstSummaryPhase?.PlanningPrompt,
-                PlanningBrainResponse = firstSummaryPhase?.PlanningResponse,
-            });
+            sources.Add(new IterationSource(
+                new IterationViewInfo
+                {
+                    Number = summary.Iteration,
+                    Phases = phases,
+                    IsCurrent = false,
+                    PlanningBrainPrompt = firstSummaryPhase?.PlanningPrompt,
+                    PlanningBrainResponse = firstSummaryPhase?.PlanningResponse,
+                    UsageTotals = SumWorkerUsage(summary.Phases),
+                },
+                summary.Phases));
         }
 
         // Build view for the current/unsummarized iteration from pipeline state.
-        if (pipeline is not null && !iterations.Any(i => i.Number == pipeline.Iteration))
+        if (pipeline is not null && !sources.Any(s => s.View.Number == pipeline.Iteration))
         {
             var currentIter = pipeline.Iteration;
             var isCurrent = pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed;
@@ -129,18 +160,48 @@ internal static class GoalDetailViewBuilder
 
             var currentPhases = BuildPhasesFromPipeline(goalId, pipeline, currentIter);
 
-            iterations.Add(new IterationViewInfo
-            {
-                Number = currentIter,
-                Phases = currentPhases,
-                IsCurrent = isCurrent,
-                PlanReason = pipeline.Plan?.Reason,
-                PlanningBrainPrompt = firstLogEntry?.PlanningPrompt,
-                PlanningBrainResponse = firstLogEntry?.PlanningResponse,
-            });
+            // The EXACT phase records this iteration was built from: its own PhaseLog entries.
+            // Materialised so a later PhaseLog append cannot change an already-built total.
+            var currentPhaseResults = pipeline.PhaseLog
+                .Where(e => e.Iteration == currentIter)
+                .ToList();
+
+            sources.Add(new IterationSource(
+                new IterationViewInfo
+                {
+                    Number = currentIter,
+                    Phases = currentPhases,
+                    IsCurrent = isCurrent,
+                    PlanReason = pipeline.Plan?.Reason,
+                    PlanningBrainPrompt = firstLogEntry?.PlanningPrompt,
+                    PlanningBrainResponse = firstLogEntry?.PlanningResponse,
+                    UsageTotals = SumWorkerUsage(currentPhaseResults),
+                },
+                currentPhaseResults));
         }
 
-        return iterations;
+        return sources;
+    }
+
+    /// <summary>
+    /// Sums the usage of the given phase records and applies the shared "no usage to show"
+    /// convention: the result is <c>null</c> when NO worker phase reported usage, so renderers show
+    /// nothing at all and legacy data renders exactly as before.
+    /// <para>
+    /// Non-worker phases (Planning, Merging, Done, Failed) neither contribute tokens nor make the
+    /// result non-null — <see cref="PhaseUsageTotals.Sum"/> ignores them entirely. As soon as at
+    /// least one WORKER phase reported, the result is non-null, and an EMPTY summary counts as
+    /// reported-with-zero exactly as <see cref="PhaseUsageTotals.Sum"/> counts it.
+    /// </para>
+    /// <para>
+    /// The dashboard page calls this for its stored-iteration and stored-goal totals too, so the
+    /// convention exists exactly once and both render paths agree.
+    /// </para>
+    /// </summary>
+    internal static PhaseUsageTotals.Result? SumWorkerUsage(IEnumerable<PhaseResult> phases)
+    {
+        var totals = PhaseUsageTotals.Sum(phases);
+        return totals.PhasesWithUsage > 0 ? totals : null;
     }
 
     // ── BuildPhasesFromSummary ──────────────────────────────────────────────────
@@ -348,6 +409,8 @@ internal static class GoalDetailViewBuilder
                     BrainPrompt = entry.BrainPrompt,
                     WorkerPrompt = entry.WorkerPrompt,
                     Clarifications = phaseClarifications ?? [],
+                    // The phase's reported usage, verbatim: null stays null (not reported).
+                    Usage = entry.Usage,
                 });
             }
 
@@ -410,6 +473,8 @@ internal static class GoalDetailViewBuilder
             ReviewVerdict = isReviewPhase && isLastOccurrence ? summary?.ReviewVerdict : null,
             Clarifications = clarifications ?? [],
             ProgressReports = progress,
+            // The phase's reported usage, verbatim: null stays null (not reported).
+            Usage = phase.Usage,
         };
     }
 
