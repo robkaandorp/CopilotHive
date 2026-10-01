@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using CopilotHive.Shared;
 using CopilotHive.Workers;
 using SharpCoder;
 
@@ -118,7 +119,8 @@ public sealed partial class Composer
         var relPath = Path.GetRelativePath(_configRepo.LocalPath, filePath).Replace('\\', '/');
         _logger.LogInformation("Composer updated config repo file '{FilePath}'", relPath);
 
-        return $"✅ Written {content.Length} characters to '{relPath}'. Use commit_config_changes to persist.";
+        return $"✅ Written {content.Length} characters to '{relPath}'. Use commit_config_changes to persist. "
+            + AgentsMdSize.Describe(content.Length);
     }
 
     /// <summary>
@@ -160,7 +162,8 @@ public sealed partial class Composer
         var relPath = $"agents/{workerRole.ToRoleName()}.agents.md";
         _logger.LogInformation("Composer edited config repo file '{FilePath}'", relPath);
 
-        return $"✅ Replacement applied to '{relPath}'. Use commit_config_changes to persist.";
+        return $"✅ Replacement applied to '{relPath}'. Use commit_config_changes to persist. "
+            + AgentsMdSize.Describe(updated.Length);
     }
 
     /// <summary>

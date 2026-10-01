@@ -9,6 +9,7 @@ using Microsoft.Extensions.AI;
 using SharpCoder;
 using SharpCoder.Providers;
 using SharpCoder.SubAgents;
+using SharpCoder.Tools;
 
 using System.ComponentModel;
 using System.Diagnostics;
@@ -575,9 +576,12 @@ public sealed class SharpCoderRunner : IAgentRunner
                 Follow this policy exactly:
 
                 1. **Look before you edit.** Read the existing files and check their current sizes
-                   first — call the `get_file_sizes` tool before making any edit, and call it again
-                   after you re-read a file you changed. The agents/ folder may contain only a few
-                   files or none at all, and a missing file counts as empty (0 characters); the same
+                   first — call the `get_file_sizes` tool before making any edit. Edit `*.agents.md`
+                   files with `edit_agents_file` / `write_agents_file`, which report the file's new
+                   size after every edit, so no separate size check is needed afterwards. If a
+                   sub-agent or the built-in `edit_file` / `write_file` changed a file, call
+                   `get_file_sizes` again. The agents/ folder may contain only a few files or none
+                   at all, and a missing file counts as empty (0 characters); the same
                    {WorkerConstants.AgentsMdMaxCharacters}-character limit applies to a newly created file.
                 2. **Only genuinely new lessons.** Formulate only lessons that are genuinely new,
                    broadly applicable, and not already covered by an existing rule. Write them in
@@ -1367,7 +1371,11 @@ public sealed class SharpCoderRunner : IAgentRunner
             tools.Add(BuildDocChangesTool());
 
         if (_currentRole == WorkerRole.Improver)
+        {
             tools.Add(BuildFileSizesTool());
+            tools.Add(BuildEditAgentsFileTool(ct));
+            tools.Add(BuildWriteAgentsFileTool(ct));
+        }
 
         // EVERY role gets the completed-phase reports of this iteration: an earlier phase's report
         // can hold evidence a later phase needs to verify (the second Coding occurrence after a
@@ -1629,4 +1637,74 @@ public sealed class SharpCoderRunner : IAgentRunner
         },
         "get_file_sizes",
         $"Get character and byte counts for files in the agents directory. Use before editing to check against the {WorkerConstants.AgentsMdMaxCharacters}-character limit.");
+
+    /// <summary>
+    /// The directory holding the <c>*.agents.md</c> guidance files — the SAME directory
+    /// <c>get_file_sizes</c> reads. The Improver's working directory is
+    /// <c>&lt;configRepoDir&gt;/agents</c>, so the delegated paths are relative to this folder.
+    /// </summary>
+    private string AgentsDirectory => Path.Combine(_configRepoDir, "agents");
+
+    /// <summary>
+    /// Appends the file's FULL post-edit size line (<see cref="AgentsMdSize.Describe"/>) to a
+    /// delegated <see cref="FileTools"/> result, but ONLY when that result reports success
+    /// (it starts with <c>Successfully</c>). Any other result is an error and is returned
+    /// unchanged with no size line.
+    /// <para>
+    /// The size is read back from the file itself — the FULL text, not the length of the
+    /// replacement — so the Improver always sees the file's real size against the limit.
+    /// </para>
+    /// </summary>
+    private static string WithAgentsFileSize(string result, string agentsDir, string filePath)
+    {
+        if (!result.StartsWith("Successfully", StringComparison.Ordinal))
+            return result;
+
+        var fullPath = Path.GetFullPath(Path.Combine(agentsDir, filePath));
+        return result + " " + AgentsMdSize.Describe(File.ReadAllText(fullPath).Length);
+    }
+
+    /// <summary>
+    /// <c>edit_agents_file</c> — the Improver's size-reporting wrapper around SharpCoder's
+    /// <c>edit_file</c>. Delegates ALL editing rules (exact single-occurrence match, path
+    /// containment under the agents folder) to <see cref="FileTools"/> and adds the file's full
+    /// size to a successful result.
+    /// </summary>
+    /// <param name="ct">The assignment's cancellation token, forwarded to every file operation.</param>
+    private AITool BuildEditAgentsFileTool(CancellationToken ct)
+    {
+        var agentsDir = AgentsDirectory;
+        return AIFunctionFactory.Create(
+            (async ([Description("Relative path of the file under the agents folder, e.g. 'coder.agents.md'.")] string filePath,
+             [Description("The exact text to find and replace. Must occur exactly once in the file.")] string oldString,
+             [Description("The replacement text.")] string newString) =>
+            {
+                _log.Info($"Tool call: edit_agents_file(path={filePath})");
+                var result = await new FileTools(agentsDir).edit_file(filePath, oldString, newString, ct);
+                return WithAgentsFileSize(result, agentsDir, filePath);
+            }),
+            "edit_agents_file",
+            $"Edit a file under the agents folder. Same rules as edit_file (relative path inside the agents folder, oldString must occur exactly once). Prefer this for *.agents.md files: on success it reports the file's full size against the {WorkerConstants.AgentsMdMaxCharacters}-character limit.");
+    }
+
+    /// <summary>
+    /// <c>write_agents_file</c> — the Improver's size-reporting wrapper around SharpCoder's
+    /// <c>write_file</c>. Delegates ALL rules (path containment, parent-directory creation) to
+    /// <see cref="FileTools"/> and adds the file's full size to a successful result.
+    /// </summary>
+    /// <param name="ct">The assignment's cancellation token, forwarded to every file operation.</param>
+    private AITool BuildWriteAgentsFileTool(CancellationToken ct)
+    {
+        var agentsDir = AgentsDirectory;
+        return AIFunctionFactory.Create(
+            (async ([Description("Relative path of the file under the agents folder, e.g. 'coder.agents.md'.")] string filePath,
+             [Description("Complete replacement content to write.")] string content) =>
+            {
+                _log.Info($"Tool call: write_agents_file(path={filePath})");
+                var result = await new FileTools(agentsDir).write_file(filePath, content, ct);
+                return WithAgentsFileSize(result, agentsDir, filePath);
+            }),
+            "write_agents_file",
+            $"Create or overwrite a file under the agents folder. Same rules as write_file (relative path inside the agents folder). Prefer this for *.agents.md files: on success it reports the file's full size against the {WorkerConstants.AgentsMdMaxCharacters}-character limit.");
+    }
 }

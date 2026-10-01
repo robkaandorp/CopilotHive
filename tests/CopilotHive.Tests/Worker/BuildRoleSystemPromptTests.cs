@@ -181,6 +181,31 @@ public sealed class BuildRoleSystemPromptTests
     }
 
     /// <summary>
+    /// Rule 1 of the guidance update policy must direct the Improver at the two size-reporting
+    /// tools, and must NOT ask for the removed second <c>get_file_sizes</c> call after an edit the
+    /// new tools already report on. Removal-proof: fails if either tool name or the
+    /// "no separate size check" wording is dropped, or if the old re-read requirement returns.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Improver_NamesTheSizeReportingAgentsFileTools()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Improver, null);
+        var normalizedPrompt = string.Join(' ',
+            prompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        Assert.Contains("edit_agents_file", prompt, StringComparison.Ordinal);
+        Assert.Contains("write_agents_file", prompt, StringComparison.Ordinal);
+        Assert.Contains(
+            "which report the file's new size after every edit, so no separate size check is needed afterwards",
+            normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("call `get_file_sizes` again", normalizedPrompt, StringComparison.Ordinal);
+
+        // The old blanket re-check requirement is gone.
+        Assert.DoesNotContain("call it again", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("after you re-read a file you changed", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The complete Improver prompt must deliver the append-new/compress-old contract together
     /// with the existing scope, delegation, anti-duplication, and safety constraints. Supplying
     /// learned guidance also proves the role policy remains composed before that appendix.
@@ -199,8 +224,12 @@ public sealed class BuildRoleSystemPromptTests
 
         Assert.Contains("Read the existing files and check their current sizes", prompt, StringComparison.Ordinal);
         Assert.Contains("call the `get_file_sizes` tool before making any edit", prompt, StringComparison.Ordinal);
-        Assert.Contains("call it again", prompt, StringComparison.Ordinal);
-        Assert.Contains("after you re-read a file you changed", prompt, StringComparison.Ordinal);
+        Assert.Contains("files with `edit_agents_file` / `write_agents_file`", prompt, StringComparison.Ordinal);
+        Assert.Contains("report the file's new", prompt, StringComparison.Ordinal);
+        Assert.Contains("size after every edit, so no separate size check is needed afterwards", prompt, StringComparison.Ordinal);
+        Assert.Contains("sub-agent or the built-in `edit_file` / `write_file` changed a file, call", prompt, StringComparison.Ordinal);
+        Assert.Contains("`get_file_sizes` again", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("call it again", prompt, StringComparison.Ordinal);
         Assert.Contains("genuinely new", prompt, StringComparison.Ordinal);
         Assert.Contains("broadly applicable", prompt, StringComparison.Ordinal);
         Assert.Contains("not already covered by an existing rule", prompt, StringComparison.Ordinal);
@@ -330,10 +359,17 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("missing file counts as empty (0 characters)", normalizedPrompt, StringComparison.Ordinal);
         Assert.Contains("limit applies to a newly created file", normalizedPrompt, StringComparison.Ordinal);
 
-        // The mandatory size checks survive in rule 1.
+        // The mandatory size checks survive in rule 1, now pointing at the size-reporting tools.
         Assert.Contains("call the `get_file_sizes` tool before making any edit", prompt, StringComparison.Ordinal);
-        Assert.Contains("call it again", prompt, StringComparison.Ordinal);
-        Assert.Contains("after you re-read a file you changed", prompt, StringComparison.Ordinal);
+        Assert.Contains(
+            "Edit `*.agents.md` files with `edit_agents_file` / `write_agents_file`, which report the file's new "
+            + "size after every edit, so no separate size check is needed afterwards.",
+            normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains(
+            "If a sub-agent or the built-in `edit_file` / `write_file` changed a file, call `get_file_sizes` again.",
+            normalizedPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("call it again", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("after you re-read a file you changed", prompt, StringComparison.Ordinal);
 
         // The OLD blanket ban is gone.
         Assert.DoesNotContain("only edit `*.agents.md` files", prompt, StringComparison.OrdinalIgnoreCase);

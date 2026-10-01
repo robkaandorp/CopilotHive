@@ -5,6 +5,7 @@ using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Shared;
 using CopilotHive.Workers;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.AI;
@@ -10371,6 +10372,112 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
         Assert.Contains("❌", result);
         Assert.Contains("old_string is required", result);
         Assert.Contains("must not be empty", result);
+    }
+
+    // ── size reporting on successful agents.md edits ──
+
+    /// <summary>
+    /// A successful update must report the file's full written length against the limit, so the
+    /// Composer can tell how much room is left without reading the file back.
+    /// Removal-proof: fails if the appended size line is dropped.
+    /// </summary>
+    [Fact]
+    public async Task UpdateAgentsMd_Success_ReportsWrittenLengthAgainstLimit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string content = "# Coder Instructions\nDo stuff.";
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("Coder", content, cancellationToken: ct);
+
+        Assert.Contains("✅ Written", result);
+        Assert.Contains(AgentsMdSize.Describe(content.Length), result, StringComparison.Ordinal);
+        Assert.Contains("File is now 30 characters (limit 8000).", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("over the", result, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An over-limit update must say exactly how far over the limit the written file is. The file
+    /// is still written (the Composer's own tools do not enforce the cap), but the size line
+    /// makes the violation visible.
+    /// </summary>
+    [Fact]
+    public async Task UpdateAgentsMd_OverLimitContent_ReportsOverTheLimit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var content = new string('x', AgentsMdSize.MaxCharacters + 1);
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("Coder", content, cancellationToken: ct);
+
+        Assert.Contains("✅ Written", result);
+        Assert.Contains(AgentsMdSize.Describe(content.Length), result, StringComparison.Ordinal);
+        Assert.Contains(
+            $"File is now {AgentsMdSize.MaxCharacters + 1} characters — 1 over the {AgentsMdSize.MaxCharacters}-character limit.",
+            result,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A successful edit must report the FULL post-edit file length — not the length of the
+    /// replacement string — so the number reflects the file on disk.
+    /// Removal-proof: passes only when the size is read from the file after the replacement; using
+    /// <c>new_string.Length</c> would report 2 instead of the full 16-character file.
+    /// </summary>
+    [Fact]
+    public async Task EditAgentsMd_Success_ReportsFullPostEditFileLengthNotReplacementLength()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var filePath = Path.Combine(_configRepoDir, "agents", "coder.agents.md");
+        const string original = "Line A\nLine B\nLine C";
+        await File.WriteAllTextAsync(filePath, original, ct);
+        const string replacement = "XY";
+        var expected = original.Replace("Line B", replacement, StringComparison.Ordinal);
+
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Coder", "Line B", replacement, cancellationToken: ct);
+
+        Assert.Contains("✅ Replacement applied", result);
+        Assert.Equal(original.Length - "Line B".Length + replacement.Length, expected.Length);
+        Assert.NotEqual(replacement.Length, expected.Length);
+        Assert.Contains($"File is now {expected.Length} characters (limit 8000).", result, StringComparison.Ordinal);
+        Assert.DoesNotContain($"File is now {replacement.Length} characters", result, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Error results must stay exactly as they were — no size line is appended when nothing was
+    /// written. Covers the update path and the edit path (missing file, old_string not found,
+    /// invalid role, required arguments).
+    /// </summary>
+    [Theory]
+    [InlineData("update-noconfigrepo")]
+    [InlineData("update-invalidrole")]
+    [InlineData("update-missingcontent")]
+    [InlineData("edit-noconfigrepo")]
+    [InlineData("edit-missingfile")]
+    [InlineData("edit-oldstringnotfound")]
+    [InlineData("edit-invalidrole")]
+    [InlineData("edit-emptyoldstring")]
+    public async Task AgentsMdTools_ErrorPaths_ContainNoSizeLine(string scenario)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = scenario switch
+        {
+            "update-noconfigrepo" => await _composerWithoutConfigRepo.UpdateAgentsMdAsync("Coder", "# C", cancellationToken: ct),
+            "update-invalidrole" => await _composerWithConfigRepo.UpdateAgentsMdAsync("NotARole", "# C", cancellationToken: ct),
+            "update-missingcontent" => await _composerWithConfigRepo.UpdateAgentsMdAsync("Coder", null!, cancellationToken: ct),
+            "edit-noconfigrepo" => await _composerWithoutConfigRepo.EditAgentsMdAsync("Coder", "old", "new", cancellationToken: ct),
+            "edit-missingfile" => await _composerWithConfigRepo.EditAgentsMdAsync("Reviewer", "old", "new", cancellationToken: ct),
+            "edit-oldstringnotfound" => await EditAgainstExistingContentAsync("does not exist", "new", ct),
+            "edit-invalidrole" => await _composerWithConfigRepo.EditAgentsMdAsync("NotARole", "old", "new", cancellationToken: ct),
+            "edit-emptyoldstring" => await _composerWithConfigRepo.EditAgentsMdAsync("Coder", "", "new", cancellationToken: ct),
+            _ => throw new InvalidOperationException($"No error path defined for scenario '{scenario}'."),
+        };
+
+        Assert.Contains("❌", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("File is now", result, StringComparison.Ordinal);
+    }
+
+    private async Task<string> EditAgainstExistingContentAsync(string oldString, string newString, CancellationToken ct)
+    {
+        var filePath = Path.Combine(_configRepoDir, "agents", "tester.agents.md");
+        await File.WriteAllTextAsync(filePath, "Some content here", ct);
+        return await _composerWithConfigRepo.EditAgentsMdAsync("Tester", oldString, newString, cancellationToken: ct);
     }
 
     // ── commit_config_changes ──
