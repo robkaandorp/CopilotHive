@@ -87,6 +87,20 @@ public sealed class WorkerService(
     internal string? HeartbeatTaskIdForTest => _currentTaskId;
 
     /// <summary>
+    /// TEST SEAM — writes the same field the heartbeat reads, so a test can perform a TASK
+    /// TRANSITION from inside a fake runner's usage snapshot call and thereby exercise the
+    /// heartbeat's transition-consistency check deterministically.
+    /// </summary>
+    /// <remarks>
+    /// INERT IN PRODUCTION: nothing in the worker calls it, it holds no state, decides nothing and
+    /// only assigns the existing field. It is the smallest thing that makes the window between the
+    /// heartbeat's task-id capture and its post-snapshot re-read addressable — no external
+    /// scheduling can land a mutation inside those two synchronous statements.
+    /// </remarks>
+    /// <param name="taskId">The task id to publish, or <c>null</c> for "no current task".</param>
+    internal void SetCurrentTaskIdForTest(string? taskId) => _currentTaskId = taskId;
+
+    /// <summary>
     /// THE SERVICE'S ONE PUBLISHED CONNECTION — an ACCEPTED registration together with its opened
     /// duplex work stream, the gRPC client for that registration and the provisioner associated with
     /// them. Every production operation SNAPSHOTS this one reference, once, before it awaits, so it
@@ -3038,6 +3052,16 @@ public sealed class WorkerService(
                         _log.Info($"Received task {domainTask.TaskId}: {domainTask.GoalDescription}");
 
                         // Mark busy before async execution so heartbeats reflect the real state
+                        //
+                        // THE USAGE RESET HAPPENS BEFORE THE TASK ID IS PUBLISHED — deliberately so.
+                        // A heartbeat reads the task id and the runner's usage snapshot, and the
+                        // snapshot it reads must belong to the task that id names. Resetting FIRST
+                        // guarantees that the instant the id becomes visible the runner's sink is
+                        // already the NEW task's (empty) one, so a heartbeat can never attach the
+                        // PREVIOUS task's accumulated usage to this task id. The executor resets
+                        // again as its own first step; a second reset is harmless (a fresh-empty
+                        // sink replaces a fresh-empty sink).
+                        _agentRunner.ResetTaskUsage();
                         _currentTaskId = domainTask.TaskId;
                         _currentRole = domainTask.Role.ToRoleName();
 
@@ -5035,6 +5059,11 @@ public sealed class WorkerService(
     /// propagating. A tick that already passed the check keeps its captured client, token and
     /// outcome.
     /// </para>
+    /// <para>
+    /// THE LIVE USAGE IS THE RUNNING TASK'S USAGE ACCUMULATED SO FAR, attached to the SAME task id
+    /// the request names. It is sent ONLY while the worker is busy on a task AND the runner reports
+    /// usage. See the transition-consistency check below for why no locking is required.
+    /// </para>
     /// </remarks>
     private async Task SendHeartbeatAsync(WorkerConnection connection, CancellationToken ct)
     {
@@ -5042,6 +5071,40 @@ public sealed class WorkerService(
         {
             var client = connection.EnsureUsable().Client;
             var taskId = _currentTaskId;
+
+            // THE TRANSITION-CONSISTENCY CHECK. A snapshot is attached ONLY when the task id this
+            // tick captured is STILL the current task id after the snapshot was taken (ordinal
+            // equality), so a task transition that landed in between can never tag one task's usage
+            // with another task's id.
+            //
+            // WHY THAT IS SUFFICIENT, AND WHY NO LOCKING IS REQUIRED:
+            //   * Task ids are unique per assignment, so an id that is still current after the read
+            //     names one, unambiguous task.
+            //   * The NEXT task's id is published only AFTER its usage reset (see the assignment
+            //     site), so the runner's sink is never carrying the previous task's numbers at the
+            //     instant that id becomes visible.
+            //   * Therefore a snapshot read while the id stayed unchanged either belongs to that
+            //     task, or is a fresh-empty sink created for the next assignment just before its id
+            //     was published. The second case merely UNDER-REPORTS (an empty/partial summary) and
+            //     is tagged with a task that has already finished; live display only uses snapshots
+            //     whose task id matches the pipeline's ACTIVE task, so the mismatched one is
+            //     harmlessly ignored.
+            //   * The two reads are plain volatile field reads of a reference that is only ever
+            //     REASSIGNED at a sequential task boundary, so no torn state is possible and no lock
+            //     is needed.
+            // A null usage (a runner that does not report usage) and a task-id change both leave
+            // LiveUsage ABSENT — "no live usage reported" — never a zero measurement.
+            TaskUsage? liveUsage = null;
+            if (taskId is not null)
+            {
+                var usage = _agentRunner.GetTaskUsage();
+                if (usage is not null
+                    && string.Equals(_currentTaskId, taskId, StringComparison.Ordinal))
+                {
+                    liveUsage = GrpcMapper.ToGrpc(usage);
+                }
+            }
+
             await client.HeartbeatAsync(new HeartbeatRequest
             {
                 WorkerId = connection.AssignedId,
@@ -5051,6 +5114,7 @@ public sealed class WorkerService(
                 ContextUsagePercent = taskId is not null
                     ? _agentRunner.GetContextUsagePercent()
                     : 0,
+                LiveUsage = liveUsage,
             }, cancellationToken: ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

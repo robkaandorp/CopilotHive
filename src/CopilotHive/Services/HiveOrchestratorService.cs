@@ -914,7 +914,12 @@ public sealed class HiveOrchestratorService(
     /// <returns>An acknowledged <see cref="HeartbeatResponse"/>.</returns>
     public override Task<HeartbeatResponse> Heartbeat(HeartbeatRequest request, ServerCallContext context)
     {
-        workerPool.UpdateHeartbeat(request.WorkerId, request.ContextUsagePercent);
+        // THE LIVE USAGE PAIR TRAVELS TOGETHER OR NOT AT ALL. It is derived BEFORE the store call so a
+        // malformed report can never partially update the worker, and every failure path — usage
+        // absent, task id empty, or a mapping failure (unknown source) — resolves to (null, null),
+        // which the pool applies as an explicit CLEAR of any previously stored pair.
+        var (liveUsageTaskId, liveUsage) = MapLiveUsageForHeartbeat(request);
+        workerPool.UpdateHeartbeat(request.WorkerId, request.ContextUsagePercent, liveUsageTaskId, liveUsage);
         logger.LogDebug("Heartbeat from {WorkerId} (busy={Busy}, role={Role}, task={TaskId}, ctx={Ctx}%)",
             request.WorkerId, request.Busy, request.CurrentRole, request.CurrentTaskId, request.ContextUsagePercent);
 
@@ -964,6 +969,60 @@ public sealed class HiveOrchestratorService(
         }
 
         return Task.FromResult(new HeartbeatResponse { Acknowledged = true });
+    }
+
+    /// <summary>
+    /// Resolves the live usage pair a heartbeat carries into the domain values the pool stores, or
+    /// <c>(null, null)</c> when this heartbeat reports no usable live usage.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE PAIR IS RESOLVED WHOLE. The task id is echoed ONLY together with a successfully mapped
+    /// summary, and EVERY failure path yields BOTH values <c>null</c>: a usage without a task id
+    /// cannot be attributed, an empty task id names no task, and an entry whose
+    /// <see cref="Shared.Grpc.UsageSourceKind"/> is unspecified/unknown makes the whole report
+    /// unmappable (see <see cref="GrpcMapper.ToDomain(TaskUsage)"/>). The pool treats a
+    /// <c>(null, null)</c> pair as an explicit CLEAR, so the caller's previous snapshot never
+    /// outlives the heartbeat that stopped reporting one.
+    /// </para>
+    /// <para>
+    /// A MAPPING FAILURE IS NEVER A HEARTBEAT FAILURE. The malformed report is logged and dropped;
+    /// the timestamp, the context usage and the acknowledgement are exactly the same as for a
+    /// well-formed heartbeat, so a worker with a broken usage report is still kept alive rather than
+    /// being evicted or retried into a loop.
+    /// </para>
+    /// </remarks>
+    /// <param name="request">The heartbeat whose live usage is resolved.</param>
+    /// <returns>The task-id/summary pair to store, or <c>(null, null)</c> when there is none.</returns>
+    private (string? TaskId, SharpCoder.UsageSummary? Usage) MapLiveUsageForHeartbeat(HeartbeatRequest request)
+    {
+        // ABSENT usage means "the worker is not reporting live usage" — a legacy/idle worker, or a
+        // runner without usage. Message presence is the only trustworthy signal here.
+        if (request.LiveUsage is null)
+            return (null, null);
+
+        // A usage with no task id cannot be attributed to a task, so it is not stored at all.
+        if (string.IsNullOrEmpty(request.CurrentTaskId))
+        {
+            logger.LogDebug(
+                "Heartbeat from {WorkerId} carried live usage without a current task id — ignoring it.",
+                request.WorkerId);
+            return (null, null);
+        }
+
+        try
+        {
+            return (request.CurrentTaskId, GrpcMapper.ToDomain(request.LiveUsage));
+        }
+        catch (InvalidOperationException ex)
+        {
+            // The report itself is malformed (unspecified/unknown source). Drop it — but ONLY it:
+            // the heartbeat is still applied and acknowledged by the caller.
+            logger.LogWarning(ex,
+                "Heartbeat from {WorkerId} carried unmappable live usage for task {TaskId} — ignoring the usage.",
+                request.WorkerId, request.CurrentTaskId);
+            return (null, null);
+        }
     }
 
     /// <summary>

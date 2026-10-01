@@ -350,29 +350,7 @@ public static class GrpcMapper
         {
             // Assigning the message sets the field's presence bit: an empty summary is a PRESENT
             // report with zero entries, never absence.
-            complete.Usage = new TaskUsage();
-            foreach (var entry in result.Usage.Entries)
-            {
-                var tokenUsage = entry.Usage;
-                var wireEntry = new TaskUsageEntry
-                {
-                    Source = ToGrpc(entry.Source),
-                    InputTokens = tokenUsage.InputTokens,
-                    OutputTokens = tokenUsage.OutputTokens,
-                    CachedInputTokens = tokenUsage.CachedInputTokens,
-                    ReasoningTokens = tokenUsage.ReasoningTokens,
-                    Calls = tokenUsage.Calls,
-                    CachedInputReportedCalls = tokenUsage.CachedInputReportedCalls,
-                    ReasoningReportedCalls = tokenUsage.ReasoningReportedCalls,
-                    Estimated = ToGrpc(tokenUsage.Estimated),
-                };
-                // ONLY set when non-null: never normalize a null model to an empty string.
-                if (entry.Model is not null)
-                {
-                    wireEntry.Model = entry.Model;
-                }
-                complete.Usage.Entries.Add(wireEntry);
-            }
+            complete.Usage = ToGrpc(result.Usage);
         }
         if (result.Metrics is not null)
         {
@@ -400,6 +378,54 @@ public static class GrpcMapper
             };
         }
         return complete;
+    }
+
+    /// <summary>
+    /// Converts a domain <see cref="SharpCoder.UsageSummary"/> to the gRPC <see cref="TaskUsage"/>
+    /// equivalent: one wire entry per domain entry, each copying every token count, reported-calls
+    /// counter and the full estimated breakdown verbatim.
+    /// </summary>
+    /// <remarks>
+    /// THE RETURNED MESSAGE IS ALWAYS PRESENT — an empty summary becomes a message with zero entries,
+    /// which is a real measurement ("no model calls"), never absence. CALLERS OWN THE PRESENCE BIT:
+    /// assigning the result to a message field is what records "usage was reported".
+    /// <para>
+    /// The entry <c>model</c> (field 2 of <c>TaskUsageEntry</c>) has explicit presence and is set
+    /// ONLY when <see cref="SharpCoder.UsageEntry.Model"/> is non-null, so a receiver can still tell
+    /// "unknown model" from "model reported as empty".
+    /// </para>
+    /// </remarks>
+    /// <param name="usage">The domain usage report; must not be <c>null</c>. An empty summary is valid.</param>
+    /// <returns>A detached wire usage message.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// An entry's source has no wire equivalent (see <see cref="ToGrpc(SharpUsageSource)"/>).
+    /// </exception>
+    public static TaskUsage ToGrpc(SharpUsageSummary usage)
+    {
+        var wire = new TaskUsage();
+        foreach (var entry in usage.Entries)
+        {
+            var tokenUsage = entry.Usage;
+            var wireEntry = new TaskUsageEntry
+            {
+                Source = ToGrpc(entry.Source),
+                InputTokens = tokenUsage.InputTokens,
+                OutputTokens = tokenUsage.OutputTokens,
+                CachedInputTokens = tokenUsage.CachedInputTokens,
+                ReasoningTokens = tokenUsage.ReasoningTokens,
+                Calls = tokenUsage.Calls,
+                CachedInputReportedCalls = tokenUsage.CachedInputReportedCalls,
+                ReasoningReportedCalls = tokenUsage.ReasoningReportedCalls,
+                Estimated = ToGrpc(tokenUsage.Estimated),
+            };
+            // ONLY set when non-null: never normalize a null model to an empty string.
+            if (entry.Model is not null)
+            {
+                wireEntry.Model = entry.Model;
+            }
+            wire.Entries.Add(wireEntry);
+        }
+        return wire;
     }
 
     /// <summary>

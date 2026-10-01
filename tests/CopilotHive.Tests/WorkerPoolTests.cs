@@ -2,6 +2,11 @@ using CopilotHive.Models;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 
+using SharpUsageEntry = SharpCoder.UsageEntry;
+using SharpUsageSource = SharpCoder.UsageSource;
+using SharpUsageSummary = SharpCoder.UsageSummary;
+using SharpTokenUsage = SharpCoder.TokenUsage;
+
 namespace CopilotHive.Tests;
 
 public sealed class WorkerPoolTests
@@ -1155,6 +1160,198 @@ public sealed class WorkerPoolTests
 
         Assert.Null(pool.GetWorker("ghost"));
         Assert.Equal(0, pool.ConnectedWorkerCount);
+    }
+
+    #endregion
+
+    // ── UpdateHeartbeat — the live usage pair ─────────────────────────────────
+
+    #region UpdateHeartbeat — live usage is stored BOTH-OR-NEITHER
+
+    /// <summary>
+    /// Builds a usage summary with DISTINCT non-zero counts, so a dropped, mixed-up or aliased
+    /// snapshot is always visible.
+    /// </summary>
+    private static SharpUsageSummary LiveUsage(string model, long seed) => new(
+    [
+        new SharpUsageEntry(SharpUsageSource.Agent, model, new SharpTokenUsage
+        {
+            InputTokens = 100 + seed,
+            OutputTokens = 200 + seed,
+            CachedInputTokens = 300 + seed,
+            ReasoningTokens = 400 + seed,
+            Calls = 1,
+            CachedInputReportedCalls = 1,
+            ReasoningReportedCalls = 1,
+        }),
+    ]);
+
+    /// <summary>Asserts every count of one <see cref="LiveUsage"/> summary exactly.</summary>
+    private static void AssertLiveUsageCounts(SharpUsageSummary? usage, string model, long seed)
+    {
+        Assert.NotNull(usage);
+        var entry = Assert.Single(usage!.Entries);
+        Assert.Equal(SharpUsageSource.Agent, entry.Source);
+        Assert.Equal(model, entry.Model);
+        Assert.Equal(100 + seed, entry.Usage.InputTokens);
+        Assert.Equal(200 + seed, entry.Usage.OutputTokens);
+        Assert.Equal(300 + seed, entry.Usage.CachedInputTokens);
+        Assert.Equal(400 + seed, entry.Usage.ReasoningTokens);
+        Assert.Equal(1, entry.Usage.Calls);
+    }
+
+    /// <summary>
+    /// THE BOTH-OR-NEITHER STORE: a heartbeat carrying BOTH a non-empty task id and a usage snapshot
+    /// stores both, and both are visible on the registered instance as well as in the pool's
+    /// detached capture.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_BothLiveUsageValues_StoresBoth()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+        worker.IsBusy = true;
+        worker.CurrentTaskId = "task-1";
+
+        pool.UpdateHeartbeat("w1", contextUsagePercent: 42, liveUsageTaskId: "task-1", liveUsage: LiveUsage("model-a", 1));
+
+        Assert.Equal("task-1", worker.LiveUsageTaskId);
+        AssertLiveUsageCounts(worker.LiveUsage, "model-a", 1);
+
+        // The capture reports the SAME pair, so the store is not invisible to pool consumers.
+        var snapshot = Assert.Single(pool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.Equal("task-1", snapshot.LiveUsageTaskId);
+        AssertLiveUsageCounts(snapshot.LiveUsage, "model-a", 1);
+    }
+
+    /// <summary>
+    /// USAGE ABSENT CLEARS BOTH: a heartbeat that carries no usage — but still a non-empty task id —
+    /// must not leave the previous snapshot visible, because that snapshot belongs to a measurement
+    /// the worker has stopped reporting.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_NullUsage_ClearsBoth()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+        worker.IsBusy = true;
+        worker.CurrentTaskId = "task-1";
+        pool.UpdateHeartbeat("w1", 42, "task-1", LiveUsage("model-a", 1));
+        Assert.NotNull(worker.LiveUsage);
+
+        pool.UpdateHeartbeat("w1", 43, liveUsageTaskId: "task-1", liveUsage: null);
+
+        Assert.Null(worker.LiveUsage);
+        Assert.Null(worker.LiveUsageTaskId);
+
+        var snapshot = Assert.Single(pool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.Null(snapshot.LiveUsage);
+        Assert.Null(snapshot.LiveUsageTaskId);
+        // The heartbeat itself was still applied.
+        Assert.Equal(43, worker.ContextUsagePercent);
+    }
+
+    /// <summary>
+    /// TASK ID ABSENT CLEARS BOTH: usage without an attribution cannot be stored, and the pair is
+    /// never stored partially — the previous snapshot is cleared together with its tag.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_NullTaskId_ClearsBoth()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+        pool.UpdateHeartbeat("w1", 42, "task-1", LiveUsage("model-a", 1));
+        Assert.NotNull(worker.LiveUsage);
+
+        pool.UpdateHeartbeat("w1", 43, liveUsageTaskId: null, liveUsage: LiveUsage("model-b", 2));
+
+        Assert.Null(worker.LiveUsage);
+        Assert.Null(worker.LiveUsageTaskId);
+    }
+
+    /// <summary>
+    /// AN EMPTY TASK ID CLEARS BOTH: the wire uses the empty string for "no task", so it must be
+    /// treated exactly like <c>null</c> rather than stored as an id.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_EmptyTaskId_ClearsBoth()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+        pool.UpdateHeartbeat("w1", 42, "task-1", LiveUsage("model-a", 1));
+        Assert.NotNull(worker.LiveUsage);
+
+        pool.UpdateHeartbeat("w1", 43, liveUsageTaskId: "", liveUsage: LiveUsage("model-b", 2));
+
+        Assert.Null(worker.LiveUsage);
+        Assert.Null(worker.LiveUsageTaskId);
+    }
+
+    /// <summary>
+    /// THE EXISTING PARAMETERLESS-STYLE CALLER still compiles (the parameters are optional) AND keeps
+    /// the pair invariant: a heartbeat that passes neither value leaves the pair cleared rather than
+    /// keeping whatever the previous heartbeat reported.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_ExistingTwoArgumentCaller_ClearsThePair()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+        pool.UpdateHeartbeat("w1", 42, "task-1", LiveUsage("model-a", 1));
+        Assert.NotNull(worker.LiveUsage);
+
+        pool.UpdateHeartbeat("w1", contextUsagePercent: 44);
+
+        Assert.Null(worker.LiveUsage);
+        Assert.Null(worker.LiveUsageTaskId);
+        Assert.Equal(44, worker.ContextUsagePercent);
+    }
+
+    /// <summary>
+    /// THE CAPTURE IS DETACHED: mutating the snapshot's usage — including replacing its whole entry
+    /// list — cannot change what the NEXT capture reports. A capture that aliased the pool's stored
+    /// instance fails here, because the mutation reaches it.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_CapturedLiveUsage_IsDetachedFromThePool()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+        pool.UpdateHeartbeat("w1", 42, "task-1", LiveUsage("model-a", 1));
+
+        var first = Assert.Single(pool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.NotNull(first.LiveUsage);
+        AssertLiveUsageCounts(first.LiveUsage, "model-a", 1);
+        // THE OBSERVABLE INSTANCE IS NOT THE POOL'S: no shared mutable summary escapes the lock.
+        Assert.NotSame(worker.LiveUsage, first.LiveUsage);
+
+        first.LiveUsage!.Entries =
+        [
+            new SharpUsageEntry(
+                SharpUsageSource.Compaction,
+                "post-capture-replacement",
+                new SharpTokenUsage { InputTokens = 999_999, Calls = 1 }),
+        ];
+
+        var second = Assert.Single(pool.CaptureWorkerStatus(), w => w.Id == "w1");
+        AssertLiveUsageCounts(second.LiveUsage, "model-a", 1);
+        Assert.Same(worker.LiveUsageTaskId, second.LiveUsageTaskId);
+    }
+
+    /// <summary>
+    /// AN UNKNOWN WORKER IS STILL A NO-OP, even when the heartbeat carries live usage: nothing is
+    /// stored, nothing is created, and the pool count is unchanged.
+    /// </summary>
+    [Fact]
+    public void UpdateHeartbeat_UnknownWorker_WithLiveUsage_IsNoOp()
+    {
+        var pool = CreatePool();
+
+        pool.UpdateHeartbeat("ghost", contextUsagePercent: 42, liveUsageTaskId: "task-1", liveUsage: LiveUsage("model-a", 1));
+
+        Assert.Null(pool.GetWorker("ghost"));
+        Assert.Equal(0, pool.ConnectedWorkerCount);
+        Assert.Empty(pool.CaptureWorkerStatus());
     }
 
     /// <summary>

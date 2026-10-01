@@ -70,4 +70,26 @@ internal readonly record struct WorkerStatusSnapshot
 
     /// <summary>UTC timestamp when the worker first connected.</summary>
     public required DateTime ConnectedAt { get; init; }
+
+    /// <summary>
+    /// The latest heartbeat usage snapshot the captured worker had reported at the captured instant —
+    /// the usage its RUNNING task had accumulated so far — or <c>null</c> when the worker reported none.
+    /// </summary>
+    /// <remarks>
+    /// IT IS DETACHED LIKE EVERYTHING ELSE HERE: the capture copies it with <c>Snapshot()</c>, so a
+    /// consumer never receives — and can never mutate — the pool's stored instance or a live
+    /// accumulation. BOTH-OR-NEITHER with <see cref="LiveUsageTaskId"/>: the pool stores and clears the
+    /// pair together, so at any captured instant either both are present or both are <c>null</c>.
+    /// </remarks>
+    public required SharpCoder.UsageSummary? LiveUsage { get; init; }
+
+    /// <summary>
+    /// The task id the captured worker's <see cref="LiveUsage"/> snapshot was reported for, or
+    /// <c>null</c> when no live usage was reported at the captured instant.
+    /// </summary>
+    /// <remarks>
+    /// IT TAGS THE SNAPSHOT, it is not a second copy of <see cref="CurrentTaskId"/>: a consumer must
+    /// compare the two to know whether the snapshot belongs to the task it is displaying.
+    /// </remarks>
+    public required string? LiveUsageTaskId { get; init; }
 }

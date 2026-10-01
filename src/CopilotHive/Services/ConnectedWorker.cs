@@ -64,6 +64,33 @@ public sealed class ConnectedWorker
     public int ContextUsagePercent { get; set; }
 
     /// <summary>
+    /// THE LATEST HEARTBEAT USAGE SNAPSHOT this worker reported for the task named in
+    /// <see cref="LiveUsageTaskId"/>: the usage the RUNNING task had accumulated as of that heartbeat.
+    /// A detached snapshot, never a live accumulation, so later model calls cannot change a value
+    /// already stored here.
+    /// </summary>
+    /// <remarks>
+    /// BOTH ARE NON-NULL TOGETHER OR NULL TOGETHER — this field and <see cref="LiveUsageTaskId"/> are
+    /// a PAIR and a partial update is never acceptable: a usage with no task id cannot be attributed,
+    /// and a task id with no usage would claim a measurement that was never reported. The invariant is
+    /// ENFORCED BY THE CALLERS (<see cref="WorkerPool.UpdateHeartbeat"/> writes and clears both in the
+    /// same lock span); this property is a plain settable field and does not check it itself. An
+    /// EMPTY (non-null) summary is meaningful here: "the task has made no model calls yet".
+    /// </remarks>
+    public SharpCoder.UsageSummary? LiveUsage { get; set; }
+
+    /// <summary>
+    /// THE TASK ID the latest heartbeat usage snapshot (<see cref="LiveUsage"/>) was reported for — the
+    /// worker's <c>current_task_id</c> at that heartbeat. Non-null exactly when <see cref="LiveUsage"/>
+    /// is non-null (see it for the enforced-by-callers pairing invariant).
+    /// </summary>
+    /// <remarks>
+    /// IT TAGS THE SNAPSHOT, it does not replace <see cref="CurrentTaskId"/>: the two are independent
+    /// fields, and a consumer that needs the usage of a specific task must compare against this id.
+    /// </remarks>
+    public string? LiveUsageTaskId { get; set; }
+
+    /// <summary>
     /// THE COMPLETION-PUBLICATION SELECTION HOLD of THIS instance: <c>true</c> only during the short
     /// interval in which the instance has already been RELEASED by a negotiated ordinary completion
     /// but its completion-receipt acknowledgement has not yet been queued on its own stream.

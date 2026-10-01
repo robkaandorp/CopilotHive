@@ -413,6 +413,10 @@ public sealed class WorkerPool : IWorkerPool
                 ContextUsagePercent = worker.ContextUsagePercent,
                 LastHeartbeat = worker.LastHeartbeat,
                 ConnectedAt = worker.ConnectedAt,
+                // DETACHED: the pool's stored instance is never handed out, so a consumer mutating the
+                // capture cannot change what the next capture reports. A null stays null.
+                LiveUsage = worker.LiveUsage?.Snapshot(),
+                LiveUsageTaskId = worker.LiveUsageTaskId,
             });
         }
 
@@ -449,15 +453,39 @@ public sealed class WorkerPool : IWorkerPool
     public int ConnectedWorkerCount => _workers.Count;
 
     /// <summary>
-    /// Updates the last heartbeat timestamp for the specified worker.
+    /// Updates the last heartbeat timestamp for the specified worker, together with its context usage
+    /// and — when the worker reported one — the RUNNING task's live usage snapshot.
     /// </summary>
     /// <remarks>
     /// Taken under <c>_activityLock</c> so the write is ordered against
     /// <see cref="PurgeStaleWorkers"/>, which decides eviction on the strength of this timestamp.
+    /// <para>
+    /// THE LIVE USAGE PAIR IS BOTH-OR-NEITHER. <paramref name="liveUsageTaskId"/> and
+    /// <paramref name="liveUsage"/> are stored together ONLY when BOTH are non-null and the task id is
+    /// non-empty; in EVERY other case — usage absent, id absent, id empty — BOTH
+    /// <see cref="ConnectedWorker.LiveUsageTaskId"/> and <see cref="ConnectedWorker.LiveUsage"/> are
+    /// CLEARED. Partial storage is never acceptable: a usage with no attribution, or a stale snapshot
+    /// left behind by a heartbeat that no longer reports one, would both misreport what the worker is
+    /// doing. The clearing happens on EVERY heartbeat, so a worker that stops reporting usage (idle,
+    /// or a runner with no usage) cannot leave its previous snapshot visible.
+    /// </para>
+    /// <para>
+    /// A heartbeat for an unknown worker is a NO-OP: nothing is stored, cleared or created.
+    /// </para>
     /// </remarks>
     /// <param name="id">Identifier of the worker.</param>
     /// <param name="contextUsagePercent">Estimated context window usage as a percentage (0–100).</param>
-    public void UpdateHeartbeat(string id, int contextUsagePercent = 0)
+    /// <param name="liveUsageTaskId">
+    /// The task the reported usage belongs to, or <c>null</c>/empty when no live usage is reported.
+    /// </param>
+    /// <param name="liveUsage">
+    /// The running task's usage accumulated so far, or <c>null</c> when no live usage is reported.
+    /// </param>
+    public void UpdateHeartbeat(
+        string id,
+        int contextUsagePercent = 0,
+        string? liveUsageTaskId = null,
+        SharpCoder.UsageSummary? liveUsage = null)
     {
         lock (_activityLock)
         {
@@ -466,6 +494,18 @@ public sealed class WorkerPool : IWorkerPool
 
             worker.LastHeartbeat = DateTime.UtcNow;
             worker.ContextUsagePercent = contextUsagePercent;
+
+            // BOTH-OR-NEITHER: the pair is written whole, or the pair is cleared whole.
+            if (!string.IsNullOrEmpty(liveUsageTaskId) && liveUsage is not null)
+            {
+                worker.LiveUsageTaskId = liveUsageTaskId;
+                worker.LiveUsage = liveUsage;
+            }
+            else
+            {
+                worker.LiveUsageTaskId = null;
+                worker.LiveUsage = null;
+            }
         }
     }
 

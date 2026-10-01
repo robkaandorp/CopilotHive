@@ -1624,4 +1624,198 @@ public sealed class GrpcMapperTests
         Assert.Equal(10, total.CachedInputReportedCalls); // 5 + 5 — below Calls
         Assert.Equal(14, total.ReasoningReportedCalls);
     }
+
+    // ── ToGrpc(UsageSummary): the SHARED usage writer ─────────────────────────
+
+    /// <summary>
+    /// The public <see cref="GrpcMapper.ToGrpc(SharpUsageSummary)"/> overload — the same writer the
+    /// completion path and the heartbeat's live usage use — round-trips TWO entries through the wire
+    /// and back through <see cref="GrpcMapper.ToDomain(TaskUsage)"/>, keeping every token count,
+    /// both reported-calls counters (including one deliberately below <c>Calls</c>) and all 13
+    /// estimated fields of each entry.
+    /// </summary>
+    [Fact]
+    public void UsageSummary_ToGrpc_TwoEntries_RoundTripKeepsEveryCount()
+    {
+        var original = new SharpUsageSummary(
+        [
+            BuildFullUsageEntry(SharpUsageSource.Agent, "model-a"),
+            BuildFullUsageEntry(SharpUsageSource.SubAgentCompaction, "model-b"),
+        ]);
+
+        var wire = GrpcMapper.ToGrpc(original);
+        var decoded = TaskUsage.Parser.ParseFrom(wire.ToByteArray());
+        var restored = GrpcMapper.ToDomain(decoded);
+
+        Assert.Equal(2, restored.Entries.Count);
+
+        var agent = Assert.Single(restored.Entries, e => e.Source == SharpUsageSource.Agent);
+        Assert.Equal("model-a", agent.Model);
+        AssertTokenUsageIsFullyPreserved(agent.Usage);
+
+        var compaction = Assert.Single(restored.Entries, e => e.Source == SharpUsageSource.SubAgentCompaction);
+        Assert.Equal("model-b", compaction.Model);
+        AssertTokenUsageIsFullyPreserved(compaction.Usage);
+    }
+
+    /// <summary>
+    /// THE EXTRACTION IS WIRE-IDENTICAL: the standalone overload produces EXACTLY the bytes the
+    /// completion path writes for the same summary, so moving the loop behind
+    /// <c>ToGrpc(UsageSummary)</c> cannot have changed the completion's wire output.
+    /// </summary>
+    /// <remarks>
+    /// The comparison is made on RE-PARSED bytes, so it observes the serialized message rather than
+    /// the in-memory object the mapper happened to build.
+    /// </remarks>
+    [Fact]
+    public void UsageSummary_ToGrpc_MatchesTheCompletionPath_ByteForByte()
+    {
+        var usage = new SharpUsageSummary(
+        [
+            BuildFullUsageEntry(SharpUsageSource.Agent, "model-a"),
+            BuildFullUsageEntry(SharpUsageSource.Compaction, null),
+        ]);
+
+        var complete = GrpcMapper.ToGrpc(BuildFullTaskResult() with { Usage = usage });
+        var viaCompletion = TaskUsage.Parser.ParseFrom(complete.Usage.ToByteArray());
+
+        var viaStandalone = TaskUsage.Parser.ParseFrom(GrpcMapper.ToGrpc(usage).ToByteArray());
+
+        Assert.Equal(viaCompletion.ToByteArray(), viaStandalone.ToByteArray());
+    }
+
+    /// <summary>
+    /// A PRESENT-but-EMPTY summary maps to a message with zero entries — a real measurement — and
+    /// decodes back to a non-null empty summary. The overload itself never decides presence: it
+    /// always returns a message.
+    /// </summary>
+    [Fact]
+    public void UsageSummary_ToGrpc_EmptySummary_IsAnEmptyPresentMessage()
+    {
+        var wire = GrpcMapper.ToGrpc(new SharpUsageSummary());
+
+        Assert.NotNull(wire);
+        Assert.Empty(wire.Entries);
+
+        var decoded = TaskUsage.Parser.ParseFrom(wire.ToByteArray());
+        Assert.NotNull(decoded);
+        Assert.Empty(decoded.Entries);
+
+        var restored = GrpcMapper.ToDomain(decoded);
+        Assert.Empty(restored.Entries);
+        Assert.Equal(0, restored.Total.Calls);
+    }
+
+    /// <summary>
+    /// The entry-model PRESENCE BIT is written by the overload exactly as the completion path wrote
+    /// it: a <c>null</c> model stays absent on the wire (never normalized to the empty string), and a
+    /// model reported as empty stays PRESENT with an empty value.
+    /// </summary>
+    [Fact]
+    public void UsageSummary_ToGrpc_ModelPresence_IsWrittenExactly()
+    {
+        var nullModel = GrpcMapper.ToGrpc(new SharpUsageSummary([BuildFullUsageEntry(SharpUsageSource.Agent, null)]));
+        Assert.False(nullModel.Entries[0].HasModel, "A null entry model must be absent on the wire.");
+        Assert.Null(GrpcMapper.ToDomain(TaskUsage.Parser.ParseFrom(nullModel.ToByteArray())).Entries[0].Model);
+
+        var emptyModel = GrpcMapper.ToGrpc(new SharpUsageSummary([BuildFullUsageEntry(SharpUsageSource.Agent, "")]));
+        Assert.True(emptyModel.Entries[0].HasModel, "An empty (non-null) model must stay PRESENT on the wire.");
+        Assert.Equal("", emptyModel.Entries[0].Model);
+        Assert.Equal("", GrpcMapper.ToDomain(TaskUsage.Parser.ParseFrom(emptyModel.ToByteArray())).Entries[0].Model);
+    }
+
+    /// <summary>
+    /// The overload is the INVERSE of <see cref="GrpcMapper.ToDomain(TaskUsage)"/> for every usage
+    /// source, so a live-usage heartbeat and a completion cannot disagree about how a source is
+    /// spelled on the wire.
+    /// </summary>
+    [Theory]
+    [InlineData(SharpUsageSource.Agent, GrpcUsageSourceKind.Agent)]
+    [InlineData(SharpUsageSource.Compaction, GrpcUsageSourceKind.Compaction)]
+    [InlineData(SharpUsageSource.SubAgent, GrpcUsageSourceKind.SubAgent)]
+    [InlineData(SharpUsageSource.SubAgentCompaction, GrpcUsageSourceKind.SubAgentCompaction)]
+    public void UsageSummary_ToGrpc_EachSource_MatchesTheInboundMapping(SharpUsageSource source, GrpcUsageSourceKind wire)
+    {
+        var message = GrpcMapper.ToGrpc(new SharpUsageSummary(
+        [
+            new SharpUsageEntry(source, "model-x", new SharpTokenUsage { InputTokens = 5, Calls = 1 }),
+        ]));
+
+        var entry = Assert.Single(message.Entries);
+        Assert.Equal(wire, entry.Source);
+        Assert.Equal(source, GrpcMapper.ToDomain(entry.Source));
+    }
+
+    /// <summary>
+    /// An UNSPECIFIED source cannot be written by the overload either: the outbound source mapping
+    /// refuses every value without a wire equivalent rather than silently emitting
+    /// <c>USAGE_SOURCE_KIND_UNSPECIFIED</c>.
+    /// </summary>
+    [Fact]
+    public void UsageSummary_ToGrpc_UnmappableSource_Throws()
+    {
+        var summary = new SharpUsageSummary(
+        [
+            new SharpUsageEntry(
+                (SharpUsageSource)99,
+                "model-x",
+                new SharpTokenUsage { InputTokens = 5, Calls = 1 }),
+        ]);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => GrpcMapper.ToGrpc(summary));
+        Assert.Contains("99", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ── HeartbeatRequest.live_usage (field 7) ────────────────────────────────
+
+    /// <summary>
+    /// THE HEARTBEAT'S LIVE-USAGE FIELD IS ADDITIVE: it is exactly field 7 and collides with none of
+    /// the pre-existing heartbeat fields (1, 3, 4, 5, 6 — 2 is reserved), so an old server reads the
+    /// heartbeat exactly as before and simply ignores the usage it does not know. No handshake and no
+    /// renumbering is involved.
+    /// </summary>
+    [Fact]
+    public void HeartbeatRequest_LiveUsage_UsesFieldSevenWithoutRenumberingExistingFields()
+    {
+        Assert.Equal(7, HeartbeatRequest.LiveUsageFieldNumber);
+
+        int[] existing =
+        [
+            HeartbeatRequest.WorkerIdFieldNumber,
+            HeartbeatRequest.BusyFieldNumber,
+            HeartbeatRequest.CurrentTaskIdFieldNumber,
+            HeartbeatRequest.CurrentRoleFieldNumber,
+            HeartbeatRequest.ContextUsagePercentFieldNumber,
+        ];
+
+        Assert.Equal([1, 3, 4, 5, 6], existing);
+        Assert.DoesNotContain(HeartbeatRequest.LiveUsageFieldNumber, existing);
+        // Field 2 stays reserved: the removed fixed WorkerRole is never reused for usage.
+        Assert.DoesNotContain(2, existing);
+    }
+
+    /// <summary>
+    /// The heartbeat's presence bit is the ONLY trustworthy signal: a heartbeat that never touches
+    /// field 7 decodes with <c>LiveUsage == null</c> ("the worker reports no live usage"), while a
+    /// PRESENT-but-EMPTY usage decodes as a real measurement with zero entries — never as absence.
+    /// </summary>
+    [Fact]
+    public void HeartbeatRequest_LiveUsage_PresenceDistinguishesAbsenceFromEmptyReport()
+    {
+        var legacy = new HeartbeatRequest { WorkerId = "w1", Busy = false, ContextUsagePercent = 10 };
+        var decodedLegacy = HeartbeatRequest.Parser.ParseFrom(legacy.ToByteArray());
+        Assert.Null(decodedLegacy.LiveUsage);
+
+        var reporting = new HeartbeatRequest
+        {
+            WorkerId = "w1",
+            Busy = true,
+            CurrentTaskId = "task-1",
+            LiveUsage = new TaskUsage(),
+        };
+        var decodedReporting = HeartbeatRequest.Parser.ParseFrom(reporting.ToByteArray());
+        Assert.NotNull(decodedReporting.LiveUsage);
+        Assert.Empty(decodedReporting.LiveUsage.Entries);
+        Assert.Equal("task-1", decodedReporting.CurrentTaskId);
+    }
 }

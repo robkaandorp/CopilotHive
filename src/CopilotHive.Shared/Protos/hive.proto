@@ -443,6 +443,18 @@ message HeartbeatRequest {
   string current_task_id = 4;     // Empty if idle
   string current_role = 5;        // Current assigned role name (e.g. "coder"), empty if idle
   int32 context_usage_percent = 6;
+  // The RUNNING task's usage accumulated SO FAR, carried by an upgraded worker. Message fields
+  // have native presence, which is the only trustworthy signal here:
+  //   * ABSENT  → the worker is idle, its runner does not report usage, or the sender is a legacy
+  //               worker. The receiver must treat it as "no live usage reported" (null), NOT zero.
+  //   * PRESENT → the running task's usage as of this heartbeat. It may have ZERO entries, which is
+  //               a real measurement: the task has made no model calls yet.
+  // It is present ONLY while the worker is busy AND its runner reports usage, and it holds the
+  // usage accumulated so far by the task named in current_task_id (field 4) — the two fields are a
+  // pair, so a receiver must store them together or not at all.
+  // Additive and backward compatible: an old server ignores this field and keeps its existing
+  // behavior, and no new handshake is required.
+  TaskUsage live_usage = 7;
 }
 
 message HeartbeatResponse {
