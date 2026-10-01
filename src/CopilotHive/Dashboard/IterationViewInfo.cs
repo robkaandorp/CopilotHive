@@ -33,4 +33,21 @@ public sealed class IterationViewInfo
     /// </para>
     /// </summary>
     internal PhaseUsageTotals.Result? UsageTotals { get; init; }
+
+    /// <summary>
+    /// Whether <see cref="UsageTotals"/> includes the RUNNING phase's LIVE usage — the running task's
+    /// usage the dashboard resolved from a worker heartbeat — on top of the persisted per-phase
+    /// reports.
+    /// <para>
+    /// It is <c>true</c> only for the live iteration whose running entry received that usage; every
+    /// other iteration (summarised, stored, or a live one whose running task's usage was never
+    /// attributed) is <c>false</c> and its total is persisted-data-only. Renderers append
+    /// "(includes running phase)" when it is <c>true</c>.
+    /// </para>
+    /// <para>
+    /// INTERNAL like <see cref="UsageTotals"/>: the razor page and the builder live in the same
+    /// assembly, and the flag describes an internal total.
+    /// </para>
+    /// </summary>
+    internal bool IncludesLiveUsage { get; init; }
 }

@@ -27,26 +27,38 @@ internal static class GoalDetailViewBuilder
     /// The full goal with IterationSummaries loaded from the store, or null to use <paramref name="goal"/> directly.
     /// </param>
     /// <param name="config">Hive configuration, or null.</param>
+    /// <param name="runningTaskUsage">
+    /// The LIVE usage of the task the pipeline is currently running, as resolved by the CALLER from a
+    /// worker-heartbeat capture, or <c>null</c> when no single worker reported usage for the active
+    /// task. It is applied ONLY to the running entry of the live iteration (see
+    /// <see cref="PhaseViewInfo.IsLiveUsage"/>) and into that iteration's and the goal's totals. The
+    /// default <c>null</c> leaves every value byte-identical to the pre-live-usage output, so callers
+    /// that cannot attribute live usage (and existing tests) keep their exact behaviour.
+    /// </param>
     /// <returns>A fully-populated <see cref="GoalDetailInfo"/>, or null if the goal is not found.</returns>
     public static GoalDetailInfo? Build(
         Goal goal,
         string goalId,
         GoalPipeline? pipeline,
         Goal? fullGoalWithSummaries,
-        HiveConfigFile? config)
+        HiveConfigFile? config,
+        SharpCoder.UsageSummary? runningTaskUsage = null)
     {
         // Use the full goal with summaries if provided (store path), otherwise use lightweight goal.
         // The authoritative goal is used for ALL view-model fields (not just Iterations).
         var effectiveGoal = fullGoalWithSummaries ?? goal;
 
-        var iterationSources = BuildIterationSources(effectiveGoal, goalId, pipeline);
+        var iterationSources = BuildIterationSources(effectiveGoal, goalId, pipeline, runningTaskUsage);
         var iterations = iterationSources.Select(s => s.View).ToList();
 
         // The goal total sums the union of exactly the phase records each iteration was built from.
         // Every iteration contributes exactly once: a summarised iteration contributes its chosen
-        // summary's phases, the live iteration contributes its own PhaseLog entries, and the two sets
-        // can never overlap (the live branch runs only when no summary exists for its number).
+        // summary's phases, the live iteration contributes its own PhaseLog entries — with the
+        // RUNNING entry replaced by a DETACHED substitute carrying the live usage when the caller
+        // attributed one — and the two sets can never overlap (the live branch runs only when no
+        // summary exists for its number).
         var goalUsage = SumWorkerUsage(iterationSources.SelectMany(s => s.Phases));
+        var goalIncludesLiveUsage = iterationSources.Any(s => s.IncludesLiveUsage);
 
         // Derive effective status from pipeline phase
         var effectiveStatus = pipeline?.Phase switch
@@ -81,6 +93,7 @@ internal static class GoalDetailViewBuilder
             RepositoryNames = effectiveGoal.RepositoryNames,
             FailureReason = effectiveGoal.FailureReason,
             UsageTotals = goalUsage,
+            IncludesLiveUsage = goalIncludesLiveUsage,
         };
     }
 
@@ -99,7 +112,18 @@ internal static class GoalDetailViewBuilder
     /// the EXACT set the iteration's <see cref="IterationViewInfo.UsageTotals"/> are summed over —
     /// never a wider one — so the goal total can union these lists without counting a phase twice.
     /// </summary>
-    private sealed record IterationSource(IterationViewInfo View, IReadOnlyList<PhaseResult> Phases);
+    /// <param name="View">The iteration view built from <paramref name="Phases"/>.</param>
+    /// <param name="Phases">
+    /// The exact phase records this iteration was summed over. For the live iteration the RUNNING entry
+    /// is the DETACHED substitute carrying the caller-supplied live usage (when one was attributed),
+    /// never the pipeline's own <see cref="PhaseResult"/> — the pipeline is never mutated.
+    /// </param>
+    /// <param name="IncludesLiveUsage">
+    /// Whether <paramref name="Phases"/> contains such a live-usage substitute, i.e. whether the
+    /// iteration's (and therefore the goal's) total counts the running task's live usage.
+    /// </param>
+    private sealed record IterationSource(
+        IterationViewInfo View, IReadOnlyList<PhaseResult> Phases, bool IncludesLiveUsage);
 
     /// <summary>
     /// Builds the iteration views together with the exact phase records each one was built from.
@@ -108,8 +132,16 @@ internal static class GoalDetailViewBuilder
     /// branch runs only when NO summary exists for the pipeline's current iteration, so a summarised
     /// current iteration never also contributes its PhaseLog usage.
     /// </summary>
+    /// <param name="goal">The authoritative goal supplying the persisted summaries.</param>
+    /// <param name="goalId">The goal identifier.</param>
+    /// <param name="pipeline">The live pipeline, or <c>null</c> for a stored-only goal.</param>
+    /// <param name="runningTaskUsage">
+    /// The running task's live usage, already attributed to the pipeline's active task by the caller,
+    /// or <c>null</c> when none was attributed. It is applied ONLY to the live iteration's running
+    /// entry; summarised iterations are never affected.
+    /// </param>
     private static List<IterationSource> BuildIterationSources(
-        Goal goal, string goalId, GoalPipeline? pipeline)
+        Goal goal, string goalId, GoalPipeline? pipeline, SharpCoder.UsageSummary? runningTaskUsage = null)
     {
         var sources = new List<IterationSource>();
 
@@ -145,7 +177,8 @@ internal static class GoalDetailViewBuilder
                     PlanningBrainResponse = firstSummaryPhase?.PlanningResponse,
                     UsageTotals = SumWorkerUsage(summary.Phases),
                 },
-                summary.Phases));
+                summary.Phases,
+                IncludesLiveUsage: false));
         }
 
         // Build view for the current/unsummarized iteration from pipeline state.
@@ -158,13 +191,28 @@ internal static class GoalDetailViewBuilder
             var firstLogEntry = pipeline.PhaseLog
                 .FirstOrDefault(e => e.Iteration == currentIter);
 
-            var currentPhases = BuildPhasesFromPipeline(goalId, pipeline, currentIter);
-
             // The EXACT phase records this iteration was built from: its own PhaseLog entries.
             // Materialised so a later PhaseLog append cannot change an already-built total.
             var currentPhaseResults = pipeline.PhaseLog
                 .Where(e => e.Iteration == currentIter)
                 .ToList();
+
+            // The row application and the running-entry selection happen in the SAME call, so the
+            // total can never include a live usage that no row marks (or vice versa).
+            var currentPhases = BuildPhasesFromPipelineCore(
+                goalId, pipeline, currentIter, runningTaskUsage, out var runningEntry);
+
+            // THE LIVE-INCLUSIVE PHASE SET: the running entry is replaced by a DETACHED substitute
+            // carrying the live usage — same Name/Occurrence so it still counts, and it is a COPY so
+            // the pipeline's own PhaseResult (and its null Usage) is never written to. Without live
+            // usage the ORIGINAL list is used verbatim, so every value is byte-identical to today.
+            var summedPhases = currentPhaseResults;
+            var includesLiveUsage = false;
+            if (runningTaskUsage is not null && runningEntry is not null)
+            {
+                summedPhases = ReplaceWithLiveUsageSubstitute(currentPhaseResults, runningEntry, runningTaskUsage);
+                includesLiveUsage = true;
+            }
 
             sources.Add(new IterationSource(
                 new IterationViewInfo
@@ -175,12 +223,52 @@ internal static class GoalDetailViewBuilder
                     PlanReason = pipeline.Plan?.Reason,
                     PlanningBrainPrompt = firstLogEntry?.PlanningPrompt,
                     PlanningBrainResponse = firstLogEntry?.PlanningResponse,
-                    UsageTotals = SumWorkerUsage(currentPhaseResults),
+                    UsageTotals = SumWorkerUsage(summedPhases),
+                    IncludesLiveUsage = includesLiveUsage,
                 },
-                currentPhaseResults));
+                summedPhases,
+                includesLiveUsage));
         }
 
         return sources;
+    }
+
+    /// <summary>
+    /// THE DETACHED LIVE-USAGE SUBSTITUTE: a fresh phase-record list in which the running entry is
+    /// replaced by a COPY carrying <paramref name="runningTaskUsage"/> in place of its own
+    /// (necessarily null) usage. Every other record is carried over VERBATIM and in the original
+    /// order.
+    /// <para>
+    /// The copy exists so a total can count the running phase's live usage WITHOUT ever writing to the
+    /// pipeline's own <see cref="PhaseResult"/>: the pipeline's entry keeps <c>Usage == null</c> until
+    /// the phase genuinely completes, so nothing is double counted at the completion boundary (where
+    /// the persisted report replaces this substitute entirely).
+    /// </para>
+    /// </summary>
+    /// <param name="phaseResults">The live iteration's own records; the running entry must be one of them.</param>
+    /// <param name="runningEntry">The exact instance to substitute; never mutated.</param>
+    /// <param name="runningTaskUsage">The running task's live usage to carry on the substitute.</param>
+    private static List<PhaseResult> ReplaceWithLiveUsageSubstitute(
+        IReadOnlyList<PhaseResult> phaseResults, PhaseResult runningEntry, SharpCoder.UsageSummary runningTaskUsage)
+    {
+        var substituted = new List<PhaseResult>(phaseResults.Count);
+        foreach (var phase in phaseResults)
+        {
+            substituted.Add(ReferenceEquals(phase, runningEntry)
+                ? new PhaseResult
+                {
+                    // Same identity as the entry it stands in for, so the total still counts it at the
+                    // same position — only the usage differs.
+                    Name = phase.Name,
+                    Result = phase.Result,
+                    Iteration = phase.Iteration,
+                    Occurrence = phase.Occurrence,
+                    Usage = runningTaskUsage,
+                }
+                : phase);
+        }
+
+        return substituted;
     }
 
     /// <summary>
@@ -302,9 +390,42 @@ internal static class GoalDetailViewBuilder
     /// <summary>
     /// Builds the list of <see cref="PhaseViewInfo"/> entries for the live pipeline's
     /// current iteration, using PhaseLog for completed/active phases and the plan for pending ones.
+    /// <para>
+    /// No live usage is applied: this overload reports PERSISTED per-phase usage only, exactly as it
+    /// did before live usage existed. Callers that resolved a running task's live usage go through
+    /// <see cref="Build"/> (or the private core) so the row markup and the iteration total agree.
+    /// </para>
     /// </summary>
-    public static List<PhaseViewInfo> BuildPhasesFromPipeline(string goalId, GoalPipeline pipeline, int currentIter)
+    public static List<PhaseViewInfo> BuildPhasesFromPipeline(string goalId, GoalPipeline pipeline, int currentIter) =>
+        BuildPhasesFromPipelineCore(goalId, pipeline, currentIter, runningTaskUsage: null, out _);
+
+    /// <summary>
+    /// THE LIVE-ITERATION BUILDER, with the caller's attributed live usage applied to the ONE running
+    /// row. It is the core <see cref="BuildPhasesFromPipeline(string, GoalPipeline, int)"/> builds on,
+    /// so the rendered rows and the iteration total can never disagree about which entry is running.
+    /// </summary>
+    /// <param name="goalId">The goal identifier.</param>
+    /// <param name="pipeline">The live pipeline.</param>
+    /// <param name="currentIter">The iteration being viewed.</param>
+    /// <param name="runningTaskUsage">
+    /// The running task's live usage, or <c>null</c> when none was attributed — in which case every row
+    /// keeps its persisted usage verbatim and no row is marked live.
+    /// </param>
+    /// <param name="runningEntry">
+    /// The pipeline's own <see cref="PhaseResult"/> instance selected as the running entry — the exact
+    /// entry the substitute for the totals stands in for — or <c>null</c> when the live iteration has
+    /// no running worker entry. The instance is NEVER mutated; it is reported so the caller can
+    /// substitute it, and only it, in the summed phase set.
+    /// </param>
+    private static List<PhaseViewInfo> BuildPhasesFromPipelineCore(
+        string goalId,
+        GoalPipeline pipeline,
+        int currentIter,
+        SharpCoder.UsageSummary? runningTaskUsage,
+        out PhaseResult? runningEntry)
     {
+        runningEntry = null;
+
         // Determine the planning phase status.
         var planningStatus = pipeline.Phase == GoalPhase.Planning ? "active" : "completed";
 
@@ -351,6 +472,22 @@ internal static class GoalDetailViewBuilder
             foreach (var entry in logEntries)
                 loggedPhases.Add((entry.Name, entry.Occurrence ?? 1));
 
+            // THE RUNNING ENTRY: the LAST current-iteration entry that has not completed, carries no
+            // persisted usage of its own, and belongs to a WORKER phase. A completed entry is history;
+            // an entry that already carries a persisted report is a finished phase (the completion
+            // boundary) and is never overwritten, so no usage can be counted twice; the Planning row is
+            // synthesised and is not a worker phase. Several qualifying entries → the LAST one is the
+            // running one: PhaseLog is chronological, so the most recently appended unfinished worker
+            // entry is the phase the pipeline is executing now.
+            var runningLogEntry = logEntries.LastOrDefault(e =>
+                e.CompletedAt is null
+                && e.Usage is null
+                && !string.IsNullOrEmpty(e.Name.ToRoleName()));
+
+            // The live usage applies to that ONE entry, and only when the caller attributed one.
+            if (runningTaskUsage is not null)
+                runningEntry = runningLogEntry;
+
             // Show PhaseLog entries (completed and active)
             foreach (var entry in logEntries)
             {
@@ -387,6 +524,10 @@ internal static class GoalDetailViewBuilder
                 var metrics = pipeline.Metrics;
                 var hasMetrics = status is "completed" or "active" or "failed" or "waiting";
 
+                // LIVE USAGE lands on the running row ONLY, and never replaces a persisted report:
+                // the selection above already excluded every entry that carries one.
+                var isLiveUsage = runningTaskUsage is not null && ReferenceEquals(entry, runningLogEntry);
+
                 phases.Add(new PhaseViewInfo
                 {
                     Name = entry.Name.ToDisplayName(),
@@ -409,8 +550,11 @@ internal static class GoalDetailViewBuilder
                     BrainPrompt = entry.BrainPrompt,
                     WorkerPrompt = entry.WorkerPrompt,
                     Clarifications = phaseClarifications ?? [],
-                    // The phase's reported usage, verbatim: null stays null (not reported).
-                    Usage = entry.Usage,
+                    // The phase's reported usage, verbatim: null stays null (not reported) — except on
+                    // the running row, which shows the running task's live usage instead (still null
+                    // when no live usage was attributed).
+                    Usage = isLiveUsage ? runningTaskUsage : entry.Usage,
+                    IsLiveUsage = isLiveUsage,
                 });
             }
 

@@ -367,18 +367,21 @@
                 @{
                     // The _detail path uses the builder's goal total (the union of exactly the phase
                     // sets the timeline was built from); the stored path sums the stored iterations.
+                    // Only the _detail path can include a running phase's live usage: the stored path
+                    // reads completed summaries, which never carry live figures.
                     var goalUsageTotals = _detail is not null
                         ? _detail.UsageTotals
                         : _storedGoal is not null
                             ? GoalDetailViewBuilder.SumWorkerUsage(_storedIterations.SelectMany(i => i.Phases))
                             : null;
+                    var goalIncludesLiveUsage = _detail?.IncludesLiveUsage ?? false;
                 }
                 @if (goalUsageTotals is { } storedOrDetailUsageTotals)
                 {
                     <div class="card" style="margin-bottom:0.75rem">
                         <div class="label">Token Usage</div>
                         <div style="margin-top:0.5rem;font-size:0.85rem;color:var(--text-muted)">
-                            <div>Total: @UsageFormat.FormatUsageLine(storedOrDetailUsageTotals.Usage.Total)@UsageFormat.FormatMissingPhasesNote(storedOrDetailUsageTotals)</div>
+                            <div>Total: @UsageFormat.FormatUsageLine(storedOrDetailUsageTotals.Usage.Total)@UsageFormat.FormatMissingPhasesNote(storedOrDetailUsageTotals)@(goalIncludesLiveUsage ? " (includes running phase)" : "")</div>
                             @foreach (var goalUsageEntryLine in UsageFormat.FormatEntryLines(storedOrDetailUsageTotals.Usage))
                             {
                                 <div>@goalUsageEntryLine</div>
@@ -429,7 +432,7 @@
                                             }
                                             @if (UsageFormat.FormatPhaseBoxLabel(phase.Usage) is { } phaseUsageLabel)
                                             {
-                                                <span class="phase-box-duration">@phaseUsageLabel</span>
+                                                <span class="phase-box-duration">@phaseUsageLabel@(phase.IsLiveUsage ? " (live)" : "")</span>
                                             }
                                         </button>
                                     }
@@ -443,7 +446,7 @@
                                 @if (iter.UsageTotals is { } iterationUsage)
                                 {
                                     <div style="margin-bottom:0.5rem;font-size:0.85rem;color:var(--text-muted)">
-                                        Iteration total: @UsageFormat.FormatUsageLine(iterationUsage.Usage.Total)@UsageFormat.FormatMissingPhasesNote(iterationUsage)
+                                        Iteration total: @UsageFormat.FormatUsageLine(iterationUsage.Usage.Total)@UsageFormat.FormatMissingPhasesNote(iterationUsage)@(iter.IncludesLiveUsage ? " (includes running phase)" : "")
                                     </div>
                                 }
                                 <div class="iter-content" @ref="_iterContentRef">
@@ -471,7 +474,7 @@
                                             @if (phase.Usage is not null)
                                             {
                                                 <div style="margin-bottom:0.5rem;font-size:0.85rem;color:var(--text-muted)">
-                                                    <div>Tokens: @UsageFormat.FormatUsageLine(phase.Usage.Total)</div>
+                                                    <div>Tokens@(phase.IsLiveUsage ? " (so far, live)" : ""): @UsageFormat.FormatUsageLine(phase.Usage.Total)</div>
                                                     @foreach (var usageEntryLine in UsageFormat.FormatEntryLines(phase.Usage))
                                                     {
                                                         <div>@usageEntryLine</div>

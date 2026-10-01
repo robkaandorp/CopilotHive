@@ -986,6 +986,368 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal("Brain decided to skip review this iteration.", currentIteration.PlanReason);
     }
 
+    // ── Live running-phase usage (heartbeat-attributed) ─────────────────────────
+
+    /// <summary>
+    /// A one-entry usage summary whose numbers are all DISTINCT from the other fixture, so a value
+    /// taken from the wrong source cannot coincidentally match.
+    /// </summary>
+    private static SharpCoder.UsageSummary HeartbeatUsage(string model, long input, long output) => new(
+    [
+        new SharpCoder.UsageEntry(SharpCoder.UsageSource.Agent, model, new SharpCoder.TokenUsage
+        {
+            InputTokens = input,
+            OutputTokens = output,
+            Calls = 1,
+            CachedInputReportedCalls = 1,
+            ReasoningReportedCalls = 1,
+        }),
+    ]);
+
+    /// <summary>
+    /// Builds a pipeline whose LIVE iteration has ONE completed worker entry carrying a persisted usage
+    /// report and a RUNNING Coding entry (not completed, no persisted usage), and registers it with the
+    /// manager, so <see cref="DashboardStateService.GetGoalDetail"/> sees a real pipeline.
+    /// <para>
+    /// The completed entry is part of the fixture on purpose: it keeps every total NON-NULL, so a test
+    /// that expects no live usage can still show that the running entry stays counted as a worker phase
+    /// WITHOUT usage (<c>PhasesWithoutUsage</c>) instead of disappearing from the totals. The premise is
+    /// asserted too: a Planning pipeline would build only the synthetic Planning row, so no worker row
+    /// could show live usage at all.
+    /// </para>
+    /// </summary>
+    private static GoalPipeline RunningCodingPipeline(GoalPipelineManager pipelineManager, string goalId)
+    {
+        var goal = new Goal
+        {
+            Id = goalId,
+            Description = "Goal with a running worker phase",
+            Status = GoalStatus.InProgress,
+        };
+
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.SetPlan(new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.DocWriting, GoalPhase.Testing, GoalPhase.Merging],
+            Reason = "plan for the live-usage test",
+        });
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // A COMPLETED worker entry with a persisted report, then the RUNNING Coding entry with none.
+        var completedAt = DateTime.UtcNow.AddSeconds(-5);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.DocWriting,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = completedAt.AddSeconds(-10),
+            CompletedAt = completedAt,
+            Usage = PersistedDocWritingUsage,
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow,
+        });
+
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.NotEqual(GoalPhase.Planning, pipeline.Phase);
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        return pipeline;
+    }
+
+    /// <summary>The persisted usage of the fixture's COMPLETED worker entry, distinct from every live figure.</summary>
+    private static readonly SharpCoder.UsageSummary PersistedDocWritingUsage = HeartbeatUsage("model-persisted", 700, 70);
+
+    /// <summary>
+    /// Asserts that <paramref name="actual"/> reports exactly the same figures as
+    /// <paramref name="expected"/> — value equality, not reference equality: the pool hands out a
+    /// DETACHED copy of a heartbeat's usage (<c>Snapshot()</c>), so the instance a consumer sees is
+    /// deliberately never the one that was stored.
+    /// </summary>
+    private static void AssertUsageFigures(SharpCoder.UsageSummary expected, SharpCoder.UsageSummary? actual)
+    {
+        Assert.NotNull(actual);
+        Assert.Equal(UsageFormat.FormatUsageLine(expected.Total), UsageFormat.FormatUsageLine(actual!.Total));
+        Assert.Equal(UsageFormat.FormatEntryLines(expected), UsageFormat.FormatEntryLines(actual));
+    }
+
+    /// <summary>
+    /// The heartbeat-attributed live usage reaches the RUNNING Coding row: the row carries that exact
+    /// summary, is marked live, and the iteration and goal totals include it (so the goal card renders
+    /// the "(includes running phase)" note). The heartbeat id is compared ORDINALLY against the
+    /// pipeline's active task id, and the worker is a REAL <see cref="WorkerPool"/> registration whose
+    /// heartbeat is delivered through <see cref="WorkerPool.UpdateHeartbeat"/>.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_HeartbeatTaggedWithTheActiveTaskId_ShowsLiveUsageOnTheRunningRow()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = RunningCodingPipeline(pipelineManager, "live-usage-goal");
+
+        pipeline.SetActiveTask("task-1");
+        workerPool.RegisterWorker("w1", []);
+        var liveUsage = HeartbeatUsage("model-live", 4_200, 1_300);
+        workerPool.UpdateHeartbeat("w1", 42, "task-1", liveUsage);
+
+        // PREMISE: the pool really attributes that usage to task-1, so the assertions below are not
+        // passing merely because the heartbeat was dropped.
+        var captured = Assert.Single(workerPool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.Equal("task-1", captured.LiveUsageTaskId);
+        AssertUsageFigures(liveUsage, captured.LiveUsage);
+        // The capture is DETACHED: the pool stored its own copy, so the snapshot is never the
+        // caller's instance (and mutating one can never reach the other).
+        Assert.NotSame(liveUsage, captured.LiveUsage);
+
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
+
+        var detail = await service.GetGoalDetail("live-usage-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        Assert.True(iteration.IsCurrent);
+
+        var codingRow = Assert.Single(iteration.Phases, p => p.Name == "Coding");
+        Assert.True(codingRow.IsLiveUsage);
+        AssertUsageFigures(liveUsage, codingRow.Usage);
+
+        // The COMPLETED row keeps its own persisted report and is NOT live.
+        var docWritingRow = Assert.Single(iteration.Phases, p => p.Name == "Doc Writing");
+        AssertUsageFigures(PersistedDocWritingUsage, docWritingRow.Usage);
+        Assert.False(docWritingRow.IsLiveUsage);
+
+        // No OTHER row received the live usage — the pending worker phases stay untouched.
+        Assert.All(iteration.Phases.Where(p => p.Name is not ("Coding" or "Doc Writing")), p =>
+        {
+            Assert.False(p.IsLiveUsage);
+            Assert.Null(p.Usage);
+        });
+
+        // The totals include the running phase's live usage and say so: the running entry counts as
+        // REPORTED (with live usage), so only the pending phases are absent from these counts — they
+        // were never dispatched and are not in the phase log at all.
+        Assert.True(iteration.IncludesLiveUsage);
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(2, iteration.UsageTotals!.PhasesWithUsage);
+        Assert.Equal(0, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.Equal(700 + 4_200, iteration.UsageTotals.Usage.Total.InputTokens);
+        Assert.Equal(70 + 1_300, iteration.UsageTotals.Usage.Total.OutputTokens);
+
+        Assert.True(detail.IncludesLiveUsage);
+        Assert.NotNull(detail.UsageTotals);
+        Assert.Equal(700 + 4_200, detail.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(70 + 1_300, detail.UsageTotals.Usage.Total.OutputTokens);
+        Assert.Equal(2, detail.UsageTotals.PhasesWithUsage);
+
+        // …and the entry the pipeline still owns reports NOTHING: the live figure lives only in the view.
+        Assert.Null(Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Coding).Usage);
+    }
+
+    /// <summary>
+    /// A heartbeat tagged with a DIFFERENT task id than the pipeline's active task id contributes no
+    /// live usage: the running row stays unmarked and the totals stay persisted-data-only, so a stale
+    /// report from a task the worker is no longer running can never be shown as the running phase.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_HeartbeatTaggedWithADifferentTaskId_ShowsNoLiveUsage()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = RunningCodingPipeline(pipelineManager, "stale-usage-goal");
+
+        pipeline.SetActiveTask("task-1");
+        workerPool.RegisterWorker("w1", []);
+        // A real, non-empty usage — reported for a DIFFERENT task id.
+        workerPool.UpdateHeartbeat("w1", 42, "task-other", HeartbeatUsage("model-stale", 999_000, 888_000));
+
+        // PREMISE: the usage really is stored, tagged with the OTHER id — otherwise this test would pass
+        // even if the heartbeat had been dropped.
+        var captured = Assert.Single(workerPool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.Equal("task-other", captured.LiveUsageTaskId);
+        Assert.NotNull(captured.LiveUsage);
+
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
+
+        var detail = await service.GetGoalDetail("stale-usage-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        var codingRow = Assert.Single(iteration.Phases, p => p.Name == "Coding");
+        Assert.False(codingRow.IsLiveUsage);
+        Assert.Null(codingRow.Usage);
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+
+        // The running phase still counts as a worker phase WITHOUT a report, and the stale figure is in
+        // neither the totals nor the entry lines.
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(1, iteration.UsageTotals!.PhasesWithUsage);
+        Assert.Equal(1, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.Equal(700, iteration.UsageTotals.Usage.Total.InputTokens);
+        Assert.DoesNotContain(iteration.UsageTotals.Usage.Entries, e => e.Model == "model-stale");
+        Assert.NotNull(detail.UsageTotals);
+        Assert.Equal(1, detail.UsageTotals!.PhasesWithoutUsage);
+        Assert.DoesNotContain(detail.UsageTotals.Usage.Entries, e => e.Model == "model-stale");
+    }
+
+    /// <summary>
+    /// WITHOUT an active task id the pipeline attributes nothing, so a heartbeat that names SOME task
+    /// contributes no live usage — even though the usage is genuinely stored in the pool. The pipeline
+    /// pointer is the attribution key: no pointer, no live usage.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_NoActiveTaskId_ShowsNoLiveUsageEvenWhenAHeartbeatExists()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = RunningCodingPipeline(pipelineManager, "no-active-task-goal");
+
+        // PREMISE: no active task AND a worker whose heartbeat really does carry usage for "task-1".
+        Assert.Null(pipeline.ActiveTaskId);
+        workerPool.RegisterWorker("w1", []);
+        workerPool.UpdateHeartbeat("w1", 42, "task-1", HeartbeatUsage("model-live", 4_200, 1_300));
+        var captured = Assert.Single(workerPool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.Equal("task-1", captured.LiveUsageTaskId);
+        Assert.NotNull(captured.LiveUsage);
+
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
+
+        var detail = await service.GetGoalDetail("no-active-task-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        var codingRow = Assert.Single(iteration.Phases, p => p.Name == "Coding");
+        Assert.False(codingRow.IsLiveUsage);
+        Assert.Null(codingRow.Usage);
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(1, iteration.UsageTotals!.PhasesWithUsage);
+        Assert.Equal(1, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.DoesNotContain(iteration.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+        Assert.DoesNotContain(detail.UsageTotals!.Usage.Entries, e => e.Model == "model-live");
+    }
+
+    /// <summary>
+    /// The task-id comparison is ORDINAL: a heartbeat whose id differs only by CASE from the pipeline's
+    /// active task id is a DIFFERENT task, so it contributes no live usage. A case-insensitive
+    /// comparison would show the usage here, making the task-id attribution weaker than the ids
+    /// themselves.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_HeartbeatTaskIdDifferingOnlyByCase_ShowsNoLiveUsage()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = RunningCodingPipeline(pipelineManager, "case-sensitive-usage-goal");
+
+        pipeline.SetActiveTask("task-1");
+        workerPool.RegisterWorker("w1", []);
+        workerPool.UpdateHeartbeat("w1", 42, "TASK-1", HeartbeatUsage("model-case", 5_000, 500));
+
+        // PREMISE: the differently-cased usage really is stored — the refusal is about the COMPARISON,
+        // not about a dropped heartbeat.
+        var captured = Assert.Single(workerPool.CaptureWorkerStatus(), w => w.Id == "w1");
+        Assert.Equal("TASK-1", captured.LiveUsageTaskId);
+        AssertUsageFigures(HeartbeatUsage("model-case", 5_000, 500), captured.LiveUsage);
+
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
+
+        var detail = await service.GetGoalDetail("case-sensitive-usage-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        var codingRow = Assert.Single(iteration.Phases, p => p.Name == "Coding");
+        Assert.False(codingRow.IsLiveUsage);
+        Assert.Null(codingRow.Usage);
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+        Assert.DoesNotContain(iteration.UsageTotals!.Usage.Entries, e => e.Model == "model-case");
+        Assert.DoesNotContain(detail.UsageTotals!.Usage.Entries, e => e.Model == "model-case");
+    }
+
+    /// <summary>
+    /// TWO workers reporting usage for the same active task id make the attribution ambiguous, so NO
+    /// live usage is shown: the usage is never summed and never guessed, and both figures stay out of
+    /// the totals.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_TwoWorkersReportingTheSameActiveTaskId_ShowsNoLiveUsage()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = RunningCodingPipeline(pipelineManager, "ambiguous-usage-goal");
+
+        pipeline.SetActiveTask("task-1");
+        workerPool.RegisterWorker("w1", []);
+        workerPool.RegisterWorker("w2", []);
+        var first = HeartbeatUsage("model-first", 1_000, 100);
+        var second = HeartbeatUsage("model-second", 2_000, 200);
+        workerPool.UpdateHeartbeat("w1", 42, "task-1", first);
+        workerPool.UpdateHeartbeat("w2", 43, "task-1", second);
+
+        // PREMISE: both heartbeats really are stored for the active task id — otherwise the ambiguity
+        // this test is about would not exist.
+        Assert.Equal(2, workerPool.CaptureWorkerStatus().Count(w => w.LiveUsageTaskId == "task-1"));
+
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
+
+        var detail = await service.GetGoalDetail("ambiguous-usage-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        var codingRow = Assert.Single(iteration.Phases, p => p.Name == "Coding");
+        Assert.False(codingRow.IsLiveUsage);
+        Assert.Null(codingRow.Usage);
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(1, iteration.UsageTotals!.PhasesWithoutUsage);
+        // Neither figure was summed into the totals.
+        Assert.DoesNotContain(iteration.UsageTotals.Usage.Entries, e => e.Model is "model-first" or "model-second");
+        Assert.DoesNotContain(detail.UsageTotals!.Usage.Entries, e => e.Model is "model-first" or "model-second");
+    }
+
     /// <summary>
     /// When the pipeline is past Planning but <see cref="GoalPipeline.Plan"/>
     /// is <c>null</c>, fallback phases (Coding, Testing, Review, Merging)

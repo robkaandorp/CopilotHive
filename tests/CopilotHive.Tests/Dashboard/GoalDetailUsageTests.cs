@@ -827,4 +827,596 @@ public sealed class GoalDetailUsageTests
         Assert.Null(IterationTotalLine(GoalDetailViewBuilder.SumWorkerUsage(storedIterations[0].Phases)));
         Assert.Empty(GoalCardLines(GoalDetailViewBuilder.SumWorkerUsage(storedIterations.SelectMany(i => i.Phases))));
     }
+
+    /// <summary>
+    /// A COMPLETED worker phase record (<see cref="PhaseResult.CompletedAt"/> set) with the given
+    /// persisted usage — the shape a FINISHED phase has in the live <see cref="GoalPipeline.PhaseLog"/>.
+    /// </summary>
+    private static PhaseResult CompletedPhase(GoalPhase name, UsageSummary? usage, int iteration = 1, int? occurrence = 1) => new()
+    {
+        Name = name,
+        Result = PhaseOutcome.Pass,
+        Iteration = iteration,
+        Occurrence = occurrence,
+        StartedAt = DateTime.UtcNow.AddSeconds(-5),
+        CompletedAt = DateTime.UtcNow,
+        Usage = usage,
+    };
+
+    /// <summary>
+    /// A pipeline in <paramref name="iteration"/> whose installed plan is
+    /// Coding → Testing → Review → Merging and whose current phase is <paramref name="phase"/>. The
+    /// worker phase is a PREMISE of every live-usage fixture below: in Planning the live branch builds
+    /// only the synthetic Planning row, so no worker row could receive live usage at all.
+    /// </summary>
+    private static GoalPipeline LivePipeline(Goal goal, GoalPhase phase, int iteration = 1)
+    {
+        var pipeline = new GoalPipeline(goal, maxRetries: 3, maxIterations: 5);
+        while (pipeline.Iteration < iteration)
+            pipeline.IterationBudget.TryConsume();
+
+        pipeline.SetPlan(new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+            Reason = "live plan reason",
+        });
+        pipeline.AdvanceTo(phase);
+        return pipeline;
+    }
+
+    // ── Mirrors of the GoalDetail.razor LIVE usage markup ──────────────────────
+
+    /// <summary>Mirrors the phase-box label including the live marker the razor appends.</summary>
+    private static string? LivePhaseBoxLabel(PhaseViewInfo phase) =>
+        UsageFormat.FormatPhaseBoxLabel(phase.Usage) is { } label
+            ? $"{label}{(phase.IsLiveUsage ? " (live)" : "")}"
+            : null;
+
+    /// <summary>Mirrors the phase-detail usage block, including the live wording on the total line.</summary>
+    private static IReadOnlyList<string> LivePhaseDetailLines(PhaseViewInfo phase) =>
+        phase.Usage is null
+            ? []
+            : [$"Tokens{(phase.IsLiveUsage ? " (so far, live)" : "")}: {UsageFormat.FormatUsageLine(phase.Usage.Total)}",
+               .. UsageFormat.FormatEntryLines(phase.Usage)];
+
+    /// <summary>Mirrors the "Iteration total" line including the live note the razor appends.</summary>
+    private static string? LiveIterationTotalLine(IterationViewInfo iteration) =>
+        iteration.UsageTotals is { } totals
+            ? $"Iteration total: {UsageFormat.FormatUsageLine(totals.Usage.Total)}{UsageFormat.FormatMissingPhasesNote(totals)}" +
+              $"{(iteration.IncludesLiveUsage ? " (includes running phase)" : "")}"
+            : null;
+
+    /// <summary>Mirrors the left-panel "Token Usage" card body including the live note.</summary>
+    private static IReadOnlyList<string> LiveGoalCardLines(GoalDetailInfo detail) =>
+        detail.UsageTotals is { } totals
+            ? [$"Total: {UsageFormat.FormatUsageLine(totals.Usage.Total)}{UsageFormat.FormatMissingPhasesNote(totals)}" +
+               $"{(detail.IncludesLiveUsage ? " (includes running phase)" : "")}",
+               .. UsageFormat.FormatEntryLines(totals.Usage)]
+            : [];
+
+    /// <summary>
+    /// Every usage-relevant value of a built view, as text: the per-iteration totals and live flags,
+    /// every row's usage and live flag, and the goal total with its live flag. Used to prove that an
+    /// omitted or explicit-<c>null</c> <c>runningTaskUsage</c> produces IDENTICAL output.
+    /// </summary>
+    private static List<string> UsageProjection(GoalDetailInfo detail) =>
+    [
+        .. detail.Iterations.Select(iteration =>
+            $"iteration {iteration.Number}: totals={Describe(iteration.UsageTotals)} includesLive={iteration.IncludesLiveUsage}"),
+        .. detail.Iterations.SelectMany(iteration => iteration.Phases)
+            .Select(phase => $"phase {phase.Name}/{phase.RoleName} [{phase.Status}]: usage={Describe(phase.Usage)} isLive={phase.IsLiveUsage}"),
+        $"goal: totals={Describe(detail.UsageTotals)} includesLive={detail.IncludesLiveUsage}",
+    ];
+
+    private static string Describe(UsageSummary? usage) =>
+        usage is null ? "<none>" : $"entries={usage.Entries.Count} | {UsageFormat.FormatUsageLine(usage.Total)}";
+
+    private static string Describe(PhaseUsageTotals.Result? totals) =>
+        totals is null ? "<none>" : $"{Describe(totals.Usage)} | with={totals.PhasesWithUsage} without={totals.PhasesWithoutUsage}";
+
+    // ── Live running-phase usage ───────────────────────────────────────────────
+
+    /// <summary>
+    /// (a) The running entry — the LAST current-iteration entry that has not completed, carries no
+    /// persisted usage and belongs to a worker phase — receives the caller's live usage and is the ONLY
+    /// row marked live. The iteration and the goal totals both include it (and the iteration's own
+    /// total counts it under <c>PhasesWithUsage</c>, not <c>PhasesWithoutUsage</c>), and both report
+    /// <c>IncludesLiveUsage</c>.
+    /// <para>
+    /// The fixture is built so each selection rule is observable: the completed Coding entry (persisted
+    /// usage) must keep it, the earlier unfinished Doc Writing entry must NOT be used even though it
+    /// qualifies, and the non-worker Merging entry appended LAST must be ignored despite coming after
+    /// the running Review entry.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Build_RunningEntryWithLiveUsage_MarksOnlyTheLastQualifyingWorkerRow_AndIncludesItInBothTotals()
+    {
+        var persistedIterationOne = OneEntry(UsageSource.Agent, "model-history", 1, 2, 1);
+        var completedCoding = OneEntry(UsageSource.Agent, "model-completed-coding", 10, 20, 1);
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-live", 1_000, 2_000, 3, cached: 30, cachedReported: 1);
+
+        var fullGoal = WorkerPhaseGoal(Phase(GoalPhase.Coding, persistedIterationOne));
+        var lightGoal = new Goal { Id = "goal-usage", Description = "Goal with usage" };
+        var pipeline = LivePipeline(lightGoal, GoalPhase.Review, iteration: 2);
+
+        // PREMISES: a real worker phase with an installed plan, and NO summary for the live iteration
+        // (otherwise the live branch would be suppressed for that number and nothing could be marked).
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Review, pipeline.Phase);
+        Assert.DoesNotContain(pipeline.CompletedIterationSummaries, s => s.Iteration == 2);
+
+        pipeline.PhaseLog.Add(CompletedPhase(GoalPhase.Coding, completedCoding, iteration: 2));
+        pipeline.PhaseLog.Add(Phase(GoalPhase.DocWriting, usage: null, iteration: 2));
+        pipeline.PhaseLog.Add(Phase(GoalPhase.Review, usage: null, iteration: 2));
+        pipeline.PhaseLog.Add(Phase(GoalPhase.Merging, usage: null, iteration: 2));
+
+        var detail = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-usage", pipeline, fullGoal, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(detail);
+        var iterations = detail!.Iterations;
+        Assert.Equal([1, 2], iterations.Select(i => i.Number));
+
+        var firstIteration = Assert.Single(iterations, i => i.Number == 1);
+        Assert.False(firstIteration.IncludesLiveUsage);
+        Assert.False(Assert.Single(firstIteration.Phases, p => p.Name == "Coding").IsLiveUsage);
+
+        var liveIteration = Assert.Single(iterations, i => i.Number == 2);
+        Assert.True(liveIteration.IsCurrent);
+
+        // The completed row keeps its PERSISTED usage and is not marked live.
+        var codingRow = Assert.Single(liveIteration.Phases, p => p.Name == "Coding");
+        Assert.Same(completedCoding, codingRow.Usage);
+        Assert.False(codingRow.IsLiveUsage);
+
+        // An unfinished WORKER row that is NOT the last qualifying one stays untouched.
+        var docWritingRow = Assert.Single(liveIteration.Phases, p => p.Name == "Doc Writing");
+        Assert.Null(docWritingRow.Usage);
+        Assert.False(docWritingRow.IsLiveUsage);
+
+        // THE RUNNING ROW: the live usage, marked live.
+        var runningRow = Assert.Single(liveIteration.Phases, p => p.Name == "Review");
+        Assert.Same(liveUsage, runningRow.Usage);
+        Assert.True(runningRow.IsLiveUsage);
+
+        // …and the non-worker row appended after it is never the running entry.
+        var mergingRow = Assert.Single(liveIteration.Phases, p => p.Name == "Merging");
+        Assert.Null(mergingRow.Usage);
+        Assert.False(mergingRow.IsLiveUsage);
+        Assert.Null(Assert.Single(liveIteration.Phases, p => p.Name == "Planning").Usage);
+
+        // ITERATION TOTAL: the running entry counts as REPORTED (with the live usage) and the truly
+        // unreported Doc Writing row is the only one counted as missing. The non-worker Merging row is
+        // in neither count.
+        Assert.NotNull(liveIteration.UsageTotals);
+        Assert.True(liveIteration.IncludesLiveUsage);
+        Assert.Equal(2, liveIteration.UsageTotals!.PhasesWithUsage);
+        Assert.Equal(1, liveIteration.UsageTotals.PhasesWithoutUsage);
+        Assert.Equal(completedCoding.Total.InputTokens + liveUsage.Total.InputTokens, liveIteration.UsageTotals.Usage.Total.InputTokens);
+        Assert.Equal(completedCoding.Total.OutputTokens + liveUsage.Total.OutputTokens, liveIteration.UsageTotals.Usage.Total.OutputTokens);
+        Assert.Contains(liveIteration.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+
+        // GOAL TOTAL: the summary's phase, the completed phase and the running phase, each counted once.
+        Assert.NotNull(detail.UsageTotals);
+        Assert.True(detail.IncludesLiveUsage);
+        Assert.Equal(1 + 10 + 1_000, detail.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(2 + 20 + 2_000, detail.UsageTotals.Usage.Total.OutputTokens);
+        Assert.Equal(3, detail.UsageTotals.PhasesWithUsage);
+        Assert.Equal(1, detail.UsageTotals.PhasesWithoutUsage);
+
+        // RENDERED TEXT: the live markers and the live WORDING, through the same helpers the razor uses.
+        Assert.Equal("30 tok", LivePhaseBoxLabel(codingRow));
+        Assert.Equal("3.0K tok (live)", LivePhaseBoxLabel(runningRow));
+        Assert.Equal(
+            [
+                "Tokens (so far, live): input 1,000 / ≥30 (partial) cached input / output 2,000 / unknown reasoning / 3 calls",
+                "SubAgent / model-live: input 1,000 / ≥30 (partial) cached input / output 2,000 / unknown reasoning / 3 calls",
+            ],
+            LivePhaseDetailLines(runningRow));
+        Assert.Equal(
+            "Iteration total: input 1,010 / ≥30 (partial) cached input / output 2,020 / unknown reasoning / 4 calls" +
+            " (1 worker phase(s) without usage reported) (includes running phase)",
+            LiveIterationTotalLine(liveIteration));
+        Assert.Equal(
+            "Total: input 1,011 / ≥30 (partial) cached input / output 2,022 / unknown reasoning / 5 calls" +
+            " (1 worker phase(s) without usage reported) (includes running phase)",
+            LiveGoalCardLines(detail)[0]);
+        Assert.Contains(
+            "SubAgent / model-live: input 1,000 / ≥30 (partial) cached input / output 2,000 / unknown reasoning / 3 calls",
+            LiveGoalCardLines(detail));
+    }
+
+    /// <summary>
+    /// A live iteration with NO running worker entry — every logged phase is either completed or
+    /// already carries persisted usage — applies NO live usage: the completed rows keep their own
+    /// reports, nothing is marked live, and neither the iteration nor the goal reports
+    /// <c>IncludesLiveUsage</c>.
+    /// </summary>
+    [Fact]
+    public void Build_RunningTaskUsageWithoutARunningWorkerEntry_IsIgnoredEntirely()
+    {
+        var completedCoding = OneEntry(UsageSource.Agent, "model-completed-coding", 10, 20, 1);
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-never-used", 900_000, 800_000, 1);
+
+        var lightGoal = new Goal { Id = "goal-no-running-entry", Description = "No running entry" };
+        var pipeline = LivePipeline(lightGoal, GoalPhase.Review);
+        pipeline.PhaseLog.Add(CompletedPhase(GoalPhase.Coding, completedCoding));
+        pipeline.PhaseLog.Add(CompletedPhase(GoalPhase.Review, usage: null));
+
+        var detail = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-no-running-entry", pipeline, fullGoalWithSummaries: null, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(10, iteration.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(1, iteration.UsageTotals.PhasesWithUsage);
+        Assert.Equal(1, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.DoesNotContain(iteration.UsageTotals.Usage.Entries, e => e.Model == "model-never-used");
+        Assert.All(iteration.Phases, p => Assert.False(p.IsLiveUsage));
+        Assert.Equal(10, detail.UsageTotals!.Usage.Total.InputTokens);
+        Assert.DoesNotContain(detail.UsageTotals.Usage.Entries, e => e.Model == "model-never-used");
+    }
+
+    /// <summary>
+    /// (b) The COMPLETION BOUNDARY: the running entry already carries a PERSISTED usage while the
+    /// pipeline still points at it. The persisted report is never overwritten by the live figure — the
+    /// row keeps it, is not marked live, and neither total counts the live usage, so nothing is double
+    /// counted.
+    /// </summary>
+    [Fact]
+    public void Build_RunningEntryAlreadyCarryingPersistedUsage_IsNeverOverwrittenAndNeverDoubleCounted()
+    {
+        var persistedUsage = OneEntry(UsageSource.Agent, "model-persisted", 7, 9, 1);
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-live", 900_000, 800_000, 1);
+
+        var lightGoal = new Goal { Id = "goal-boundary", Description = "Completion boundary" };
+        var pipeline = LivePipeline(lightGoal, GoalPhase.Coding);
+
+        // The completion-boundary shape: the entry is STILL the pipeline's current one (not completed)
+        // but its worker result already wrote a usage report.
+        var runningEntry = Phase(GoalPhase.Coding, persistedUsage);
+        pipeline.PhaseLog.Add(runningEntry);
+
+        var detail = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-boundary", pipeline, fullGoalWithSummaries: null, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+
+        var codingRow = Assert.Single(iteration.Phases, p => p.Name == "Coding");
+        Assert.Same(persistedUsage, codingRow.Usage);
+        Assert.False(codingRow.IsLiveUsage);
+
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(1, iteration.UsageTotals!.PhasesWithUsage);
+        Assert.Equal(0, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.Equal(7, iteration.UsageTotals.Usage.Total.InputTokens);
+        Assert.Equal(9, iteration.UsageTotals.Usage.Total.OutputTokens);
+        Assert.DoesNotContain(iteration.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+        Assert.Equal(7, detail.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(9, detail.UsageTotals.Usage.Total.OutputTokens);
+        Assert.DoesNotContain(detail.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+
+        // The pipeline's own entry is untouched: the persisted report is still the SAME instance.
+        Assert.Same(persistedUsage, Assert.Single(pipeline.PhaseLog).Usage);
+    }
+
+    /// <summary>
+    /// (c) Without live usage — the parameter omitted entirely AND passed explicitly as <c>null</c> —
+    /// every usage-relevant value of the built view is IDENTICAL, and every live flag stays
+    /// <c>false</c>: the running row shows no usage and both totals are persisted-data-only.
+    /// </summary>
+    [Fact]
+    public void Build_NoRunningTaskUsage_ProducesIdenticalOutputWithAllLiveFlagsFalse()
+    {
+        var persistedIterationOne = OneEntry(UsageSource.Agent, "model-history", 1, 2, 1);
+        var completedCoding = OneEntry(UsageSource.Agent, "model-completed-coding", 10, 20, 1);
+
+        var fullGoal = WorkerPhaseGoal(Phase(GoalPhase.Coding, persistedIterationOne));
+        var lightGoal = new Goal { Id = "goal-usage", Description = "Goal with usage" };
+
+        GoalPipeline NewFixture()
+        {
+            var pipeline = LivePipeline(lightGoal, GoalPhase.Review, iteration: 2);
+            pipeline.PhaseLog.Add(CompletedPhase(GoalPhase.Coding, completedCoding, iteration: 2));
+            pipeline.PhaseLog.Add(Phase(GoalPhase.DocWriting, usage: null, iteration: 2));
+            pipeline.PhaseLog.Add(Phase(GoalPhase.Review, usage: null, iteration: 2));
+            return pipeline;
+        }
+
+        // Today's call shape (the parameter omitted entirely)…
+        var omitted = GoalDetailViewBuilder.Build(lightGoal, "goal-usage", NewFixture(), fullGoal, config: null);
+        // …versus the same call with the new parameter passed explicitly as null.
+        var explicitNull = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-usage", NewFixture(), fullGoal, config: null, runningTaskUsage: null);
+
+        Assert.NotNull(omitted);
+        Assert.NotNull(explicitNull);
+        Assert.Equal(UsageProjection(omitted!), UsageProjection(explicitNull!));
+
+        // The running row is present but carries nothing, and no flag anywhere is set.
+        var iteration = Assert.Single(omitted!.Iterations, i => i.Number == 2);
+        Assert.Null(Assert.Single(iteration.Phases, p => p.Name == "Review").Usage);
+        Assert.All(omitted.Iterations, i => Assert.False(i.IncludesLiveUsage));
+        Assert.All(omitted.Iterations.SelectMany(i => i.Phases), p => Assert.False(p.IsLiveUsage));
+        Assert.False(omitted.IncludesLiveUsage);
+
+        // The totals are the persisted ones: the summary's phase and the completed live-iteration phase
+        // count, the two unreported rows do not.
+        Assert.NotNull(iteration.UsageTotals);
+        Assert.Equal(10, iteration.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(20, iteration.UsageTotals.Usage.Total.OutputTokens);
+        Assert.Equal(1, iteration.UsageTotals.PhasesWithUsage);
+        Assert.Equal(2, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.Equal("Iteration total: input 10 / unknown cached input / output 20 / unknown reasoning / 1 calls" +
+                     " (2 worker phase(s) without usage reported)",
+            LiveIterationTotalLine(iteration));
+        Assert.Equal(1 + 10, omitted.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(2 + 20, omitted.UsageTotals.Usage.Total.OutputTokens);
+        Assert.Equal(2, omitted.UsageTotals.PhasesWithUsage);
+        Assert.Equal(2, omitted.UsageTotals.PhasesWithoutUsage);
+        Assert.Equal(
+            "Total: input 11 / unknown cached input / output 22 / unknown reasoning / 2 calls" +
+            " (2 worker phase(s) without usage reported)",
+            LiveGoalCardLines(omitted)[0]);
+    }
+
+    /// <summary>
+    /// (d) The live usage lands ONLY on the live iteration's running row: the live iteration's COMPLETED
+    /// entry and every row of a SUMMARISED iteration keep their own (persisted or absent) reports, and
+    /// neither of those totals reports <c>IncludesLiveUsage</c>.
+    /// </summary>
+    [Fact]
+    public void Build_LiveUsage_IsNeverAppliedToCompletedEntriesOrSummarisedIterations()
+    {
+        var summaryUsage = OneEntry(UsageSource.Agent, "model-summary", 1, 2, 1);
+        var completedTesting = OneEntry(UsageSource.Agent, "model-completed-testing", 300, 400, 1);
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-live", 5_000, 6_000, 1);
+
+        var fullGoal = WorkerPhaseGoal(Phase(GoalPhase.Coding, summaryUsage));
+        var lightGoal = new Goal { Id = "goal-scope", Description = "Live usage scope" };
+        var pipeline = LivePipeline(lightGoal, GoalPhase.Testing, iteration: 2);
+
+        pipeline.PhaseLog.Add(CompletedPhase(GoalPhase.Coding, completedTesting, iteration: 2));
+        pipeline.PhaseLog.Add(Phase(GoalPhase.Testing, usage: null, iteration: 2));
+
+        var detail = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-scope", pipeline, fullGoal, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(detail);
+
+        // THE SUMMARISED ITERATION is untouched: its row keeps the persisted report, its total is its
+        // own and it reports no live usage.
+        var summarised = Assert.Single(detail!.Iterations, i => i.Number == 1);
+        Assert.False(summarised.IncludesLiveUsage);
+        var summarisedCoding = Assert.Single(summarised.Phases, p => p.Name == "Coding");
+        Assert.Same(summaryUsage, summarisedCoding.Usage);
+        Assert.False(summarisedCoding.IsLiveUsage);
+        Assert.Equal(1, summarised.UsageTotals!.Usage.Total.InputTokens);
+        Assert.DoesNotContain(summarised.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+
+        // THE LIVE ITERATION: the completed row keeps its own report and is not live; only the running
+        // Testing row is.
+        var liveIteration = Assert.Single(detail.Iterations, i => i.Number == 2);
+        var completedCodingRow = Assert.Single(liveIteration.Phases, p => p.Name == "Coding");
+        Assert.Same(completedTesting, completedCodingRow.Usage);
+        Assert.False(completedCodingRow.IsLiveUsage);
+        var runningRow = Assert.Single(liveIteration.Phases, p => p.Name == "Testing");
+        Assert.Same(liveUsage, runningRow.Usage);
+        Assert.True(runningRow.IsLiveUsage);
+
+        Assert.True(liveIteration.IncludesLiveUsage);
+        Assert.Equal(300 + 5_000, liveIteration.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(2, liveIteration.UsageTotals.PhasesWithUsage);
+
+        // The goal total unions the three distinct contributors exactly once each.
+        Assert.True(detail.IncludesLiveUsage);
+        Assert.Equal(1 + 300 + 5_000, detail.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(3, detail.UsageTotals.PhasesWithUsage);
+    }
+
+    /// <summary>
+    /// (e) NO MUTATION: after <see cref="GoalDetailViewBuilder.Build"/> applied a live usage, every
+    /// entry in the pipeline's own <see cref="GoalPipeline.PhaseLog"/> is the SAME instance with the
+    /// SAME (null) usage and the same completion state — the live figure reached the view models through
+    /// a detached substitute only.
+    /// </summary>
+    [Fact]
+    public void Build_RunningEntryWithLiveUsage_LeavesThePipelinePhaseLogUnmutated()
+    {
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-live", 12, 34, 1);
+
+        var lightGoal = new Goal { Id = "goal-no-mutation", Description = "No mutation" };
+        var pipeline = LivePipeline(lightGoal, GoalPhase.Review, iteration: 2);
+
+        var completedEntry = CompletedPhase(GoalPhase.Coding, OneEntry(UsageSource.Agent, "model-completed", 1, 2, 1), iteration: 2);
+        var runningEntry = Phase(GoalPhase.Review, usage: null, iteration: 2);
+        pipeline.PhaseLog.Add(completedEntry);
+        pipeline.PhaseLog.Add(runningEntry);
+        var snapshotBefore = pipeline.PhaseLog.ToList();
+
+        var detail = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-no-mutation", pipeline, fullGoalWithSummaries: null, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(detail);
+        Assert.Equal(snapshotBefore, pipeline.PhaseLog);
+        Assert.Same(runningEntry, pipeline.PhaseLog[1]);
+        Assert.Null(runningEntry.Usage);
+        Assert.Null(runningEntry.CompletedAt);
+        // The COMPLETED entry still carries exactly the persisted report it was built with.
+        Assert.Same(snapshotBefore[0].Usage, completedEntry.Usage);
+        Assert.NotNull(completedEntry.CompletedAt);
+
+        // The running row DID receive the live usage — which is only possible because the row holds a
+        // detached summary, since the entry itself still reports none.
+        var runningRow = Assert.Single(Assert.Single(detail!.Iterations).Phases, p => p.Name == "Review");
+        Assert.Same(liveUsage, runningRow.Usage);
+        Assert.Null(pipeline.PhaseLog[1].Usage);
+    }
+
+    // ── Live usage cannot reach the stored (no-pipeline) path or a summarised current iteration ──
+
+    /// <summary>
+    /// The STORED (no-pipeline) path can never show live usage: with <c>pipeline: null</c> there is no
+    /// live iteration and no running entry at all, so a caller-supplied live usage is ignored entirely
+    /// and the stored totals are persisted-data-only with every flag <c>false</c>.
+    /// </summary>
+    [Fact]
+    public void Build_StoredPathWithoutAPipeline_NeverAppliesLiveUsage()
+    {
+        var storedUsage = OneEntry(UsageSource.Agent, "model-stored", 5, 6, 1);
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-live", 900_000, 800_000, 1);
+
+        var fullGoal = WorkerPhaseGoal(Phase(GoalPhase.Coding, storedUsage));
+        var withoutLiveUsage = GoalDetailViewBuilder.Build(fullGoal, "goal-usage", pipeline: null, fullGoal, config: null);
+        var withLiveUsage = GoalDetailViewBuilder.Build(
+            fullGoal, "goal-usage", pipeline: null, fullGoal, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(withoutLiveUsage);
+        Assert.NotNull(withLiveUsage);
+
+        // The stored path ignores the live figure COMPLETELY: every value is the same as before.
+        Assert.Equal(UsageProjection(withoutLiveUsage!), UsageProjection(withLiveUsage!));
+        Assert.False(withLiveUsage!.IncludesLiveUsage);
+        Assert.All(withLiveUsage.Iterations.SelectMany(i => i.Phases), p => Assert.False(p.IsLiveUsage));
+        Assert.DoesNotContain(withLiveUsage.UsageTotals!.Usage.Entries, e => e.Model == "model-live");
+    }
+
+    /// <summary>
+    /// A SUMMARISED current iteration suppresses the live branch for its number, so a caller-supplied
+    /// live usage cannot reach it either: the iteration keeps its summary's phases and total, no row is
+    /// marked live, and the goal total is unchanged.
+    /// </summary>
+    [Fact]
+    public void Build_CurrentIterationAlreadySummarised_IgnoresCallerSuppliedLiveUsage()
+    {
+        var summaryUsage = OneEntry(UsageSource.Agent, "model-summary", 3, 4, 1);
+        var liveUsage = OneEntry(UsageSource.SubAgent, "model-live", 900_000, 800_000, 1);
+
+        var lightGoal = new Goal { Id = "goal-summarised-live", Description = "Summarised current iteration" };
+        var fullGoal = new Goal
+        {
+            Id = "goal-summarised-live",
+            Description = "Summarised current iteration",
+            IterationSummaries = [new IterationSummary { Iteration = 1, Phases = [Phase(GoalPhase.Coding, summaryUsage)] }],
+        };
+
+        var pipeline = new GoalPipeline(lightGoal, maxRetries: 3, maxIterations: 5);
+        Assert.Equal(1, pipeline.Iteration);
+        pipeline.PhaseLog.Add(Phase(GoalPhase.Coding, usage: null, iteration: 1));
+
+        var detail = GoalDetailViewBuilder.Build(
+            lightGoal, "goal-summarised-live", pipeline, fullGoal, config: null, runningTaskUsage: liveUsage);
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail!.Iterations);
+        Assert.False(iteration.IsCurrent);
+        Assert.False(iteration.IncludesLiveUsage);
+        Assert.False(detail.IncludesLiveUsage);
+        Assert.All(iteration.Phases, p => Assert.False(p.IsLiveUsage));
+        Assert.Equal(3, iteration.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(1, iteration.UsageTotals.PhasesWithUsage);
+        Assert.Equal(0, iteration.UsageTotals.PhasesWithoutUsage);
+        Assert.DoesNotContain(iteration.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+        Assert.Equal(3, detail.UsageTotals!.Usage.Total.InputTokens);
+        Assert.DoesNotContain(detail.UsageTotals.Usage.Entries, e => e.Model == "model-live");
+    }
+
+    // ── Markup contract: the live markers really are wired into GoalDetail.razor ────────────────    //
+    // No bUnit: like the other page-contract tests in this repo, these read the ACTUAL razor source
+    // and scope every assertion to the region it belongs to, so a marker removed from the _detail
+    // path (while some other occurrence still exists elsewhere) cannot pass.
+
+    /// <summary>
+    /// Reads the actual <c>GoalDetail.razor</c> source by walking up from the current directory to
+    /// the repo root (identified by the presence of a <c>*.slnx</c> file).
+    /// </summary>
+    private static string ReadGoalDetailRazorSource()
+    {
+        var repoRoot = Environment.CurrentDirectory;
+        while (repoRoot != null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
+        {
+            repoRoot = Directory.GetParent(repoRoot)?.FullName;
+        }
+
+        Assert.NotNull(repoRoot);
+        var razorPath = Path.Combine(repoRoot, "src", "CopilotHive", "Components", "Pages", "GoalDetail.razor");
+        Assert.True(File.Exists(razorPath), $"Source file not found at {razorPath}");
+        return File.ReadAllText(razorPath);
+    }
+
+    /// <summary>Extracts the region of <paramref name="source"/> between two markers, exclusively.</summary>
+    private static string ExtractBetween(string source, string startMarker, string endMarker)
+    {
+        var start = source.IndexOf(startMarker, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Start marker not found in GoalDetail.razor: {startMarker}");
+        var end = source.IndexOf(endMarker, start + startMarker.Length, StringComparison.Ordinal);
+        Assert.True(end > start, $"End marker not found after the start marker in GoalDetail.razor: {endMarker}");
+        return source[start..end];
+    }
+
+    /// <summary>
+    /// The live markers exist in the <c>_detail</c> iteration region and nowhere in the stored region:
+    /// the phase box appends <c>(live)</c> to the SHARED box label, the phase detail uses the
+    /// "so far, live" wording, and the iteration total line appends the running-phase note — all
+    /// driven by <c>phase.IsLiveUsage</c> / <c>iter.IncludesLiveUsage</c>. The stored iteration block
+    /// (which reads persisted <see cref="PhaseResult"/> records that can never be live) carries none of
+    /// them.
+    /// </summary>
+    [Fact]
+    public void RazorSource_TheDetailPathCarriesTheLiveMarkers_AndTheStoredPathDoesNot()
+    {
+        var source = ReadGoalDetailRazorSource();
+
+        const string detailIterations = "@* _detail iterations *@";
+        const string storedIterations = "@* _storedIterations (from SQLite) *@";
+
+        var detailRegion = ExtractBetween(source, detailIterations, storedIterations);
+
+        // PHASE BOX: the shared label helper is still the source of the label, and the live marker is
+        // appended from the row's own flag.
+        Assert.Contains("UsageFormat.FormatPhaseBoxLabel(phase.Usage)", detailRegion);
+        Assert.Contains("@phaseUsageLabel@(phase.IsLiveUsage ? \" (live)\" : \"\")", detailRegion);
+
+        // PHASE DETAIL: the same helper lines, with the live wording on the total line only.
+        Assert.Contains("<div>Tokens@(phase.IsLiveUsage ? \" (so far, live)\" : \"\"): @UsageFormat.FormatUsageLine(phase.Usage.Total)</div>", detailRegion);
+        Assert.Contains("@foreach (var usageEntryLine in UsageFormat.FormatEntryLines(phase.Usage))", detailRegion);
+
+        // ITERATION TOTAL: the running-phase note, appended after the shared missing-phases note.
+        Assert.Contains("@(iter.IncludesLiveUsage ? \" (includes running phase)\" : \"\")", detailRegion);
+
+        var storedRegion = source[source.IndexOf(storedIterations, StringComparison.Ordinal)..];
+        Assert.DoesNotContain("IsLiveUsage", storedRegion);
+        Assert.DoesNotContain("IncludesLiveUsage", storedRegion);
+        Assert.DoesNotContain("(live)", storedRegion);
+        Assert.DoesNotContain("(so far, live)", storedRegion);
+        Assert.DoesNotContain("(includes running phase)", storedRegion);
+    }
+
+    /// <summary>
+    /// The goal card's "Total:" line appends the running-phase note, driven by the <c>_detail</c>
+    /// model's own flag — and the note comes from <c>_detail</c> ONLY, never from the stored path (which
+    /// reads completed summaries that can never carry a live figure).
+    /// </summary>
+    [Fact]
+    public void RazorSource_GoalCardTotalAppendsTheRunningPhaseNoteFromTheDetailFlagOnly()
+    {
+        var source = ReadGoalDetailRazorSource();
+
+        var cardRegion = ExtractBetween(
+            source,
+            "@* Token Usage — the goal total, only when a worker phase reported usage *@",
+            "@* RIGHT PANEL — iterations *@");
+
+        Assert.Contains("var goalIncludesLiveUsage = _detail?.IncludesLiveUsage ?? false;", cardRegion);
+        Assert.Contains("@(goalIncludesLiveUsage ? \" (includes running phase)\" : \"\")", cardRegion);
+        Assert.Contains("UsageFormat.FormatUsageLine(storedOrDetailUsageTotals.Usage.Total)", cardRegion);
+        Assert.Contains("UsageFormat.FormatMissingPhasesNote(storedOrDetailUsageTotals)", cardRegion);
+    }
 }

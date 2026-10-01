@@ -65,4 +65,20 @@ public sealed class GoalDetailInfo
     /// </para>
     /// </summary>
     internal PhaseUsageTotals.Result? UsageTotals { get; init; }
+
+    /// <summary>
+    /// Whether <see cref="UsageTotals"/> includes the RUNNING phase's LIVE usage — the running task's
+    /// usage resolved from a worker heartbeat and attributed to the live iteration's running entry.
+    /// <para>
+    /// It is <c>true</c> only when the goal total was summed over a live iteration that included such
+    /// a substitute; a goal without a running phase (or whose running task's usage was not
+    /// attributed) is <c>false</c> and its total is persisted-data-only. Renderers append
+    /// "(includes running phase)" when it is <c>true</c>.
+    /// </para>
+    /// <para>
+    /// INTERNAL like <see cref="UsageTotals"/>: the razor page and the builder live in the same
+    /// assembly, and the flag describes an internal total.
+    /// </para>
+    /// </summary>
+    internal bool IncludesLiveUsage { get; init; }
 }

@@ -54,4 +54,18 @@ public sealed class PhaseViewInfo
     /// </para>
     /// </summary>
     public SharpCoder.UsageSummary? Usage { get; init; }
+
+    /// <summary>
+    /// Whether <see cref="Usage"/> is the RUNNING task's LIVE usage — the usage a worker reported on
+    /// its heartbeat for the phase it is executing RIGHT NOW — instead of a persisted per-phase
+    /// report.
+    /// <para>
+    /// It is <c>true</c> only on the single running row of the LIVE iteration, and only when the
+    /// running task's usage could be attributed to exactly one worker. It is <c>false</c> for every
+    /// other row: a persisted report, a pending phase, a non-worker phase, and every row of a
+    /// summarised or stored iteration. Renderers use it purely to MARK the value as live (e.g. a
+    /// <c>(live)</c> suffix and a "so far" wording); it never changes the value itself.
+    /// </para>
+    /// </summary>
+    public bool IsLiveUsage { get; init; }
 }

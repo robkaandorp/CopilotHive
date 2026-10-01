@@ -190,7 +190,52 @@ public sealed class DashboardStateService : IDisposable
         }
 
         var pipeline = _pipelineManager.GetByGoalId(goalId);
-        return GoalDetailViewBuilder.Build(goal, goalId, pipeline, fullGoalWithSummaries, _config);
+        var runningTaskUsage = ResolveRunningTaskUsage(pipeline);
+        return GoalDetailViewBuilder.Build(goal, goalId, pipeline, fullGoalWithSummaries, _config, runningTaskUsage);
+    }
+
+    /// <summary>
+    /// Resolves the LIVE usage of the task the pipeline is currently running from ONE worker-status
+    /// capture, or <c>null</c> when it cannot be attributed to exactly one worker.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE ACTIVE TASK ID IS READ ONCE into a local and the capture is taken ONCE, and the two are
+    /// independent reads — the pointer may move between them, which simply yields no match. A worker
+    /// snapshot contributes only when its <see cref="WorkerStatusSnapshot.LiveUsageTaskId"/> equals
+    /// that id ORDINALLY, so usage a worker reported for a task it is no longer running is never
+    /// shown as the running phase's usage.
+    /// </para>
+    /// <para>
+    /// EXACTLY ONE MATCH IS REQUIRED. Zero matches (no worker is running the task — e.g. the task was
+    /// just dispatched and no heartbeat has arrived yet), SEVERAL matches (two workers report the same
+    /// task id, which would make a single figure misleading), a <c>null</c>/blank active task id and
+    /// the absence of a pipeline all yield <c>null</c> — no live usage is shown. The snapshots are
+    /// never summed and never guessed: a sum would present a fabricated figure as measured.
+    /// </para>
+    /// <para>
+    /// The returned summary is the detached snapshot the pool captured, so no
+    /// <see cref="ConnectedWorker"/> reference is read, stored or exposed here.
+    /// </para>
+    /// </remarks>
+    /// <param name="pipeline">The goal's pipeline, or <c>null</c> when the goal is not active.</param>
+    /// <returns>The running task's live usage, or <c>null</c> when it cannot be attributed.</returns>
+    private SharpCoder.UsageSummary? ResolveRunningTaskUsage(GoalPipeline? pipeline)
+    {
+        // Read ONCE: the id the rest of this method attributes usage to.
+        var activeTaskId = pipeline?.ActiveTaskId;
+        if (string.IsNullOrEmpty(activeTaskId))
+            return null;
+
+        // ONE capture for this response, exactly like GetSnapshot's worker projection.
+        var workers = _workerPool.CaptureWorkerStatus();
+
+        var matches = workers
+            .Where(w => string.Equals(w.LiveUsageTaskId, activeTaskId, StringComparison.Ordinal))
+            .ToList();
+
+        // EXACTLY ONE match, or no live usage: several matches are ambiguous, so neither is used.
+        return matches.Count == 1 ? matches[0].LiveUsage : null;
     }
 
     // ── Log access ─────────────────────────────────────────────────────────────
