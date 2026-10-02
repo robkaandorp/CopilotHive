@@ -1,5 +1,53 @@
 ## [Unreleased]
 
+## [0.41.0] — 2026-10-02
+
+### Added
+
+- **Worker phase usage measurement** — Workers report provider-reported usage per task in the optional `TaskComplete.usage` field, so older workers remain compatible. Usage is reported per task in `TaskComplete.usage` and stored on each `PhaseResult.Usage`, grouped by `(source, model)` for Agent, Compaction, SubAgent and SubAgentCompaction calls. Each group includes input token counts, cached-input counts, output token counts, reasoning counts, model-call count, and an estimated per-category token breakdown as part of the reported usage. Per-phase figures appear on goal records and the dashboard goal detail page; iteration totals and the derived goal total are also available. Cached-input and reasoning categories show `≥N (partial)` when only some calls report them and `unknown` when no call reports them. Phases without any usage report are counted and named as “without usage reported”; they are never treated as zero.
+- **Live usage on the dashboard** — Worker heartbeats carry the running task's usage in `HeartbeatRequest.live_usage`. The dashboard goal detail page marks running-phase figures “(live)” and totals “(includes running phase)”. Composer `get_goal` shows persisted figures only; it does not include live running-phase usage.
+- **Dashboard goal usage** — The goal detail page shows a usage label on phase boxes, per-phase details by source and model, iteration totals, and a goal-level “Token Usage” card.
+- **Composer `get_goal` usage** — Persisted usage is shown as per-phase suffixes, iteration totals, and a `### Token Usage` section.
+- **Brain and pre-execution review usage** — Per-goal Brain calls and pre-execution reviews are recorded in the nullable `brain_usage` and `review_usage` goal columns, added automatically at startup without a manual migration. The dashboard and `get_goal` goal total combines workers, Brain and pre-execution review usage, with separate Workers, Brain and Pre-execution review lines. Brain usage is cleared when a failed goal is moved back to Draft; review usage is kept. Usage from returned results, including Error-status results, is recorded before the failure exception is raised; no usage is recorded only when execution fails without returning a result.
+- **Composer usage** — The last chat turn, session (persisted with the session), clarification answers and manual compactions (kept in memory since orchestrator start) are measured. The Composer chat status bar shows ` · turn X tok · session Y tok`, with full details in its tooltip.
+- **Worker `get_phase_report` tool** — Every worker role can read complete reports of phases already completed in the current iteration.
+- **Guidance size after edits** — Composer `update_agents_md` and `edit_agents_md`, and the Improver-only `edit_agents_file` and `write_agents_file` tools, report the file's full size against the 8,000-character limit after each successful edit.
+
+### Changed
+
+- **SharpCoder dependencies** — SharpCoder and SharpCoder.Providers upgraded from 0.21.1 to **0.22.0**, with accurate per-call usage accounting across normal, streaming, compaction and sub-agent calls.
+- **NuGet dependencies** — Versions changed since the v0.40.3 release:
+  - `coverlet.collector` 10.0.1 → 10.1.0
+  - `Google.Protobuf` 3.35.1 → 3.36.2
+  - `Grpc.AspNetCore` 2.83.0 → 2.84.0
+  - `Grpc.Net.Client` 2.83.0 → 2.84.0
+  - `Grpc.Tools` 2.83.0 → 2.84.0
+  - `Markdig` 1.3.2 → 1.4.0
+  - `Microsoft.AspNetCore.Mvc.Testing` 10.0.11 → 10.0.12
+  - `Microsoft.Data.Sqlite` 10.0.11 → 10.0.12
+  - `Microsoft.EntityFrameworkCore.Design` 10.0.11 → 10.0.12
+  - `Microsoft.EntityFrameworkCore.Sqlite` 10.0.11 → 10.0.12
+  - `Microsoft.Extensions.AI` 10.9.0 → 10.10.0
+  - `Microsoft.NET.Test.Sdk` 18.9.0 → 18.10.1
+  - `Moq` 4.20.72 → 4.21.0
+  - `NuGet.Versioning` 6.13.2 → 7.9.0
+  - `xunit.runner.visualstudio` 3.1.5 → 4.0.0
+  - `xunit.v3` remains pinned at 3.2.2; upgrading it to 4.x requires global.json/CI migration work outside this update and is recorded as a follow-up.
+- **Worker image and SDK setup** — Removed the unused baked-in `worker-agents.md` and `docker/worker/skills/`. The repository's `install-dotnet-sdk` skill is idempotent and retries downloads; the build and test skills direct workers to it when `dotnet` is missing.
+
+### Fixed
+
+- **Composer phase output for a running iteration** — `get_phase_output` also returns completed phases of the goal's currently running iteration and marks the data as live.
+- **Composer clarification answers** — Auto-answers now come from the final assistant message, preventing raw tool-call stream text from leaking into answers. Empty or tool-bearing answers, max-step replies and escalation replies are escalated to a human.
+- **In-memory SQLite ownership** — `CopilotHiveDbContext.CreateInMemory()` now disposes its in-memory SQLite connection with the context.
+
+### Upgrade notes
+
+- **Upgrade orchestrator and workers together.** Worker usage, live usage and `get_phase_report` require workers on 0.41.0. The new proto fields are optional, so older workers still work, but their phases appear as “without usage reported”.
+- The goals table receives the two new nullable columns automatically at startup; no manual migration is needed.
+- Usage is recorded only from the moment the new build runs; earlier goals show no figures, and Brain/review usage is not reconstructed.
+- **Known limits:** A sub-agent call that ends after a task's final usage snapshot is not included in that task's figures. Cached-input and reasoning counts are `unknown` for providers that do not report them, including Ollama models: the OllamaSharp client library does not yet map Ollama's `prompt_eval_cached_count`. The input/output category breakdown is an estimate.
+
 ## [0.40.3] — 2026-09-29
 
 ### Fixed

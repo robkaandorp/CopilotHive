@@ -209,7 +209,7 @@ public sealed class DashboardStateService : IDisposable
     /// <para>
     /// EXACTLY ONE MATCH IS REQUIRED. Zero matches (no worker is running the task — e.g. the task was
     /// just dispatched and no heartbeat has arrived yet), SEVERAL matches (two workers report the same
-    /// task id, which would make a single figure misleading), a <c>null</c>/blank active task id and
+    /// task id, which would make a single figure misleading), a <c>null</c>/empty active task id and
     /// the absence of a pipeline all yield <c>null</c> — no live usage is shown. The snapshots are
     /// never summed and never guessed: a sum would present a fabricated figure as measured.
     /// </para>

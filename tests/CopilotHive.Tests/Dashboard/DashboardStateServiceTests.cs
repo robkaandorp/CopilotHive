@@ -1100,8 +1100,8 @@ public sealed class DashboardStateServiceTests : IDisposable
         var captured = Assert.Single(workerPool.CaptureWorkerStatus(), w => w.Id == "w1");
         Assert.Equal("task-1", captured.LiveUsageTaskId);
         AssertUsageFigures(liveUsage, captured.LiveUsage);
-        // The capture is DETACHED: the pool stored its own copy, so the snapshot is never the
-        // caller's instance (and mutating one can never reach the other).
+        // CaptureWorkerStatus takes a Snapshot() at capture time, so the captured summary is never
+        // the caller's instance; the pool itself stores the reference it was given.
         Assert.NotSame(liveUsage, captured.LiveUsage);
 
         var logSink = new DashboardLogSink();
