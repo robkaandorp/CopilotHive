@@ -363,28 +363,42 @@
                         </table>
                     </div>
                 }
-                @* Token Usage — the goal total, only when a worker phase reported usage *@
+                @* Token Usage — the goal breakdown (workers + Brain + pre-execution review), rendered whenever any of the three reported *@
                 @{
-                    // The _detail path uses the builder's goal total (the union of exactly the phase
-                    // sets the timeline was built from); the stored path sums the stored iterations.
-                    // Only the _detail path can include a running phase's live usage: the stored path
-                    // reads completed summaries, which never carry live figures.
-                    var goalUsageTotals = _detail is not null
-                        ? _detail.UsageTotals
-                        : _storedGoal is not null
-                            ? GoalDetailViewBuilder.SumWorkerUsage(_storedIterations.SelectMany(i => i.Phases))
-                            : null;
-                    var goalIncludesLiveUsage = _detail?.IncludesLiveUsage ?? false;
+                    // The _detail path uses the builder's breakdown (the union of exactly the phase
+                    // sets the timeline was built from, plus the goal's OWN stored Brain/review usage);
+                    // the stored path sums the stored iterations and reads the stored goal directly.
+                    GoalUsageBreakdown? goalUsageBreakdown;
+                    bool goalIncludesLiveUsage;
+                    if (_detail is not null)
+                    {
+                        goalUsageBreakdown = _detail.GoalUsage;
+                        goalIncludesLiveUsage = _detail.IncludesLiveUsage;
+                    }
+                    else if (_storedGoal is { } storedGoalForUsage)
+                    {
+                        goalUsageBreakdown = GoalUsageBreakdown.Create(
+                            PhaseUsageTotals.Sum(_storedIterations.SelectMany(i => i.Phases)),
+                            storedGoalForUsage.BrainUsage,
+                            storedGoalForUsage.ReviewUsage);
+                        // The stored path reads completed summaries, which never carry a live figure:
+                        // the worker-derived lines can never include a running phase here.
+                        goalIncludesLiveUsage = false;
+                    }
+                    else
+                    {
+                        goalUsageBreakdown = null;
+                        goalIncludesLiveUsage = false;
+                    }
                 }
-                @if (goalUsageTotals is { } storedOrDetailUsageTotals)
+                @if (goalUsageBreakdown is { } usageBreakdown)
                 {
                     <div class="card" style="margin-bottom:0.75rem">
                         <div class="label">Token Usage</div>
                         <div style="margin-top:0.5rem;font-size:0.85rem;color:var(--text-muted)">
-                            <div>Total: @UsageFormat.FormatUsageLine(storedOrDetailUsageTotals.Usage.Total)@UsageFormat.FormatMissingPhasesNote(storedOrDetailUsageTotals)@(goalIncludesLiveUsage ? " (includes running phase)" : "")</div>
-                            @foreach (var goalUsageEntryLine in UsageFormat.FormatEntryLines(storedOrDetailUsageTotals.Usage))
+                            @foreach (var (depth, text) in UsageFormat.FormatGoalUsageLines(usageBreakdown, goalIncludesLiveUsage))
                             {
-                                <div>@goalUsageEntryLine</div>
+                                <div style="@(depth == 1 ? "padding-left:1rem" : null)">@text</div>
                             }
                         </div>
                     </div>

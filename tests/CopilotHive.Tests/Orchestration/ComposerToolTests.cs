@@ -2927,6 +2927,24 @@ public sealed class ComposerToolTests : IDisposable
         });
 
     /// <summary>
+    /// THE WORKER fixture of the goal-breakdown tests: 1,000 input / 200 output / 3 calls with cached
+    /// input PARTIAL (1 of 3) and reasoning UNKNOWN (0 of 3).
+    /// </summary>
+    private static SharpCoder.UsageEntry WorkerUsageEntry() => new(
+        SharpCoder.UsageSource.Agent,
+        "model-w",
+        new SharpCoder.TokenUsage
+        {
+            InputTokens = 1_000,
+            OutputTokens = 200,
+            CachedInputTokens = 30,
+            ReasoningTokens = 40,
+            Calls = 3,
+            CachedInputReportedCalls = 1,
+            ReasoningReportedCalls = 0,
+        });
+
+    /// <summary>
     /// The per-phase suffix, the iteration total and the <c>### Token Usage</c> section, asserted
     /// with the EXACT renderings — including <c>unknown</c>, <c>≥{n} (partial)</c>,
     /// <c>(unknown model)</c> and the missing-phase note. The non-worker Merging phase carries usage
@@ -3235,6 +3253,185 @@ public sealed class ComposerToolTests : IDisposable
             "- Agent / model-quiet: input 40 / unknown cached input / output 4 / unknown reasoning / 3 calls\n",
             result);
         Assert.DoesNotContain("(partial)", result);
+    }
+
+    // ── get_goal — the goal breakdown: workers + Brain + pre-execution review ──
+
+    /// <summary>
+    /// The Brain usage written through the PRODUCTION write path (<see cref="IGoalStore.AddGoalUsageAsync"/>
+    /// with <see cref="GoalUsageKind.Brain"/>): a bucket no worker phase produced.
+    /// </summary>
+    private static SharpCoder.UsageSummary BrainUsageReport() => new(
+    [
+        new SharpCoder.UsageEntry(SharpCoder.UsageSource.SubAgent, "model-b", new SharpCoder.TokenUsage
+        {
+            InputTokens = 50,
+            OutputTokens = 5,
+            CachedInputTokens = 7,
+            ReasoningTokens = 9,
+            Calls = 2,
+            CachedInputReportedCalls = 2,
+            ReasoningReportedCalls = 2,
+        }),
+    ]);
+
+    /// <summary>The review usage written for <see cref="GoalUsageKind.PreExecutionReview"/>, with a null model.</summary>
+    private static SharpCoder.UsageSummary ReviewUsageReport() => new(
+    [
+        new SharpCoder.UsageEntry(SharpCoder.UsageSource.Compaction, null, new SharpCoder.TokenUsage
+        {
+            InputTokens = 8,
+            OutputTokens = 1,
+            Calls = 1,
+            CachedInputReportedCalls = 1,
+            ReasoningReportedCalls = 1,
+        }),
+    ]);
+
+    /// <summary>
+    /// The <c>### Token Usage</c> section for a goal with worker, Brain AND review usage is the GRAND
+    /// total followed by one block per source, each with its own per-(source, model) lines indented.
+    /// The whole section is asserted with the EXACT text, so a missing block, a reordered block or a
+    /// worker-only total fails here — and the per-phase suffix / iteration total prove they stayed
+    /// WORKERS-ONLY (neither the Brain's 50 nor the review's 8 input appears there).
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_WorkerBrainAndReviewUsage_RendersTheGrandTotalSectionWithAllThreeBlocks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-all-three", "Goal using workers, Brain and reviews");
+        await _store.AddIterationAsync("usage-all-three", new IterationSummary
+        {
+            Iteration = 1,
+            // A missing worker phase is counted ONCE, on the grand total only — the note describes the
+            // workers whose tokens are absent from the total, not the Brain or review figures.
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 45.2,
+                    Usage = new SharpCoder.UsageSummary([WorkerUsageEntry()]),
+                },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Skip, DurationSeconds = 0.5, Usage = null },
+            ],
+        }, ct);
+
+        await _store.AddGoalUsageAsync("usage-all-three", GoalUsageKind.Brain, BrainUsageReport(), ct);
+        await _store.AddGoalUsageAsync("usage-all-three", GoalUsageKind.PreExecutionReview, ReviewUsageReport(), ct);
+
+        var result = await _composer.GetGoalAsync("usage-all-three");
+
+        const string expectedSection =
+            "\n### Token Usage\n"
+            + "- Total: input 1,058 / ≥37 (partial) cached input / output 206 / ≥49 (partial) reasoning / 6 calls (1 worker phase(s) without usage reported)\n"
+            + "- Workers: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls\n"
+            + "  - Agent / model-w: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls\n"
+            + "- Brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls\n"
+            + "  - SubAgent / model-b: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls\n"
+            + "- Pre-execution review: input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls\n"
+            + "  - Compaction / (unknown model): input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls\n";
+        Assert.Contains(expectedSection, result);
+
+        // The per-phase suffix and the iteration total stay WORKERS-ONLY: they show the Coding phase's
+        // own report, never the Brain's 50 or the review's 8 (which the section above pins separately).
+        Assert.Contains(
+            "- Coding: pass (45.2s) | input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls\n",
+            result);
+        Assert.Contains(
+            "- Iteration total: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls (1 worker phase(s) without usage reported)\n",
+            result);
+
+        // The section sits after the iterations, exactly as before.
+        Assert.True(
+            result.IndexOf("### Iterations", StringComparison.Ordinal)
+                < result.IndexOf("### Token Usage", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A goal whose ONLY usage is Brain/review (e.g. still in Planning, no iterations at all) still
+    /// gets the section: the tokens were really spent. With no worker phase reported there is no
+    /// <c>Workers:</c> line and no missing-phases note.
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_BrainOnlyUsage_RendersTheSectionWithoutAWorkersLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-brain-only", "Goal planned but not executed");
+        await _store.AddGoalUsageAsync("usage-brain-only", GoalUsageKind.Brain, BrainUsageReport(), ct);
+
+        var result = await _composer.GetGoalAsync("usage-brain-only");
+
+        Assert.Contains(
+            "\n### Token Usage\n"
+            + "- Total: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls\n"
+            + "- Brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls\n"
+            + "  - SubAgent / model-b: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls\n",
+            result);
+        Assert.DoesNotContain("Workers:", result);
+        Assert.DoesNotContain("Pre-execution review:", result);
+        Assert.DoesNotContain("without usage reported", result);
+    }
+
+    /// <summary>A review-only goal lists the grand total and the review block — and nothing else.</summary>
+    [Fact]
+    public async Task GetGoal_ReviewOnlyUsage_RendersTheSectionWithoutWorkersOrBrainLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("usage-review-only", "Goal reviewed but not executed");
+        await _store.AddGoalUsageAsync("usage-review-only", GoalUsageKind.PreExecutionReview, ReviewUsageReport(), ct);
+
+        var result = await _composer.GetGoalAsync("usage-review-only");
+
+        Assert.Contains(
+            "\n### Token Usage\n"
+            + "- Total: input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls\n"
+            + "- Pre-execution review: input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls\n"
+            + "  - Compaction / (unknown model): input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls\n",
+            result);
+        Assert.DoesNotContain("Workers:", result);
+        Assert.DoesNotContain("Brain:", result);
+    }
+
+    /// <summary>
+    /// NOTHING anywhere renders NO section: worker phases that reported nothing, plus a stored value
+    /// that is absent or an EMPTY summary (which the store would never write anyway) — the goal's
+    /// output stays byte-identical to the pre-usage rendering.
+    /// </summary>
+    [Fact]
+    public async Task GetGoal_NoUsageAnywhere_RendersNoTokenSectionAtAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // A goal seeded directly with an EMPTY summary in each usage property: the closest a caller
+        // could come to "a summary with nothing in it", which must still mean "render nothing".
+        await _store.CreateGoalAsync(new Goal
+        {
+            Id = "usage-empty-summaries",
+            Description = "Goal whose usage summaries are empty",
+            Status = GoalStatus.Draft,
+            CreatedAt = new DateTime(2025, 6, 15, 10, 0, 0, DateTimeKind.Utc),
+            BrainUsage = new SharpCoder.UsageSummary(),
+            ReviewUsage = new SharpCoder.UsageSummary(),
+        }, ct);
+        await _store.AddIterationAsync("usage-empty-summaries", new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.2 }],
+        }, ct);
+
+        var result = await _composer.GetGoalAsync("usage-empty-summaries");
+
+        Assert.DoesNotContain("### Token Usage", result);
+        Assert.DoesNotContain("Iteration total", result);
+        Assert.DoesNotContain("Workers:", result);
+        Assert.DoesNotContain("Brain:", result);
+        Assert.DoesNotContain("Pre-execution review:", result);
+        Assert.Contains("- Coding: pass (45.2s)\n", result);
     }
 
     [Fact]

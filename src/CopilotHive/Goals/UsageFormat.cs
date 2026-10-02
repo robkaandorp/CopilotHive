@@ -116,6 +116,73 @@ internal static class UsageFormat
     }
 
     /// <summary>
+    /// Renders the goal-level usage breakdown as an ORDERED list of lines, each with the nesting
+    /// depth the caller indents by:
+    /// <list type="number">
+    ///   <item>depth 0 <c>Total: {usage line}{missing-phases note}{live}</c> — the GRAND total of all three sources;</item>
+    ///   <item>when any worker phase reported, depth 0 <c>Workers: {usage line}{live}</c> and one depth 1 entry line per worker <c>(source, model)</c> bucket;</item>
+    ///   <item>when Brain usage is present, depth 0 <c>Brain: {usage line}</c> and its depth 1 entry lines;</item>
+    ///   <item>when review usage is present, depth 0 <c>Pre-execution review: {usage line}</c> and its depth 1 entry lines.</item>
+    /// </list>
+    /// <para>
+    /// The <c>(includes running phase)</c> marker appears on the <c>Total:</c> and <c>Workers:</c>
+    /// lines ONLY when <paramref name="includesLiveUsage"/> is <c>true</c>: both are worker-derived
+    /// totals that can count a running phase's live figure, whereas Brain and review usage is
+    /// persisted data that no live capture ever touches. The missing-phases note belongs to the
+    /// grand total as well, because it describes the worker phases whose tokens are absent from it.
+    /// </para>
+    /// <para>
+    /// PURE and culture-invariant, like every helper here: it composes
+    /// <see cref="FormatUsageLine(TokenUsage)"/>, <see cref="FormatEntryLines(UsageSummary)"/> and
+    /// <see cref="FormatMissingPhasesNote(PhaseUsageTotals.Result)"/> and adds no formatting of its
+    /// own. Callers that render nothing when the breakdown is <c>null</c> keep legacy goals
+    /// byte-identical.
+    /// </para>
+    /// </summary>
+    /// <param name="usage">The goal's usage breakdown; must not be <c>null</c>.</param>
+    /// <param name="includesLiveUsage">
+    /// Whether the worker-derived lines count a running phase's LIVE usage, in which case the
+    /// <c>(includes running phase)</c> marker is appended to them.
+    /// </param>
+    /// <returns>One <c>(depth, text)</c> pair per rendered line, in render order.</returns>
+    internal static IReadOnlyList<(int Depth, string Text)> FormatGoalUsageLines(
+        GoalUsageBreakdown usage, bool includesLiveUsage)
+    {
+        ArgumentNullException.ThrowIfNull(usage);
+
+        var live = includesLiveUsage ? " (includes running phase)" : "";
+        var lines = new List<(int Depth, string Text)>
+        {
+            (0, $"Total: {FormatUsageLine(usage.Total.Total)}{FormatMissingPhasesNote(usage.Workers)}{live}"),
+        };
+
+        // The Workers line appears only for a goal whose worker phases reported: a Brain- or
+        // review-only goal has no worker figure to show, and 0 tokens from nobody is not a number.
+        if (usage.Workers.PhasesWithUsage > 0)
+        {
+            lines.Add((0, $"Workers: {FormatUsageLine(usage.Workers.Usage.Total)}{live}"));
+            foreach (var entryLine in FormatEntryLines(usage.Workers.Usage))
+                lines.Add((1, entryLine));
+        }
+
+        if (usage.Brain is { } brain)
+        {
+            lines.Add((0, $"Brain: {FormatUsageLine(brain.Total)}"));
+            foreach (var entryLine in FormatEntryLines(brain))
+                lines.Add((1, entryLine));
+        }
+
+        if (usage.Review is { } review)
+        {
+            lines.Add((0, $"Pre-execution review: {FormatUsageLine(review.Total)}"));
+            foreach (var entryLine in FormatEntryLines(review))
+                lines.Add((1, entryLine));
+        }
+
+        return lines;
+    }
+
+    /// <summary>
     /// Renders the compact label for a phase box, or <c>null</c> when the phase has no usage to show
     /// — not reported (legacy data, a legacy worker or test double), a non-worker phase such as
     /// Planning, or a phase that has not run yet. Callers render the label only for a non-null

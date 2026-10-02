@@ -50,30 +50,52 @@ public sealed class GoalDetailInfo
     /// <summary>Reason the goal failed, if applicable.</summary>
     public string? FailureReason { get; init; }
     /// <summary>
-    /// The summed token usage across ALL of the goal's iterations — the union of exactly the phase
-    /// records each <see cref="IterationViewInfo"/> was built from, with every iteration counted
-    /// exactly once — or <c>null</c> when no worker phase reported usage.
+    /// The goal's FULL token-usage breakdown — worker phases, stored Brain usage and stored
+    /// pre-execution review usage, plus their grand total — or <c>null</c> when the goal has no usage
+    /// to show at all (no worker phase reported AND both stored summaries are absent).
+    /// <para>
+    /// <c>null</c> means "render no Token Usage card at all", so a legacy goal without usage renders
+    /// exactly as it did before. A goal with ONLY Brain or review usage yields a non-null breakdown
+    /// even though no worker phase has run yet, so the card appears for a goal that was reviewed or
+    /// planned but has not executed.
+    /// </para>
+    /// <para>
+    /// INTERNAL because <see cref="GoalUsageBreakdown"/> itself is internal — a public property would
+    /// be a CS0053 error. The dashboard page and <see cref="GoalDetailViewBuilder"/> live in the same
+    /// assembly, so both read it directly.
+    /// </para>
+    /// </summary>
+    internal GoalUsageBreakdown? GoalUsage { get; init; }
+
+    /// <summary>
+    /// The summed token usage of the goal's WORKER phases — the union of exactly the phase records
+    /// each <see cref="IterationViewInfo"/> was built from, with every iteration counted exactly once
+    /// — or <c>null</c> when no worker phase reported usage.
     /// <para>
     /// INTERNAL because <see cref="PhaseUsageTotals.Result"/> is internal — a public property would
     /// be a CS0053 error. The dashboard page and <see cref="GoalDetailViewBuilder"/> live in the same
     /// assembly, so both read it directly.
     /// </para>
     /// <para>
-    /// <c>null</c> means "render no Token Usage card at all", so a legacy goal without usage renders
-    /// exactly as it did before. An EMPTY (non-null) summary from a worker phase is a real zero-call
-    /// measurement and therefore counts as reported, exactly like <see cref="PhaseUsageTotals.Sum"/>.
+    /// <c>null</c> means "the goal's worker phases reported nothing", so a legacy goal without usage
+    /// renders exactly as it did before. An EMPTY (non-null) summary from a worker phase is a real
+    /// zero-call measurement and therefore counts as reported, exactly like
+    /// <see cref="PhaseUsageTotals.Sum"/> counts it. The goal detail page no longer renders from this
+    /// property (it renders the card from <see cref="GoalUsage"/> instead); it is kept for the
+    /// worker-phase figure on its own.
     /// </para>
     /// </summary>
     internal PhaseUsageTotals.Result? UsageTotals { get; init; }
 
     /// <summary>
-    /// Whether <see cref="UsageTotals"/> includes the RUNNING phase's LIVE usage — the running task's
-    /// usage resolved from a worker heartbeat and attributed to the live iteration's running entry.
+    /// Whether <see cref="GoalUsage"/> and <see cref="UsageTotals"/> include the RUNNING phase's LIVE
+    /// usage — the running task's usage resolved from a worker heartbeat and attributed to the live
+    /// iteration's running entry.
     /// <para>
-    /// It is <c>true</c> only when the goal total was summed over a live iteration that included such
-    /// a substitute; a goal without a running phase (or whose running task's usage was not
-    /// attributed) is <c>false</c> and its total is persisted-data-only. Renderers append
-    /// "(includes running phase)" when it is <c>true</c>.
+    /// It is <c>true</c> only when the worker-phase total was summed over a live iteration that
+    /// included such a substitute; a goal without a running phase (or whose running task's usage was
+    /// not attributed) is <c>false</c> and its worker figures are persisted-data-only. Renderers
+    /// append "(includes running phase)" to the worker-derived lines when it is <c>true</c>.
     /// </para>
     /// <para>
     /// INTERNAL like <see cref="UsageTotals"/>: the razor page and the builder live in the same
