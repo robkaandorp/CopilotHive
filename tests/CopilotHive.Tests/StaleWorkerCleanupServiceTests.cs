@@ -85,7 +85,7 @@ public sealed class StaleWorkerCleanupServiceTests
             l => l.Log(
                 LogLevel.Warning,
                 It.IsAny<EventId>(),
-                It.Is<It.IsAnyType>((v, _) => v.ToString()!.Contains("worker-1")),
+                It.Is<It.IsAnyType>((v, _) => v!.ToString()!.Contains("worker-1")),
                 It.IsAny<Exception?>(),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
             Times.Once);
@@ -297,7 +297,7 @@ public sealed class StaleWorkerCleanupServiceTests
             l => l.Log(
                 LogLevel.Warning,
                 It.IsAny<EventId>(),
-                It.Is<It.IsAnyType>((v, _) => v.ToString()!.Contains("reclaiming")),
+                It.Is<It.IsAnyType>((v, _) => v!.ToString()!.Contains("reclaiming")),
                 It.IsAny<Exception?>(),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
             Times.Never);
@@ -337,8 +337,8 @@ public sealed class StaleWorkerCleanupServiceTests
                 LogLevel.Warning,
                 It.IsAny<EventId>(),
                 It.Is<It.IsAnyType>((v, _) =>
-                    v.ToString()!.Contains("inactive since") &&
-                    v.ToString()!.Contains(inactiveSince.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture))),
+                    v!.ToString()!.Contains("inactive since") &&
+                    v!.ToString()!.Contains(inactiveSince.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture))),
                 It.IsAny<Exception?>(),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
             Times.Once);
