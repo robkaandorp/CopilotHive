@@ -609,15 +609,16 @@ public sealed partial class Composer
             }
         }
 
-        // The per-goal usage section, only when ANY persisted phase reported usage. A goal whose
-        // data predates the usage property (or whose workers never reported) renders as before.
-        var goalTotals = PhaseUsageTotals.Sum(iterations.SelectMany(i => i.Phases));
-        if (goalTotals.PhasesWithUsage > 0)
+        // The per-goal usage section, only when the goal has usage to show: the grand total of the
+        // worker phases, the stored Brain usage and the stored pre-execution review usage. A goal
+        // whose data predates usage (or that reported nothing anywhere) renders as before.
+        var goalBreakdown = GoalUsageBreakdown.Create(
+            PhaseUsageTotals.Sum(iterations.SelectMany(i => i.Phases)), goal.BrainUsage, goal.ReviewUsage);
+        if (goalBreakdown is not null)
         {
             sb.AppendLine("\n### Token Usage");
-            sb.AppendLine($"- Total: {UsageFormat.FormatUsageLine(goalTotals.Usage.Total)}{UsageFormat.FormatMissingPhasesNote(goalTotals)}");
-            foreach (var entryLine in UsageFormat.FormatEntryLines(goalTotals.Usage))
-                sb.AppendLine($"- {entryLine}");
+            foreach (var (depth, text) in UsageFormat.FormatGoalUsageLines(goalBreakdown, includesLiveUsage: false))
+                sb.AppendLine(depth == 0 ? $"- {text}" : $"  - {text}");
         }
 
         if (goal.Notes.Count > 0)

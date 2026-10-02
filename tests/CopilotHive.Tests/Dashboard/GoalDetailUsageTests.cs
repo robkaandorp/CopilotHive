@@ -201,12 +201,17 @@ public sealed class GoalDetailUsageTests
             ? null
             : $"Iteration total: {UsageFormat.FormatUsageLine(totals.Usage.Total)}{UsageFormat.FormatMissingPhasesNote(totals)}";
 
-    /// <summary>Mirrors the left-panel "Token Usage" card body: total line plus entry lines.</summary>
-    private static IReadOnlyList<string> GoalCardLines(PhaseUsageTotals.Result? totals) =>
-        totals is null
+    /// <summary>
+    /// Mirrors the left-panel "Token Usage" card body: the lines
+    /// <see cref="UsageFormat.FormatGoalUsageLines"/> produces for the breakdown, with depth-1 lines
+    /// indented exactly as the razor indents them.
+    /// </summary>
+    private static IReadOnlyList<string> GoalCardLines(GoalUsageBreakdown? breakdown, bool includesLiveUsage = false) =>
+        breakdown is null
             ? []
-            : [$"Total: {UsageFormat.FormatUsageLine(totals.Usage.Total)}{UsageFormat.FormatMissingPhasesNote(totals)}",
-               .. UsageFormat.FormatEntryLines(totals.Usage)];
+            : UsageFormat.FormatGoalUsageLines(breakdown, includesLiveUsage)
+                .Select(l => l.Depth == 1 ? $"    {l.Text}" : l.Text)
+                .ToList();
 
     // ── UsageFormat: rendered lines ────────────────────────────────────────────
 
@@ -733,14 +738,20 @@ public sealed class GoalDetailUsageTests
             IterationTotalLine(iteration.UsageTotals));
         Assert.DoesNotContain("without usage reported", IterationTotalLine(iteration.UsageTotals));
 
-        // GOAL CARD: the same total, plus the same two entry lines.
+        // GOAL CARD: the grand total, the Workers line (the same total — this goal has no Brain or
+        // review usage and no missing worker phase), then the same two entry lines INDENTED. The card
+        // is driven by the breakdown, and the worker-only total it reports is unchanged.
+        Assert.NotNull(detail.GoalUsage);
+        Assert.Null(detail.GoalUsage!.Brain);
+        Assert.Null(detail.GoalUsage.Review);
         Assert.Equal(
             [
                 "Total: input 1,005 / ≥41 (partial) cached input / output 207 / ≥53 (partial) reasoning / 5 calls",
-                "Agent / model-a: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls",
-                "SubAgent / (unknown model): input 5 / 11 cached input / output 7 / 13 reasoning / 2 calls",
+                "Workers: input 1,005 / ≥41 (partial) cached input / output 207 / ≥53 (partial) reasoning / 5 calls",
+                "    Agent / model-a: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls",
+                "    SubAgent / (unknown model): input 5 / 11 cached input / output 7 / 13 reasoning / 2 calls",
             ],
-            GoalCardLines(detail.UsageTotals));
+            GoalCardLines(detail.GoalUsage));
     }
 
     /// <summary>
@@ -761,7 +772,9 @@ public sealed class GoalDetailUsageTests
 
         Assert.Empty(PhaseDetailLines(null));
         Assert.Null(IterationTotalLine(iteration.UsageTotals));
-        Assert.Empty(GoalCardLines(detail.UsageTotals));
+        // NOTHING reported anywhere → no breakdown → no card at all.
+        Assert.Null(detail.GoalUsage);
+        Assert.Empty(GoalCardLines(detail.GoalUsage));
     }
 
     // ── Mirrored presentation: the stored fallback path ───────────────────────
@@ -795,9 +808,14 @@ public sealed class GoalDetailUsageTests
         Assert.NotNull(detail);
         var detailIteration = Assert.Single(detail!.Iterations);
 
-        // Stored path: the page sums the stored phase records through the builder's shared helper.
+        // Stored path: the page sums the stored phase records through the builder's shared helper and
+        // builds its breakdown from that sum plus the STORED goal's own Brain/review usage.
         var storedIterationTotals = GoalDetailViewBuilder.SumWorkerUsage(storedIteration.Phases);
         var storedGoalTotals = GoalDetailViewBuilder.SumWorkerUsage(storedIterations.SelectMany(i => i.Phases));
+        var storedBreakdown = GoalUsageBreakdown.Create(
+            PhaseUsageTotals.Sum(storedIterations.SelectMany(i => i.Phases)),
+            brain: null,
+            review: null);
 
         var storedPhase = Assert.Single(storedIteration.Phases, p => p.Name == GoalPhase.Coding);
 
@@ -805,7 +823,7 @@ public sealed class GoalDetailUsageTests
         Assert.Equal("1.2K tok", PhaseBoxLabel(storedPhase.Usage));
         Assert.Equal(PhaseDetailLines(detailIteration.Phases.Single(p => p.Name == "Coding").Usage), PhaseDetailLines(storedPhase.Usage));
         Assert.Equal(IterationTotalLine(detailIteration.UsageTotals), IterationTotalLine(storedIterationTotals));
-        Assert.Equal(GoalCardLines(detail.UsageTotals), GoalCardLines(storedGoalTotals));
+        Assert.Equal(GoalCardLines(detail.GoalUsage), GoalCardLines(storedBreakdown));
 
         // The one missing worker phase is named on BOTH totals, so the note is identical too.
         Assert.Equal(" (1 worker phase(s) without usage reported)", UsageFormat.FormatMissingPhasesNote(storedGoalTotals!));
@@ -825,7 +843,204 @@ public sealed class GoalDetailUsageTests
             Assert.Null(PhaseBoxLabel(phase.Usage));
 
         Assert.Null(IterationTotalLine(GoalDetailViewBuilder.SumWorkerUsage(storedIterations[0].Phases)));
-        Assert.Empty(GoalCardLines(GoalDetailViewBuilder.SumWorkerUsage(storedIterations.SelectMany(i => i.Phases))));
+        Assert.Empty(GoalCardLines(GoalUsageBreakdown.Create(
+            PhaseUsageTotals.Sum(storedIterations.SelectMany(i => i.Phases)), brain: null, review: null)));
+    }
+
+    // ── Mirrored presentation: the goal CARD with Brain / review usage ─────────
+
+    /// <summary>The goal's stored Brain usage — a bucket no worker phase produced.</summary>
+    private static UsageSummary BrainUsageBucket() => OneEntry(UsageSource.SubAgent, "model-brain", 50, 5, 2, cached: 7, cachedReported: 2, reasoning: 9, reasoningReported: 2);
+
+    /// <summary>The goal's stored pre-execution review usage, with a <c>null</c> model.</summary>
+    private static UsageSummary ReviewUsageBucket() => OneEntry(UsageSource.Compaction, null, 8, 1, 1, cachedReported: 1, reasoningReported: 1);
+
+    /// <summary>
+    /// A goal whose ONLY usage is Brain/review usage — a goal still in Planning, with no worker phase
+    /// at all — still gets a non-null breakdown, so its card appears. There is no <c>Workers:</c> line
+    /// (no worker phase reported) and no missing-phases note (no worker phase is missing), while the
+    /// goal's worker-only total stays <c>null</c> and unchanged.
+    /// </summary>
+    [Fact]
+    public void Build_BrainAndReviewUsageWithNoWorkerPhases_ProducesABreakdownWithoutAWorkersLine()
+    {
+        var fullGoal = new Goal
+        {
+            Id = "goal-brain-only",
+            Description = "Planned and reviewed, not executed",
+            BrainUsage = BrainUsageBucket(),
+            ReviewUsage = ReviewUsageBucket(),
+        };
+
+        var detail = GoalDetailViewBuilder.Build(fullGoal, "goal-brain-only", pipeline: null, fullGoal, config: null);
+
+        Assert.NotNull(detail);
+        // The goal's OTHER total stays worker-only and therefore null: only the breakdown shows the
+        // Brain and review figures.
+        Assert.Null(detail!.UsageTotals);
+        Assert.NotNull(detail.GoalUsage);
+        Assert.False(detail.IncludesLiveUsage);
+
+        Assert.Equal(
+            [
+                "Total: input 58 / 7 cached input / output 6 / 9 reasoning / 3 calls",
+                "Brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "    SubAgent / model-brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "Pre-execution review: input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls",
+                "    Compaction / (unknown model): input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls",
+            ],
+            GoalCardLines(detail.GoalUsage));
+    }
+
+    /// <summary>
+    /// A worker phase that reported NOTHING next to Brain/review usage: the grand total still carries
+    /// the missing-phases note (one worker phase's tokens are absent from it), the <c>Workers:</c>
+    /// line is suppressed because no worker phase reported, and the note never appears on the Brain or
+    /// review lines — it describes the WORKER phases only.
+    /// </summary>
+    [Fact]
+    public void Build_MissingWorkerPhaseNextToBrainUsage_KeepsTheNoteOnTheTotalLineOnly()
+    {
+        var fullGoal = new Goal
+        {
+            Id = "goal-missing-worker",
+            Description = "Reviewed, planning phase logged but no report",
+            BrainUsage = BrainUsageBucket(),
+            IterationSummaries =
+            [
+                new IterationSummary { Iteration = 1, Phases = [Phase(GoalPhase.Coding, usage: null)] },
+            ],
+        };
+
+        var detail = GoalDetailViewBuilder.Build(fullGoal, "goal-missing-worker", pipeline: null, fullGoal, config: null);
+
+        Assert.NotNull(detail);
+        Assert.Null(detail!.UsageTotals);
+        var lines = GoalCardLines(detail.GoalUsage);
+        Assert.DoesNotContain(lines, l => l.StartsWith("Workers:", StringComparison.Ordinal));
+        Assert.Equal(
+            "Total: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls (1 worker phase(s) without usage reported)",
+            lines[0]);
+        Assert.DoesNotContain("without usage reported", lines[1]);
+    }
+
+    /// <summary>
+    /// Worker usage next to Brain and review usage: the card's Total is the GRAND total, the Workers
+    /// line repeats the worker-only figure (which the goal's <see cref="GoalDetailInfo.UsageTotals"/>
+    /// still carries unchanged), and the missing-phases note travels with the grand total only.
+    /// </summary>
+    [Fact]
+    public void Build_WorkerUsageNextToBrainAndReview_TotalIsTheGrandTotal()
+    {
+        var fullGoal = new Goal
+        {
+            Id = "goal-all-three",
+            Description = "Workers plus Brain and review",
+            // 1,000 + 200 input/output from the worker phase, one missing worker phase.
+            BrainUsage = BrainUsageBucket(),
+            ReviewUsage = ReviewUsageBucket(),
+            IterationSummaries =
+            [
+                new IterationSummary
+                {
+                    Iteration = 1,
+                    Phases = [Phase(GoalPhase.Coding, TwoEntryUsage()), Phase(GoalPhase.Testing, usage: null)],
+                },
+            ],
+        };
+
+        var detail = GoalDetailViewBuilder.Build(fullGoal, "goal-all-three", pipeline: null, fullGoal, config: null);
+
+        Assert.NotNull(detail);
+        // The worker-only total is UNCHANGED by the Brain/review usage.
+        Assert.Equal(1_005, detail!.UsageTotals!.Usage.Total.InputTokens);
+        Assert.Equal(1, detail.UsageTotals.PhasesWithoutUsage);
+
+        var lines = GoalCardLines(detail.GoalUsage);
+        Assert.Equal(
+            [
+                "Total: input 1,063 / ≥48 (partial) cached input / output 213 / ≥62 (partial) reasoning / 8 calls (1 worker phase(s) without usage reported)",
+                "Workers: input 1,005 / ≥41 (partial) cached input / output 207 / ≥53 (partial) reasoning / 5 calls",
+                "    Agent / model-a: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls",
+                "    SubAgent / (unknown model): input 5 / 11 cached input / output 7 / 13 reasoning / 2 calls",
+                "Brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "    SubAgent / model-brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "Pre-execution review: input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls",
+                "    Compaction / (unknown model): input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls",
+            ],
+            lines);
+    }
+
+    /// <summary>
+    /// The SNAPSHOT goal is used when no full goal is loaded (the <c>fullGoalWithSummaries: null</c>
+    /// call shape): its own Brain/review usage reaches the breakdown, because the snapshot goal comes
+    /// from a store read with NO projection and therefore carries the usage columns.
+    /// </summary>
+    [Fact]
+    public void Build_WithoutAFullGoal_FallsBackToTheSnapshotGoalsOwnUsage()
+    {
+        var snapshotGoal = new Goal
+        {
+            Id = "goal-snapshot-usage",
+            Description = "Snapshot goal carrying its own usage",
+            BrainUsage = BrainUsageBucket(),
+        };
+
+        var detail = GoalDetailViewBuilder.Build(
+            snapshotGoal, "goal-snapshot-usage", pipeline: null, fullGoalWithSummaries: null, config: null);
+
+        Assert.NotNull(detail);
+        Assert.Equal(
+            [
+                "Total: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "Brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "    SubAgent / model-brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+            ],
+            GoalCardLines(detail!.GoalUsage));
+    }
+
+    /// <summary>
+    /// The STORED fallback path renders the SAME card lines from the stored iterations plus the STORED
+    /// goal's own Brain/review usage, with no live marker — the page builds its breakdown from exactly
+    /// those inputs.
+    /// </summary>
+    [Fact]
+    public void StoredPath_IncludesTheStoredGoalBrainAndReviewUsage()
+    {
+        var storedGoal = new Goal
+        {
+            Id = "goal-stored-usage",
+            Description = "Stored goal with usage",
+            BrainUsage = BrainUsageBucket(),
+            ReviewUsage = ReviewUsageBucket(),
+        };
+        var storedIterations = new List<IterationSummary>
+        {
+            new() { Iteration = 1, Phases = [Phase(GoalPhase.Coding, TwoEntryUsage())] },
+        };
+
+        var storedBreakdown = GoalUsageBreakdown.Create(
+            PhaseUsageTotals.Sum(storedIterations.SelectMany(i => i.Phases)),
+            storedGoal.BrainUsage,
+            storedGoal.ReviewUsage);
+
+        Assert.Equal(
+            [
+                "Total: input 1,063 / ≥48 (partial) cached input / output 213 / ≥62 (partial) reasoning / 8 calls",
+                "Workers: input 1,005 / ≥41 (partial) cached input / output 207 / ≥53 (partial) reasoning / 5 calls",
+                "    Agent / model-a: input 1,000 / ≥30 (partial) cached input / output 200 / unknown reasoning / 3 calls",
+                "    SubAgent / (unknown model): input 5 / 11 cached input / output 7 / 13 reasoning / 2 calls",
+                "Brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "    SubAgent / model-brain: input 50 / 7 cached input / output 5 / 9 reasoning / 2 calls",
+                "Pre-execution review: input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls",
+                "    Compaction / (unknown model): input 8 / 0 cached input / output 1 / 0 reasoning / 1 calls",
+            ],
+            GoalCardLines(storedBreakdown));
+
+        // The stored path can never carry the live marker.
+        Assert.DoesNotContain(
+            GoalCardLines(storedBreakdown),
+            l => l.Contains("includes running phase", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -886,13 +1101,12 @@ public sealed class GoalDetailUsageTests
               $"{(iteration.IncludesLiveUsage ? " (includes running phase)" : "")}"
             : null;
 
-    /// <summary>Mirrors the left-panel "Token Usage" card body including the live note.</summary>
+    /// <summary>
+    /// Mirrors the left-panel "Token Usage" card body for a BUILT view: the breakdown's lines with
+    /// the view's own live flag, indented exactly as the razor indents them.
+    /// </summary>
     private static IReadOnlyList<string> LiveGoalCardLines(GoalDetailInfo detail) =>
-        detail.UsageTotals is { } totals
-            ? [$"Total: {UsageFormat.FormatUsageLine(totals.Usage.Total)}{UsageFormat.FormatMissingPhasesNote(totals)}" +
-               $"{(detail.IncludesLiveUsage ? " (includes running phase)" : "")}",
-               .. UsageFormat.FormatEntryLines(totals.Usage)]
-            : [];
+        GoalCardLines(detail.GoalUsage, detail.IncludesLiveUsage);
 
     /// <summary>
     /// Every usage-relevant value of a built view, as text: the per-iteration totals and live flags,
@@ -906,6 +1120,7 @@ public sealed class GoalDetailUsageTests
         .. detail.Iterations.SelectMany(iteration => iteration.Phases)
             .Select(phase => $"phase {phase.Name}/{phase.RoleName} [{phase.Status}]: usage={Describe(phase.Usage)} isLive={phase.IsLiveUsage}"),
         $"goal: totals={Describe(detail.UsageTotals)} includesLive={detail.IncludesLiveUsage}",
+        $"goal breakdown: {Describe(detail.GoalUsage)}",
     ];
 
     private static string Describe(UsageSummary? usage) =>
@@ -913,6 +1128,12 @@ public sealed class GoalDetailUsageTests
 
     private static string Describe(PhaseUsageTotals.Result? totals) =>
         totals is null ? "<none>" : $"{Describe(totals.Usage)} | with={totals.PhasesWithUsage} without={totals.PhasesWithoutUsage}";
+
+    private static string Describe(GoalUsageBreakdown? breakdown) =>
+        breakdown is null
+            ? "<none>"
+            : $"workers={Describe(breakdown.Workers)} brain={Describe(breakdown.Brain)} review={Describe(breakdown.Review)}" +
+              $" total={Describe(breakdown.Total)}";
 
     // ── Live running-phase usage ───────────────────────────────────────────────
 
@@ -1022,8 +1243,9 @@ public sealed class GoalDetailUsageTests
             "Total: input 1,011 / ≥30 (partial) cached input / output 2,022 / unknown reasoning / 5 calls" +
             " (1 worker phase(s) without usage reported) (includes running phase)",
             LiveGoalCardLines(detail)[0]);
+        // The live bucket's entry line is a DEPTH-1 line, so the card indents it.
         Assert.Contains(
-            "SubAgent / model-live: input 1,000 / ≥30 (partial) cached input / output 2,000 / unknown reasoning / 3 calls",
+            "    SubAgent / model-live: input 1,000 / ≥30 (partial) cached input / output 2,000 / unknown reasoning / 3 calls",
             LiveGoalCardLines(detail));
     }
 
@@ -1400,23 +1622,41 @@ public sealed class GoalDetailUsageTests
     }
 
     /// <summary>
-    /// The goal card's "Total:" line appends the running-phase note, driven by the <c>_detail</c>
-    /// model's own flag — and the note comes from <c>_detail</c> ONLY, never from the stored path (which
-    /// reads completed summaries that can never carry a live figure).
+    /// The goal card renders the BREAKDOWN through the shared line helper and passes the running-phase
+    /// flag from the <c>_detail</c> model ONLY — never from the stored path, which reads completed
+    /// summaries that can never carry a live figure. The stored path builds its own breakdown from the
+    /// stored iterations and the stored goal's own Brain/review usage.
     /// </summary>
     [Fact]
-    public void RazorSource_GoalCardTotalAppendsTheRunningPhaseNoteFromTheDetailFlagOnly()
+    public void RazorSource_GoalCardRendersTheBreakdownWithTheDetailFlagPassedToTheSharedHelper()
     {
         var source = ReadGoalDetailRazorSource();
 
         var cardRegion = ExtractBetween(
             source,
-            "@* Token Usage — the goal total, only when a worker phase reported usage *@",
+            "@* Token Usage — the goal breakdown (workers + Brain + pre-execution review), rendered whenever any of the three reported *@",
             "@* RIGHT PANEL — iterations *@");
 
-        Assert.Contains("var goalIncludesLiveUsage = _detail?.IncludesLiveUsage ?? false;", cardRegion);
-        Assert.Contains("@(goalIncludesLiveUsage ? \" (includes running phase)\" : \"\")", cardRegion);
-        Assert.Contains("UsageFormat.FormatUsageLine(storedOrDetailUsageTotals.Usage.Total)", cardRegion);
-        Assert.Contains("UsageFormat.FormatMissingPhasesNote(storedOrDetailUsageTotals)", cardRegion);
+        // The live flag comes from _detail and nowhere else, and it is handed to the shared line helper
+        // — which is where the "(includes running phase)" marker is composed, for the worker-derived
+        // lines only. The razor composes no total line (and no missing-phases note) of its own: a
+        // hand-rolled one could drift from the section get_goal prints.
+        Assert.Contains("goalIncludesLiveUsage = _detail.IncludesLiveUsage;", cardRegion);
+        Assert.Contains("UsageFormat.FormatGoalUsageLines(usageBreakdown, goalIncludesLiveUsage)", cardRegion);
+        Assert.DoesNotContain("FormatUsageLine", cardRegion);
+        Assert.DoesNotContain("FormatMissingPhasesNote", cardRegion);
+        Assert.DoesNotContain("(includes running phase)", cardRegion);
+        Assert.DoesNotContain("_storedGoal?.IncludesLiveUsage", cardRegion);
+
+        // The _detail path reads the builder's breakdown; the stored path builds one from the stored
+        // iterations plus the stored goal's OWN Brain and review usage with includesLiveUsage: false.
+        Assert.Contains("goalUsageBreakdown = _detail.GoalUsage;", cardRegion);
+        Assert.Contains("GoalUsageBreakdown.Create(", cardRegion);
+        Assert.Contains("PhaseUsageTotals.Sum(_storedIterations.SelectMany(i => i.Phases))", cardRegion);
+        Assert.Contains("storedGoalForUsage.BrainUsage", cardRegion);
+        Assert.Contains("storedGoalForUsage.ReviewUsage", cardRegion);
+
+        // Depth-1 lines are indented; depth-0 lines are not.
+        Assert.Contains("style=\"@(depth == 1 ? \"padding-left:1rem\" : null)\"", cardRegion);
     }
 }

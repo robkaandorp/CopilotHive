@@ -57,8 +57,17 @@ internal static class GoalDetailViewBuilder
         // RUNNING entry replaced by a DETACHED substitute carrying the live usage when the caller
         // attributed one — and the two sets can never overlap (the live branch runs only when no
         // summary exists for its number).
-        var goalUsage = SumWorkerUsage(iterationSources.SelectMany(s => s.Phases));
+        // ONE sum serves both the worker-phase total and the goal BREAKDOWN, so the two can never
+        // disagree about which phase records (or which live substitute) they describe.
+        var goalUsageTotals = PhaseUsageTotals.Sum(iterationSources.SelectMany(s => s.Phases));
+        var goalUsage = SumWorkerUsage(goalUsageTotals);
         var goalIncludesLiveUsage = iterationSources.Any(s => s.IncludesLiveUsage);
+
+        // The grand total adds the goal's OWN stored usage — its Brain calls and its pre-execution
+        // reviews — to the worker phases. Null (nothing at all reported) suppresses the card, so a
+        // legacy goal renders exactly as before; a goal whose usage is Brain/review-ONLY also gets a
+        // breakdown, because the tokens were really spent even though no worker phase ran yet.
+        var goalBreakdown = GoalUsageBreakdown.Create(goalUsageTotals, effectiveGoal.BrainUsage, effectiveGoal.ReviewUsage);
 
         // Derive effective status from pipeline phase
         var effectiveStatus = pipeline?.Phase switch
@@ -93,6 +102,7 @@ internal static class GoalDetailViewBuilder
             RepositoryNames = effectiveGoal.RepositoryNames,
             FailureReason = effectiveGoal.FailureReason,
             UsageTotals = goalUsage,
+            GoalUsage = goalBreakdown,
             IncludesLiveUsage = goalIncludesLiveUsage,
         };
     }
@@ -282,13 +292,29 @@ internal static class GoalDetailViewBuilder
     /// reported-with-zero exactly as <see cref="PhaseUsageTotals.Sum"/> counts it.
     /// </para>
     /// <para>
-    /// The dashboard page calls this for its stored-iteration and stored-goal totals too, so the
-    /// convention exists exactly once and both render paths agree.
+    /// The dashboard page calls this for its stored-iteration totals too, so the convention exists
+    /// exactly once and both render paths agree — a stored GOAL total goes through
+    /// <see cref="GoalUsageBreakdown.Create"/> instead, which needs the worker counts together with
+    /// the goal's Brain and review usage.
     /// </para>
     /// </summary>
     internal static PhaseUsageTotals.Result? SumWorkerUsage(IEnumerable<PhaseResult> phases)
     {
         var totals = PhaseUsageTotals.Sum(phases);
+        return totals.PhasesWithUsage > 0 ? totals : null;
+    }
+
+    /// <summary>
+    /// Applies the same "no usage to show" convention to totals that were ALREADY summed: <c>null</c>
+    /// when no worker phase reported usage, the totals otherwise. It exists so a caller that also
+    /// needs the counts (<see cref="GoalUsageBreakdown.Create"/>) can sum ONCE and derive both the
+    /// worker-only result and the goal breakdown from that single sum.
+    /// </summary>
+    /// <param name="totals">The already-summed worker-phase totals; must not be <c>null</c>.</param>
+    /// <returns>The totals when at least one worker phase reported, otherwise <c>null</c>.</returns>
+    internal static PhaseUsageTotals.Result? SumWorkerUsage(PhaseUsageTotals.Result totals)
+    {
+        ArgumentNullException.ThrowIfNull(totals);
         return totals.PhasesWithUsage > 0 ? totals : null;
     }
 
