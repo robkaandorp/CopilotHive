@@ -3252,6 +3252,279 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     [Fact]
+    public void ParseTestFailuresFromLogs_MtpTimestampedFailures_ParsesNamesErrorsAndStackTraces()
+    {
+        // Real Microsoft.Testing.Platform stdout captured from a deliberately failing run of this
+        // repository's suite (two theory cases whose identities contain spaces, parentheses and
+        // quotes, plus one plain assertion failure), with the GitHub Actions timestamp prefixes
+        // raw job logs carry. MTP uses a distinct shape from VSTest: a lower-case
+        // "failed {identity} ({duration})" header, an indented "from {dll} ({tfm}|{arch})" line, a
+        // bare error line (no "Error Message:" label) and bare "at …" frames (no "Stack Trace:"
+        // label). Stripping the timestamp prefix also consumes the indentation that followed it,
+        // so the captured error and stack text is unindented.
+        var log = string.Join("\n",
+            "2026-10-04T19:04:12.1000000Z Running tests from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T19:04:12.2000000Z failed CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(label: \"another case with spaces\") (0ms)",
+            "2026-10-04T19:04:12.2000100Z   from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T19:04:12.2000200Z   scratch theory failure for 'another case with spaces'",
+            "2026-10-04T19:04:12.2000300Z     at CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(String label) in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpScratchFailureTests.cs:23",
+            "2026-10-04T19:04:12.2000400Z     at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+            "2026-10-04T19:04:12.2000500Z     at System.Reflection.MethodBaseInvoker.InvokeDirectByRefWithFewArgs(Object obj, Span`1 copyOfArgs, BindingFlags invokeAttr)",
+            "2026-10-04T19:04:12.3000000Z failed CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(label: \"case with spaces\") (0ms)",
+            "2026-10-04T19:04:12.3000100Z   from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T19:04:12.3000200Z   scratch theory failure for 'case with spaces'",
+            "2026-10-04T19:04:12.3000300Z     at CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(String label) in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpScratchFailureTests.cs:23",
+            "2026-10-04T19:04:12.3000400Z     at InvokeStub_MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(Object, Span`1)",
+            "2026-10-04T19:04:12.3000500Z     at System.Reflection.MethodBaseInvoker.InvokeWithOneArg(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)",
+            "2026-10-04T19:04:12.4000000Z failed CopilotHive.Tests.MtpScratchFailureTests.ScratchFailure_AssertionProducesStackTrace (0ms)",
+            "2026-10-04T19:04:12.4000100Z   from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T19:04:12.4000200Z   Assert.Equal() Failure: Values differ",
+            "2026-10-04T19:04:12.4000300Z   Expected: 42",
+            "2026-10-04T19:04:12.4000400Z   Actual:   40",
+            "2026-10-04T19:04:12.4000500Z     at CopilotHive.Tests.MtpScratchFailureTests.ScratchFailure_AssertionProducesStackTrace() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpScratchFailureTests.cs:15",
+            "2026-10-04T19:04:12.4000600Z     at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+            "2026-10-04T19:04:12.4000700Z     at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)",
+            "2026-10-04T19:04:12.5000000Z skipped CopilotHive.Tests.Knowledge.KnowledgeGraphLockingAndBatchDeleteTests.CommitToConfigRepoAsync_CaseInsensitiveFileSystem_DeleteThenWriteKeepsNewContent",
+            "2026-10-04T19:04:12.5000100Z   Filesystem is case-sensitive — the delete/write collision cannot occur.",
+            "2026-10-04T19:04:12.5000200Z   from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T19:04:12.6000000Z /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64) failed with 3 error(s) (4m 54s 690ms)",
+            "2026-10-04T19:04:12.7000000Z Test run summary: Failed!",
+            "2026-10-04T19:04:12.7000100Z   total: 11130",
+            "2026-10-04T19:04:12.7000200Z   failed: 3");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Equal(3, failures.Count);
+
+        // Theory identity keeps the spaces, parentheses, and quotes of the label suffix.
+        Assert.Equal(
+            "CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(label: \"another case with spaces\")",
+            failures[0].TestName);
+        Assert.Equal("scratch theory failure for 'another case with spaces'", failures[0].Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(String label) in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpScratchFailureTests.cs:23\n" +
+            "at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)\n" +
+            "at System.Reflection.MethodBaseInvoker.InvokeDirectByRefWithFewArgs(Object obj, Span`1 copyOfArgs, BindingFlags invokeAttr)",
+            failures[0].StackTrace);
+
+        Assert.Equal(
+            "CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(label: \"case with spaces\")",
+            failures[1].TestName);
+        Assert.Equal("scratch theory failure for 'case with spaces'", failures[1].Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(String label) in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpScratchFailureTests.cs:23\n" +
+            "at InvokeStub_MtpScratchFailureTests.ScratchTheory_FailsForCaseWithSpaces(Object, Span`1)\n" +
+            "at System.Reflection.MethodBaseInvoker.InvokeWithOneArg(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)",
+            failures[1].StackTrace);
+
+        Assert.Equal(
+            "CopilotHive.Tests.MtpScratchFailureTests.ScratchFailure_AssertionProducesStackTrace",
+            failures[2].TestName);
+        Assert.Equal("Assert.Equal() Failure: Values differ\nExpected: 42\nActual:   40", failures[2].Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpScratchFailureTests.ScratchFailure_AssertionProducesStackTrace() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpScratchFailureTests.cs:15\n" +
+            "at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)\n" +
+            "at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)",
+            failures[2].StackTrace);
+
+        // The skipped test and the run footer must not leak into the last failure's fields.
+        Assert.DoesNotContain("skipped", failures[2].Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("Test run summary", failures[2].Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("failed with 3 error(s)", failures[2].StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("from /copilot-home", failures[0].Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MtpFailureAtEndOfLogWithoutFooter_ParsesBlock()
+    {
+        // No following result line or footer: the block runs to the end of the log.
+        var log = string.Join("\n",
+            "failed Tests.Alpha.First (12ms)",
+            "  from /repo/bin/Release/net10.0/Tests.dll (net10.0|x64)",
+            "  boom",
+            "    at Alpha.First() in /src/Alpha.cs:line 7");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("Tests.Alpha.First", failure.TestName);
+        Assert.Equal("boom", failure.Error);
+        Assert.Equal("at Alpha.First() in /src/Alpha.cs:line 7", failure.StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MtpProseLine_NotMatchedAsFailure()
+    {
+        // Same guard as the VSTest header: prose in the "failed … (duration)" shape has no dotted
+        // Class.Method identity, so it must not be reported as a test failure.
+        var log = string.Join("\n",
+            "failed to restore packages (3s)",
+            "  from /repo/bin/Release/net10.0/Tests.dll (net10.0|x64)",
+            "  NuGet feed unreachable");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Empty(failures);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_VstestAndMtpBlocksInOneLog_ParsesBoth()
+    {
+        // Transition period: other monitored repositories still emit VSTest output while this one
+        // emits MTP. Both shapes must parse from a single log, in order, without either hiding the
+        // other.
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Failed Tests.Alpha.First [2 ms]",
+            "2026-08-22T09:47:38.1197375Z   Error Message:",
+            "2026-08-22T09:47:38.1197376Z    vstest failure",
+            "2026-08-22T09:47:38.1197377Z   Stack Trace:",
+            "2026-08-22T09:47:38.1197378Z    at Alpha.First()",
+            "2026-10-04T19:04:12.2000000Z failed Tests.Beta.Second (0ms)",
+            "2026-10-04T19:04:12.2000100Z   from /repo/bin/Release/net10.0/Tests.dll (net10.0|x64)",
+            "2026-10-04T19:04:12.2000200Z   mtp failure",
+            "2026-10-04T19:04:12.2000300Z     at Beta.Second()");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Equal(2, failures.Count);
+        Assert.Equal("Tests.Alpha.First", failures[0].TestName);
+        Assert.Equal("vstest failure", failures[0].Error);
+        Assert.Equal("at Alpha.First()", failures[0].StackTrace);
+        Assert.Equal("Tests.Beta.Second", failures[1].TestName);
+        Assert.Equal("mtp failure", failures[1].Error);
+        Assert.Equal("at Beta.Second()", failures[1].StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MtpSecondScaleDuration_ParsesBlock()
+    {
+        // MTP's HumanReadableDurationFormatter emits space-separated multi-component durations.
+        // This header is verbatim from a captured run (a failing scratch test that slept 1.5s);
+        // the duration's embedded space must not defeat the header match or the identity capture.
+        // The log is plain (untimestamped) console output, so only the first line of each captured
+        // field loses its indentation to the final Trim(); the interior lines keep it.
+        var log = string.Join("\n",
+            "failed CopilotHive.Tests.MtpDurationScratchTests.ScratchSecondScaleFailure_ProducesSecondMillisecondDuration (1s 500ms)",
+            "  from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "  Assert.Equal() Failure: Values differ",
+            "  Expected: 42",
+            "  Actual:   40",
+            "    at CopilotHive.Tests.MtpDurationScratchTests.ScratchSecondScaleFailure_ProducesSecondMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:22",
+            "    at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+            "    at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal(
+            "CopilotHive.Tests.MtpDurationScratchTests.ScratchSecondScaleFailure_ProducesSecondMillisecondDuration",
+            failure.TestName);
+        Assert.Equal("Assert.Equal() Failure: Values differ\n  Expected: 42\n  Actual:   40", failure.Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpDurationScratchTests.ScratchSecondScaleFailure_ProducesSecondMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:22\n" +
+            "    at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)\n" +
+            "    at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)",
+            failure.StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MtpMinuteScaleDuration_ParsesBlock()
+    {
+        // Three-component duration, verbatim from a captured run (a failing scratch test that
+        // slept 63s). Two interior spaces must still leave the identity intact.
+        var log = string.Join("\n",
+            "2026-10-04T22:32:41.1000000Z failed CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration (1m 03s 000ms)",
+            "2026-10-04T22:32:41.1000100Z   from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T22:32:41.1000200Z   minute-scale scratch failure",
+            "2026-10-04T22:32:41.1000300Z     at CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:30",
+            "2026-10-04T22:32:41.1000400Z     at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+            "2026-10-04T22:32:41.1000500Z     at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal(
+            "CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration",
+            failure.TestName);
+        Assert.Equal("minute-scale scratch failure", failure.Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:30\n" +
+            "at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)\n" +
+            "at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)",
+            failure.StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MtpFinalFailureBeforeAssemblyFooter_StackTraceNotSwallowed()
+    {
+        // The final failure is followed directly by MTP's per-assembly result footer, with no
+        // intervening skipped/passed result line (the captured shape when the last test in the
+        // assembly fails, or when skips are reported earlier in the log). The footer — and the
+        // blank line that precedes it — must bound the block: without that boundary the error
+        // text swallows the frames and the footer, and StackTrace comes back empty.
+        var log = string.Join("\n",
+            "2026-10-04T22:32:41.2000000Z failed CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration (1m 03s 000ms)",
+            "2026-10-04T22:32:41.2000100Z   from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+            "2026-10-04T22:32:41.2000200Z   minute-scale scratch failure",
+            "2026-10-04T22:32:41.2000300Z     at CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:30",
+            "2026-10-04T22:32:41.2000400Z     at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+            "2026-10-04T22:32:41.3000000Z ",
+            "2026-10-04T22:32:41.4000000Z /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64) failed with 3 error(s) (5m 19s 718ms)",
+            "2026-10-04T22:32:41.5000000Z Exit code: 2");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal(
+            "CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration",
+            failure.TestName);
+        Assert.Equal("minute-scale scratch failure", failure.Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpDurationScratchTests.ScratchMinuteScaleFailure_ProducesMinuteSecondMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:30\n" +
+            "at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+            failure.StackTrace);
+
+        // Footer text must appear in NO parsed field.
+        Assert.DoesNotContain("failed with 3 error(s)", failure.TestName, StringComparison.Ordinal);
+        Assert.DoesNotContain("failed with 3 error(s)", failure.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("failed with 3 error(s)", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("net10.0|x64", failure.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("net10.0|x64", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("Exit code", failure.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("Exit code", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("InterpretedInvoke_Method", failure.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MtpNewlineTerminatedLog_ParsesFullStack()
+    {
+        // The log ends with a final newline, so the last line is an empty one. That trailing
+        // blank must not terminate the backwards stack-frame scan and strip the trace. Untimestamped
+        // output keeps the interior frames' indentation (only the first line loses it to Trim()).
+        var log = string.Join("\n",
+                      "failed CopilotHive.Tests.MtpDurationScratchTests.ScratchQuickFailure_ProducesMillisecondDuration (0ms)",
+                      "  from /copilot-home/CopilotHive/tests/CopilotHive.Tests/bin/Release/net10.0/CopilotHive.Tests.dll (net10.0|x64)",
+                      "  quick scratch failure",
+                      "    at CopilotHive.Tests.MtpDurationScratchTests.ScratchQuickFailure_ProducesMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:14",
+                      "    at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)",
+                      "    at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)")
+                  + "\n";
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal(
+            "CopilotHive.Tests.MtpDurationScratchTests.ScratchQuickFailure_ProducesMillisecondDuration",
+            failure.TestName);
+        Assert.Equal("quick scratch failure", failure.Error);
+        Assert.Equal(
+            "at CopilotHive.Tests.MtpDurationScratchTests.ScratchQuickFailure_ProducesMillisecondDuration() in /copilot-home/CopilotHive/tests/CopilotHive.Tests/MtpDurationScratchTests.cs:14\n" +
+            "    at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)\n" +
+            "    at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)",
+            failure.StackTrace);
+    }
+
+    [Fact]
     public void ParseTestFailuresFromLogs_FailedToProse_NotMatchedAsFailure()
     {
         // "Failed to ..." prose can satisfy the header shape when it ends in a digit-leading

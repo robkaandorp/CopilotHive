@@ -47,7 +47,7 @@ CopilotHive/
 
 ```bash
 dotnet build CopilotHive.slnx
-dotnet test CopilotHive.slnx
+dotnet test --solution CopilotHive.slnx
 ```
 
 ## Conventions

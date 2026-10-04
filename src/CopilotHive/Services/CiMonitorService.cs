@@ -121,6 +121,40 @@ public class CiMonitorService
         @"^\s*Failed\s+(.+?)\s+\[\d+[^\]]*\]\s*$",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
+    /// <summary>
+    /// Matches a Microsoft.Testing.Platform (MTP) failure header line:
+    /// <c>failed {identity} ({duration})</c>. MTP prints the word <c>failed</c> in lower case and
+    /// the duration in parentheses rather than xUnit's upper-case <c>Failed {name} [duration]</c>
+    /// shape, so the VSTest header regex never matches it. The identity is captured non-greedily
+    /// up to the trailing duration parentheses, so theory names containing spaces, parentheses,
+    /// and quotes (e.g. <c>…​(label: "case with spaces")</c>) still parse. MTP's
+    /// HumanReadableDurationFormatter emits space-separated multi-component durations
+    /// (<c>0ms</c>, <c>234ms</c>, <c>1s 234ms</c>, <c>4m 54s 690ms</c>), so each component is
+    /// digit-led and further components may follow it separated by whitespace; the identity stays
+    /// anchored because the duration must run to the end of the line.
+    /// </summary>
+    private static readonly Regex MtpFailedTestRegex = new(
+        @"^\s*failed\s+(.+?)\s+\(\d+[^\s)]*(?:\s+\d+[^\s)]*)*\)\s*$",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>
+    /// Matches the indented <c>from {dll} ({tfm}|{arch})</c> line MTP prints directly under a
+    /// failure header, identifying the assembly the test ran in.
+    /// </summary>
+    private static readonly Regex MtpFromLineRegex = new(
+        @"^\s*from\s+.+?\([^)]*\)\s*$",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Matches a bare stack-frame line (<c>at {method} …</c>) inside an MTP failure block. MTP
+    /// prints no <c>Stack Trace:</c> label, so the trailing run of such lines is the trace. The
+    /// leading whitespace is optional because <see cref="StripActionsTimestamp"/> consumes the
+    /// indentation that follows a GitHub Actions timestamp prefix.
+    /// </summary>
+    private static readonly Regex MtpStackTraceLineRegex = new(
+        @"^\s*at\s+\S",
+        RegexOptions.Compiled);
+
     /// <summary>Extracts the GitHub Actions run ID from a check run's <c>details_url</c>.</summary>
     private static readonly Regex ActionsRunIdRegex = new(
         @"/actions/runs/(\d+)",
@@ -185,6 +219,31 @@ public class CiMonitorService
     /// </summary>
     private static readonly Regex GitHubActionsTimestampRegex = new(
         @"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\s+",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Matches the line that terminates a Microsoft.Testing.Platform failure block: the next
+    /// per-test result line (<c>failed|passed|skipped|…</c> followed by a dotted identity, in
+    /// either case so a following VSTest-format block also terminates it) or a run-level footer
+    /// such as <c>Test run summary:</c>, <c>Exit code:</c>, or <c>Standard output:</c>. MTP blocks
+    /// are not blank-line separated, so without this bound the last failure in a log would swallow
+    /// the following result and footer lines into its error text.
+    /// </summary>
+    private static readonly Regex MtpBlockTerminatorRegex = new(
+        @"^\s*(?:(?i:failed|passed|skipped|errored|error|canceled|cancelled|timed\s+out)\s+[A-Za-z_][\w.]*\.[A-Za-z_]\w*|Test run summary:|Test run completed|Exit code:|In process file artifacts|Standard output:|Standard error:)",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Matches MTP's per-assembly result footer, e.g.
+    /// <c>{path}.dll (net10.0|x64) failed with 3 error(s) (4m 54s 690ms)</c> or
+    /// <c>{path}.dll (net10.0|x64) passed (4m 56s 611ms)</c>. This line always closes the final
+    /// failure block, and it matches neither <see cref="MtpBlockTerminatorRegex"/> (the result word
+    /// is preceded by the assembly name) nor the failure headers, so it is recognised separately.
+    /// The <c>from {dll} ({tfm}|{arch})</c> location line has no result word after the parentheses
+    /// and therefore never matches.
+    /// </summary>
+    private static readonly Regex MtpAssemblyResultRegex = new(
+        @"^\s*\S+\.dll\s+\([^)]*\)\s+(?i:passed|failed|skipped|errored|completed)\b",
         RegexOptions.Compiled);
 
     private readonly IGoalStore? _goalStore;
@@ -1767,9 +1826,12 @@ public class CiMonitorService
     }
 
     /// <summary>
-    /// Parses xUnit test failures out of a CI log. Each failure block has the shape
-    /// <c>Failed {name} [duration]</c> followed by an <c>Error Message:</c> section and a
-    /// <c>Stack Trace:</c> section. GitHub Actions timestamp prefixes are stripped from every
+    /// Parses test failures out of a CI log, in either of the two shapes this orchestrator sees.
+    /// VSTest/xUnit blocks have the shape <c>Failed {name} [duration]</c> followed by an
+    /// <c>Error Message:</c> section and a <c>Stack Trace:</c> section.
+    /// Microsoft.Testing.Platform blocks have the shape <c>failed {identity} ({duration})</c>
+    /// followed by an indented <c>from {dll} ({tfm}|{arch})</c> line, the bare error text, and the
+    /// bare indented <c>at …</c> frames. GitHub Actions timestamp prefixes are stripped from every
     /// line before matching, so raw job logs parse the same as plain console output and the
     /// captured error/stack-trace text is timestamp-free. All such blocks are parsed; logs with
     /// no failure headers (including count-only summaries such as <c>Failed: 0</c>, or prose
@@ -1793,14 +1855,25 @@ public class CiMonitorService
 
         for (var i = 0; i < lines.Length; i++)
         {
+            // Microsoft.Testing.Platform emits a different failure shape than VSTest (lower-case
+            // "failed {identity} ({duration})", no Error Message:/Stack Trace: labels). It is
+            // handled by its own extractor so the xUnit/VSTest path below stays unchanged.
+            if (TryMatchMtpFailureHeader(lines[i], out _))
+            {
+                if (TryParseMtpFailureBlock(lines, i, out var mtpFailure))
+                    failures.Add(mtpFailure);
+                continue;
+            }
+
             if (!TryMatchFailureHeader(lines[i], out var testName))
                 continue;
 
-            // The failure block ends at the next failure header (or the end of the log).
+            // The failure block ends at the next failure header of either format (or the end of
+            // the log).
             var blockEnd = lines.Length;
             for (var j = i + 1; j < lines.Length; j++)
             {
-                if (TryMatchFailureHeader(lines[j], out _))
+                if (TryMatchFailureHeader(lines[j], out _) || TryMatchMtpFailureHeader(lines[j], out _))
                 {
                     blockEnd = j;
                     break;
@@ -1878,6 +1951,94 @@ public class CiMonitorService
             return false;
 
         testName = candidate;
+        return true;
+    }
+
+    /// <summary>
+    /// Matches a Microsoft.Testing.Platform failure header and validates that the captured
+    /// identity is a dotted <c>Class.Method</c> identifier (optionally followed by a theory
+    /// argument list). The same dotted-name guard as the VSTest header rejects prose such as
+    /// <c>failed to restore packages (3s)</c>.
+    /// </summary>
+    private static bool TryMatchMtpFailureHeader(string line, out string testName)
+    {
+        testName = string.Empty;
+
+        var header = MtpFailedTestRegex.Match(line);
+        if (!header.Success)
+            return false;
+
+        var candidate = header.Groups[1].Value.Trim();
+        if (!candidate.Contains('.', StringComparison.Ordinal))
+            return false;
+
+        testName = candidate;
+        return true;
+    }
+
+    /// <summary>
+    /// Extracts one Microsoft.Testing.Platform failure block starting at
+    /// <paramref name="headerIndex"/>. MTP prints no section labels: the header is followed by an
+    /// indented <c>from {dll} ({tfm}|{arch})</c> line, then the bare error-message lines, then the
+    /// run of bare indented <c>at …</c> frames that form the stack trace. The block ends at the
+    /// next failure header or result line of either format, at the per-assembly result footer, or
+    /// at the end of the log; trailing blank lines are trimmed before the frames are located so a
+    /// newline-terminated log still yields its full stack. A header whose remaining lines hold no
+    /// content at all is not a parseable failure.
+    /// </summary>
+    /// <param name="lines">The timestamp-stripped log lines.</param>
+    /// <param name="headerIndex">Index of the MTP failure header line.</param>
+    /// <param name="failure">The extracted (name, error, stack trace) tuple when successful.</param>
+    /// <returns><see langword="true"/> when the block was parsed.</returns>
+    private static bool TryParseMtpFailureBlock(
+        string[] lines, int headerIndex,
+        out (string TestName, string Error, string StackTrace) failure)
+    {
+        failure = default;
+
+        if (!TryMatchMtpFailureHeader(lines[headerIndex], out var testName))
+            return false;
+
+        var blockEnd = lines.Length;
+        for (var j = headerIndex + 1; j < lines.Length; j++)
+        {
+            if (MtpBlockTerminatorRegex.IsMatch(lines[j]) || MtpAssemblyResultRegex.IsMatch(lines[j]))
+            {
+                blockEnd = j;
+                break;
+            }
+        }
+
+        // Trailing blank/whitespace-only lines (the newline that ends the log, or the blank line
+        // preceding an assembly footer) must not stop the backwards stack-frame scan, so the body
+        // is trimmed from the end before the trailing run of "at …" frames is located.
+        var bodyEnd = blockEnd;
+        while (bodyEnd > headerIndex + 1 && string.IsNullOrWhiteSpace(lines[bodyEnd - 1]))
+            bodyEnd--;
+
+        // Skip MTP's indented "from <dll> (<tfm>|<arch>)" location line when present.
+        var bodyStart = headerIndex + 1;
+        if (bodyStart < bodyEnd && MtpFromLineRegex.IsMatch(lines[bodyStart]))
+            bodyStart++;
+
+        // The stack trace is the trailing run of bare "at …" frame lines; everything before it
+        // is the error text.
+        var stackStart = bodyEnd;
+        for (var j = bodyEnd - 1; j >= bodyStart; j--)
+        {
+            if (MtpStackTraceLineRegex.IsMatch(lines[j]))
+                stackStart = j;
+            else
+                break;
+        }
+
+        var error = string.Join("\n", lines[bodyStart..stackStart]).Trim();
+        var stackTrace = string.Join("\n", lines[stackStart..bodyEnd]).Trim();
+
+        if (error.Length == 0 && stackTrace.Length == 0)
+            return false; // header followed by nothing parseable
+
+        failure = (testName, error, stackTrace);
         return true;
     }
 
