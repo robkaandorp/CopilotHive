@@ -4,8 +4,11 @@ using CopilotHive.Services;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+
+using ConfigurationPage = CopilotHive.Components.Pages.Configuration;
 
 using Xunit;
 
@@ -592,6 +595,72 @@ public class ConfigFacadeSettingsTests
     }
 
     /// <summary>
+    /// The worker task INACTIVITY timeout travels the whole facade save path onto the live
+    /// config: a value AND the documented "disabled" value 0 both reach
+    /// <see cref="OrchestratorConfig.WorkerTaskTimeoutMinutes"/> (0 is a real setting, not an
+    /// omitted marker). The live config is the authority the cleanup service reads, so the 0
+    /// takes effect in-process even though the shared YAML writer's
+    /// <c>OmitDefaults</c> convention drops CLR-default values from the file.
+    /// </summary>
+    [Theory]
+    [InlineData(45, 45)]
+    [InlineData(0, 0)]
+    public async Task SaveOrchestratorAsync_RealService_PersistsWorkerTaskTimeoutMinutes(
+        int submitted, int expected)
+    {
+        var (config, service, dir) = ConfigFacadeTests.CreateRealService(seed: cfg =>
+            cfg.Orchestrator = new OrchestratorConfig { WorkerTaskTimeoutMinutes = 90 });
+        try
+        {
+            using var factory = new ConfigFacadeTests.FacadeFactory(config, service);
+            var facade = factory.Services.GetRequiredService<IConfigFacade>();
+
+            var result = await facade.SaveOrchestratorAsync(
+                new OrchestratorSettingsUpdate(
+                    MaxIterations: null, MaxRetriesPerTask: null, MaxParallelGoals: null,
+                    VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null,
+                    WorkerTaskTimeoutMinutes: submitted));
+
+            Assert.True(result.Success, result.Error);
+            Assert.True(result.Value!.Saved);
+            Assert.Equal(expected, config.Orchestrator.WorkerTaskTimeoutMinutes);
+        }
+        finally
+        {
+            ConfigFacadeTests.CleanupDir(dir);
+        }
+    }
+
+    /// <summary>
+    /// An omitted (null) worker task inactivity timeout is left unchanged — the stored 90 must
+    /// not fall back to the 60 default or to 0.
+    /// </summary>
+    [Fact]
+    public async Task SaveOrchestratorAsync_WorkerTaskTimeoutOmitted_LeavesStoredValueUnchanged()
+    {
+        var (config, service, dir) = ConfigFacadeTests.CreateRealService(seed: cfg =>
+            cfg.Orchestrator = new OrchestratorConfig { WorkerTaskTimeoutMinutes = 90 });
+        try
+        {
+            using var factory = new ConfigFacadeTests.FacadeFactory(config, service);
+            var facade = factory.Services.GetRequiredService<IConfigFacade>();
+
+            var result = await facade.SaveOrchestratorAsync(
+                new OrchestratorSettingsUpdate(
+                    MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
+                    VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null));
+
+            Assert.True(result.Success, result.Error);
+            Assert.Equal(5, config.Orchestrator.MaxIterations);
+            Assert.Equal(90, config.Orchestrator.WorkerTaskTimeoutMinutes);
+        }
+        finally
+        {
+            ConfigFacadeTests.CleanupDir(dir);
+        }
+    }
+
+    /// <summary>
     /// SaveWorkersAsync with the real service → success and the context windows are persisted
     /// onto the live config (creating missing worker entries).
     /// </summary>
@@ -696,4 +765,103 @@ public class ConfigFacadeSettingsTests
             ConfigFacadeTests.CleanupDir(dir);
         }
     }
+
+    // ── Configuration.razor orchestrator tab: worker task inactivity timeout ──
+
+    /// <summary>
+    /// Load path of the new field: the real <c>Configuration.LoadOrchestratorAsync</c> reads the
+    /// REAL <see cref="ConfigFacade.GetOrchestrator"/> projection into the bound backing field.
+    /// The backing field is seeded with a DISTINCTIVE pre-state first, so a load that silently
+    /// leaves the field untouched is observable even when the stored value is 0 (the field's
+    /// own default) — a stored 0 (the documented "never reclaim inactive tasks" value) must
+    /// really load as 0.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(25)]
+    public async Task ConfigurationLoadOrchestrator_WorkerTaskTimeoutMinutes_LoadsStoredValue(int stored)
+    {
+        var (config, service, dir) = ConfigFacadeTests.CreateRealService(seed: cfg =>
+            cfg.Orchestrator = new OrchestratorConfig { WorkerTaskTimeoutMinutes = stored });
+        try
+        {
+            var facade = new ConfigFacade(
+                config,
+                service,
+                discovery: null,
+                NullLogger<ConfigFacade>.Instance,
+                repoManager: null);
+
+            var page = new ConfigurationPage();
+            SetPageFacade(page, facade);
+
+            // Distinctive pre-state: any value other than `stored` proves the load ran.
+            var sentinel = stored == 0 ? 77 : 0;
+            SetPageIntField(page, "_orchWorkerTaskTimeoutMinutes", sentinel);
+
+            await InvokeLoadOrchestratorAsync(page);
+
+            Assert.Equal(stored, GetPageIntField(page, "_orchWorkerTaskTimeoutMinutes"));
+        }
+        finally
+        {
+            ConfigFacadeTests.CleanupDir(dir);
+        }
+    }
+
+    /// <summary>
+    /// Removal-proof markup/wiring contract for the new field: the orchestrator tab renders a
+    /// numeric input bound to the dedicated backing field, labelled with the inactivity wording,
+    /// carrying the muted "0 = never reclaim inactive tasks" hint, and the save builds the update
+    /// with the named argument. Deleting any of these elements fails this test.
+    /// </summary>
+    [Fact]
+    public void ConfigurationSource_WorkerTaskTimeoutMinutes_IsEditableAndHinted()
+    {
+        var source = File.ReadAllText(ConfigurationRazorPath());
+
+        Assert.Contains(
+            ">Worker Task Inactivity Timeout (minutes)</label>", source, StringComparison.Ordinal);
+        Assert.Contains(
+            "type=\"number\" min=\"0\" @bind=\"_orchWorkerTaskTimeoutMinutes\"", source, StringComparison.Ordinal);
+        Assert.Contains(
+            "0 = never reclaim inactive tasks", source, StringComparison.Ordinal);
+
+        // Load: the backing field is populated from the DTO projection.
+        Assert.Contains(
+            "_orchWorkerTaskTimeoutMinutes = _orchestratorData.WorkerTaskTimeoutMinutes;",
+            source, StringComparison.Ordinal);
+
+        // Save: the named argument matches the DTO parameter (declared last).
+        Assert.Contains(
+            "WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes));", source, StringComparison.Ordinal);
+    }
+
+    /// <summary>Reads <c>Configuration.razor</c> by walking up to the repository root.</summary>
+    private static string ConfigurationRazorPath()
+    {
+        var repoRoot = Environment.CurrentDirectory;
+        while (repoRoot is not null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
+            repoRoot = Directory.GetParent(repoRoot)?.FullName;
+        Assert.NotNull(repoRoot);
+        return Path.Combine(repoRoot, "src", "CopilotHive", "Components", "Pages", "Configuration.razor");
+    }
+
+    /// <summary>Assigns the page's injected <see cref="IConfigFacade"/> (private setter).</summary>
+    private static void SetPageFacade(ConfigurationPage page, IConfigFacade facade) =>
+        typeof(ConfigurationPage).GetProperty("ConfigFacade", NonPublicInstance)!
+            .SetValue(page, facade);
+
+    private static async Task InvokeLoadOrchestratorAsync(ConfigurationPage page) =>
+        await (Task)typeof(ConfigurationPage)
+            .GetMethod("LoadOrchestratorAsync", NonPublicInstance)!
+            .Invoke(page, null)!;
+
+    private static int GetPageIntField(ConfigurationPage page, string name) =>
+        (int)typeof(ConfigurationPage).GetField(name, NonPublicInstance)!.GetValue(page)!;
+
+    private static void SetPageIntField(ConfigurationPage page, string name, int value) =>
+        typeof(ConfigurationPage).GetField(name, NonPublicInstance)!.SetValue(page, value);
+
+    private const BindingFlags NonPublicInstance = BindingFlags.NonPublic | BindingFlags.Instance;
 }

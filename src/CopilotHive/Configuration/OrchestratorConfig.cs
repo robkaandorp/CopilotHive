@@ -38,9 +38,12 @@ public sealed class OrchestratorConfig
     public int BranchCleanupDelayHours { get; set; } = 48;
 
     /// <summary>
-    /// Maximum wall-clock minutes a single worker task may run before the orchestrator
-    /// reclaims it and re-dispatches the phase. Guards against workers that keep
-    /// heartbeating while their LLM call hangs. Set to 0 to disable.
+    /// Worker task INACTIVITY timeout, in minutes: the number of minutes without task activity
+    /// before a busy worker's task is reclaimed and the phase re-dispatched, which covers hung
+    /// LLM calls. This is NOT a maximum run time — the timeout measures time since the task's
+    /// last activity, not wall-clock task duration. Default: 60 minutes. A value of 0 or less
+    /// disables ONLY this inactivity-based reclaiming; stale-heartbeat worker removal and the
+    /// held-attempt adoption sweep in <see cref="Services.StaleWorkerCleanupService"/> still run.
     /// </summary>
     public int WorkerTaskTimeoutMinutes { get; set; } = Services.CleanupDefaults.WorkerTaskTimeoutMinutes;
 

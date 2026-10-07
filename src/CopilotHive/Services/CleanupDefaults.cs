@@ -16,9 +16,13 @@ public static class CleanupDefaults
     public const int StaleTimeoutMinutes = 2;
 
     /// <summary>
-    /// Default maximum wall-clock minutes a single worker task may run before it is
-    /// reclaimed. Observed healthy phases complete well inside 10 minutes, so 60 leaves
-    /// generous headroom while still bounding a hung task.
+    /// Default worker task INACTIVITY timeout, in minutes: the number of minutes without task
+    /// activity before a busy worker's task is reclaimed and the phase re-dispatched. This is
+    /// NOT a maximum run time. Observed healthy phases report activity well inside 10 minutes,
+    /// so the default of 60 leaves generous headroom while still bounding a hung task. A value
+    /// of 0 or less disables ONLY this inactivity-based reclaiming; stale-heartbeat worker
+    /// removal (<see cref="StaleTimeoutMinutes"/>) and the held-attempt adoption sweep
+    /// (<see cref="HeldAttemptAdoptionGraceMinutes"/>) still run.
     /// </summary>
     public const int WorkerTaskTimeoutMinutes = 60;
 

@@ -906,6 +906,11 @@ else
                         <label style="color:var(--text-muted);font-size:0.9rem">Branch Cleanup Delay Hours</label>
                         <input type="number" min="0" @bind="_orchBranchCleanupDelayHours"
                                style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Worker Task Inactivity Timeout (minutes)</label>
+                        <input type="number" min="0" @bind="_orchWorkerTaskTimeoutMinutes"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                        <div style="grid-column:2;color:var(--text-muted);font-size:0.8rem">0 = never reclaim inactive tasks</div>
                     </div>
 
                     <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1rem">
@@ -1256,6 +1261,7 @@ else
     private bool _orchVerboseLogging;
     private int _orchBrainMaxSteps;
     private int _orchBranchCleanupDelayHours;
+    private int _orchWorkerTaskTimeoutMinutes;
 
     // Workers tab
     private WorkersConfigDto? _workersData;
@@ -1711,6 +1717,7 @@ else
                     _orchVerboseLogging = _orchestratorData.VerboseLogging;
                     _orchBrainMaxSteps = _orchestratorData.BrainMaxSteps;
                     _orchBranchCleanupDelayHours = _orchestratorData.BranchCleanupDelayHours;
+                    _orchWorkerTaskTimeoutMinutes = _orchestratorData.WorkerTaskTimeoutMinutes;
                 }
             }
         }
@@ -1816,7 +1823,8 @@ else
                 MaxParallelGoals: _orchMaxParallelGoals,
                 VerboseLogging: _orchVerboseLogging,
                 BrainMaxSteps: _orchBrainMaxSteps,
-                BranchCleanupDelayHours: _orchBranchCleanupDelayHours));
+                BranchCleanupDelayHours: _orchBranchCleanupDelayHours,
+                WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes));
             if (result.Success)
             {
                 await LoadOrchestratorAsync();

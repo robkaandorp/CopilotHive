@@ -178,15 +178,40 @@ public sealed class FacadeDtosSerializationTests
 
     public void OrchestratorSettingsUpdate_RoundTrips_AllProperties()
     {
+        // Six positional arguments: the added worker-task-inactivity-timeout parameter is the
+        // LAST one with a default, so existing positional callers must still compile and
+        // serialize as an explicit null (the endpoint's JSON options do not ignore nulls).
         var update = new OrchestratorSettingsUpdate(10, 3, 2, true, 50, 24);
 
         var json = JsonSerializer.Serialize(update, JsonOpts);
 
         Assert.Equal(
-            """{"maxIterations":10,"maxRetriesPerTask":3,"maxParallelGoals":2,"verboseLogging":true,"brainMaxSteps":50,"branchCleanupDelayHours":24}""",
+            """{"maxIterations":10,"maxRetriesPerTask":3,"maxParallelGoals":2,"verboseLogging":true,"brainMaxSteps":50,"branchCleanupDelayHours":24,"workerTaskTimeoutMinutes":null}""",
             json);
 
         Assert.Equal(update, JsonSerializer.Deserialize<OrchestratorSettingsUpdate>(json, JsonOpts));
+    }
+
+    /// <summary>
+    /// The worker task INACTIVITY timeout round-trips as a REAL value, including 0 — 0 means
+    /// "disabled" and is distinct from an omitted (null) field, so it must never collapse to
+    /// null or to an ignored member.
+    /// </summary>
+    [Theory]
+    [InlineData(25)]
+    [InlineData(0)]
+    public void OrchestratorSettingsUpdate_WorkerTaskTimeoutMinutes_RoundTrips(int value)
+    {
+        var update = new OrchestratorSettingsUpdate(10, 3, 2, true, 50, 24, value);
+
+        var json = JsonSerializer.Serialize(update, JsonOpts);
+
+        Assert.Contains($"\"workerTaskTimeoutMinutes\":{value}", json, StringComparison.Ordinal);
+
+        var roundTripped = JsonSerializer.Deserialize<OrchestratorSettingsUpdate>(json, JsonOpts);
+
+        Assert.Equal(update, roundTripped);
+        Assert.Equal(value, roundTripped!.WorkerTaskTimeoutMinutes);
     }
 
     [Fact]
@@ -208,6 +233,8 @@ public sealed class FacadeDtosSerializationTests
         Assert.Null(roundTripped.BrainMaxSteps);
 
         Assert.Null(roundTripped.BranchCleanupDelayHours);
+
+        Assert.Null(roundTripped.WorkerTaskTimeoutMinutes);
     }
 
     [Fact]

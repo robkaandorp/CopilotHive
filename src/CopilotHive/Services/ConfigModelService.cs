@@ -704,6 +704,8 @@ public sealed class ConfigModelService
             _config.Orchestrator.BrainMaxSteps = update.BrainMaxSteps.Value;
         if (update.BranchCleanupDelayHours is not null)
             _config.Orchestrator.BranchCleanupDelayHours = update.BranchCleanupDelayHours.Value;
+        if (update.WorkerTaskTimeoutMinutes is not null)
+            _config.Orchestrator.WorkerTaskTimeoutMinutes = update.WorkerTaskTimeoutMinutes.Value;
 
         var message = "chore: update orchestrator settings";
         _logger.LogInformation("Updating orchestrator settings");

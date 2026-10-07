@@ -113,11 +113,19 @@ public sealed record ModelConfigUpdate(
 /// <param name="VerboseLogging">Whether verbose logging is enabled.</param>
 /// <param name="BrainMaxSteps">New maximum Brain tool-call steps.</param>
 /// <param name="BranchCleanupDelayHours">New branch cleanup delay in hours.</param>
+/// <param name="WorkerTaskTimeoutMinutes">
+/// New worker task INACTIVITY timeout, in minutes. This is the number of minutes without task
+/// activity before a busy worker's task is reclaimed and the phase re-dispatched — it is NOT a
+/// maximum run time. A value of 0 or less disables ONLY this inactivity-based reclaiming;
+/// stale-heartbeat worker removal and the held-attempt adoption sweep in
+/// <see cref="StaleWorkerCleanupService"/> still run.
+/// </param>
 public sealed record OrchestratorSettingsUpdate(
     int? MaxIterations, int? MaxRetriesPerTask, int? MaxParallelGoals,
     bool? VerboseLogging,
     int? BrainMaxSteps,
-    int? BranchCleanupDelayHours);
+    int? BranchCleanupDelayHours,
+    int? WorkerTaskTimeoutMinutes = null);
 
 /// <summary>
 /// Request body for adding or updating a repository.
@@ -300,7 +308,12 @@ public sealed record WorkerEntryDto(string? Model, string? PremiumModel, int? Co
 /// <param name="VerboseLogging">Whether verbose logging is enabled.</param>
 /// <param name="BrainMaxSteps">Maximum tool-call steps the Brain agent may take per request.</param>
 /// <param name="BranchCleanupDelayHours">Delay in hours before deleting feature branches for completed goals.</param>
-/// <param name="WorkerTaskTimeoutMinutes">Maximum wall-clock minutes a single worker task may run.</param>
+/// <param name="WorkerTaskTimeoutMinutes">
+/// Worker task INACTIVITY timeout in minutes: the number of minutes without task activity before
+/// a busy worker's task is reclaimed and the phase re-dispatched. It is NOT a maximum run time.
+/// A value of 0 or less disables ONLY this inactivity-based reclaiming; stale-heartbeat worker
+/// removal and the held-attempt adoption sweep in <see cref="StaleWorkerCleanupService"/> still run.
+/// </param>
 /// <param name="ReasoningEffort">Orchestrator reasoning effort, or <c>null</c> when unset.</param>
 public sealed record OrchestratorConfigDto(
     string? Model,

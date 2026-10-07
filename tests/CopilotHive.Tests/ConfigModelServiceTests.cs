@@ -1082,7 +1082,8 @@ public sealed class ConfigModelServiceTests : IDisposable
             MaxIterations: 99, MaxRetriesPerTask: 7, MaxParallelGoals: 4,
             VerboseLogging: true,
             BrainMaxSteps: 120,
-            BranchCleanupDelayHours: 12);
+            BranchCleanupDelayHours: 12,
+            WorkerTaskTimeoutMinutes: 90);
 
         await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
 
@@ -1092,6 +1093,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.True(config.Orchestrator.VerboseLogging);
         Assert.Equal(120, config.Orchestrator.BrainMaxSteps);
         Assert.Equal(12, config.Orchestrator.BranchCleanupDelayHours);
+        Assert.Equal(90, config.Orchestrator.WorkerTaskTimeoutMinutes);
     }
 
     [Fact]
@@ -1139,6 +1141,177 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
         Assert.Contains("orchestrator", repo.Commits[0].Message);
+    }
+
+    // ── UpdateOrchestratorSettingsAsync — WorkerTaskTimeoutMinutes ───────────
+
+    /// <summary>
+    /// The worker task INACTIVITY timeout is a pure pass-through: a non-null value reaches the
+    /// live config AND the hive-config.yaml the service wrote, under the snake_case key.
+    /// </summary>
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutes_UpdatesConfigAndYaml()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new OrchestratorSettingsUpdate(
+            MaxIterations: null, MaxRetriesPerTask: null, MaxParallelGoals: null,
+            VerboseLogging: null,
+            BrainMaxSteps: null,
+            BranchCleanupDelayHours: null,
+            WorkerTaskTimeoutMinutes: 90);
+
+        await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal(90, config.Orchestrator.WorkerTaskTimeoutMinutes);
+
+        // The real write path serialized it: read hive-config.yaml back from disk.
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("worker_task_timeout_minutes: 90", yaml);
+    }
+
+    /// <summary>
+    /// Zero is the documented "disabled" value and is NOT the DTO's omitted marker: a 0 must
+    /// reach the live config (where the cleanup service treats it as "never reclaim inactive
+    /// tasks") rather than being dropped as a no-op. The written YAML changes too: the seeded
+    /// <c>worker_task_timeout_minutes: 90</c> key disappears, because the shared writer's
+    /// <c>OmitDefaults</c> convention omits CLR-default values (the same convention that already
+    /// applies to <c>branch_cleanup_delay_hours: 0</c>).
+    /// </summary>
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesZero_AppliesZeroToConfig()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { WorkerTaskTimeoutMinutes = 90 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // Seed the file with the NON-default value so the YAML delta below is observable.
+        await svc.UpdateOrchestratorSettingsAsync(
+            new OrchestratorSettingsUpdate(
+                MaxIterations: null, MaxRetriesPerTask: null, MaxParallelGoals: null,
+                VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null,
+                WorkerTaskTimeoutMinutes: 90),
+            TestContext.Current.CancellationToken);
+
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        var before = await File.ReadAllTextAsync(configPath, TestContext.Current.CancellationToken);
+        Assert.Contains("worker_task_timeout_minutes: 90", before);
+
+        await svc.UpdateOrchestratorSettingsAsync(
+            new OrchestratorSettingsUpdate(
+                MaxIterations: null, MaxRetriesPerTask: null, MaxParallelGoals: null,
+                VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null,
+                WorkerTaskTimeoutMinutes: 0),
+            TestContext.Current.CancellationToken);
+
+        // 0 is a REAL value, not "omitted": it replaces the stored 90 on the live config, which
+        // is the authority the cleanup service reads.
+        Assert.Equal(0, config.Orchestrator.WorkerTaskTimeoutMinutes);
+
+        // The write path ran again and committed, and the file no longer carries the stale 90.
+        Assert.Equal(2, repo.Commits.Count);
+        Assert.Equal("hive-config.yaml", repo.Commits[1].File);
+        var after = await File.ReadAllTextAsync(configPath, TestContext.Current.CancellationToken);
+        Assert.DoesNotContain("worker_task_timeout_minutes: 90", after);
+        Assert.DoesNotContain("worker_task_timeout_minutes", after);
+    }
+
+    /// <summary>
+    /// LIMITATION PIN (pre-existing, repo-wide — NOT introduced by this field): the shared YAML
+    /// serializer (`ConfigRepoManager.YamlSerializer`) uses
+    /// <c>DefaultValuesHandling.OmitDefaults</c>, which omits any member whose value equals the
+    /// CLR default — so a persisted <c>0</c> is indistinguishable from an absent key and a
+    /// restart re-reads the 60 default. The same convention already applies to the documented
+    /// <c>BranchCleanupDelayHours = 0</c> ("immediate cleanup"). Inside one process the live
+    /// config carries the 0 (see the test above); this test records the writer's convention so
+    /// the boundary stays machine-visible. If the serializer later persists CLR-default values,
+    /// this test fails and must be updated to assert the key's presence.
+    /// </summary>
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesZero_WriterOmitsClrDefaultValue()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateOrchestratorSettingsAsync(
+            new OrchestratorSettingsUpdate(
+                MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
+                VerboseLogging: null,
+                BrainMaxSteps: null,
+                BranchCleanupDelayHours: 12,
+                WorkerTaskTimeoutMinutes: 0),
+            TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+
+        // Control: a NON-default value in the same update IS persisted, so the omission below is
+        // the writer's CLR-default rule and not a missing write.
+        Assert.Contains("max_iterations: 5", yaml);
+        Assert.Contains("branch_cleanup_delay_hours: 12", yaml);
+        Assert.DoesNotContain("worker_task_timeout_minutes", yaml);
+    }
+
+    /// <summary>
+    /// Null is the omitted marker: a partial update that does not mention the field leaves the
+    /// stored value exactly as it was (90 stays 90, not the 60 default and not 0).
+    /// </summary>
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesOmitted_LeavesStoredValueUnchanged()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { WorkerTaskTimeoutMinutes = 90 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new OrchestratorSettingsUpdate(
+            MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
+            VerboseLogging: null,
+            BrainMaxSteps: null,
+            BranchCleanupDelayHours: null,
+            WorkerTaskTimeoutMinutes: null);
+
+        await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal(5, config.Orchestrator.MaxIterations);
+        Assert.Equal(90, config.Orchestrator.WorkerTaskTimeoutMinutes);
+    }
+
+    /// <summary>
+    /// The service has NO validation layer for the worker task inactivity timeout (the goal's
+    /// stated contract): a negative value is written through AS-IS to the live config, exactly
+    /// like a positive one — it behaves like 0 ("disabled") at the cleanup service, but the
+    /// stored/config value itself must not be clamped. A clamping mutant
+    /// (e.g. <c>Math.Max(0, value)</c>) fails this test.
+    /// </summary>
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesNegative_WrittenThroughUnclamped()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateOrchestratorSettingsAsync(
+            new OrchestratorSettingsUpdate(
+                MaxIterations: null, MaxRetriesPerTask: null, MaxParallelGoals: null,
+                VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null,
+                WorkerTaskTimeoutMinutes: -3),
+            TestContext.Current.CancellationToken);
+
+        // Written through as-is: the config stores -3, NOT 0 or the 60 default.
+        Assert.Equal(-3, config.Orchestrator.WorkerTaskTimeoutMinutes);
+
+        // The write path ran and serialized it under the snake_case key.
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("worker_task_timeout_minutes: -3", yaml);
     }
 
     // ── UpdateWorkerContextWindowsAsync tests ────────────────────────────────
