@@ -49,6 +49,23 @@ public sealed class GoalDetailInfo
     public List<string> RepositoryNames { get; init; } = [];
     /// <summary>Reason the goal failed, if applicable.</summary>
     public string? FailureReason { get; init; }
+
+    /// <summary>
+    /// Whether the resume action would be ACCEPTED for this goal right now — i.e. whether
+    /// <see cref="GoalDispatcher.ResumeGoalAsync"/> would return <c>true</c> for it.
+    /// <para>
+    /// Computed by <see cref="GoalResumeEligibility.IsResumable"/> over the goal and the goal's
+    /// pipeline phase/coder branch, resolved IN MEMORY OR FROM THE STORE
+    /// (<see cref="GoalPipelineManager.GetPhaseAndCoderBranch"/>). It is therefore still correct
+    /// after an orchestrator restart, when a Failed pipeline exists only in the database.
+    /// </para>
+    /// <para>
+    /// <c>false</c> is the default, so a detail built without the flag (and every legacy caller)
+    /// renders without the resume button. The Goal Detail page shows the button iff this is
+    /// <c>true</c>: the page and the backend read ONE rule and cannot disagree.
+    /// </para>
+    /// </summary>
+    public bool CanResume { get; init; }
     /// <summary>
     /// The goal's FULL token-usage breakdown — worker phases, stored Brain usage and stored
     /// pre-execution review usage, plus their grand total — or <c>null</c> when the goal has no usage

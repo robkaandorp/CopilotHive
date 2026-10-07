@@ -1155,6 +1155,153 @@ public sealed class ResumeRestartGateTests
         Assert.Equal(3, row.ReviewRetries);
     }
 
+    // ── Parity: the shared rule answers what ResumeGoalAsync answers ─────────
+
+    /// <summary>
+    /// PARITY between the shared rule and the backend, over the fixture shapes above: for each row
+    /// the answer <see cref="GoalResumeEligibility.IsResumable"/> gives for the goal and its
+    /// pipeline (observed with the SAME read-only lookup the dashboard uses) is EXACTLY the answer
+    /// <see cref="GoalDispatcher.ResumeGoalAsync"/> gives. The dispatcher's answer is taken from the
+    /// SAME fixture instance, so a divergence in either direction fails the row.
+    /// </summary>
+    /// <remarks>
+    /// Each row is a real resume attempt through the production entry point, so the row's expected
+    /// value is not merely the rule restated: the assertion pins what the backend ACTUALLY did
+    /// against what the rule PREDICTED. The cancelled, branch-mismatch and case-only-mismatch rows
+    /// are the isolation vectors for rules 1 and 3; the exhaustion and "Worker failed" rows for
+    /// rule 4.
+    /// </remarks>
+    [Theory]
+    // (reason, coderBranch, expected)
+    [InlineData("Review rejected the changes", "canonical", true)]
+    [InlineData("Worker failed: build error in Coding", "canonical", true)]
+    [InlineData("Exceeded max iterations", "canonical", true)]
+    [InlineData("Cancelled by user", "canonical", false)]
+    [InlineData("cancelled by user", "canonical", false)]
+    [InlineData("Cancelled by user (test)", "canonical", true)]
+    [InlineData("Review rejected the changes", "other", false)]
+    [InlineData("Review rejected the changes", "case-only", false)]
+    [InlineData("Review rejected the changes", null, false)]
+    [InlineData("Worker failed: build error in Coding", null, false)]
+    [InlineData("Exceeded max iterations", null, true)]
+    public async Task IsResumable_MatchesResumeGoalAsync_ForEveryFixtureShape(
+        string reason, string? branchKind, bool expected)
+    {
+        var goalId = "parity-fixture-shape";
+        var store = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, reason);
+        store.AddGoal(goal);
+
+        var manager = new GoalPipelineManager();
+        var branch = branchKind switch
+        {
+            "canonical" => $"copilothive/{goalId}",
+            "other" => "copilothive/some-other-goal",
+            "case-only" => $"COPILOTHIVE/{goalId}",
+            null => null,
+            _ => throw new InvalidOperationException($"Unhandled branch kind '{branchKind}'"),
+        };
+        FailedPipeline(manager, goal, branch);
+
+        // The rule reads the pipeline through the SAME side-effect-free lookup the dashboard uses.
+        var observed = manager.GetPhaseAndCoderBranch(goalId);
+        Assert.NotNull(observed);
+        var predicted = GoalResumeEligibility.IsResumable(goal, observed!.Value.Phase, observed.Value.CoderBranch);
+
+        var dispatcher = CreateDispatcher(store, manager);
+        dispatcher.BranchListerForTest = (repo, ct) =>
+            Task.FromResult(branch is null ? [] : new List<string> { branch });
+        var actual = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.Equal(expected, predicted);
+        Assert.Equal(predicted, actual);
+    }
+
+    /// <summary>
+    /// The MUTATING backend must not change the rule's answer once it has run: after a SUCCESSFUL
+    /// resume the pipeline is no longer Failed, so the rule reports <c>false</c> — and the backend
+    /// refuses a second resume. This pins that the rule tracks the live state rather than caching a
+    /// stale phase, which is what makes the page's button disappear after use.
+    /// </summary>
+    [Fact]
+    public async Task IsResumable_FollowsTheLiveState_AfterASuccessfulResume()
+    {
+        const string goalId = "parity-post-resume";
+        var store = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Review rejected the changes");
+        store.AddGoal(goal);
+
+        var manager = new GoalPipelineManager();
+        FailedPipeline(manager, goal, $"copilothive/{goalId}");
+
+        var before = manager.GetPhaseAndCoderBranch(goalId);
+        Assert.True(GoalResumeEligibility.IsResumable(goal, before!.Value.Phase, before.Value.CoderBranch));
+
+        var dispatcher = CreateDispatcher(store, manager);
+        dispatcher.BranchListerForTest = (repo, ct) => Task.FromResult(new List<string> { $"copilothive/{goalId}" });
+        Assert.True(await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken));
+
+        var after = manager.GetPhaseAndCoderBranch(goalId);
+        Assert.NotNull(after);
+        Assert.NotEqual(GoalPhase.Failed, after!.Value.Phase);
+        Assert.False(GoalResumeEligibility.IsResumable(goal, after.Value.Phase, after.Value.CoderBranch));
+        Assert.False(await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken));
+    }
+
+    /// <summary>
+    /// A goal that is not Failed at all is refused by the backend while the rule reports the same
+    /// answer — the goal-level gate is shared, not re-implemented per caller.
+    /// </summary>
+    [Fact]
+    public async Task IsResumable_MatchesResumeGoalAsync_ForANonFailedGoal()
+    {
+        const string goalId = "parity-not-failed";
+        var store = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Review rejected the changes");
+        goal.Status = GoalStatus.Completed;
+        store.AddGoal(goal);
+
+        var manager = new GoalPipelineManager();
+        FailedPipeline(manager, goal, $"copilothive/{goalId}");
+
+        var observed = manager.GetPhaseAndCoderBranch(goalId);
+        Assert.NotNull(observed);
+        var predicted = GoalResumeEligibility.IsResumable(goal, observed!.Value.Phase, observed.Value.CoderBranch);
+        Assert.False(predicted);
+
+        var dispatcher = CreateDispatcher(store, manager);
+        dispatcher.BranchListerForTest = (repo, ct) =>
+            throw new InvalidOperationException("a non-Failed goal must never reach branch observation");
+        var actual = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.Equal(predicted, actual);
+        Assert.Equal(GoalStatus.Completed, goal.Status);
+    }
+
+    /// <summary>
+    /// NO PIPELINE ANYWHERE is refused by the backend and predicted by the rule from the same
+    /// <c>null</c> observation — the null-phase row of the matrix, exercised through the dispatcher.
+    /// </summary>
+    [Fact]
+    public async Task IsResumable_MatchesResumeGoalAsync_WhenNoPipelineExists()
+    {
+        const string goalId = "parity-no-pipeline";
+        var store = new RecordingGoalStore();
+        var goal = FailedGoal(goalId, "Exceeded max iterations");
+        store.AddGoal(goal);
+
+        var manager = new GoalPipelineManager();
+        var observed = manager.GetPhaseAndCoderBranch(goalId);
+        Assert.Null(observed);
+        var predicted = GoalResumeEligibility.IsResumable(goal, observed?.Phase, observed?.CoderBranch);
+        Assert.False(predicted);
+
+        var dispatcher = CreateDispatcher(store, manager);
+        var actual = await dispatcher.ResumeGoalAsync(goalId, 5, TestContext.Current.CancellationToken);
+
+        Assert.Equal(predicted, actual);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     /// <summary>

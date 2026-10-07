@@ -181,17 +181,54 @@ public sealed class DashboardStateService : IDisposable
         if (goal is null)
             return null;
 
-        // GetSnapshot uses GetAllGoalsAsync which does NOT populate IterationSummaries.
-        // For the detail view we need the full goal with summaries loaded from the store.
-        Goal? fullGoalWithSummaries = null;
-        if (goal.IterationSummaries.Count == 0 && _goalStore is not null)
-        {
-            fullGoalWithSummaries = await _goalStore.GetGoalAsync(goalId);
-        }
+        // ONE authoritative read of the stored goal, serving BOTH the display summaries and the
+        // resume-eligibility input below.
+        //
+        // GetSnapshot uses GetAllGoalsAsync which does NOT populate IterationSummaries, so the
+        // detail view needs the full goal with summaries loaded from the store. The display use is
+        // unchanged: the stored goal is handed to the builder EXACTLY under the old condition
+        // (only when the snapshot goal carries no summaries), so what is rendered does not shift.
+        var storedGoal = _goalStore is null ? null : await _goalStore.GetGoalAsync(goalId);
+        var fullGoalWithSummaries = goal.IterationSummaries.Count == 0 ? storedGoal : null;
 
         var pipeline = _pipelineManager.GetByGoalId(goalId);
         var runningTaskUsage = ResolveRunningTaskUsage(pipeline);
-        return GoalDetailViewBuilder.Build(goal, goalId, pipeline, fullGoalWithSummaries, _config, runningTaskUsage);
+
+        // THE RESUME FLAG — FAIL CLOSED, and exactly as the backend computes it.
+        //
+        // The eligibility input is the AUTHORITATIVE stored goal: the same GetGoalAsync path, and the
+        // same instance, that GoalDispatcher.ResumeGoalAsync reads. It is deliberately NOT the
+        // snapshot's copy, whose Status GetSnapshot overwrites from the pipeline phase
+        // (Done => Completed, Failed => Failed, else InProgress) — a DERIVED value, not the lifecycle
+        // truth. Evaluating the snapshot goal would show the button for a goal the backend refuses,
+        // precisely the boundary the lifecycle produces when a pipeline reaches Failed BEFORE the
+        // asynchronous goal finalization persists that status.
+        //
+        // FAIL CLOSED WHEN THERE IS NO AUTHORITATIVE GOAL: ResumeGoalAsync refuses UNCONDITIONALLY in
+        // both absence states — `if (goalStore is null) return false;` when no goal store is
+        // configured, and `if (goal is null || !IsResumeCandidateGoal(goal)) return false;` when the
+        // stored goal is missing (re-checked inside the resume lock). The dashboard can compute that
+        // answer exactly: it knows whether a store is configured and whether GetGoalAsync answered.
+        // So a null stored goal — no store configured, or the goal deleted while its pipeline is
+        // still live — yields CanResume = false, which is BACKEND parity, not merely the safe
+        // direction: in no-store mode the dispatcher refuses EVERY goal, and a goal deleted from the
+        // store no longer exists for the backend either. Without this, the page would evaluate the
+        // phase-derived display Status and show a button that fails on click.
+        //
+        // Everything else is unchanged and still ADMITS nothing: the pipeline is resolved IN MEMORY
+        // OR FROM THE STORE (the read that makes the flag correct after an orchestrator restart, when
+        // a Failed pipeline is not in memory because LoadActivePipelines skips terminal phases), and
+        // that lookup registers no pipeline instance and no task mapping.
+        var canResume = false;
+        if (storedGoal is not null)
+        {
+            var phaseAndBranch = _pipelineManager.GetPhaseAndCoderBranch(goalId);
+            canResume = GoalResumeEligibility.IsResumable(
+                storedGoal, phaseAndBranch?.Phase, phaseAndBranch?.CoderBranch);
+        }
+
+        return GoalDetailViewBuilder.Build(
+            goal, goalId, pipeline, fullGoalWithSummaries, _config, runningTaskUsage, canResume);
     }
 
     /// <summary>

@@ -35,6 +35,12 @@ internal static class GoalDetailViewBuilder
     /// default <c>null</c> leaves every value byte-identical to the pre-live-usage output, so callers
     /// that cannot attribute live usage (and existing tests) keep their exact behaviour.
     /// </param>
+    /// <param name="canResume">
+    /// Whether the resume action would be ACCEPTED for this goal, as decided by the CALLER with
+    /// <see cref="GoalResumeEligibility.IsResumable"/> over the goal's pipeline phase/coder branch
+    /// (resolved in memory or from the store). The default <c>false</c> renders without the resume
+    /// button, so existing callers keep their exact behaviour.
+    /// </param>
     /// <returns>A fully-populated <see cref="GoalDetailInfo"/>, or null if the goal is not found.</returns>
     public static GoalDetailInfo? Build(
         Goal goal,
@@ -42,7 +48,8 @@ internal static class GoalDetailViewBuilder
         GoalPipeline? pipeline,
         Goal? fullGoalWithSummaries,
         HiveConfigFile? config,
-        SharpCoder.UsageSummary? runningTaskUsage = null)
+        SharpCoder.UsageSummary? runningTaskUsage = null,
+        bool canResume = false)
     {
         // Use the full goal with summaries if provided (store path), otherwise use lightweight goal.
         // The authoritative goal is used for ALL view-model fields (not just Iterations).
@@ -101,6 +108,7 @@ internal static class GoalDetailViewBuilder
             RepositoryUrl = ResolveRepositoryUrl(effectiveGoal, config),
             RepositoryNames = effectiveGoal.RepositoryNames,
             FailureReason = effectiveGoal.FailureReason,
+            CanResume = canResume,
             UsageTotals = goalUsage,
             GoalUsage = goalBreakdown,
             IncludesLiveUsage = goalIncludesLiveUsage,

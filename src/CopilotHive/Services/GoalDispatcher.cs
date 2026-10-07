@@ -295,44 +295,6 @@ public sealed class GoalDispatcher : BackgroundService
     private const string ResumeUnknown = "unknown";
 
     /// <summary>
-    /// Determines whether a goal failed specifically due to iteration-budget exhaustion,
-    /// making it eligible for the branchless (variant B) resumption via
-    /// <see cref="ResumeGoalAsync"/>.
-    /// Matches the failure reasons produced by <see cref="PipelineDriver"/>:
-    /// "Exceeded max iterations" and "Exceeded max iterations during merge conflict resolution".
-    /// </summary>
-    private static bool IsIterationExhaustionFailure(Goal goal)
-    {
-        if (goal.Status != GoalStatus.Failed)
-            return false;
-        if (string.IsNullOrEmpty(goal.FailureReason))
-            return false;
-        var reason = goal.FailureReason;
-        return reason.Contains("Exceeded max iterations", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("max iterations", StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// The cancellation predicate: a goal is cancellation-failed iff its
-    /// <see cref="Goal.FailureReason"/> EQUALS "Cancelled by user" under
-    /// <see cref="StringComparison.OrdinalIgnoreCase"/>. Equality — never <c>Contains</c>: a
-    /// reason such as "Cancelled by user (test)" is a different failure and stays resumable.
-    /// Cancellation-failed goals are never resumable (the snapshot-removal contract owns them).
-    /// </summary>
-    private static bool IsCancellationFailure(Goal goal) =>
-        string.Equals(goal.FailureReason, "Cancelled by user", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Goal-level resume eligibility: a Failed goal that was not cancelled by a user.
-    /// Deliberately broader than <see cref="IsIterationExhaustionFailure"/> so that any
-    /// non-cancellation failure reaches the in-lock pipeline load, where
-    /// <see cref="GoalPipeline.CoderBranch"/> decides between the branch-backed restart
-    /// (variant A) and the branchless exhaustion resume (variant B).
-    /// </summary>
-    private static bool IsResumeCandidateGoal(Goal goal) =>
-        goal.Status == GoalStatus.Failed && !IsCancellationFailure(goal);
-
-    /// <summary>
     /// Collapses a failure reason to a single, bounded, control-character-free line for logging
     /// and for the failure-informed planning context. The exact algorithm: every CR and LF becomes
     /// a single space; every other control character (below 0x20 or 0x7F) is removed; consecutive
@@ -594,9 +556,11 @@ public sealed class GoalDispatcher : BackgroundService
             return false;
 
         // Check goal-level eligibility BEFORE acquiring lock. Deliberately broad: the variant
-        // is decided in-lock, once the pipeline (and its CoderBranch) is loaded.
+        // is decided in-lock, once the pipeline (and its CoderBranch) is loaded. THE RULE IS THE
+        // SHARED ONE (GoalResumeEligibility) the dashboard's resume button also reads, so the two
+        // can never disagree.
         var goal = await goalStore.GetGoalAsync(goalId, ct);
-        if (goal is null || !IsResumeCandidateGoal(goal))
+        if (goal is null || !GoalResumeEligibility.IsResumeCandidateGoal(goal))
             return false;
 
         var lockObj = _resumeLock;
@@ -605,7 +569,7 @@ public sealed class GoalDispatcher : BackgroundService
         {
             // Re-check goal-level eligibility inside lock (could have changed)
             goal = await goalStore.GetGoalAsync(goalId, ct);
-            if (goal is null || !IsResumeCandidateGoal(goal))
+            if (goal is null || !GoalResumeEligibility.IsResumeCandidateGoal(goal))
                 return false;
 
             // Load pipeline
@@ -622,13 +586,16 @@ public sealed class GoalDispatcher : BackgroundService
                 return false;
 
             // ── Variant selection (no mutation may precede this) ─────────────────
+            // The rule itself lives in GoalResumeEligibility — the SAME rule the dashboard's
+            // resume button reads — while the refusal log stays here so the diagnostic and the
+            // order of the checks are unchanged.
             var isBranchBacked = pipeline.CoderBranch is not null;
             if (isBranchBacked)
             {
                 // Branch-name invariant: ORDINAL, case-SENSITIVE. Git branch names are
                 // case-sensitive, so a case-only mismatch signals a corrupted snapshot and
                 // must surface as a rejection, never as a silent recreate.
-                var canonicalBranch = $"copilothive/{goalId}";
+                var canonicalBranch = GoalResumeEligibility.CanonicalCoderBranch(goalId);
                 if (!string.Equals(pipeline.CoderBranch, canonicalBranch, StringComparison.Ordinal))
                 {
                     _logger.LogWarning(
@@ -637,7 +604,7 @@ public sealed class GoalDispatcher : BackgroundService
                     return false;
                 }
             }
-            else if (!IsIterationExhaustionFailure(goal))
+            else if (!GoalResumeEligibility.IsIterationExhaustionFailure(goal))
             {
                 // Branchless resume is only defined for iteration exhaustion.
                 return false;

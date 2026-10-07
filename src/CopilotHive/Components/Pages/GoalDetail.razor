@@ -912,13 +912,15 @@
                     }
                 }
 
-                @* Extend Iterations — Failed with iteration exhaustion *@
-                @if ((_detail?.FailureReason?.Contains("iteration", StringComparison.OrdinalIgnoreCase) == true
-                    || _storedGoal?.FailureReason?.Contains("iteration", StringComparison.OrdinalIgnoreCase) == true)
-                    && (_detail?.Status == GoalStatus.Failed || _storedGoal?.Status == GoalStatus.Failed))
+                @* Resume — shown exactly when the backend (GoalDispatcher.ResumeGoalAsync) would
+                   accept a resume: a Failed goal, not cancelled, whose pipeline is Failed and
+                   either carries the canonical coder branch or (branchless) failed by iteration
+                   exhaustion. The rule lives in GoalResumeEligibility; the page only reads the
+                   flag the dashboard computed with it. *@
+                @if (_detail?.CanResume == true)
                 {
                     <button class="approve-btn" @onclick="ExtendIterationsAsync" disabled="@_extendingIterations">
-                        @(_extendingIterations ? "Extending..." : "➕ Extend Iterations (+5)")
+                        @(_extendingIterations ? "Extending..." : "➕ Resume (+5 iterations)")
                     </button>
                     @if (_extendError is not null)
                     {

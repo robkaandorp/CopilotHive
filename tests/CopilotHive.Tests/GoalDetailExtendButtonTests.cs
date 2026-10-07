@@ -1,21 +1,24 @@
 using CopilotHive.Goals;
+using CopilotHive.Services;
 
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Tests for the "Extend Iterations" button and <c>ExtendIterationsAsync</c> handler in
-/// <c>GoalDetail.razor</c>. Because the project does not use bUnit, these tests use two
-/// removal-proof strategies:
+/// Tests for the RESUME button (formerly "Extend Iterations") and its
+/// <c>ExtendIterationsAsync</c> handler in <c>GoalDetail.razor</c>. Because the project does not use
+/// bUnit, these tests use two removal-proof strategies:
 /// <list type="bullet">
 ///   <item>
-///     Source-file content assertions that read the actual <c>GoalDetail.razor</c> source and
-///     verify the required markup, state fields, endpoint URL, request body, status-code handling,
-///     success refresh, and <c>finally</c> reset are present. Deleting or regressing any of these
+///     Source-file content assertions that read the actual <c>GoalDetail.razor</c> source and verify
+///     the required markup, state fields, the shared <c>CanResume</c> guard, the button label, the
+///     success refresh, and the <c>finally</c> reset are present. Deleting or regressing any of these
 ///     production elements fails the corresponding test.
 ///   </item>
 ///   <item>
 ///     Helper-logic tests that mirror the button's visibility condition and text computation with
-///     specific expected values (like <c>GoalDetailReviewBadgeTests</c>).
+///     specific expected values (like <c>GoalDetailReviewBadgeTests</c>). The visibility mirror reads
+///     the SHARED flag only — the resume RULE itself is exercised against
+///     <see cref="GoalResumeEligibility"/> in <see cref="GoalResumeEligibilityTests"/>.
 ///   </item>
 /// </list>
 /// </summary>
@@ -103,18 +106,18 @@ public sealed class GoalDetailExtendButtonTests
     }
 
     /// <summary>
-    /// Extracts the source text of the extend-iterations button block (the <c>@if</c> that guards
-    /// the button markup) so markup assertions target that block specifically.
+    /// Extracts the source text of the resume button block (the <c>@if</c> that guards the button
+    /// markup) so markup assertions target that block specifically.
     /// </summary>
     private static string ExtractExtendButtonBlock(string source)
     {
-        const string marker = "@* Extend Iterations — Failed with iteration exhaustion *@";
+        const string marker = "@* Resume — shown exactly when the backend";
         var start = source.IndexOf(marker, StringComparison.Ordinal);
-        Assert.True(start >= 0, "Extend Iterations markup block comment not found in GoalDetail.razor");
+        Assert.True(start >= 0, "Resume markup block comment not found in GoalDetail.razor");
 
         // Capture a generous slice through the closing of the guarded block.
         var end = source.IndexOf("_extendError", start, StringComparison.Ordinal);
-        Assert.True(end >= 0, "Extend button block does not contain expected error markup");
+        Assert.True(end >= 0, "Resume button block does not contain expected error markup");
         // Extend to end of that line's containing block.
         var blockEnd = source.IndexOf('}', source.IndexOf('}', end) + 1);
         if (blockEnd < 0) blockEnd = Math.Min(source.Length, start + 1200);
@@ -123,37 +126,38 @@ public sealed class GoalDetailExtendButtonTests
 
     // ── markup source assertions (removal-proof) ─────────────────────────────
 
+    /// <summary>
+    /// REMOVAL-PROOF: the block is guarded by the SHARED flag <c>_detail?.CanResume</c> — the flag the
+    /// dashboard computed with <see cref="GoalResumeEligibility.IsResumable"/>, the same rule
+    /// <see cref="GoalDispatcher.ResumeGoalAsync"/> enforces. Re-introducing a failure-reason text
+    /// check (the defect this replaces) fails this test.
+    /// </summary>
     [Fact]
-    public void ExtendButton_Markup_ContainsVisibilityConditionForDetailFailureReason()
-    {
-        var source = ReadGoalDetailRazorSource();
-        Assert.Contains(
-            "_detail?.FailureReason?.Contains(\"iteration\", StringComparison.OrdinalIgnoreCase)",
-            source);
-    }
-
-    [Fact]
-    public void ExtendButton_Markup_ContainsVisibilityConditionForStoredGoalFailureReason()
-    {
-        var source = ReadGoalDetailRazorSource();
-        Assert.Contains(
-            "_storedGoal?.FailureReason?.Contains(\"iteration\", StringComparison.OrdinalIgnoreCase)",
-            source);
-    }
-
-    [Fact]
-    public void ExtendButton_Markup_ContainsFailedStatusCheck()
+    public void ResumeButton_Markup_IsGuardedByTheSharedCanResumeFlag()
     {
         var source = ReadGoalDetailRazorSource();
         var block = ExtractExtendButtonBlock(source);
-        // The Failed status check must live inside the extend button block, next to the
-        // FailureReason iteration check — not merely somewhere in the file.
-        Assert.Contains("FailureReason", block);
-        Assert.Contains("GoalStatus.Failed", block);
+
+        Assert.Contains("_detail?.CanResume == true", block);
+        Assert.DoesNotContain("FailureReason", block);
+        Assert.DoesNotContain("CanResume", ExtractMethodSource(source, "private async Task ExtendIterationsAsync()"));
+    }
+
+    /// <summary>
+    /// The old visibility condition is GONE from the page: no block may gate the resume button on the
+    /// failure reason's text, and no <c>Contains(</c> test on a failure reason may remain anywhere.
+    /// </summary>
+    [Fact]
+    public void ResumeButton_Markup_ContainsNoFailureReasonTextCheck()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.DoesNotContain("_detail?.FailureReason?.Contains(\"iteration\"", source);
+        Assert.DoesNotContain("_storedGoal?.FailureReason?.Contains(\"iteration\"", source);
+        Assert.DoesNotContain("_detail?.FailureReason?.Contains", source);
     }
 
     [Fact]
-    public void ExtendButton_Markup_ContainsExtendingIterationsLoadingState()
+    public void ResumeButton_Markup_ContainsExtendingIterationsLoadingState()
     {
         var source = ReadGoalDetailRazorSource();
         var block = ExtractExtendButtonBlock(source);
@@ -162,7 +166,7 @@ public sealed class GoalDetailExtendButtonTests
     }
 
     [Fact]
-    public void ExtendButton_Markup_ContainsExtendErrorDisplay()
+    public void ResumeButton_Markup_ContainsExtendErrorDisplay()
     {
         var source = ReadGoalDetailRazorSource();
         var block = ExtractExtendButtonBlock(source);
@@ -170,7 +174,7 @@ public sealed class GoalDetailExtendButtonTests
     }
 
     [Fact]
-    public void ExtendButton_Markup_ContainsApproveBtnClass()
+    public void ResumeButton_Markup_ContainsApproveBtnClass()
     {
         var source = ReadGoalDetailRazorSource();
         var block = ExtractExtendButtonBlock(source);
@@ -248,52 +252,49 @@ public sealed class GoalDetailExtendButtonTests
     // ── helper-logic tests mirroring GoalDetail.razor conditions ─────────────
 
     /// <summary>
-    /// Mirrors the <c>GoalDetail.razor</c> visibility condition for the Extend Iterations button.
-    /// The button is visible only when the goal is <see cref="GoalStatus.Failed"/> and its failure
-    /// reason contains "iteration" (case-insensitive).
+    /// Mirrors the <c>GoalDetail.razor</c> visibility condition for the resume button. The page reads
+    /// EXACTLY the shared flag — <c>_detail?.CanResume == true</c> — so this mirror is the flag's own
+    /// predicate, never a re-implementation of the resume rule: the rule lives in
+    /// <see cref="GoalResumeEligibility"/> and is exercised by
+    /// <see cref="GoalResumeEligibilityTests"/>. A missing detail renders no button.
     /// </summary>
-    private static bool IsExtendButtonVisible(GoalStatus? status, string? failureReason) =>
-        (failureReason?.Contains("iteration", StringComparison.OrdinalIgnoreCase) == true)
-        && status == GoalStatus.Failed;
+    private static bool IsResumeButtonVisible(bool? canResume) => canResume == true;
 
     [Fact]
-    public void Visibility_FailedWithIterationReason_ReturnsTrue() =>
-        Assert.True(IsExtendButtonVisible(GoalStatus.Failed, "Exceeded max iterations"));
+    public void Visibility_CanResumeTrue_ReturnsTrue() => Assert.True(IsResumeButtonVisible(true));
 
     [Fact]
-    public void Visibility_FailedWithOtherReason_ReturnsFalse() =>
-        Assert.False(IsExtendButtonVisible(GoalStatus.Failed, "merge conflict"));
+    public void Visibility_CanResumeFalse_ReturnsFalse() => Assert.False(IsResumeButtonVisible(false));
 
     [Fact]
-    public void Visibility_CompletedWithIterationReason_ReturnsFalse() =>
-        Assert.False(IsExtendButtonVisible(GoalStatus.Completed, "Exceeded max iterations"));
-
-    [Fact]
-    public void Visibility_FailedWithNullFailureReason_ReturnsFalse() =>
-        Assert.False(IsExtendButtonVisible(GoalStatus.Failed, null));
-
-    [Fact]
-    public void Visibility_FailedWithUppercaseIteration_ReturnsTrue() =>
-        Assert.True(IsExtendButtonVisible(GoalStatus.Failed, "ITERATION exhausted"));
-
-    [Fact]
-    public void Visibility_NullStatusWithIterationReason_ReturnsFalse() =>
-        Assert.False(IsExtendButtonVisible(null, "iteration"));
+    public void Visibility_NoDetail_ReturnsFalse() => Assert.False(IsResumeButtonVisible(null));
 
     /// <summary>
     /// Mirrors the button-text computation in <c>GoalDetail.razor</c>:
-    /// <c>_extendingIterations ? "Extending..." : "➕ Extend Iterations (+5)"</c>.
+    /// <c>_extendingIterations ? "Extending..." : "➕ Resume (+5 iterations)"</c>.
     /// </summary>
-    private static string GetExtendButtonText(bool isExtending) =>
-        isExtending ? "Extending..." : "➕ Extend Iterations (+5)";
+    private static string GetResumeButtonText(bool isExtending) =>
+        isExtending ? "Extending..." : "➕ Resume (+5 iterations)";
 
     [Fact]
     public void ButtonText_Extending_ReturnsExtendingText() =>
-        Assert.Equal("Extending...", GetExtendButtonText(true));
+        Assert.Equal("Extending...", GetResumeButtonText(true));
 
     [Fact]
     public void ButtonText_NotExtending_ReturnsDefaultText() =>
-        Assert.Equal("➕ Extend Iterations (+5)", GetExtendButtonText(false));
+        Assert.Equal("➕ Resume (+5 iterations)", GetResumeButtonText(false));
+
+    /// <summary>
+    /// REMOVAL-PROOF for the RELABEL: the button's idle text is the new label and the old
+    /// "Extend Iterations (+5)" wording is gone from the source entirely.
+    /// </summary>
+    [Fact]
+    public void ButtonText_IdleLabel_IsTheNewResumeLabel()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.Contains("\"➕ Resume (+5 iterations)\"", source);
+        Assert.DoesNotContain("Extend Iterations", source);
+    }
 
     // ── Linked Issues backlink (source-file assertions, removal-proof) ──────
 

@@ -350,6 +350,49 @@ public sealed class GoalPipelineManager
         _taskToGoal.TryGetValue(taskId, out var goalId) ? GetByGoalId(goalId) : null;
 
     /// <summary>
+    /// THE PURE READ for the dashboard's resume-eligibility check: the pair
+    /// (<see cref="GoalPipeline.Phase"/>, <see cref="GoalPipeline.CoderBranch"/>) of the pipeline
+    /// registered for <paramref name="goalId"/> IN MEMORY, else of the pipeline loaded from the
+    /// store, else <c>null</c> when no pipeline exists anywhere.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// NO SIDE EFFECT. Nothing is added to <see cref="_pipelines"/> NOR to <see cref="_taskToGoal"/>,
+    /// in either path: a store hit contributes only the snapshot's two scalar values
+    /// (<see cref="PipelineSnapshot.Phase"/> and <see cref="PipelineSnapshot.CoderBranch"/>), which
+    /// are returned and the snapshot dropped, so a dashboard read can never ADMIT a terminal
+    /// pipeline into memory (which
+    /// <see cref="RestorePipeline"/> deliberately does, and which
+    /// <c>PipelineStore.LoadActivePipelines</c> deliberately does NOT do for terminal phases — the
+    /// restart shape this read exists for). No lock is taken and no store write is performed.
+    /// </para>
+    /// <para>
+    /// The in-memory hit is checked FIRST and is authoritative: an instance registered by
+    /// <see cref="GetByGoalId"/> is the live one, and its phase may legitimately differ from the
+    /// last persisted row. A store snapshot that cannot be materialized (unknown phase name,
+    /// corrupt JSON) throws out of <c>_store.LoadPipeline</c> exactly as it does for every other
+    /// caller; it is never converted into a silent "no pipeline".
+    /// </para>
+    /// </remarks>
+    /// <param name="goalId">The goal whose pipeline phase and coder branch are read.</param>
+    /// <returns>
+    /// The observed phase and coder branch, or <c>null</c> when the goal has no pipeline in memory
+    /// and none in the store (or no store is configured).
+    /// </returns>
+    public (GoalPhase Phase, string? CoderBranch)? GetPhaseAndCoderBranch(string goalId)
+    {
+        var inMemory = GetByGoalId(goalId);
+        if (inMemory is not null)
+            return (inMemory.Phase, inMemory.CoderBranch);
+
+        if (_store is null)
+            return null;
+
+        var snapshot = _store.LoadPipeline(goalId);
+        return snapshot is null ? null : (snapshot.Phase, snapshot.CoderBranch);
+    }
+
+    /// <summary>
     /// Registers an IN-MEMORY mapping from taskId → goalId so pipelines can be looked up by task.
     /// </summary>
     /// <remarks>

@@ -932,6 +932,112 @@ public sealed class GoalPipelineManagerTests
 
     #endregion
 
+    #region GetPhaseAndCoderBranch
+
+    /// <summary>
+    /// The in-memory pipeline is AUTHORITATIVE and is checked FIRST: its phase may legitimately be
+    /// ahead of the last persisted row (a failure that has already advanced the live pipeline but has
+    /// not yet been saved as Failed). A store-first read would report the stale Coding row and hide a
+    /// resumable goal, so this test fails on exactly that mutant.
+    /// </summary>
+    [Fact]
+    public async Task GetPhaseAndCoderBranch_InMemoryAheadOfStore_ReturnsTheInMemoryPair()
+    {
+        // THE CONTEXT IS OWNED BY THIS SCOPE: PipelineStore does not take ownership and its
+        // DisposeAsync is a no-op, so the in-memory SQLite connection is only closed
+        // deterministically when the CONTEXT is disposed — hence the explicit using scope.
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        await using var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var goal = CreateGoal("stale-store-goal", "Live pipeline ahead of its persisted row");
+        var pipeline = manager.CreatePipeline(goal);
+        pipeline.CoderBranch = "copilothive/stale-store-goal";
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        manager.PersistFull(pipeline);   // the store row is still Coding…
+        pipeline.AdvanceTo(GoalPhase.Failed);   // …while the live pipeline has already failed
+
+        var observed = manager.GetPhaseAndCoderBranch("stale-store-goal");
+
+        Assert.NotNull(observed);
+        Assert.Equal(GoalPhase.Failed, observed!.Value.Phase);
+        Assert.Equal("copilothive/stale-store-goal", observed.Value.CoderBranch);
+    }
+
+    /// <summary>
+    /// The store fallback for a pipeline that is NOT in memory — the post-restart shape — read
+    /// WITHOUT admitting the pipeline: the registry and the pipeline list are unchanged by the read.
+    /// </summary>
+    [Fact]
+    public async Task GetPhaseAndCoderBranch_StoreOnly_ReturnsTheSnapshotPairWithoutAdmitting()
+    {
+        // THE CONTEXT IS OWNED BY THIS SCOPE: PipelineStore does not take ownership and its
+        // DisposeAsync is a no-op, so the in-memory SQLite connection is only closed
+        // deterministically when the CONTEXT is disposed — hence the explicit using scope.
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        await using var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+        var seedingManager = new GoalPipelineManager(store);
+
+        var goal = CreateGoal("store-only-read-goal", "Store-only read");
+        var pipeline = seedingManager.CreatePipeline(goal);
+        pipeline.CoderBranch = "copilothive/store-only-read-goal";
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        seedingManager.PersistFull(pipeline);
+
+        // A FRESH manager sharing the store: nothing in memory, exactly the post-restart state.
+        var manager = new GoalPipelineManager(store);
+        Assert.Null(manager.GetByGoalId("store-only-read-goal"));
+
+        var observed = manager.GetPhaseAndCoderBranch("store-only-read-goal");
+
+        Assert.NotNull(observed);
+        Assert.Equal(GoalPhase.Failed, observed!.Value.Phase);
+        Assert.Equal("copilothive/store-only-read-goal", observed.Value.CoderBranch);
+        Assert.Null(manager.GetByGoalId("store-only-read-goal"));
+        Assert.Empty(manager.GetAllPipelines());
+    }
+
+    [Fact]
+    public async Task GetPhaseAndCoderBranch_UnknownGoal_ReturnsNull()
+    {
+        // THE CONTEXT IS OWNED BY THIS SCOPE: PipelineStore does not take ownership and its
+        // DisposeAsync is a no-op, so the in-memory SQLite connection is only closed
+        // deterministically when the CONTEXT is disposed — hence the explicit using scope.
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        await using var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        Assert.Null(manager.GetPhaseAndCoderBranch("no-such-goal"));
+    }
+
+    [Fact]
+    public void GetPhaseAndCoderBranch_NoStore_ReturnsNullForAnUnknownGoal()
+    {
+        var manager = new GoalPipelineManager();
+
+        Assert.Null(manager.GetPhaseAndCoderBranch("no-such-goal"));
+    }
+
+    /// <summary>
+    /// Without a store the read still answers from memory — the in-memory path is never gated on a
+    /// configured store.
+    /// </summary>
+    [Fact]
+    public void GetPhaseAndCoderBranch_NoStore_ReturnsTheInMemoryPair()
+    {
+        var manager = new GoalPipelineManager();
+        var pipeline = manager.CreatePipeline(CreateGoal("memory-only-goal", "In memory"));
+        pipeline.CoderBranch = "copilothive/memory-only-goal";
+
+        var observed = manager.GetPhaseAndCoderBranch("memory-only-goal");
+
+        Assert.NotNull(observed);
+        Assert.Equal(GoalPhase.Planning, observed!.Value.Phase);
+        Assert.Equal("copilothive/memory-only-goal", observed.Value.CoderBranch);
+    }
+
+    #endregion
+
     #region RestorePipeline / UnregisterTask
 
     [Fact]
