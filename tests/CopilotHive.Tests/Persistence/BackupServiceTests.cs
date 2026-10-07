@@ -19,6 +19,13 @@ namespace CopilotHive.Tests.Persistence;
 /// </summary>
 public sealed class BackupServiceTests
 {
+    /// <summary>
+    /// Builds the SQLite connection string for a test database. Uses <c>Pooling=False</c> to mirror
+    /// the production backup path: a pooled native handle can outlive the restore file swap and
+    /// then be reused against the replaced file by a later context.
+    /// </summary>
+    private static string ConnectionString(string path) => $"Data Source={path};Pooling=False";
+
     private sealed class TestDbContextFactory : IDbContextFactory<CopilotHiveDbContext>
     {
         private readonly DbContextOptions<CopilotHiveDbContext> _options;
@@ -33,7 +40,7 @@ public sealed class BackupServiceTests
 
         var dbPath = Path.Combine(stateDir, "copilothive.db");
         var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-            .UseSqlite($"Data Source={dbPath}")
+            .UseSqlite(ConnectionString(dbPath))
             .Options;
 
         using (var context = new CopilotHiveDbContext(options))
@@ -303,7 +310,7 @@ public sealed class BackupServiceTests
             var ct = TestContext.Current.CancellationToken;
             var dbPath = Path.Combine(stateDir, "copilothive.db");
             var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
+                .UseSqlite(ConnectionString(dbPath))
                 .Options;
 
             // Create a backup of the pristine database (no goals).
@@ -550,7 +557,7 @@ public sealed class BackupServiceTests
             var ct = TestContext.Current.CancellationToken;
             var dbPath = Path.Combine(stateDir, "copilothive.db");
             var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
+                .UseSqlite(ConnectionString(dbPath))
                 .Options;
 
             var masterPath = Path.Combine(stateDir, "brain-master.json");
@@ -616,7 +623,7 @@ public sealed class BackupServiceTests
             var ct = TestContext.Current.CancellationToken;
             var dbPath = Path.Combine(stateDir, "copilothive.db");
             var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
+                .UseSqlite(ConnectionString(dbPath))
                 .Options;
 
             // Set up full state: brain-master.json, brain-goal files, composer-session.json,
@@ -715,7 +722,7 @@ public sealed class BackupServiceTests
             var walPath = dbPath + "-wal";
             var shmPath = dbPath + "-shm";
             var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
+                .UseSqlite(ConnectionString(dbPath))
                 .Options;
 
             // Enable WAL mode and write data to generate -wal and -shm files.
@@ -759,7 +766,7 @@ public sealed class BackupServiceTests
             var ct = TestContext.Current.CancellationToken;
             var dbPath = Path.Combine(stateDir, "copilothive.db");
             var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
+                .UseSqlite(ConnectionString(dbPath))
                 .Options;
 
             // Step 1: Create backup A (pristine state, 0 goals).
@@ -807,7 +814,7 @@ public sealed class BackupServiceTests
 
                 // The safety backup DB should contain the goal that was added before restore.
                 var safetyOptions = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                    .UseSqlite($"Data Source={tempSafetyDb}")
+                    .UseSqlite(ConnectionString(tempSafetyDb))
                     .Options;
                 using var safetyContext = new CopilotHiveDbContext(safetyOptions);
                 var goalCount = await safetyContext.Goals.CountAsync(ct);
