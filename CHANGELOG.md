@@ -1,5 +1,31 @@
 ## [Unreleased]
 
+## [0.42.0] — 2026-10-07
+
+### Added
+
+- **Improver resolves concurrent guidance conflicts** — When the post-commit config-repository pull returns a content conflict limited to `agents/*.agents.md` files, the same Improver session merges both sides and publishes the result. Before publishing, the result is checked for leftover conflict markers and the 8,000-character limit; content that fails either check is never pushed. At most 2 publication attempts are made, and a second attempt occurs only after a non-fast-forward push rejection. Other pull or push failures behave as before. Previously, a conflicting Improver aborted and its lessons were lost. (`improver-resolve-config-pull-conflicts`; issue `improver-cannot-resolve-concurrent-guidance-edits-during-config-repository-publication`)
+- **Worker task inactivity timeout on the Configuration page** — `orchestrator.worker_task_timeout_minutes` is editable in the orchestrator settings form and via `PATCH /api/config/orchestrator`. It is the number of minutes without task activity before a busy worker's task is reclaimed, not a maximum run time. A value of `0` disables only this inactivity reclaiming. (`config-ui-worker-task-timeout`)
+
+### Changed
+
+- **Tests run on Microsoft.Testing.Platform (MTP)** — The root `global.json` sets `"test": { "runner": "Microsoft.Testing.Platform" }`, so `dotnet test` on the .NET 10 SDK uses MTP instead of VSTest. The CI test step runs `dotnet test --project tests/CopilotHive.Tests/CopilotHive.Tests.csproj -c Release --no-build` (user change `c30abeb`). The worker test runbooks (`.github/skills/test/SKILL.md` and `.github/copilot-instructions.md`) document these command forms: `dotnet test --solution <solution-file>` and `dotnet test --solution CopilotHive.slnx`.
+- **Test dependencies** — `xunit.v3` upgraded from 3.2.2 to 4.0.1; `coverlet.collector` 10.1.0 was replaced by `Microsoft.Testing.Extensions.CodeCoverage` 18.11.2. Coverage uses the MTP coverage option documented in the test skill, not the VSTest `--collect` collector: `dotnet test --solution <solution-file> --coverage --coverage-output-format cobertura --coverage-output coverage.cobertura.xml --results-directory ./TestResults`. `xunit.runner.visualstudio` remains at 4.0.0.
+- **SharpCoder and SharpCoder.Providers 0.22.0 → 0.22.1** — The worker `bash` tool now caps stdout and stderr at about 50,000 characters each; oversized output keeps the head and tail with an omission marker, so large build and test logs no longer flood worker conversations. See SharpCoder's 0.22.1 changelog for further details.
+
+### Fixed
+
+- **CI failure parsing for MTP output** — `CiMonitorService` now also parses MTP-format test failure blocks from GitHub Actions logs, preserving the failing test's name, error message, and stack trace; VSTest-format parsing remains for other monitored repositories. This completes the deferred `xunit.v3` 4.x upgrade noted in the 0.41.0 entry. (`migrate-tests-to-mtp-and-xunit-v3-4`)
+- **Resume button on Goal Detail** — The button now appears for exactly the failed goals the backend can resume, including after an orchestrator restart, and no longer guesses from the word "iteration" in the failure reason. Its label is `➕ Resume (+5 iterations)`. (`goal-detail-resume-button-eligibility`)
+- **Saved zero config values survive a restart** — `hive-config.yaml` now preserves an explicit `0` for integer settings whose code default is non-zero: `max_iterations`, `max_retries_per_task`, `max_parallel_goals`, `brain_max_steps`, `branch_cleanup_delay_hours`, `worker_task_timeout_minutes`, `max_steps`, and `ci_timeout_minutes`. Previously, a saved `0` was omitted and the code default returned on restart; for example, `worker_task_timeout_minutes: 0` reverted to 60 and `branch_cleanup_delay_hours: 0` reverted to 48. Existing config files with non-zero values are written exactly as before. (`persist-zero-config-values`; issue `shared-yaml-writer-drops-any-persisted-0-value-so-a-saved-0-silently-reverts-to-the-default-on-restart`)
+- **Intermittent `BackupServiceTests` failure** — Tests now open SQLite without connection pooling, so a pooled handle can no longer outlive the database file swap during a restore. This is a test-only change. (`backup-tests-disable-sqlite-pooling`)
+
+### Upgrade notes
+
+- **Contributors / local runs:** Use the .NET 10 SDK. Run `dotnet test` with the MTP argument forms (`--project` / `--solution`); the VSTest-only `--logger` and `--collect` arguments no longer apply. The documented full-suite form is `dotnet test --solution <solution-file>`.
+- **Workers:** Redeploy workers with the 0.42.0 image for SharpCoder 0.22.1's bash output cap and the Improver conflict resolution; upgrade the orchestrator at the same time.
+- **Config:** If you previously saved `0` for any affected setting, it was lost on restart; re-save it once after upgrading.
+
 ## [0.41.0] — 2026-10-02
 
 ### Added
