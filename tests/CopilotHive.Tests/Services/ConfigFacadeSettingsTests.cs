@@ -599,8 +599,9 @@ public class ConfigFacadeSettingsTests
     /// config: a value AND the documented "disabled" value 0 both reach
     /// <see cref="OrchestratorConfig.WorkerTaskTimeoutMinutes"/> (0 is a real setting, not an
     /// omitted marker). The live config is the authority the cleanup service reads, so the 0
-    /// takes effect in-process even though the shared YAML writer's
-    /// <c>OmitDefaults</c> convention drops CLR-default values from the file.
+    /// takes effect in-process; it is also persisted explicitly to the file, because the member
+    /// carries <c>DefaultValuesHandling.Preserve</c> and would otherwise be dropped by the shared
+    /// writer's <c>OmitDefaults</c> convention and revert to 60 on restart.
     /// </summary>
     [Theory]
     [InlineData(45, 45)]

@@ -34,7 +34,13 @@ public sealed class RepositoryConfig
     public string DefaultBranch { get; set; } = "main";
     /// <summary>Whether CI monitoring is enabled for this repository.</summary>
     public bool MonitorCi { get; set; } = false;
-    /// <summary>Timeout in minutes before a CI run is considered failed.</summary>
+    /// <summary>
+    /// Timeout in minutes before a CI run is considered failed. Carries
+    /// <c>DefaultValuesHandling.Preserve</c> because its initializer is NON-ZERO: the shared
+    /// writer's <c>OmitDefaults</c> convention would otherwise drop a persisted <c>0</c> and the
+    /// value would silently revert to 30 on restart.
+    /// </summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int CiTimeoutMinutes { get; set; } = 30;
 
     /// <summary>Optional release automation configuration for this repository.</summary>

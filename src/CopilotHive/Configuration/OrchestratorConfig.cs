@@ -1,7 +1,17 @@
+using YamlDotNet.Serialization;
+
 namespace CopilotHive.Configuration;
 
 /// <summary>
 /// Orchestrator-level configuration from the config file.
+/// <para>
+/// Every <c>int</c> member whose code initializer is NON-ZERO carries
+/// <c>[YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]</c>. The shared writer
+/// (see <see cref="ConfigRepoManager"/>) configures <c>OmitDefaults</c>, which otherwise drops any
+/// value equal to the CLR default (<c>0</c> for <c>int</c>) regardless of the property
+/// initializer — so a persisted <c>0</c> would silently revert to the code default on restart.
+/// <c>Preserve</c> keeps a <c>0</c> written explicitly; non-zero values are unaffected.
+/// </para>
 /// </summary>
 public sealed class OrchestratorConfig
 {
@@ -18,23 +28,28 @@ public sealed class OrchestratorConfig
     /// </summary>
     public string? Model { get; set; }
     /// <summary>Maximum number of goal iterations before giving up.</summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int MaxIterations { get; set; } = Constants.DefaultMaxIterations;
     /// <summary>Maximum number of retries per individual task.</summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int MaxRetriesPerTask { get; set; } = Constants.DefaultMaxRetriesPerTask;
     /// <summary>
     /// Maximum number of goals to execute in parallel. Default: 1 (sequential).
     /// Set to a value &gt; 1 to enable concurrent goal execution. When multiple goals
     /// run in parallel, each has its own Brain session forked from the master.
     /// </summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int MaxParallelGoals { get; set; } = 1;
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
     public bool VerboseLogging { get; set; }
     /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int BrainMaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
     /// <summary>
     /// Delay in hours before deleting feature branches for completed goals.
     /// Default: 48 hours. Set to 0 for immediate cleanup.
     /// </summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int BranchCleanupDelayHours { get; set; } = 48;
 
     /// <summary>
@@ -44,7 +59,10 @@ public sealed class OrchestratorConfig
     /// last activity, not wall-clock task duration. Default: 60 minutes. A value of 0 or less
     /// disables ONLY this inactivity-based reclaiming; stale-heartbeat worker removal and the
     /// held-attempt adoption sweep in <see cref="Services.StaleWorkerCleanupService"/> still run.
+    /// A persisted <c>0</c> is written to the config file explicitly (see the type-level remarks),
+    /// so "disabled" survives a restart.
     /// </summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int WorkerTaskTimeoutMinutes { get; set; } = Services.CleanupDefaults.WorkerTaskTimeoutMinutes;
 
     /// <summary>

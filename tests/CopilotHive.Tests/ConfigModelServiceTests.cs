@@ -1176,9 +1176,10 @@ public sealed class ConfigModelServiceTests : IDisposable
     /// Zero is the documented "disabled" value and is NOT the DTO's omitted marker: a 0 must
     /// reach the live config (where the cleanup service treats it as "never reclaim inactive
     /// tasks") rather than being dropped as a no-op. The written YAML changes too: the seeded
-    /// <c>worker_task_timeout_minutes: 90</c> key disappears, because the shared writer's
-    /// <c>OmitDefaults</c> convention omits CLR-default values (the same convention that already
-    /// applies to <c>branch_cleanup_delay_hours: 0</c>).
+    /// <c>worker_task_timeout_minutes: 90</c> is replaced by an explicit
+    /// <c>worker_task_timeout_minutes: 0</c>, because the member carries
+    /// <c>DefaultValuesHandling.Preserve</c> — the shared writer's <c>OmitDefaults</c> convention
+    /// would otherwise drop the CLR-default <c>0</c> and a restart would silently re-read 60.
     /// </summary>
     [Fact]
     public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesZero_AppliesZeroToConfig()
@@ -1213,27 +1214,26 @@ public sealed class ConfigModelServiceTests : IDisposable
         // is the authority the cleanup service reads.
         Assert.Equal(0, config.Orchestrator.WorkerTaskTimeoutMinutes);
 
-        // The write path ran again and committed, and the file no longer carries the stale 90.
+        // The write path ran again and committed, and the file carries the explicit 0 — so the
+        // "disabled" setting survives a restart instead of reverting to the 60 default.
         Assert.Equal(2, repo.Commits.Count);
         Assert.Equal("hive-config.yaml", repo.Commits[1].File);
         var after = await File.ReadAllTextAsync(configPath, TestContext.Current.CancellationToken);
         Assert.DoesNotContain("worker_task_timeout_minutes: 90", after);
-        Assert.DoesNotContain("worker_task_timeout_minutes", after);
+        Assert.Contains("worker_task_timeout_minutes: 0", after);
     }
 
     /// <summary>
-    /// LIMITATION PIN (pre-existing, repo-wide — NOT introduced by this field): the shared YAML
-    /// serializer (`ConfigRepoManager.YamlSerializer`) uses
-    /// <c>DefaultValuesHandling.OmitDefaults</c>, which omits any member whose value equals the
-    /// CLR default — so a persisted <c>0</c> is indistinguishable from an absent key and a
-    /// restart re-reads the 60 default. The same convention already applies to the documented
-    /// <c>BranchCleanupDelayHours = 0</c> ("immediate cleanup"). Inside one process the live
-    /// config carries the 0 (see the test above); this test records the writer's convention so
-    /// the boundary stays machine-visible. If the serializer later persists CLR-default values,
-    /// this test fails and must be updated to assert the key's presence.
+    /// PERSISTENCE PIN for the documented "disabled" value: <c>WorkerTaskTimeoutMinutes = 0</c>
+    /// reaches the shared YAML writer and MUST be written as an explicit
+    /// <c>worker_task_timeout_minutes: 0</c>. The member carries
+    /// <c>[YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]</c>, which overrides
+    /// the writer's <c>OmitDefaults</c> convention for THIS member only — without the attribute the
+    /// CLR-default <c>0</c> is dropped, the "disabled" setting is lost on restart, and the 60 code
+    /// default silently comes back.
     /// </summary>
     [Fact]
-    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesZero_WriterOmitsClrDefaultValue()
+    public async Task UpdateOrchestratorSettingsAsync_WorkerTaskTimeoutMinutesZero_WriterPersistsZero()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
@@ -1251,11 +1251,12 @@ public sealed class ConfigModelServiceTests : IDisposable
         var yaml = await File.ReadAllTextAsync(
             Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
 
-        // Control: a NON-default value in the same update IS persisted, so the omission below is
-        // the writer's CLR-default rule and not a missing write.
+        // Control: a NON-default value in the same update IS persisted, so the assertion below is
+        // about the zero specifically and not a missing write.
         Assert.Contains("max_iterations: 5", yaml);
         Assert.Contains("branch_cleanup_delay_hours: 12", yaml);
-        Assert.DoesNotContain("worker_task_timeout_minutes", yaml);
+        // The persisted 0 (the point of this pin): the key IS present, with the literal value 0.
+        Assert.Contains("worker_task_timeout_minutes: 0", yaml);
     }
 
     /// <summary>

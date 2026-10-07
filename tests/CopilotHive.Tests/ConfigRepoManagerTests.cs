@@ -1658,6 +1658,214 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Equal("updated-model", second.Orchestrator.Model);
     }
 
+    // ── WriteConfigAsync: persisted zero values (per-member DefaultValuesHandling.Preserve) ──
+
+    /// <summary>
+    /// The complete set of config members that carry
+    /// <c>[YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]</c> because their
+    /// code initializer is NON-ZERO: <c>&lt;member&gt;</c> → the <c>snake_case</c> YAML key the
+    /// shared writer produces for it, a setter that stores an EXPLICIT <c>0</c> there (leaving every
+    /// other member at its code default), and a reader that reads the value back from a parsed
+    /// config. This table is the single source of truth for the round-trip theory below; an
+    /// attributed member missing from it is caught by <see cref="PreservedZeroMembers_CoverEveryAttributedMember"/>.
+    /// </summary>
+    private static readonly (string Member, string YamlKey, Action<HiveConfigFile> SetZero, Func<HiveConfigFile, int> ReadBack)[] PreservedZeroMembers =
+    [
+        ("MaxIterations", "max_iterations",
+            c => c.Orchestrator.MaxIterations = 0,
+            c => c.Orchestrator.MaxIterations),
+        ("MaxRetriesPerTask", "max_retries_per_task",
+            c => c.Orchestrator.MaxRetriesPerTask = 0,
+            c => c.Orchestrator.MaxRetriesPerTask),
+        ("MaxParallelGoals", "max_parallel_goals",
+            c => c.Orchestrator.MaxParallelGoals = 0,
+            c => c.Orchestrator.MaxParallelGoals),
+        ("BrainMaxSteps", "brain_max_steps",
+            c => c.Orchestrator.BrainMaxSteps = 0,
+            c => c.Orchestrator.BrainMaxSteps),
+        ("BranchCleanupDelayHours", "branch_cleanup_delay_hours",
+            c => c.Orchestrator.BranchCleanupDelayHours = 0,
+            c => c.Orchestrator.BranchCleanupDelayHours),
+        ("WorkerTaskTimeoutMinutes", "worker_task_timeout_minutes",
+            c => c.Orchestrator.WorkerTaskTimeoutMinutes = 0,
+            c => c.Orchestrator.WorkerTaskTimeoutMinutes),
+        ("MaxSteps", "max_steps",
+            c => c.Composer = new ComposerConfig { MaxSteps = 0 },
+            c => c.Composer!.MaxSteps),
+        ("CiTimeoutMinutes", "ci_timeout_minutes",
+            c => c.Repositories = [new RepositoryConfig { Name = "round-trip-repo", Url = "https://example.com/round-trip.git", CiTimeoutMinutes = 0 }],
+            c => c.Repositories[0].CiTimeoutMinutes)
+    ];
+
+    /// <summary>
+    /// Resolves a table entry by member name. Fail-fast: an unknown name THROWS rather than
+    /// silently selecting a default, so a renamed <c>[InlineData]</c> can never test another member.
+    /// </summary>
+    private static (string Member, string YamlKey, Action<HiveConfigFile> SetZero, Func<HiveConfigFile, int> ReadBack) PreservedZeroMember(string member)
+    {
+        foreach (var entry in PreservedZeroMembers)
+        {
+            if (entry.Member == member)
+                return entry;
+        }
+
+        throw new InvalidOperationException(
+            $"'{member}' is not in the PreservedZeroMembers table — the theory data and the table have diverged.");
+    }
+
+    /// <summary>
+    /// ROUND TRIP for every member that carries <c>DefaultValuesHandling.Preserve</c>: a member set
+    /// to an EXPLICIT <c>0</c> must appear in the written <c>hive-config.yaml</c> as
+    /// <c>&lt;key&gt;: 0</c> and must parse back through <see cref="ConfigRepoManager.ParseConfig"/>
+    /// (the path a RESTART uses) as <c>0</c>, not as the code default.
+    /// <para>
+    /// DISCRIMINATING: with <c>OmitDefaults</c> alone, the CLR default <c>0</c> is dropped (and the
+    /// whole section can collapse to <c>{}</c>), so removing the attribute from ANY one of these
+    /// members fails that member's case — the key is absent from disk and the parsed value reverts
+    /// to the non-zero code default. The assertion is on the RAW YAML TEXT, not on a re-parse, so a
+    /// future change that starts omitting the key cannot be masked by a coincidence of values.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("MaxIterations")]
+    [InlineData("MaxRetriesPerTask")]
+    [InlineData("MaxParallelGoals")]
+    [InlineData("BrainMaxSteps")]
+    [InlineData("BranchCleanupDelayHours")]
+    [InlineData("WorkerTaskTimeoutMinutes")]
+    [InlineData("MaxSteps")]
+    [InlineData("CiTimeoutMinutes")]
+    public async Task WriteConfigAsync_NonZeroDefaultIntMemberSetToZero_IsPersistedAndRoundTrips(string member)
+    {
+        // Fail-fast lookup: an unknown name THROWS rather than silently testing another member.
+        var (_, yamlKey, setZero, readBack) = PreservedZeroMember(member);
+
+        // Arrange: only THIS member is set, and to an explicit 0. Every other member keeps its
+        // code default (which is non-zero for the members under test).
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        setZero(config);
+        Assert.Equal(0, readBack(config));
+
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        // Act: write through the production writer to a real file on disk.
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+        var disk = await ReadWrittenYamlAsync(manager);
+
+        // Assert (1): the RAW persistence contract — the snake_case key is present with value 0.
+        Assert.Contains($"{yamlKey}: 0", disk, StringComparison.Ordinal);
+
+        // Assert (2): the restart path — the same file parsed by the production parser keeps the 0.
+        var reparsed = ConfigRepoManager.ParseConfig(disk);
+        Assert.Equal(0, readBack(reparsed));
+    }
+
+    /// <summary>
+    /// NOT-OVER-BROAD control for the round-trip theory: <see cref="WorkerConfig.ContextWindow"/>
+    /// has a ZERO code initializer, where <c>0</c> means "unset" (no per-role override). It must
+    /// NOT carry the attribute, so an explicit <c>0</c> is still OMITTED from the file — the
+    /// per-member <c>Preserve</c> is targeted, never a blanket "serialize every zero".
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_ZeroDefaultMemberSetToZero_IsStillOmitted()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new() { Model = "coder-model", ContextWindow = 0 }
+            }
+        };
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+        var disk = await ReadWrittenYamlAsync(manager);
+
+        // Positive control: the section IS written, so the absence below is the omission rule and
+        // not a missing write.
+        Assert.Contains("coder-model", disk, StringComparison.Ordinal);
+        Assert.DoesNotContain("context_window", disk, StringComparison.Ordinal);
+        Assert.Equal(0, ConfigRepoManager.ParseConfig(disk).Workers["coder"].ContextWindow);
+    }
+
+    /// <summary>
+    /// Completeness/removal guard for the per-member attribute: every NON-ZERO-initializer
+    /// <c>int</c> member of the YAML-bound config types must carry
+    /// <c>YamlMemberAttribute.DefaultValuesHandling = DefaultValuesHandling.Preserve</c>, and the
+    /// round-trip theory's table must name every one of them. Reflection over the REAL config types
+    /// (not a hand-kept list) is what makes an attribute deleted from a member, or a member added
+    /// without one, fail loudly — the round-trip theory alone would not notice a ninth member.
+    /// <para>
+    /// The expected set is derived from the members' own runtime initializers: a default-constructed
+    /// instance whose <c>int</c> member is non-zero is dropped as a CLR default by the writer's
+    /// <c>OmitDefaults</c> convention unless it is preserved. Zero-initialized members
+    /// (<see cref="WorkerConfig.ContextWindow"/>) are excluded BY CONSTRUCTION — their omission is
+    /// intentional, so they must NOT carry the attribute.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void PreservedZeroMembers_CoverEveryAttributedMember()
+    {
+        var zeroDefaultMembers = new List<string>();
+        var nonZeroDefaultMembers = new List<string>();
+
+        void Inspect(Type type, object instance, string path)
+        {
+            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (prop.PropertyType != typeof(int) || prop.GetIndexParameters().Length != 0)
+                    continue;
+
+                var value = (int)prop.GetValue(instance)!;
+                if (value == 0)
+                {
+                    zeroDefaultMembers.Add($"{path}.{prop.Name}");
+                    continue;
+                }
+
+                nonZeroDefaultMembers.Add($"{path}.{prop.Name}");
+                Assert.True(
+                    HasPreserveAttribute(prop),
+                    $"{path}.{prop.Name} has the non-zero initializer {value} but does NOT carry " +
+                    "DefaultValuesHandling.Preserve — a persisted 0 would be dropped from hive-config.yaml.");
+            }
+        }
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig(),
+            Repositories = [new RepositoryConfig { Name = "n", Url = "https://example.com/n.git" }]
+        };
+
+        Inspect(typeof(OrchestratorConfig), config.Orchestrator, "Orchestrator");
+        Inspect(typeof(ComposerConfig), config.Composer!, "Composer");
+        Inspect(typeof(RepositoryConfig), config.Repositories[0], "RepositoryConfig");
+        Inspect(typeof(WorkerConfig), new WorkerConfig(), "WorkerConfig");
+
+        // The zero-initializer exclusion set is real, not vacuous: the only zero-initialized int
+        // member is WorkerConfig.ContextWindow, and it must NOT be attributed ("unset" is 0 there).
+        Assert.Equal(["WorkerConfig.ContextWindow"], zeroDefaultMembers);
+        Assert.False(HasPreserveAttribute(typeof(WorkerConfig).GetProperty(nameof(WorkerConfig.ContextWindow))!),
+            "WorkerConfig.ContextWindow is 0-initialized (0 means unset) and must stay omitted from YAML.");
+
+        // Every attributed member is in the round-trip table, and the table has no stale entries:
+        // both sides are the BARE member names.
+        Assert.Equal(
+            nonZeroDefaultMembers.Select(p => p[(p.IndexOf('.') + 1)..]).OrderBy(x => x, StringComparer.Ordinal),
+            PreservedZeroMembers.Select(e => e.Member).OrderBy(x => x, StringComparer.Ordinal));
+
+        // Pinned cardinality: the eight members this goal attributes (a new member must be added
+        // to the table AND attributed, or this fails).
+        Assert.Equal(8, nonZeroDefaultMembers.Count);
+
+        static bool HasPreserveAttribute(PropertyInfo prop) =>
+            prop.GetCustomAttributes(typeof(YamlMemberAttribute), inherit: true)
+                .Cast<YamlMemberAttribute>()
+                .Any(a => a.DefaultValuesHandling == DefaultValuesHandling.Preserve);
+    }
+
     // ── WriteConfigAsync snapshot serialization fidelity tests ───────────────
 
     /// <summary>

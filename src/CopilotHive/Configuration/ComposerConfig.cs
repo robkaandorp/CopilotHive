@@ -1,7 +1,15 @@
+using YamlDotNet.Serialization;
+
 namespace CopilotHive.Configuration;
 
 /// <summary>
 /// Configuration for the Composer conversational agent.
+/// <para>
+/// An <c>int</c> member whose code initializer is NON-ZERO carries
+/// <c>[YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]</c>: the shared writer's
+/// <c>OmitDefaults</c> convention would otherwise drop a persisted <c>0</c> (the CLR default),
+/// silently reverting the value to the code default on restart.
+/// </para>
 /// </summary>
 public sealed class ComposerConfig
 {
@@ -10,6 +18,7 @@ public sealed class ComposerConfig
     /// parse time (see <see cref="ConfigRepoManager.ParseConfig"/>).</summary>
     public string? Model { get; set; }
     /// <summary>Maximum tool-call steps per Composer request.</summary>
+    [YamlMember(DefaultValuesHandling = DefaultValuesHandling.Preserve)]
     public int MaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
 
     /// <summary>
