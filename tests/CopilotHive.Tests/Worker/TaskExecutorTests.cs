@@ -3276,6 +3276,10 @@ public sealed class TaskExecutorTests
                 ["commit", "-m", ImproverCommitMessage],
                 ["remote", "get-url", "origin"],
                 ["pull", "--no-rebase", "origin"],
+                // The CONFLICT CLASSIFICATION status query runs between the failed pull and the
+                // abort: its (empty) output proves no resolvable agents.md conflict, so the
+                // established abort/no-push outcome follows unchanged.
+                ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
                 ["merge", "--abort"],
                 .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
             ]);
@@ -3841,6 +3845,10 @@ public sealed class TaskExecutorTests
                 "diff --cached --name-only -z",
                 $"commit -m \"{ImproverCommitMessage}\"",
                 "pull --no-rebase",
+                // The CONFLICT CLASSIFICATION status query runs between the failed pull and the
+                // abort: its (empty) output proves no resolvable agents.md conflict, so the
+                // established abort/no-push outcome follows unchanged.
+                "status --porcelain=v1 --untracked-files=all --ignored",
                 "merge --abort",
                 .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
             ],
@@ -7734,20 +7742,36 @@ public sealed class TaskExecutorTests
         // ── Boundary 0: the starting remote SHA ───────────────────────────────
         var remoteShaBeforeRun1 = playground.RemoteMainSha();
 
-        // The rejected-push mechanism: a pre-push hook that advances the bare remote ONCE,
-        // between this worker's fetch and its push. Git then refuses the non-fast-forward
-        // update on its own — the rejection is real, not simulated.
+        // The rejected-push mechanism: a pre-push hook that advances the bare remote DURING this
+        // worker's push. Git then refuses the ref update on its own — the rejection is real, not
+        // simulated.
+        //
+        // THE ADVANCE IS BUDGETED TO THE TWO PERMITTED PUBLICATION ATTEMPTS. Under the new bounded
+        // retry rule a non-fast-forward rejection (`[rejected]` together with `(fetch first)` or
+        // `(non-fast-forward)`) starts a SECOND attempt, so the second push must be rejected too
+        // and the run must still fail without ever launching a THIRD push. This environment's
+        // LOCAL transport reports the receive-pack ref-lock shape instead —
+        //   remote: error: cannot lock ref 'refs/heads/main': is at … but expected …
+        //   ! [remote rejected] … (failed to update ref)
+        // — which carries neither marker and is therefore NOT retryable, so exactly ONE attempt
+        // happens here. The budget keeps the fixture truthful under EITHER wording. It is zeroed
+        // before run 2 (whose publication must succeed), and every push attempt is recorded, so
+        // the "no third push" bound is pinned independently of git's message.
         var interloperContent = "REMOTE-INTERLOPER-V2\n";
         var hookPath = Path.Combine(worker, ".git", "hooks", "pre-push");
-        var advanceMarker = Path.Combine(worker, ".git", "ADVANCE_ONCE");
+        var advanceBudget = Path.Combine(worker, ".git", "ADVANCE_BUDGET");
+        var pushAttemptLog = Path.Combine(playground.Root, "push-attempts.txt");
         var pusherScriptDir = Path.Combine(playground.Root, "hook-pusher");
         Directory.CreateDirectory(pusherScriptDir);
         File.WriteAllText(
             hookPath,
             $"""
             #!/bin/sh
-            if [ -f '{advanceMarker}' ]; then
-              rm -f '{advanceMarker}'
+            echo attempt >> '{pushAttemptLog}'
+            remaining=$(cat '{advanceBudget}' 2>/dev/null || echo 0)
+            case "$remaining" in ''|*[!0-9]*) remaining=0 ;; esac
+            if [ "$remaining" -gt 0 ]; then
+              echo $((remaining - 1)) > '{advanceBudget}'
               rm -rf '{pusherScriptDir}/clone'
               git -c protocol.file.allow=always clone -q '{playground.RemoteDir}' '{pusherScriptDir}/clone'
               cd '{pusherScriptDir}/clone' || exit 0
@@ -7769,7 +7793,7 @@ public sealed class TaskExecutorTests
                 | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
                 | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
         }
-        File.WriteAllText(advanceMarker, "");
+        File.WriteAllText(advanceBudget, "2");
 
         // ── RUN 1: the improver's own publication commits; the push loses the race ──
         // The agent EDITS the guidance file (its real job); TaskExecutor's publication stage
@@ -7814,6 +7838,14 @@ public sealed class TaskExecutorTests
         Assert.Equal("FAIL", run1Result.Metrics!.Verdict);
         Assert.False(run1Result.GitStatus!.Pushed);
         Assert.DoesNotContain("fatal:", run1Result.Output, StringComparison.Ordinal);
+        // THE RETRY BOUND: this rejection is bounded to two publication attempts, so at most TWO
+        // pushes were attempted and no third was ever launched. (Were the retry loop unbounded, or
+        // its bound raised above two, the witness below would show a third attempt; a rejection
+        // that is NOT retryable shows exactly one.)
+        var pushAttempts = File.Exists(pushAttemptLog)
+            ? File.ReadAllLines(pushAttemptLog).Length
+            : 0;
+        Assert.InRange(pushAttempts, 1, 2);
 
         // CLEAN-AT-STEP-END: the rejected push had no confirmed publication, so run 1's own
         // finalization already restored the checkout to the captured fetched baseline — the
@@ -7835,6 +7867,9 @@ public sealed class TaskExecutorTests
         // already restored the branch. Run 2's preparation still re-fetches and re-restores.
 
         // ── RUN 2: preparation must discard the abandoned commit ─────────────
+        // RUN 2's own publication MUST SUCCEED: its advance budget is spent, so the hook can no
+        // longer move the remote under that push.
+        File.WriteAllText(advanceBudget, "0");
         var remoteShaBeforeRun2 = playground.RemoteMainSha();
         string? run2SeenHead = null;
         string? run2SeenGuidance = null;
@@ -10558,4 +10593,1406 @@ public sealed class TaskExecutorTests
         public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
             => throw failure;
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // (e) CONFLICT RESOLUTION AND THE BOUNDED PUBLICATION RETRY
+    //
+    // A post-commit `pull --no-rebase` that RETURNS nonzero is CLASSIFIED from the verbose
+    // porcelain status: only a proven UU/AA direct-child agents/<name>.agents.md conflict is
+    // resolved in the same session and then published, within at most two publication attempts.
+    // Every other shape keeps the pre-goal outcome byte for byte.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>The single conflicted guidance file every qualifying-conflict vector uses.</summary>
+    private const string ConflictFile = "agents/coder.agents.md";
+
+    /// <summary>
+    /// The publication-attempt bound the goal specifies. <c>TaskExecutor</c> keeps its own private
+    /// constant; this test-side mirror is what the retry vectors COUNT, so a bound change in either
+    /// direction (unbounded, or raised above two) fails them.
+    /// </summary>
+    private const int MaxPublicationAttemptBound = 2;
+
+    /// <summary>
+    /// The status record of a QUALIFYING conflict: exactly one <c>UU</c> unmerged entry on the
+    /// direct child <see cref="ConflictFile"/>.
+    /// </summary>
+    private const string QualifyingConflictStatus = "UU agents/coder.agents.md\n";
+
+    /// <summary>
+    /// The conflict-markered content git leaves behind after a conflicted agents-file merge: BOTH
+    /// sides are present and all three marker prefixes are on their OWN line starts.
+    /// </summary>
+    private const string ConflictMarkerContent =
+        "<<<<<<< HEAD\nLOCAL-LESSON\n=======\nREMOTE-LESSON\n>>>>>>> origin/main\n";
+
+    /// <summary>The classification <c>status</c> query's tokenized form (deliberately no <c>-z</c>).</summary>
+    private static readonly string[] ClassificationStatusLaunch =
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"];
+
+    /// <summary>The pre-goal pull-failure reason for a stdout-only conflict on <see cref="ConflictFile"/>.</summary>
+    private const string OldPullFailureReason =
+        "git pull failed (exit 1): stdout: CONFLICT (content): Merge conflict in agents/coder.agents.md " +
+        "— push not attempted after the failed pull";
+
+    /// <summary>
+    /// The conflict-resolution prompt contract: it NAMES the conflicted file, instructs a BOTH-SIDES
+    /// merge (the remote side's lessons kept, this run's new lessons added), instructs removing every
+    /// conflict marker, keeps the protected safety guidance, pins the configured character limit, and
+    /// explicitly forbids picking one side wholesale.
+    /// </summary>
+    private static void AssertResolutionPromptContent(string prompt, string conflictedFile)
+    {
+        Assert.Contains(conflictedFile, prompt, StringComparison.Ordinal);
+        Assert.Contains("MERGING BOTH SIDES", prompt, StringComparison.Ordinal);
+        Assert.Contains("Keep the lessons the incoming (remote) side added.", prompt, StringComparison.Ordinal);
+        Assert.Contains("Add the new lessons this run produced that are still missing.", prompt, StringComparison.Ordinal);
+        Assert.Contains("Remove EVERY conflict marker", prompt, StringComparison.Ordinal);
+        Assert.Contains($"{WorkerConstants.AgentsMdMaxCharacters} characters", prompt, StringComparison.Ordinal);
+        Assert.Contains("Do NOT choose one side wholesale", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A SEAM responder in which the FIRST status query (the preparation's post-restore
+    /// verification) answers EMPTY — a clean working tree — and the SECOND (the conflict
+    /// classification) answers <paramref name="classification"/>. Every other command is delegated
+    /// to <paramref name="extra"/>; an unhandled command falls through to
+    /// <see cref="ConfigRepoPreparationFakes.SeamAnswer"/>.
+    /// </summary>
+    private static Func<IReadOnlyList<string>, GitProcessResult?> SeamConflictResponder(
+        Func<GitProcessResult?> classification,
+        Func<IReadOnlyList<string>, GitProcessResult?>? extra = null)
+    {
+        var statusCalls = 0;
+        return tokens =>
+        {
+            if (tokens is ["status", ..])
+            {
+                var call = ++statusCalls;
+                return call == 2 ? classification() : new GitProcessResult(0, string.Empty, string.Empty);
+            }
+
+            return extra?.Invoke(tokens);
+        };
+    }
+
+    /// <summary>
+    /// The publication-stage answers shared by the conflict vectors: a non-empty staged diff and a
+    /// post-commit pull that RETURNS a nonzero exit with a stdout-only conflict record.
+    /// </summary>
+    private static Func<IReadOnlyList<string>, GitProcessResult?> ConflictPublicationStage(
+        string stagedPath = ConflictFile) =>
+        tokens => tokens switch
+        {
+            ["diff", ..] => new GitProcessResult(0, StagedOutput(stagedPath), string.Empty),
+            ["pull", "--no-rebase", ..] => new GitProcessResult(
+                1, $"CONFLICT (content): Merge conflict in {stagedPath}", string.Empty),
+            _ => null,
+        };
+
+    /// <summary>
+    /// The launched commands AFTER the <paramref name="occurrence"/>th <c>pull --no-rebase</c> — the
+    /// window that carries the classification (and, on a retry, the resolved republication).
+    /// </summary>
+    private static List<string[]> LaunchesAfterPull(SeamProcessRunnerFake fake, int occurrence = 1)
+    {
+        var seen = 0;
+        for (var i = 0; i < fake.Launched.Count; i++)
+        {
+            if (fake.Launched[i] is ["pull", "--no-rebase", ..] && ++seen == occurrence)
+                return [.. fake.Launched.Skip(i + 1)];
+        }
+
+        Assert.Fail($"the post-commit pull occurrence {occurrence} never launched");
+        return [];
+    }
+
+    /// <summary>
+    /// The FAIL-CLOSED contract for a non-qualifying pull failure: ONLY the initial prompt ran (no
+    /// resolution prompt at all), the classification <c>status</c> really was launched, the merge was
+    /// aborted, nothing was staged or pushed, and the reason is the unchanged pre-goal wording.
+    /// </summary>
+    private static void AssertFailClosedPullFailure(
+        SeamProcessRunnerFake fake, MockAgentRunner agent, TaskResult result, string expectedReason)
+    {
+        Assert.Single(agent.PromptCalls);
+
+        var afterPull = LaunchesAfterPull(fake);
+        Assert.Contains(afterPull, t => t is ["status", ..]);
+        Assert.Contains(afterPull, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(afterPull, t => t is ["add", ..] or ["commit", ..] or ["push", ..]);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Contains(OldPullFailureReason, expectedReason, StringComparison.Ordinal);
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git pull failed"));
+        Assert.Equal(expectedReason, issue);
+        Assert.Contains(expectedReason, result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 1 — RESOLVED. A post-commit pull that RETURNS nonzero with a qualifying
+    /// <c>UU agents/coder.agents.md</c> conflict is resolved IN THE SAME SESSION and published: the
+    /// launch sequence is pull → classification status → add → commit → a FRESH publication-HEAD
+    /// check → push, with NO <c>merge --abort</c> anywhere, and the confirmed publication reports
+    /// Completed/PASS with Pushed=true. The resolution prompt names the conflicted file and its
+    /// output reaches the task Output under the evidence header.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_QualifyingConflict_ResolvesCommitsAndPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsFile = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string InitialOutput = "initial improver analysis";
+        const string ResolutionOutput = "RESOLVED-BOTH-SIDES";
+
+        // PREMISE: the working tree really holds conflict-markered guidance, and the classification
+        // status really announces ONE unmerged direct-child agents file.
+        File.WriteAllText(agentsFile, ConflictMarkerContent);
+        Assert.Contains("<<<<<<<", File.ReadAllText(agentsFile), StringComparison.Ordinal);
+        Assert.StartsWith("UU agents/", QualifyingConflictStatus, StringComparison.Ordinal);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (++prompts == 1)
+                    return Task.FromResult(InitialOutput);
+
+                // THE RESOLUTION: both sides survive and no marker remains.
+                File.WriteAllText(agentsFile, "LOCAL-LESSON\nREMOTE-LESSON\nTHIS-RUN-LESSON\n");
+                return Task.FromResult(ResolutionOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-qualifying", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // THE EXACT SEQUENCE: the classification status replaces the abort, the resolved content is
+        // staged and committed, and the publication HEAD is resolved FRESH before the push.
+        AssertLaunchedSequence(fake,
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                // the INITIAL improvement commit of this run
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                // publication attempt 1: the pull CONFLICTS, the classification qualifies, and the
+                // same session resolves it — so the abort is replaced by the resolved re-commit
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ClassificationStatusLaunch,
+                ["add", "agents/*.agents.md"],
+                ["commit", "-m", ImproverCommitMessage],
+                // the FRESH publication-HEAD check of this attempt, then the confirmed push
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+                ["check-ref-format", "--allow-onelevel", "HEAD"],
+                ["remote", "get-url", "origin"],
+                ["push", "origin", "HEAD"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
+            ]);
+
+        Assert.DoesNotContain(fake.Launched, t => t is ["merge", ..]);
+
+        // TWO prompts: the initial one and the ONE resolution prompt, delivered in the config agents
+        // directory, carrying the full both-sides contract.
+        Assert.Equal(2, agent.PromptCalls.Count);
+        Assert.Equal(Path.Combine(configRepoDir, "agents"), agent.PromptCalls[1].WorkDir);
+        AssertResolutionPromptContent(agent.PromptCalls[1].Prompt, ConflictFile);
+
+        // TRUTHFUL PUBLICATION: Completed/PASS with the confirmed push.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+
+        // EVIDENCE: the resolution answer is in Output under its own header, after the initial output,
+        // and the resolution really repaired the file that was published.
+        Assert.Contains(InitialOutput, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config repo conflict resolution]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(ResolutionOutput, result.Output, StringComparison.Ordinal);
+        Assert.True(
+            result.Output.IndexOf(InitialOutput, StringComparison.Ordinal)
+                < result.Output.IndexOf(ResolutionOutput, StringComparison.Ordinal),
+            "the initial output precedes the resolution evidence");
+        Assert.Equal("LOCAL-LESSON\nREMOTE-LESSON\nTHIS-RUN-LESSON\n", File.ReadAllText(agentsFile));
+    }
+
+    /// <summary>
+    /// VECTOR 1b — THE COMMON REAL-WORLD CASE QUALIFIES. A conflicted agents-file merge does not
+    /// leave ONLY the unmerged entry behind: every file that merged CLEANLY is still listed by
+    /// <c>status --porcelain=v1</c> too — the STAGED-ONLY <c>M  </c> (X=M, Y=space: index
+    /// modification) and <c>A  </c> (index addition) records below. The classification must admit
+    /// those SUPPORTED records alongside the qualifying <c>UU agents/coder.agents.md</c> entry, so
+    /// the full resolved path runs: pull → status → ONE resolution prompt → both gates clean → add →
+    /// merge-concluding commit → a FRESH publication HEAD → push, with NO <c>merge --abort</c> and a
+    /// confirmed Pushed=true Completed/PASS publication. The resolution answer reaches Output under
+    /// the evidence header.
+    /// <para>
+    /// PREMISE-ASSERTED: the fed record really does carry BOTH staged-only entries (the premise
+    /// assertions below recompute them from the literals and require them in the same fed string that
+    /// reaches the fake), so the test cannot pass against a pair table that dropped the staged-only
+    /// shapes from the supported domain.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_CleanlyMergedStagedOnlyEntriesBesideTheConflict_ResolvesCommitsAndPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsFile = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string InitialOutput = "initial improver analysis";
+        const string ResolutionOutput = "RESOLVED-ALONGSIDE-CLEAN-MERGES";
+
+        // The status record a real conflicted merge produces: the ONE unmerged entry PLUS the
+        // staged-only records of the files that merged cleanly. BOTH cleanly merged shapes are
+        // STAGED-ONLY: X carries the index status (M / A) and Y is a SPACE (nothing further in the
+        // worktree). ` M` would be the WORKTREE-only direction and is deliberately NOT what this
+        // vector feeds.
+        const string StagedOnlyModified = "M  agents/tester.agents.md";
+        const string StagedOnlyAddition = "A  agents/other.agents.md";
+        var statusOutput =
+            QualifyingConflictStatus + StagedOnlyModified + "\n" + StagedOnlyAddition + "\n";
+
+        // PREMISE: the fed record really carries BOTH staged-only entries alongside the qualifying
+        // unmerged entry, and neither staged-only entry is unmerged (so only a supported-domain pair
+        // table can let the classification through).
+        Assert.Contains(ConflictFile, statusOutput, StringComparison.Ordinal);
+        Assert.Equal(
+            [ConflictFile, "agents/tester.agents.md", "agents/other.agents.md"],
+            SplitLines(statusOutput).Where(l => l.Length > 0).Select(l => l[3..]).ToArray());
+        Assert.Equal("M ", StagedOnlyModified[..2]);
+        Assert.Equal("A ", StagedOnlyAddition[..2]);
+        // STAGED-ONLY means Y is a SPACE in BOTH rows — the index column, not the worktree column.
+        Assert.All(
+            new[] { StagedOnlyModified, StagedOnlyAddition },
+            entry => Assert.Equal(' ', entry[1]));
+        Assert.All(
+            new[] { StagedOnlyModified, StagedOnlyAddition },
+            entry => Assert.DoesNotContain(entry[..2], UnmergedStatusPairsForTest));
+        Assert.True(
+            IsSupportedClassificationRecord(statusOutput),
+            "premise: the staged-only entries are inside the supported qualification domain");
+
+        File.WriteAllText(agentsFile, ConflictMarkerContent);
+        Assert.Contains("<<<<<<<", File.ReadAllText(agentsFile), StringComparison.Ordinal);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, statusOutput, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (++prompts == 1)
+                    return Task.FromResult(InitialOutput);
+
+                // THE RESOLUTION: both sides survive and no marker remains.
+                File.WriteAllText(agentsFile, "LOCAL-LESSON\nREMOTE-LESSON\nTHIS-RUN-LESSON\n");
+                return Task.FromResult(ResolutionOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-clean-merges", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // THE EXACT SEQUENCE: the classification status qualifies, the abort is replaced by the
+        // resolved re-commit, and the publication HEAD is resolved FRESH before the push.
+        AssertLaunchedSequence(fake,
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                // the INITIAL improvement commit of this run
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                // publication attempt 1: the pull CONFLICTS alongside the cleanly merged records,
+                // the classification qualifies, and the same session resolves the conflict
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ClassificationStatusLaunch,
+                ["add", "agents/*.agents.md"],
+                ["commit", "-m", ImproverCommitMessage],
+                // the FRESH publication-HEAD check of this attempt, then the confirmed push
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+                ["check-ref-format", "--allow-onelevel", "HEAD"],
+                ["remote", "get-url", "origin"],
+                ["push", "origin", "HEAD"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
+            ]);
+
+        Assert.DoesNotContain(fake.Launched, t => t is ["merge", ..]);
+
+        // TWO prompts: the initial one and the ONE resolution prompt, delivered in the config agents
+        // directory, carrying the full both-sides contract.
+        Assert.Equal(2, agent.PromptCalls.Count);
+        Assert.Equal(Path.Combine(configRepoDir, "agents"), agent.PromptCalls[1].WorkDir);
+        AssertResolutionPromptContent(agent.PromptCalls[1].Prompt, ConflictFile);
+
+        // TRUTHFUL PUBLICATION: Completed/PASS with the confirmed push.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+
+        // EVIDENCE: the resolution answer is in Output under its own header, after the initial output.
+        Assert.Contains(InitialOutput, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config repo conflict resolution]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(ResolutionOutput, result.Output, StringComparison.Ordinal);
+        Assert.True(
+            result.Output.IndexOf(InitialOutput, StringComparison.Ordinal)
+                < result.Output.IndexOf(ResolutionOutput, StringComparison.Ordinal),
+            "the initial output precedes the resolution evidence");
+        Assert.Equal("LOCAL-LESSON\nREMOTE-LESSON\nTHIS-RUN-LESSON\n", File.ReadAllText(agentsFile));
+    }
+
+    /// <summary>
+    /// VECTOR 2 — MARKERS LEFT. The resolution answer leaves conflict markers in the file, so the
+    /// post-resolution content gate aborts the merge, stages nothing, pushes nothing and fails with a
+    /// <c>config repo conflict resolution failed:</c> reason naming the file and the marker cause.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_MarkersLeft_AbortsAndNeverStagesOrPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsFile = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string ResolutionOutput = "resolution-left-the-markers";
+
+        File.WriteAllText(agentsFile, ConflictMarkerContent);
+        Assert.Contains(">>>>>>>", File.ReadAllText(agentsFile), StringComparison.Ordinal);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (++prompts == 1)
+                    return Task.FromResult("initial improver analysis");
+
+                // The agent "resolved" the conflict but the markers survived.
+                File.WriteAllText(
+                    agentsFile, "MERGED-ATTEMPT\n<<<<<<< HEAD\nLOCAL\n=======\nREMOTE\n>>>>>>> origin/main\n");
+                return Task.FromResult(ResolutionOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-markers-left", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        AssertLaunchedSequence(fake,
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                // the INITIAL improvement commit of this run
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                // publication attempt 1: the classification qualifies, but the content gate rejects
+                // the marker-bearing result, so the merge is aborted and NOTHING is staged or pushed
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ClassificationStatusLaunch,
+                ["merge", "--abort"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
+            ]);
+
+        Assert.Equal(2, agent.PromptCalls.Count);
+        AssertResolutionPromptContent(agent.PromptCalls[1].Prompt, ConflictFile);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal([ConflictFile], result.GitStatus.ChangedFiles);
+
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("config repo conflict resolution failed:"));
+        Assert.StartsWith("config repo conflict resolution failed: ", issue, StringComparison.Ordinal);
+        Assert.Contains(ConflictFile, issue, StringComparison.Ordinal);
+        Assert.Contains("conflict markers remain in agents/coder.agents.md", issue, StringComparison.Ordinal);
+        Assert.Contains("nothing was staged or pushed", issue, StringComparison.Ordinal);
+
+        // EVIDENCE PRESERVED: the resolution answer survives into Output ahead of the reason.
+        Assert.Contains(ResolutionOutput, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config repo conflict resolution]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 3 — MARKERS INTRODUCED BY CONDENSATION. The resolution answer leaves the file OVER the
+    /// character limit, so the size enforcement re-prompts; that condensation brings the file back
+    /// within the limit but introduces a conflict-marker line, and the marker scan — which runs AFTER
+    /// every agent edit — catches it: abort, no push, resolution failure.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_CondensationIntroducesMarkers_AbortsAndNeverPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsFile = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string OversizedOutput = "resolution-produced-an-oversized-file";
+        const string CondensedOutput = "condensation-reintroduced-a-marker";
+
+        File.WriteAllText(agentsFile, ConflictMarkerContent);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                var call = ++prompts;
+                if (call == 1)
+                    return Task.FromResult("initial improver analysis");
+
+                if (call == 2)
+                {
+                    // The RESOLUTION answer leaves the file over the limit (no markers left).
+                    File.WriteAllText(agentsFile, new string('x', WorkerConstants.AgentsMdMaxCharacters + 1));
+                    return Task.FromResult(OversizedOutput);
+                }
+
+                // The CONDENSATION brings the size back within the limit but reintroduces a marker.
+                File.WriteAllText(
+                    agentsFile, "COMPRESSED\n=======\nREMOTE\n");
+                return Task.FromResult(CondensedOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-condense-markers", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // PREMISE: the resolution really was over the limit and the condensation really repaired the
+        // size but left a marker line behind.
+        Assert.Equal(3, agent.PromptCalls.Count);
+        Assert.Contains(
+            $"exceed the {WorkerConstants.AgentsMdMaxCharacters}-character limit",
+            agent.PromptCalls[2].Prompt, StringComparison.Ordinal);
+        var finalContent = File.ReadAllText(agentsFile);
+        Assert.True(
+            finalContent.Length <= WorkerConstants.AgentsMdMaxCharacters,
+            "premise: the condensation really brought the file within the limit");
+        Assert.Contains(
+            SplitLines(finalContent), l => l.StartsWith("=======", StringComparison.Ordinal));
+
+        var afterPull = LaunchesAfterPull(fake);
+        Assert.Contains(afterPull, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(afterPull, t => t is ["add", ..] or ["commit", ..] or ["push", ..]);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("config repo conflict resolution failed:"));
+        Assert.Contains(ConflictFile, issue, StringComparison.Ordinal);
+        Assert.Contains("conflict markers remain in agents/coder.agents.md", issue, StringComparison.Ordinal);
+
+        // EVIDENCE: the resolution AND the condensation segments both survive into Output.
+        Assert.Contains(OversizedOutput, result.Output, StringComparison.Ordinal);
+        Assert.Contains(CondensedOutput, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Agents.md size enforcement]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 4 — OVER THE LIMIT. Condensation cannot bring the resolved file within the limit even
+    /// after every permitted retry, so the content gate aborts the merge, stages nothing, pushes
+    /// nothing, and fails with the resolution-failure reason naming the file and the over-limit cause.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_ResolvedContentOverLimit_AbortsAndNeverPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsFile = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string OversizedOutput = "resolution-and-condensation-cannot-fit";
+
+        File.WriteAllText(agentsFile, ConflictMarkerContent);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (++prompts > 1)
+                    File.WriteAllText(agentsFile, new string('x', WorkerConstants.AgentsMdMaxCharacters + 1));
+
+                return Task.FromResult(prompts == 1 ? "initial improver analysis" : OversizedOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-over-limit", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // PREMISE: the initial prompt plus the ONE resolution prompt plus EVERY permitted condensation
+        // retry ran, and the file is still over the limit at the decision point.
+        Assert.Equal(1 + 1 + WorkerConstants.AgentsMdMaxRetries, agent.PromptCalls.Count);
+        Assert.True(
+            File.ReadAllText(agentsFile).Length > WorkerConstants.AgentsMdMaxCharacters,
+            "premise: the condensation really could not bring the file within the limit");
+
+        var afterPull = LaunchesAfterPull(fake);
+        Assert.Contains(afterPull, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(afterPull, t => t is ["add", ..] or ["commit", ..] or ["push", ..]);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("config repo conflict resolution failed:"));
+        Assert.Contains(ConflictFile, issue, StringComparison.Ordinal);
+        Assert.Contains(
+            $"still over the {WorkerConstants.AgentsMdMaxCharacters}-character limit", issue, StringComparison.Ordinal);
+        Assert.Contains("coder.agents.md", issue, StringComparison.Ordinal);
+        Assert.Contains("nothing was staged or pushed", issue, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 5 — NOT A CONFLICT. The post-commit pull RETURNS nonzero but the classification status
+    /// reports NO unmerged entry at all (a fetch/transport failure), so the conflict does not
+    /// qualify: the status really launched, then <c>merge --abort</c>, the unchanged pre-goal reason,
+    /// no push, and NO resolution prompt.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_NoUnmergedEntry_KeepsThePreGoalPath()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string StatusOutput = "?? leftover.txt\n";
+
+        // PREMISE: the fake status record really parses but carries NO unmerged entry at all — the
+        // exact fail-closed shape (an ordinary dirty worktree, not a proven conflict).
+        var statusLines = SplitLines(StatusOutput).Where(l => l.Length > 0).ToArray();
+        Assert.NotEmpty(statusLines);
+        Assert.DoesNotContain(
+            statusLines,
+            l => l[..2] is "DD" or "AU" or "UD" or "UA" or "DU" or "AA" or "UU");
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, StatusOutput, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-not-a-conflict", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        AssertFailClosedPullFailure(fake, agent, result, OldPullFailureReason);
+
+        // ABSENCE OF THE RESOLUTION PROMPT, observed: the ONE prompt is the initial one.
+        Assert.DoesNotContain("MERGING BOTH SIDES", Assert.Single(agent.PromptCalls).Prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 6a — THE STATUS COMMAND FAILS. A nonzero classification status keeps today's outcome:
+    /// abort, the pre-goal reason, no push and no resolution prompt. The status output is
+    /// deliberately a PERFECT conflict record, so only the failing exit code decides the outcome.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_StatusFails_KeepsThePreGoalPath()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(3, QualifyingConflictStatus, "status exploded"),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-status-fails", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        AssertFailClosedPullFailure(fake, agent, result, OldPullFailureReason);
+        Assert.DoesNotContain("MERGING BOTH SIDES", Assert.Single(agent.PromptCalls).Prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 6b — THE STATUS COMMAND THROWS. The LEGACY route is where a git command can really
+    /// THROW (the seam maps a launch failure to its own exit -1 rejection), so this pins the
+    /// classification's throw arm: abort, the pre-goal reason, no push, no resolution prompt.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_StatusThrows_KeepsThePreGoalPath()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        // The preparation's own post-restore verification issues the SAME opaque status string, so
+        // the thrower fires on the SECOND call only — the CONFLICT CLASSIFICATION. The thrower runs
+        // BEFORE the responder, so ONE shared counter decides both.
+        var statusCalls = 0;
+        var classificationThrew = false;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput(ConflictFile), string.Empty),
+                "pull --no-rebase" => (1, "CONFLICT (content): Merge conflict in agents/coder.agents.md", string.Empty),
+                // Only ever reached for the PREPARATION's status query (the classification throws).
+                "status --porcelain=v1 --untracked-files=all --ignored" => (0, string.Empty, string.Empty),
+                _ => null,
+            },
+            GitCommandThrower = args =>
+            {
+                if (args != "status --porcelain=v1 --untracked-files=all --ignored")
+                    return null;
+
+                if (++statusCalls != 2)
+                    return null;
+
+                classificationThrew = true;
+                return new InvalidOperationException("status exploded");
+            },
+        };
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-resolve-status-throws", configRepoDir, git, agentRunner: agent);
+
+        // PREMISE: the preparation's clean check ran first, and the SECOND status query — the
+        // CONFLICT CLASSIFICATION — really threw.
+        Assert.True(statusCalls >= 2, "the classification status query never ran");
+        Assert.True(classificationThrew, "the classification status did not throw — the test is vacuous");
+
+        Assert.Single(agent.PromptCalls);
+        Assert.DoesNotContain("MERGING BOTH SIDES", agent.PromptCalls[0].Prompt, StringComparison.Ordinal);
+
+        var pullIndex = git.GitCommands.IndexOf("pull --no-rebase");
+        Assert.True(pullIndex >= 0, "the post-commit pull never launched");
+        Assert.Equal(
+            "status --porcelain=v1 --untracked-files=all --ignored", git.GitCommands[pullIndex + 1]);
+        Assert.Equal("merge --abort", git.GitCommands[pullIndex + 2]);
+        Assert.DoesNotContain("push", git.GitCommands);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git pull failed"));
+        Assert.Equal(OldPullFailureReason, issue);
+        // SANITIZED: the throwing status's own message never escapes.
+        Assert.DoesNotContain("exploded", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 7 — THROWN PULL, BYTE-UNCHANGED. A pull that THROWS keeps the pre-goal path exactly: no
+    /// classification status is launched, no <c>merge --abort</c> runs, and the reason is the
+    /// sanitized <c>git pull failed with an error [...]</c> text. The full retained Output is pinned
+    /// as an EXACT string, so any added stage, note or reordering fails this test.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_ThrownPull_KeepsThePreGoalPathByteForByte()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string InitialOutput = "initial improver analysis";
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (0, StagedOutput(ConflictFile), string.Empty)
+                : null,
+            GitCommandThrower = args => args == "pull --no-rebase"
+                ? new InvalidOperationException("pull exploded")
+                : null,
+        };
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(InitialOutput),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-resolve-thrown-pull", configRepoDir, git, agentRunner: agent);
+
+        // NO classification, NO abort: the NEXT command after the thrown pull is the step-end
+        // cleanup's own worktree probe.
+        var pullIndex = git.GitCommands.IndexOf("pull --no-rebase");
+        Assert.True(pullIndex >= 0, "the post-commit pull never launched");
+        Assert.Equal("rev-parse --show-toplevel", git.GitCommands[pullIndex + 1]);
+        Assert.DoesNotContain("merge --abort", git.GitCommands);
+        Assert.DoesNotContain("push", git.GitCommands);
+        Assert.Single(agent.PromptCalls);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // BYTE-UNCHANGED: the exact pre-goal reason and the exact composed Output.
+        const string Reason = "git pull failed with an error [InvalidOperationException].";
+        Assert.Equal(Reason, Assert.Single(result.Metrics.Issues));
+        Assert.Equal($"{InitialOutput}\n\n[Config Repo Git Failure]\n{Reason}", result.Output);
+        Assert.DoesNotContain("exploded", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("[Config repo conflict resolution]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 8 — NON-QUALIFYING CONFLICT SHAPES, fail closed. For EACH of a QUOTED path, a non-agents
+    /// path, a NESTED path and a delete/modify (<c>UD</c>) entry, the classification must refuse
+    /// resolution: the status really launched, then abort, the pre-goal reason, no push, and NOT ONE
+    /// resolution prompt — the single recorded prompt is the initial one.
+    /// </summary>
+    [Theory]
+    [InlineData("UU \"agents/a b.agents.md\"\n")]
+    [InlineData("UU hive-config.yaml\n")]
+    [InlineData("UU agents/x/y.agents.md\n")]
+    [InlineData("UD agents/coder.agents.md\n")]
+    public async Task Improver_ConflictResolution_NonQualifyingConflictShape_KeepsThePreGoalPath(string statusOutput)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        // PREMISE: the fake status record really carries the offending entry the case names.
+        var entry = statusOutput.TrimEnd('\n');
+        var xy = entry[..2];
+        var path = entry[3..];
+        Assert.Equal(statusOutput, $"{xy} {path}\n");
+        Assert.True(
+            path[0] == '"' || !path.StartsWith("agents/", StringComparison.Ordinal)
+                || path[4..].Contains('/') || xy is not ("UU" or "AA"),
+            "premise: the case is genuinely non-qualifying");
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, statusOutput, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-resolve-nonqualifying-{xy}-{path.Replace('/', '_').Replace('"', 'q')}",
+            configRepoDir, seam, fake, git, agentRunner: agent);
+
+        AssertFailClosedPullFailure(fake, agent, result, OldPullFailureReason);
+        Assert.DoesNotContain("MERGING BOTH SIDES", Assert.Single(agent.PromptCalls).Prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 9 — PUSH REJECTED ONCE, then RESOLVED AND PUBLISHED. The first push is rejected
+    /// non-fast-forward, which is the ONE retryable failure, so a SECOND publication attempt runs:
+    /// its pull RETURNS nonzero with a qualifying conflict, the same session resolves it, the
+    /// publication HEAD is resolved FRESH, and the second push succeeds. The exact launch sequence
+    /// is pinned, so the fresh per-attempt HEAD check (and the resolved re-commit) is proved, and the
+    /// confirmed publication reports Completed/PASS with Pushed=true.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_PushRejectedOnce_RetriesAndPublishesTheResolvedMerge()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsFile = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string InitialOutput = "initial improver analysis";
+        const string ResolutionOutput = "RESOLVED-ON-THE-RETRY";
+
+        File.WriteAllText(agentsFile, ConflictMarkerContent);
+
+        var pulls = 0;
+        var pushes = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                tokens => tokens switch
+                {
+                    ["diff", ..] => new GitProcessResult(0, StagedOutput(ConflictFile), string.Empty),
+                    // Attempt 1's pull merges cleanly; attempt 2's CONFLICTS.
+                    ["pull", "--no-rebase", ..] => ++pulls == 1
+                        ? new GitProcessResult(0, string.Empty, string.Empty)
+                        : new GitProcessResult(
+                            1, "CONFLICT (content): Merge conflict in agents/coder.agents.md", string.Empty),
+                    // The FIRST push is the retryable non-fast-forward rejection; the SECOND succeeds.
+                    ["push", "origin", "HEAD"] => ++pushes == 1
+                        ? new GitProcessResult(
+                            1, string.Empty, " ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs")
+                        : new GitProcessResult(0, string.Empty, string.Empty),
+                    _ => null,
+                }),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (++prompts == 1)
+                    return Task.FromResult(InitialOutput);
+
+                File.WriteAllText(agentsFile, "LOCAL-LESSON\nREMOTE-LESSON\nRETRY-LESSON\n");
+                return Task.FromResult(ResolutionOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-retry-once", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // PREMISE: two pulls, two pushes, and the second attempt really conflicted.
+        Assert.Equal(2, pulls);
+        Assert.Equal(2, pushes);
+
+        // THE EXACT TWO-ATTEMPT SEQUENCE: each attempt ends with its OWN fresh publication-HEAD check
+        // before its push; attempt 2 replaces the abort with the resolved re-commit.
+        AssertLaunchedSequence(fake,
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                // the INITIAL improvement commit of this run
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                // attempt 1: a clean pull, a FRESH HEAD check, then the retryable rejection
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+                ["check-ref-format", "--allow-onelevel", "HEAD"],
+                ["remote", "get-url", "origin"],
+                ["push", "origin", "HEAD"],
+                // attempt 2: the pull conflicts, the classification qualifies, the conflict is
+                // resolved in the same session, and the publication HEAD is resolved FRESH again
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ClassificationStatusLaunch,
+                ["add", "agents/*.agents.md"],
+                ["commit", "-m", ImproverCommitMessage],
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+                ["check-ref-format", "--allow-onelevel", "HEAD"],
+                ["remote", "get-url", "origin"],
+                ["push", "origin", "HEAD"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
+            ]);
+
+        Assert.DoesNotContain(fake.Launched, t => t is ["merge", ..]);
+
+        Assert.Equal(2, agent.PromptCalls.Count);
+        AssertResolutionPromptContent(agent.PromptCalls[1].Prompt, ConflictFile);
+        Assert.Contains(ResolutionOutput, result.Output, StringComparison.Ordinal);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal("LOCAL-LESSON\nREMOTE-LESSON\nRETRY-LESSON\n", File.ReadAllText(agentsFile));
+    }
+
+    /// <summary>
+    /// VECTOR 10 — PUSH REJECTED TWICE. The retryable rejection repeats on the SECOND push, so the
+    /// bound is reached: the run fails with today's push reason and NO THIRD attempt is launched —
+    /// exactly two pull/push cycles, counted independently of the reason text.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_PushRejectedTwice_FailsWithoutAThirdAttempt()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string RetryableRejection =
+            " ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs";
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput(ConflictFile), string.Empty),
+                ["push", "origin", "HEAD"] => new GitProcessResult(1, string.Empty, RetryableRejection),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-retry-twice", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // PREMISE: the rejection really carries BOTH retryable markers, and the bound really stopped
+        // the loop after exactly two attempt cycles.
+        Assert.Contains("[rejected]", RetryableRejection, StringComparison.Ordinal);
+        Assert.Contains("(fetch first)", RetryableRejection, StringComparison.Ordinal);
+        Assert.Equal(MaxPublicationAttemptBound, fake.Launched.Count(t => t is ["pull", "--no-rebase", ..]));
+        Assert.Equal(MaxPublicationAttemptBound, fake.Launched.Count(t => t is ["push", ..]));
+
+        // TODAY'S PUSH REASON, EXACTLY — the same wording an un-retried rejection produces.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git push failed"));
+        Assert.Contains("git push failed (exit 1)", issue, StringComparison.Ordinal);
+        Assert.Contains("[rejected]", issue, StringComparison.Ordinal);
+        Assert.Contains("fetch first", issue, StringComparison.Ordinal);
+        Assert.Equal([ConflictFile], result.GitStatus.ChangedFiles);
+
+        // No resolution prompt was ever sent: no pull in this vector conflicts.
+        Assert.Single(agent.PromptCalls);
+    }
+
+    /// <summary>
+    /// VECTOR 11 — AUTH-STYLE PUSH FAILURE. A push that fails with <c>Authentication failed</c> is NOT
+    /// the retryable non-fast-forward shape, so it keeps today's handling and reason: exactly ONE
+    /// attempt cycle, no retry, and a Failed/FAIL outcome.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_AuthStylePushFailure_DoesNotRetry()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string AuthFailure =
+            "remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/org/config-repo.git/'";
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput(ConflictFile), string.Empty),
+                ["push", "origin", "HEAD"] => new GitProcessResult(128, string.Empty, AuthFailure),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-auth-push", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // PREMISE: the failure is an authentication failure and carries neither retryable marker.
+        Assert.Contains("Authentication failed", AuthFailure, StringComparison.Ordinal);
+        Assert.DoesNotContain("[rejected]", AuthFailure, StringComparison.Ordinal);
+        Assert.DoesNotContain("(fetch first)", AuthFailure, StringComparison.Ordinal);
+
+        // EXACTLY ONE attempt cycle, and today's reason — never a retry.
+        Assert.Equal(1, fake.Launched.Count(t => t is ["pull", "--no-rebase", ..]));
+        Assert.Equal(1, fake.Launched.Count(t => t is ["push", ..]));
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git push failed"));
+        Assert.Contains("git push failed (exit 128)", issue, StringComparison.Ordinal);
+        Assert.Contains("Authentication failed", issue, StringComparison.Ordinal);
+        Assert.Single(agent.PromptCalls);
+    }
+
+    /// <summary>
+    /// VECTOR 12 — THE RESOLUTION PROMPT THROWS. A non-cancellation exception from the resolution
+    /// prompt aborts the merge, keeps the accumulated evidence, and fails with a
+    /// <c>config repo conflict resolution failed:</c> reason naming the file.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_ResolutionPromptThrows_AbortsKeepsEvidenceAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string InitialOutput = "initial improver analysis";
+
+        File.WriteAllText(Path.Combine(configRepoDir, "agents", "coder.agents.md"), ConflictMarkerContent);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            // The INITIAL prompt succeeds; the RESOLUTION prompt throws a non-cancellation failure.
+            PromptResponder = (_, _, _) => ++prompts == 1
+                ? Task.FromResult(InitialOutput)
+                : throw new InvalidOperationException("resolution prompt exploded"),
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-prompt-throws", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        var afterPull = LaunchesAfterPull(fake);
+        Assert.Contains(afterPull, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(afterPull, t => t is ["add", ..] or ["commit", ..] or ["push", ..]);
+
+        Assert.Equal(2, agent.PromptCalls.Count);
+        AssertResolutionPromptContent(agent.PromptCalls[1].Prompt, ConflictFile);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("config repo conflict resolution failed:"));
+        Assert.StartsWith("config repo conflict resolution failed: ", issue, StringComparison.Ordinal);
+        Assert.Contains(ConflictFile, issue, StringComparison.Ordinal);
+        Assert.Contains("the resolution prompt failed with an error", issue, StringComparison.Ordinal);
+        // SANITIZED: the raw exception message never escapes.
+        Assert.DoesNotContain("exploded", issue, StringComparison.Ordinal);
+
+        // EVIDENCE PRESERVED on the exception's carried output: the initial agent work survives.
+        Assert.Contains(InitialOutput, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 13 — A REQUESTED CANCELLATION DURING THE RESOLUTION PROMPT. Cancellation keeps its
+    /// established semantics at the new await: the task ends Cancelled/CANCELLED, nothing is pushed,
+    /// and the accumulated evidence is composed with the bare cancellation notice — never
+    /// reclassified as a resolution failure.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_CancellationDuringTheResolutionPrompt_StaysCancelled()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        const string InitialOutput = "initial improver analysis";
+
+        File.WriteAllText(Path.Combine(configRepoDir, "agents", "coder.agents.md"), ConflictMarkerContent);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        CancellationToken? resolutionToken = null;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, promptCt) =>
+            {
+                if (++prompts == 1)
+                    return Task.FromResult(InitialOutput);
+
+                // REQUESTED CANCELLATION AT THE NEW AWAIT: the resolution prompt is handed the
+                // CALLER'S token (never a default one), cancels, and then observes the shutdown.
+                resolutionToken = promptCt;
+                cts.Cancel();
+                throw new OperationCanceledException("shutdown during resolution", cts.Token);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-cancel", configRepoDir, seam, fake, git, cts.Token, agent);
+
+        // PREMISE: the resolution prompt really was delivered, really carried the CALLER'S token, and
+        // really requested the cancellation.
+        Assert.Equal(2, agent.PromptCalls.Count);
+        AssertResolutionPromptContent(agent.PromptCalls[1].Prompt, ConflictFile);
+        Assert.True(resolutionToken.HasValue, "the resolution prompt never observed a token");
+        Assert.Equal(cts.Token, resolutionToken!.Value);
+        Assert.True(cts.IsCancellationRequested, "the execution token was never cancelled — the test is vacuous");
+
+        // CANCELLATION SEMANTICS INTACT: Cancelled/CANCELLED, never a resolution failure, never a push.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+        Assert.NotEqual("FAIL", result.Metrics.Verdict);
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+        Assert.DoesNotContain(result.Metrics.Issues, i => i.Contains("config repo conflict resolution failed:"));
+
+        // EVIDENCE: the initial output is composed with the bare cancellation notice.
+        Assert.Equal($"{InitialOutput}\n\nTask was cancelled.", result.Output);
+    }
+    /// <summary>
+    /// VECTOR 10 — MALFORMED OR UNSUPPORTED STATUS RECORDS, fail closed. A blank line (leading,
+    /// interior or an ADDITIONAL terminal terminator) and a status PAIR outside the SUPPORTED
+    /// qualification domain both make the classification refuse resolution: the status really
+    /// launched, then abort, the unchanged pre-goal reason, no push and NOT ONE resolution prompt.
+    /// Each such record is fed ALONGSIDE a perfectly qualifying <c>UU agents/coder.agents.md</c>
+    /// entry, so only the record itself can decide the outcome — and every case here was admitted
+    /// by the rejected per-character / blank-skipping parser.
+    /// <para>
+    /// WORDING RULING — the rows below fall into TWO distinct categories, and BOTH fail closed:
+    /// <c>MM</c>/<c>MD</c> are VALID porcelain-v1 records as git emits them (the reviewer verified
+    /// <c>MM tracked.txt</c> and <c>MD tracked.txt</c> with git 2.43.0): they are NOT malformed and
+    /// NOT impossible git output, this conservative policy simply treats them as UNSUPPORTED /
+    /// NON-QUALIFYING, because the guidance publisher only ever needs to act on the two genuinely
+    /// UNMERGED shapes and on the staged-only/untracked entries a conflict merge leaves behind.
+    /// <c>?M</c>, <c>U?</c> and a blank line, by contrast, are GENUINELY INVALID: text that is not a
+    /// porcelain status record at all, rather than a real record this policy declines to act on.
+    /// </para>
+    /// </summary>
+    [Theory]
+    // The record body ends with an ADDITIONAL blank line after the qualifying entry.
+    [InlineData("UU agents/coder.agents.md\n\n")]
+    // A LEADING blank line before the qualifying entry.
+    [InlineData("\nUU agents/coder.agents.md\n")]
+    // An INTERIOR blank line between two otherwise valid entries.
+    [InlineData("UU agents/coder.agents.md\n\n?? leftover.txt\n")]
+    // `?M` is outside the supported domain — a pair that is not a porcelain status at all, so the
+    // pair (not either character alone) is the domain.
+    [InlineData("UU agents/coder.agents.md\n?M hive-config.yaml\n")]
+    // VALID porcelain-v1 pairs (index + worktree modifications) that this policy does NOT support —
+    // this comment applies to the MM/MD rows ONLY.
+    [InlineData("UU agents/coder.agents.md\nMM hive-config.yaml\n")]
+    [InlineData("UU agents/coder.agents.md\nMD hive-config.yaml\n")]
+    // `U?` is a pair git does not emit: a genuinely INVALID record, failing closed like the above.
+    [InlineData("UU agents/coder.agents.md\nU? hive-config.yaml\n")]
+    // A blank line carrying a CR terminator.
+    [InlineData("UU agents/coder.agents.md\r\n\r\n")]
+    // A whitespace-only line is not a status record at all.
+    [InlineData("UU agents/coder.agents.md\n   \n")]
+    public async Task Improver_ConflictResolution_MalformedOrUnsupportedStatusRecord_KeepsThePreGoalPath(string statusOutput)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        // PREMISE: the record really does carry the defect this case names — the qualifying entry is
+        // present, and the record is NOT a supported classification (mirrored here: single terminal
+        // terminator, no blank line, a status PAIR inside the production supported qualification
+        // domain, a non-empty control-character-free path). Every case here was admitted by the
+        // rejected per-character / blank-skipping parser.
+        Assert.Contains(ConflictFile, statusOutput, StringComparison.Ordinal);
+        Assert.False(
+            IsSupportedClassificationRecord(statusOutput),
+            "premise: the case really is non-qualifying — a blank line or a status pair outside the supported domain");
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, statusOutput, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-resolve-unsupported-{statusOutput.Length}", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // ABORT + EXACT OLD REASON + NO RESOLUTION PROMPT + NO PUSH.
+        AssertFailClosedPullFailure(fake, agent, result, OldPullFailureReason);
+        Assert.DoesNotContain("MERGING BOTH SIDES", Assert.Single(agent.PromptCalls).Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("[Config repo conflict resolution]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A test-side MIRROR of the production SUPPORTED QUALIFICATION DOMAIN (a single optional CR
+    /// before ONE terminal newline, no blank line, a status pair from the production pair table, a
+    /// non-empty control-character-free path, no quote in any operand). It exists so a
+    /// non-qualifying-record case can ASSERT its own premise — that the input really is NOT a
+    /// supported classification — instead of trusting its literal.
+    /// <para>
+    /// This is a POLICY domain, not a well-formedness grammar of all valid git output: a pair
+    /// outside the mirrored table (for example <c>MM</c> or <c>MD</c>) can be perfectly VALID
+    /// porcelain-v1 output that this conservative policy simply does not act on.
+    /// </para>
+    /// </summary>
+    private static bool IsSupportedClassificationRecord(string statusOutput)
+    {
+        var body = statusOutput.EndsWith("\r\n", StringComparison.Ordinal)
+            ? statusOutput[..^2]
+            : statusOutput.EndsWith('\n') ? statusOutput[..^1] : statusOutput;
+        if (body.Length == 0)
+            return false;
+
+        foreach (var rawLine in body.Split('\n'))
+        {
+            var line = rawLine.EndsWith('\r') ? rawLine[..^1] : rawLine;
+            if (line.Length < 4 || line[2] != ' ')
+                return false;
+
+            if (!RecognizedStatusPairsForTest.Contains(line[..2]))
+                return false;
+
+            var path = line[3..];
+            if (path.Any(char.IsControl) || path.Contains('"'))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The status PAIRS of the production SUPPORTED QUALIFICATION DOMAIN, mirrored test-side from the
+    /// production pair table. A test-side mirror is what makes the unsupported-pair cases PROVE the
+    /// pair domain: a production table that admitted a pair listed here would not fail them, and one
+    /// that rejected a pair NOT listed here would fail the premise assertions instead of passing
+    /// silently. The mirror is a POLICY table, not a complete list of valid git output — pairs
+    /// outside it (such as <c>MM</c>/<c>MD</c>) are valid records this policy treats as
+    /// unsupported.
+    /// </summary>
+    private static readonly HashSet<string> RecognizedStatusPairsForTest =
+        new(StringComparer.Ordinal)
+        {
+            "DD", "AU", "UD", "UA", "DU", "AA", "UU",
+            " M", " T", " D", "M ", "T ", "D ", "A ", "AM", "AD",
+            "R ", "RM", "RD", "C ", "CM", "CD", "??", "!!",
+        };
+
+    /// <summary>
+    /// VECTOR 11 — A QUOTED OPERAND ANYWHERE poisons the record. Real git prints a rename whose
+    /// destination needs quoting as <c>R  agents/old.agents.md -&gt; "agents/a b.agents.md"</c>: the
+    /// quote sits INSIDE the path field, not at its start, so a guard that only inspects
+    /// <c>path[0]</c> lets the record through. Here that record sits ALONGSIDE a perfectly qualifying
+    /// <c>UU agents/coder.agents.md</c> entry, and the whole classification must still fail closed:
+    /// abort, the unchanged pre-goal reason, no push and no resolution prompt.
+    /// </summary>
+    [Theory]
+    // Rename: quoted DESTINATION (the shape real git emits for a spaced name).
+    [InlineData("R  agents/old.agents.md -> \"agents/a b.agents.md\"\n", false)]
+    // Rename: quoted SOURCE — the quote IS at the head of the field.
+    [InlineData("R  \"agents/a b.agents.md\" -> agents/old.agents.md\n", true)]
+    // Rename with a WORKTREE-side modification, quoted destination.
+    [InlineData("RM agents/old.agents.md -> \"agents/a b.agents.md\"\n", false)]
+    // Copy record, quoted destination.
+    [InlineData("C  agents/old.agents.md -> \"agents/a b.agents.md\"\n", false)]
+    // A quoted operand on an otherwise ordinary untracked entry.
+    [InlineData("?? \"agents/a b.agents.md\"\n", true)]
+    public async Task Improver_ConflictResolution_QuotedOperandAnywhere_KeepsThePreGoalPath(
+        string offendingRecord, bool quoteAtHead)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        // PREMISE: the offending record really carries a QUOTE. For the DESTINATION-quoted shapes it
+        // sits INSIDE the path field, NOT at its head — exactly the shape the rejected `path[0]`
+        // guard could not see; for the quoted-SOURCE shape it is at the head (that row pins that the
+        // new "quote anywhere" rule still rejects it). The record also really is a rename/copy or
+        // ordinary entry rather than an unmerged conflict.
+        var recordBody = offendingRecord.TrimEnd('\n');
+        var recordPath = recordBody[3..];
+        Assert.Contains("\"", recordPath, StringComparison.Ordinal);
+        Assert.False(
+            UnmergedStatusPairsForTest.Contains(recordBody[..2]),
+            "premise: the offending record is not an UNMERGED conflict entry");
+        Assert.Equal(quoteAtHead, recordPath[0] == '"');
+        if (!quoteAtHead)
+            Assert.True(recordPath.Contains("->", StringComparison.Ordinal) || recordPath.StartsWith("?? ", StringComparison.Ordinal),
+                "premise: a quoted operand that is not at the head is carried by a rename/copy or an ordinary entry");
+
+        // The qualifying entry is present in the SAME record, so a pass would resolve and push.
+        var statusOutput = QualifyingConflictStatus + offendingRecord;
+        Assert.Equal(2, SplitLines(statusOutput).Count(l => l.Length > 0));
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, statusOutput, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agent = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-resolve-quoted-{recordBody.Length}", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        AssertFailClosedPullFailure(fake, agent, result, OldPullFailureReason);
+        Assert.DoesNotContain("MERGING BOTH SIDES", Assert.Single(agent.PromptCalls).Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("[Config repo conflict resolution]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// VECTOR 12 — A NESTED MARKER IS CAUGHT. The resolution stages with the literal pathspec
+    /// <c>agents/*.agents.md</c>, and git's wildcard also matches path separators, so that ONE command
+    /// stages a nested <c>agents/sub/x.agents.md</c> just as it stages the direct child (verified
+    /// against real git). The agent cleans the conflicted direct child but leaves a conflict marker in
+    /// the NESTED file: the marker scan must therefore cover everything the add will stage, so the
+    /// resolution fails, the merge is aborted, nothing is staged or pushed, and the reason names the
+    /// COMPLETE nested relative path.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConflictResolution_NestedMarkerLeft_AbortsAndNamesTheNestedPath()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var nestedFile = Path.Combine(configRepoDir, "agents", "sub", "x.agents.md");
+        const string NestedRelativePath = "agents/sub/x.agents.md";
+        const string ResolutionOutput = "resolution-cleaned-only-the-named-file";
+
+        Directory.CreateDirectory(Path.GetDirectoryName(nestedFile)!);
+
+        // PREMISE: the nested offender really exists at the expected COMPLETE relative path and really
+        // carries a marker line of its own.
+        File.WriteAllText(nestedFile, ConflictMarkerContent);
+        Assert.Equal(nestedFile, Path.Combine(configRepoDir, NestedRelativePath));
+        Assert.Contains(
+            SplitLines(File.ReadAllText(nestedFile)),
+            l => l.StartsWith("<<<<<<<", StringComparison.Ordinal));
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = SeamConflictResponder(
+                () => new GitProcessResult(0, QualifyingConflictStatus, string.Empty),
+                ConflictPublicationStage()),
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var prompts = 0;
+        var agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                if (++prompts == 1)
+                    return Task.FromResult("initial improver analysis");
+
+                // The agent resolves ONLY the conflicted direct child it was told about; the nested
+                // file keeps its markers — exactly the case that used to be published.
+                File.WriteAllText(Path.Combine(configRepoDir, ConflictFile), "MERGED-ROOT\n");
+                File.WriteAllText(
+                    nestedFile,
+                    "MERGED-NESTED\n<<<<<<< HEAD\nLOCAL\n=======\nREMOTE\n>>>>>>> origin/main\n");
+                return Task.FromResult(ResolutionOutput);
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-resolve-nested-marker", configRepoDir, seam, fake, git, agentRunner: agent);
+
+        // PREMISE AFTER THE RUN: the marker really survived in the NESTED file while the direct child
+        // really is clean — so ONLY a nested-aware scan can produce the failure asserted below.
+        Assert.Equal(2, agent.PromptCalls.Count);
+        Assert.Contains(
+            SplitLines(File.ReadAllText(nestedFile)),
+            l => l.StartsWith("<<<<<<<", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            SplitLines(File.ReadAllText(Path.Combine(configRepoDir, ConflictFile))),
+            l => RecognizedMarkerPrefixesForTest.Any(m => l.StartsWith(m, StringComparison.Ordinal)));
+
+        var afterPull = LaunchesAfterPull(fake);
+        Assert.Contains(afterPull, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(afterPull, t => t is ["add", ..] or ["commit", ..] or ["push", ..]);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("config repo conflict resolution failed:"));
+        Assert.Contains(NestedRelativePath, issue, StringComparison.Ordinal);
+        Assert.Contains($"conflict markers remain in {NestedRelativePath}", issue, StringComparison.Ordinal);
+        Assert.Contains(ResolutionOutput, result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The SEVEN unmerged porcelain pairs, mirrored test-side so a premise assertion can pin that an
+    /// offending test record really is NOT an unmerged conflict entry.
+    /// </summary>
+    private static readonly HashSet<string> UnmergedStatusPairsForTest =
+        new(StringComparer.Ordinal) { "DD", "AU", "UD", "UA", "DU", "AA", "UU" };
+
+    /// <summary>The three conflict-marker line prefixes, mirrored test-side for premise assertions.</summary>
+    private static readonly string[] RecognizedMarkerPrefixesForTest = ["<<<<<<<", "=======", ">>>>>>>"];
+
 }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security;
 using System.Text.Json;
 using CopilotHive.Goals;
 using CopilotHive.Services;
@@ -585,7 +586,7 @@ public sealed class TaskExecutor(
                     // reason is appended, and the throw is mapped to TaskOutcome.Failed + an
                     // authoritative FAIL verdict below — regardless of any test/worker report
                     // or the default Improver PASS.
-                    var publication = await CommitAndPushConfigRepoAsync(ct, finalization);
+                    var publication = await CommitAndPushConfigRepoAsync(ct, finalization, agentEvidence);
                     if (publication.FailureReason is { } failureReason)
                     {
                         // A failed add/diff/commit/pull/push — AND a failed publication-HEAD
@@ -593,12 +594,21 @@ public sealed class TaskExecutor(
                         // completion. The accumulated agent/retry output and the staged summary
                         // are carried on the exception so the catch below preserves them
                         // VERBATIM and appends only the sanitized stage reason — never
-                        // replacing the evidence.
+                        // replacing the evidence. The snapshot is taken HERE, after the
+                        // publication returned: every conflict-resolution and condensation
+                        // segment the attempt appended is therefore part of the carried
+                        // evidence too.
                         throw new ConfigRepoPublicationException(
                             agentEvidence.Snapshot, failureReason, publication.Summary);
                     }
 
                     aggregatedStatus = publication.Summary;
+
+                    // REFRESH after a successful publication: the conflict-resolution prompt and
+                    // any size-enforcement retry it triggered appended their own segments to the
+                    // accumulator AFTER the pre-publication snapshot, and they are part of this
+                    // run's Output exactly like the initial response.
+                    copilotOutput = agentEvidence.Snapshot;
                 }
                 else
                 {
@@ -2378,14 +2388,29 @@ public sealed class TaskExecutor(
     /// <para>
     /// TRUTHFUL PUBLICATION: every stage distinguishes SUCCESS from FAILURE. A failed add, diff,
     /// or commit stops all subsequent publication commands and is reported as a FAILURE with a
-    /// sanitized stage-specific reason — never as a no-change completion. After a failed
-    /// post-commit pull the existing merge-abort attempt still runs (best effort), but push NEVER
-    /// proceeds — whether the abort succeeds, fails, or throws; there is no force push, retry,
-    /// or remote rollback. A failed or throwing push is a publication FAILURE, never a no-change
-    /// result, and push acceptance is never inferred from a transport error — a non-null failure
-    /// reason is returned in every such case, and Pushed is set only after a confirmed
-    /// successful push. The summary preserves the diagnostic
-    /// changed-file paths on failure so the orchestrator can log a useful warning.
+    /// sanitized stage-specific reason — never as a no-change completion. The summary preserves the
+    /// diagnostic changed-file paths on failure so the orchestrator can log a useful warning.
+    /// </para>
+    /// <para>
+    /// THE PUBLICATION ATTEMPTS (at most <see cref="MaxPublicationAttempts"/>). A THROWN
+    /// post-commit pull keeps today's handling exactly: the sanitized reason, no classification, no
+    /// merge abort and no retry. A pull that RETURNS non-zero is CLASSIFIED from the verbose
+    /// porcelain status — a pull that fails for any OTHER reason (a transport failure, a
+    /// delete/modify or otherwise non-qualifying conflict, unparseable or unsupported or quoted status
+    /// output) keeps
+    /// today's handling exactly: the best-effort merge abort, no push and no retry. A conflict that
+    /// QUALIFIES as a UU/AA direct-child <c>agents/&lt;name&gt;.agents.md</c> merge conflict is NOT
+    /// aborted: the same session resolves it, the post-resolution content gate verifies the
+    /// result, the resolved merge is committed and the attempt proceeds — that path PUBLISHES.
+    /// </para>
+    /// <para>
+    /// A failed or throwing push is a publication FAILURE, never a no-change result, and push
+    /// acceptance is never inferred from a transport error: a non-null failure reason is returned
+    /// in every case except the ONE retryable failure — a genuine non-fast-forward rejection of the
+    /// FIRST attempt, which starts a SECOND and final attempt (see
+    /// <see cref="IsNonFastForwardPushRejection"/>). Every other push failure, every push throw, and
+    /// ANY failed push on the last attempt returns its sanitized failure reason exactly as before.
+    /// <c>Pushed</c> is set only after a confirmed successful push.
     /// </para>
     /// <para>
     /// FRESH-INSTALL NO-CHANGE: on a config repo whose baseline tracks no
@@ -2399,7 +2424,7 @@ public sealed class TaskExecutor(
     /// </para>
     /// </summary>
     private async Task<ConfigRepoPublication> CommitAndPushConfigRepoAsync(
-        CancellationToken ct, ConfigRepoFinalization finalization)
+        CancellationToken ct, ConfigRepoFinalization finalization, AgentOutputEvidence agentEvidence)
     {
         if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
             return new ConfigRepoPublication(
@@ -2549,152 +2574,752 @@ public sealed class TaskExecutor(
 
         _log.Info($"Committed: {RenderForLog(commitResult.Stdout)}");
 
-        // Pull (merge orchestrator's goals/metrics commits) then push.
-        // After a FAILED post-commit pull, the merge-abort attempt below still runs (best
-        // effort), but push NEVER proceeds — there is no force push, retry, or remote rollback.
-        ConfigRepoOpResult pullResult;
-        try
+        // ── BOUNDED PUBLICATION ATTEMPTS ─────────────────────────────────────────
+        // ONE attempt = pull → (on a nonzero pull classified as a resolvable agents.md merge
+        // conflict: one resolution prompt plus the post-resolution content gate) → a FRESH
+        // publication-HEAD check → push. At most MaxPublicationAttempts attempts per task; a
+        // SECOND attempt starts ONLY when the first push was rejected as non-fast-forward.
+        // A pull that fails for a NON-qualifying reason still takes the established path: the
+        // best-effort merge abort, no push and no retry. A push failure or throw that is not that
+        // one retryable rejection — and ANY failed push on the last attempt — keeps its established
+        // handling and reason exactly. There is no force push and no remote rollback.
+        for (var attempt = 1; ; attempt++)
         {
-            pullResult = await RunConfigRepoCommandAsync(
-                ["pull", "--no-rebase"], "pull --no-rebase", ct);
-        }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            _log.Error($"git pull threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
-            return new ConfigRepoPublication(
-                stagedSummary,
-                $"git pull failed with an error [{SafeExceptionLog.Describe(ex)}].");
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log.Error($"git pull threw [{SafeExceptionLog.Describe(ex)}]");
-            return new ConfigRepoPublication(
-                stagedSummary,
-                $"git pull failed with an error [{SafeExceptionLog.Describe(ex)}].");
-        }
-
-        if (!pullResult.Success)
-        {
-            // A FAILED post-commit pull needs BOTH streams. The fetch/transport failure normally
-            // arrives on stderr while the conflict and affected-path details arrive on stdout;
-            // reporting only the stderr-derived field dropped the stdout evidence from the
-            // retained phase diagnostics. Each field is therefore rendered through RenderForLog
-            // SEPARATELY (URL redaction, then control-character sanitation) — never on the
-            // already-joined string — and only then joined with fixed framing, so both streams
-            // get the same protection. The seam-returned fields are used AS-IS: its
-            // resolved-credential literal redaction is never bypassed, and the legacy route's
-            // raw trimmed stderr / raw stdout gets the same treatment. A stream that is empty or
-            // whitespace (RenderForLog trims) contributes NO labelled segment, so the stage, the
-            // exit code and the push-not-attempted explanation survive every combination of
-            // empty streams. No prefix-length cap is applied: the useful conflict/path/fetch
-            // text is preserved.
-            var pullStdout = RenderForLog(pullResult.Stdout);
-            var pullStderr = RenderForLog(pullResult.SanitizedError);
-            List<string> pullEvidence = [];
-            if (pullStdout.Length > 0)
-                pullEvidence.Add($"stdout: {pullStdout}");
-            if (pullStderr.Length > 0)
-                pullEvidence.Add($"stderr: {pullStderr}");
-            var pullDiagnostics = string.Join(" | ", pullEvidence);
-            var pullDetail = pullDiagnostics.Length == 0 ? string.Empty : $": {pullDiagnostics}";
-
-            _log.Error($"git pull failed (exit {pullResult.ExitCode}){pullDetail}");
-            // Abort any in-progress merge (best effort). Whatever happens to the abort —
-            // success, failure, or a thrown error — push is NEVER attempted afterwards.
+            // Pull (merge orchestrator's goals/metrics commits) then push.
+            // A THROWN pull is NOT a conflict: it keeps today's handling EXACTLY — the sanitized
+            // reason, NO classification status command, NO merge abort and no retry.
+            ConfigRepoOpResult pullResult;
             try
             {
-                var abortResult = await RunConfigRepoCommandAsync(
-                    ["merge", "--abort"], "merge --abort", ct);
-                if (!abortResult.Success)
-                    _log.Error($"git merge --abort failed (exit {abortResult.ExitCode}): {RenderForLog(abortResult.SanitizedError)}");
+                pullResult = await RunConfigRepoCommandAsync(
+                    ["pull", "--no-rebase"], "pull --no-rebase", ct);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
             {
-                throw; // requested execution cancellation keeps its established semantics
+                _log.Error($"git pull threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+                return new ConfigRepoPublication(
+                    stagedSummary,
+                    $"git pull failed with an error [{SafeExceptionLog.Describe(ex)}].");
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _log.Error($"git merge --abort threw [{SafeExceptionLog.Describe(ex)}]");
+                _log.Error($"git pull threw [{SafeExceptionLog.Describe(ex)}]");
+                return new ConfigRepoPublication(
+                    stagedSummary,
+                    $"git pull failed with an error [{SafeExceptionLog.Describe(ex)}].");
             }
 
-            return new ConfigRepoPublication(
-                stagedSummary,
-                $"git pull failed (exit {pullResult.ExitCode}){pullDetail} — push not attempted after the failed pull");
+            if (!pullResult.Success)
+            {
+                // A FAILED post-commit pull needs BOTH streams. The fetch/transport failure normally
+                // arrives on stderr while the conflict and affected-path details arrive on stdout;
+                // reporting only the stderr-derived field dropped the stdout evidence from the
+                // retained phase diagnostics. Each field is therefore rendered through RenderForLog
+                // SEPARATELY (URL redaction, then control-character sanitation) — never on the
+                // already-joined string — and only then joined with fixed framing, so both streams
+                // get the same protection. The seam-returned fields are used AS-IS: its
+                // resolved-credential literal redaction is never bypassed, and the legacy route's
+                // raw trimmed stderr / raw stdout gets the same treatment. A stream that is empty or
+                // whitespace (RenderForLog trims) contributes NO labelled segment, so the stage, the
+                // exit code and the push-not-attempted explanation survive every combination of
+                // empty streams. No prefix-length cap is applied: the useful conflict/path/fetch
+                // text is preserved.
+                var pullStdout = RenderForLog(pullResult.Stdout);
+                var pullStderr = RenderForLog(pullResult.SanitizedError);
+                List<string> pullEvidence = [];
+                if (pullStdout.Length > 0)
+                    pullEvidence.Add($"stdout: {pullStdout}");
+                if (pullStderr.Length > 0)
+                    pullEvidence.Add($"stderr: {pullStderr}");
+                var pullDiagnostics = string.Join(" | ", pullEvidence);
+                var pullDetail = pullDiagnostics.Length == 0 ? string.Empty : $": {pullDiagnostics}";
+
+                _log.Error($"git pull failed (exit {pullResult.ExitCode}){pullDetail}");
+
+                // ── CONFLICT CLASSIFICATION (fail closed) ─────────────────────────
+                // ONLY a status classification proving that EVERY unmerged path is a UU/AA
+                // direct-child agents/<name>.agents.md conflict qualifies for resolution. Every
+                // other outcome — a failing or throwing status command, unparseable, unsupported or
+                // quoted output, a non-agents path, or a delete/modify conflict — keeps the
+                // ESTABLISHED behaviour below EXACTLY: merge --abort, no push, same reason.
+                var conflictedFiles = await ClassifyResolvableConflictAsync(attempt, ct);
+                if (conflictedFiles is null)
+                {
+                    await AbortConfigRepoMergeBestEffortAsync(ct);
+
+                    return new ConfigRepoPublication(
+                        stagedSummary,
+                        $"git pull failed (exit {pullResult.ExitCode}){pullDetail} — push not attempted after the failed pull");
+                }
+
+                // ── RESOLUTION + POST-RESOLUTION CONTENT GATE ─────────────────────
+                // The qualifying conflict is NOT aborted: ONE resolution prompt asks the agent to
+                // merge BOTH sides, and the resulting content is verified through the existing
+                // limits helper AND the conflict-marker scan BEFORE anything is staged. A failure
+                // of either check aborts the merge and never stages (or pushes) the unverified
+                // content.
+                var resolutionFailure = await ResolveConfigRepoConflictAsync(conflictedFiles, agentEvidence, ct);
+                if (resolutionFailure is not null)
+                    return new ConfigRepoPublication(stagedSummary, resolutionFailure);
+            }
+
+            // ── Publication-HEAD resolution (the EXACT publication evidence) ─────────
+            // After the (clean or resolved) pull and BEFORE the push: the exact publication HEAD
+            // is resolved and validated FRESH on EVERY attempt. If this fails, push NEVER
+            // proceeds — publication stops here as an ordinary failure, never guessing a SHA.
+            //
+            // EVIDENCE PRESERVATION: ResolveSingleShaAsync/RunPreparationCommandAsync signal every
+            // failure form (nonzero exit, thrown command, malformed output) by THROWING a
+            // ConfigRepoPublicationException carrying an EMPTY preservedOutput and no summary.
+            // Letting that escape here would bypass the caller's wrapper — which is what attaches
+            // the accumulated agent/retry output and the staged GitChangeSummary — and return a
+            // result with empty agent evidence and empty Git diagnostics. It is therefore caught
+            // and converted into the ordinary publication FAILURE shape, so the caller's wrapper
+            // attaches the evidence exactly as it does for a failed add/diff/commit/pull/push.
+            string publicationSha;
+            try
+            {
+                publicationSha = await ResolveSingleShaAsync(
+                    ConfigRepoGitOperations.RevHeadCommit, "publication HEAD check", "HEAD", ct,
+                    phase: PublicationPhase);
+            }
+            catch (ConfigRepoPublicationException ex)
+            {
+                // The stage-boundary reason is already sanitized; the staged summary carries the
+                // diagnostic changed-file paths. Push is NOT attempted after this failure.
+                return new ConfigRepoPublication(stagedSummary, ex.Reason);
+            }
+
+            // Push — the FINAL confirmation of publication. A failed or throwing push is a
+            // publication FAILURE, never a no-change result, and push acceptance is never inferred
+            // from a transport error: Published requires a confirmed exit-0 push.
+            ConfigRepoOpResult pushResult;
+            try
+            {
+                pushResult = await RunConfigRepoCommandAsync(
+                    ["push", "origin", "HEAD"], "push", ct);
+            }
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                _log.Error($"git push threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+                return new ConfigRepoPublication(
+                    stagedSummary,
+                    $"git push failed with an error [{SafeExceptionLog.Describe(ex)}] — the remote state is unknown");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.Error($"Push failed: {SafeExceptionLog.Describe(ex)}");
+                return new ConfigRepoPublication(
+                    stagedSummary,
+                    $"git push failed with an error [{SafeExceptionLog.Describe(ex)}] — the remote state is unknown");
+            }
+
+            if (!pushResult.Success)
+            {
+                // ── THE ONE RETRYABLE PUSH FAILURE ────────────────────────────────
+                // ONLY a genuine non-fast-forward rejection (git naming `[rejected]` together
+                // with `(fetch first)` or `(non-fast-forward)`) starts a SECOND attempt, and only
+                // while attempts remain. The retry re-runs the WHOLE attempt: a fresh pull, a
+                // fresh conflict classification/resolution when that pull conflicts, and a FRESH
+                // publication-HEAD check. Every other push failure or throw (auth, transport,
+                // hook, ambiguous) keeps today's handling and reason EXACTLY — as does ANY failed
+                // push on the LAST attempt.
+                if (attempt < MaxPublicationAttempts
+                    && pushResult.ExitCode != 0
+                    && IsNonFastForwardPushRejection(pushResult))
+                {
+                    _log.Warn(
+                        $"git push was rejected as non-fast-forward on attempt {attempt}/{MaxPublicationAttempts} — " +
+                        $"retrying the publication [{RenderForLog(pushResult.SanitizedError)}]");
+                    continue;
+                }
+
+                _log.Error($"git push failed: {RenderForLog(pushResult.SanitizedError)}");
+                return new ConfigRepoPublication(
+                    stagedSummary,
+                    $"git push failed (exit {pushResult.ExitCode}): {RenderForLog(pushResult.SanitizedError)}");
+            }
+
+            // ── CONFIRMED PUBLICATION — retained ATOMICALLY, before ANY fallible work ──
+            // BOTH facts are materialized here, immediately after the confirmed exit-zero push and
+            // BEFORE the (fallible) logging below:
+            //   * the published SHA, so finalization resets to the PUBLISHED tip; and
+            //   * the pushed SUMMARY (Pushed=true), so the confirmed publication survives even if
+            //     the log write, the session save, or any other later step throws.
+            // WorkerLogger.Info writes straight to Console.Out, so a disposed/failing writer would
+            // otherwise throw into the generic handler and produce a result WITHOUT Pushed=true
+            // even though finalization already resets to the published SHA. Every later outcome is
+            // constructed from this retained evidence rather than recomputed.
+            var publishedSummary = stagedSummary with { Pushed = true };
+            finalization.RetainConfirmedPublication(publicationSha, publishedSummary);
+
+            _log.Info($"Pushed config repo changes at {RenderForLog(publicationSha[..Math.Min(publicationSha.Length, 12)])}");
+            return new ConfigRepoPublication(finalization.PublishedSummary!, null);
         }
+    }
 
-        // ── Publication-HEAD resolution (the EXACT publication evidence) ─────────
-        // After the successful pull and BEFORE the push: the exact publication HEAD is
-        // resolved and validated. If this fails, push NEVER proceeds — publication stops
-        // here as an ordinary failure, never guessing a SHA.
-        //
-        // EVIDENCE PRESERVATION: ResolveSingleShaAsync/RunPreparationCommandAsync signal every
-        // failure form (nonzero exit, thrown command, malformed output) by THROWING a
-        // ConfigRepoPublicationException carrying an EMPTY preservedOutput and no summary.
-        // Letting that escape here would bypass the caller's wrapper — which is what attaches
-        // the accumulated agent/retry output and the staged GitChangeSummary — and return a
-        // result with empty agent evidence and empty Git diagnostics. It is therefore caught
-        // and converted into the ordinary publication FAILURE shape, so the caller's wrapper
-        // attaches the evidence exactly as it does for a failed add/diff/commit/pull/push.
-        string publicationSha;
+    // ══════════════════════════════════════════════════════════════════════════════
+    // THE CONFLICT-RESOLUTION-AND-RETRY PUBLICATION FLOW
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The BOUNDED publication-attempt count: one attempt = pull → (conflict resolution when the
+    /// pull conflict qualifies) → a FRESH publication-HEAD check → push. A second attempt starts
+    /// ONLY after a non-fast-forward push rejection.
+    /// </summary>
+    private const int MaxPublicationAttempts = 2;
+
+    /// <summary>The fixed header stamped on every resolution segment recorded as evidence.</summary>
+    private const string ResolutionEvidenceHeader = "[Config repo conflict resolution]";
+
+    /// <summary>The single-line prefix every resolution failure reason carries.</summary>
+    private const string ResolutionFailurePrefix = "config repo conflict resolution failed: ";
+
+    /// <summary>The config-repo-relative agents directory, with its trailing separator.</summary>
+    private const string AgentsRelativeDir = "agents/";
+
+    /// <summary>The guidance-file suffix every config-repo agents file shares.</summary>
+    private const string AgentsMdSuffix = ".agents.md";
+
+    /// <summary>The three conflict-marker line prefixes that may never survive a resolution.</summary>
+    private static readonly string[] ConflictMarkerPrefixes = ["<<<<<<<", "=======", ">>>>>>>"];
+
+    /// <summary>
+    /// Aborts an in-progress config-repo merge, BEST EFFORT. Whatever happens to the abort —
+    /// success, failure, or a thrown error — the caller NEVER pushes afterwards. A REQUESTED
+    /// execution cancellation propagates unchanged; every other failure is logged and swallowed.
+    /// </summary>
+    private async Task AbortConfigRepoMergeBestEffortAsync(CancellationToken ct)
+    {
         try
         {
-            publicationSha = await ResolveSingleShaAsync(
-                ConfigRepoGitOperations.RevHeadCommit, "publication HEAD check", "HEAD", ct,
-                phase: PublicationPhase);
+            var abortResult = await RunConfigRepoCommandAsync(
+                ["merge", "--abort"], "merge --abort", ct);
+            if (!abortResult.Success)
+                _log.Error($"git merge --abort failed (exit {abortResult.ExitCode}): {RenderForLog(abortResult.SanitizedError)}");
         }
-        catch (ConfigRepoPublicationException ex)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // The stage-boundary reason is already sanitized; the staged summary carries the
-            // diagnostic changed-file paths. Push is NOT attempted after this failure.
-            return new ConfigRepoPublication(stagedSummary, ex.Reason);
+            throw; // requested execution cancellation keeps its established semantics
         }
+        catch (Exception ex)
+        {
+            _log.Error($"git merge --abort threw [{SafeExceptionLog.Describe(ex)}]");
+        }
+    }
 
-        // Push — the FINAL confirmation of publication. A failed or throwing push is a
-        // publication FAILURE, never a no-change result, and push acceptance is never inferred
-        // from a transport error: Published requires a confirmed exit-0 push.
-        ConfigRepoOpResult pushResult;
+    /// <summary>
+    /// Classifies a NON-ZERO post-commit pull as a RESOLVABLE agents.md merge conflict.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The classification runs the verbose status query (<c>status --porcelain=v1
+    /// --untracked-files=all --ignored</c>, deliberately WITHOUT <c>-z</c>) through the shared
+    /// config-repo dispatch, so the seam's pre-existing grammar is the only command surface used.
+    /// It is FAIL CLOSED: a status command that fails or throws, output that does not parse, a
+    /// C-quoted path, an unmerged path outside the direct <c>agents/&lt;name&gt;.agents.md</c>
+    /// shape, a delete/modify conflict, or NO unmerged entry at all reports <c>null</c> — the
+    /// caller then keeps today's abort/no-push outcome and reason EXACTLY. A THROWN pull never
+    /// reaches this method at all.
+    /// </para>
+    /// <para>
+    /// This method never mutates anything and never throws except for a REQUESTED execution
+    /// cancellation, which propagates unchanged.
+    /// </para>
+    /// </remarks>
+    /// <returns>
+    /// The conflicted <c>agents/&lt;name&gt;.agents.md</c> paths, or <c>null</c> when the conflict
+    /// does not qualify for resolution.
+    /// </returns>
+    private async Task<IReadOnlyList<string>?> ClassifyResolvableConflictAsync(int attempt, CancellationToken ct)
+    {
+        ConfigRepoOpResult statusResult;
         try
         {
-            pushResult = await RunConfigRepoCommandAsync(
-                ["push", "origin", "HEAD"], "push", ct);
+            statusResult = await RunConfigRepoCommandAsync(
+                ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+                "status --porcelain=v1 --untracked-files=all --ignored",
+                ct);
         }
         catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
         {
-            _log.Error($"git push threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
-            return new ConfigRepoPublication(
-                stagedSummary,
-                $"git push failed with an error [{SafeExceptionLog.Describe(ex)}] — the remote state is unknown");
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Info($"Config repo conflict classification (attempt {attempt}): the status command was interrupted " +
+                      $"without a requested cancellation [{safe}] — the conflict is NOT resolvable");
+            return null;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _log.Error($"Push failed: {SafeExceptionLog.Describe(ex)}");
-            return new ConfigRepoPublication(
-                stagedSummary,
-                $"git push failed with an error [{SafeExceptionLog.Describe(ex)}] — the remote state is unknown");
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Info($"Config repo conflict classification (attempt {attempt}): the status command failed with an " +
+                      $"error [{safe}] — the conflict is NOT resolvable");
+            return null;
         }
 
-        if (!pushResult.Success)
+        if (!statusResult.Success)
         {
-            _log.Error($"git push failed: {RenderForLog(pushResult.SanitizedError)}");
-            return new ConfigRepoPublication(
-                stagedSummary,
-                $"git push failed (exit {pushResult.ExitCode}): {RenderForLog(pushResult.SanitizedError)}");
+            _log.Info($"Config repo conflict classification (attempt {attempt}): the status command failed " +
+                      $"(exit {statusResult.ExitCode}) — the conflict is NOT resolvable");
+            return null;
         }
 
-        // ── CONFIRMED PUBLICATION — retained ATOMICALLY, before ANY fallible work ──
-        // BOTH facts are materialized here, immediately after the confirmed exit-zero push and
-        // BEFORE the (fallible) logging below:
-        //   * the published SHA, so finalization resets to the PUBLISHED tip; and
-        //   * the pushed SUMMARY (Pushed=true), so the confirmed publication survives even if
-        //     the log write, the session save, or any other later step throws.
-        // WorkerLogger.Info writes straight to Console.Out, so a disposed/failing writer would
-        // otherwise throw into the generic handler and produce a result WITHOUT Pushed=true
-        // even though finalization already resets to the published SHA. Every later outcome is
-        // constructed from this retained evidence rather than recomputed.
-        var publishedSummary = stagedSummary with { Pushed = true };
-        finalization.RetainConfirmedPublication(publicationSha, publishedSummary);
+        var conflictedFiles = ParseUnmergedAgentsMdPaths(statusResult.Stdout);
+        if (conflictedFiles is null)
+        {
+            _log.Info($"Config repo conflict classification (attempt {attempt}): the status output does not prove a " +
+                      "resolvable agents.md conflict — the conflict is NOT resolvable");
+            return null;
+        }
 
-        _log.Info($"Pushed config repo changes at {RenderForLog(publicationSha[..Math.Min(publicationSha.Length, 12)])}");
-        return new ConfigRepoPublication(finalization.PublishedSummary!, null);
+        _log.Info($"Config repo conflict classification (attempt {attempt}): {conflictedFiles.Count} resolvable " +
+                  $"agents.md conflict(s) — {LogSanitizer.FormatPathList(conflictedFiles, conflictedFiles.Count)}");
+        return conflictedFiles;
+    }
+
+    /// <summary>
+    /// Parses verbose porcelain-v1 status output into the conflicting
+    /// <c>agents/&lt;name&gt;.agents.md</c> paths, or <c>null</c> when the output does not
+    /// describe a RESOLVABLE conflict.
+    /// </summary>
+    /// <remarks>
+    /// The qualifying domain is deliberately narrow and FAIL CLOSED: the whole output is a
+    /// NON-EMPTY record body with an OPTIONAL single terminal terminator (an LF, or a CRLF whose CR
+    /// immediately precedes that LF — a body with no terminator at all is accepted too), and every
+    /// line tolerates one trailing CR; a leading, interior or additional blank line is not a status
+    /// record and fails the classification. Every record must parse as <c>XY SP path</c> carrying a
+    /// status PAIR from the SUPPORTED qualification domain (the pair — never the two characters
+    /// independently — is the domain; see <see cref="IsRecognizedPorcelainStatusPair"/>); no path
+    /// operand anywhere may be QUOTED (a <c>"</c> in an unmerged path or in a rename/copy SOURCE or
+    /// DESTINATION poisons the record); there must be at least one unmerged entry; EVERY unmerged
+    /// path must be a direct child <c>agents/&lt;name&gt;.agents.md</c> whose name carries no
+    /// <c>/</c>, <c>"</c> or backslash; and EVERY unmerged entry must be <c>UU</c> or <c>AA</c>.
+    /// Anything else — an unparseable record, a blank line, an UNSUPPORTED or quoted record, a
+    /// nested path, or a delete/modify shape such as <c>DD</c>, <c>AU</c>, <c>UD</c>, <c>UA</c> or
+    /// <c>DU</c> — returns <c>null</c>, so the caller fails closed onto the established
+    /// abort/no-push behaviour.
+    /// </remarks>
+    private static List<string>? ParseUnmergedAgentsMdPaths(string statusStdout)
+    {
+        if (string.IsNullOrEmpty(statusStdout))
+            return null;
+
+        // EXACTLY ONE normal terminal newline (with an optional preceding CR) may be stripped;
+        // what remains is the record body, which must be non-empty.
+        var body = statusStdout;
+        if (body.EndsWith("\r\n", StringComparison.Ordinal))
+            body = body[..^2];
+        else if (body.EndsWith('\n'))
+            body = body[..^1];
+
+        if (body.Length == 0)
+            return null;
+
+        List<string> conflictedFiles = [];
+
+        foreach (var rawLine in body.Split('\n'))
+        {
+            var line = rawLine.EndsWith('\r') ? rawLine[..^1] : rawLine;
+
+            // A blank line ANYWHERE — leading, interior, or an ADDITIONAL terminal terminator
+            // beyond the single accepted one — is not a status record, never "nothing to report":
+            // the whole classification fails.
+            if (line.Length == 0)
+                return null;
+
+            if (!TryParsePorcelainEntry(line, out var xy, out var path))
+                return null;
+
+            if (!IsRecognizedPorcelainStatusPair(xy))
+                return null;
+
+            // QUOTED OPERANDS fail the classification CLOSED for EVERY record, not only the
+            // unmerged ones: git C-quotes a pathname exactly when it judged the name inexpressible
+            // as plain porcelain text, and that applies to an unmerged path just as much as to the
+            // SOURCE or DESTINATION operand of a rename/copy (`R  agents/old.agents.md ->
+            // "agents/a b.agents.md"`). Nothing this gate acts on is ever quoted.
+            if (path.Contains('"'))
+                return null;
+
+            if (!IsUnmergedPorcelainStatus(xy))
+                continue;
+
+            if (!IsResolvableAgentsMdConflictPath(path))
+                return null;
+
+            if (xy is not ("UU" or "AA"))
+                return null;
+
+            conflictedFiles.Add(path);
+        }
+
+        return conflictedFiles.Count == 0 ? null : conflictedFiles;
+    }
+
+    /// <summary>
+    /// Parses ONE verbose porcelain-v1 line into its two-character status and its path. The framing
+    /// is <c>XY SP path</c>: a line shorter than four characters, a missing single space at index 2,
+    /// or an empty or control-bearing path is not a usable record. The PAIR itself is NOT validated
+    /// here — it is returned verbatim, and its membership in the supported qualification domain is
+    /// decided by <see cref="IsRecognizedPorcelainStatusPair"/>.
+    /// </summary>
+    private static bool TryParsePorcelainEntry(string line, out string xy, out string path)
+    {
+        xy = string.Empty;
+        path = string.Empty;
+
+        if (line.Length < 4 || line[2] != ' ')
+            return false;
+
+        var candidate = line[3..];
+        if (candidate.Length == 0)
+            return false;
+
+        foreach (var c in candidate)
+        {
+            if (char.IsControl(c))
+                return false;
+        }
+
+        // The PAIR is returned verbatim; its membership in the supported domain is decided by the
+        // single pair table (the two characters are never judged independently — `?M` is outside the
+        // supported domain, however legal each of its characters is on its own).
+        xy = line[..2];
+        path = candidate;
+        return true;
+    }
+
+    /// <summary>
+    /// The RECOGNIZED verbose porcelain-v1 status PAIRS — the SUPPORTED QUALIFICATION DOMAIN of this
+    /// conservative policy. The pair, never the two characters independently, is the domain. A pair
+    /// OUTSIDE this table is NON-QUALIFYING and fails closed onto the established abort/no-push path,
+    /// in one of two distinct ways:
+    /// <list type="bullet">
+    ///   <item><description><b>VALID but UNSUPPORTED.</b> Pairs git genuinely emits for shapes this
+    ///   policy does not act on — for example <c>MM</c> or <c>MD</c> (index modification plus a
+    ///   worktree modification/deletion), which the reviewer verified against git 2.43.0. These are
+    ///   real porcelain-v1 records; nothing here claims they are malformed or impossible.</description></item>
+    ///   <item><description><b>GENUINELY INVALID.</b> Text that is not a porcelain status at all —
+    ///   <c>?M</c>, <c>U?</c>, a blank line — which is unparseable as a git status record rather than
+    ///   merely unsupported.</description></item>
+    /// </list>
+    /// Both categories get the SAME fail-closed outcome: the classification refuses resolution and
+    /// the caller keeps today's abort/no-push behaviour.
+    /// </summary>
+    private static bool IsRecognizedPorcelainStatusPair(string xy) =>
+        xy is "DD" or "AU" or "UD" or "UA" or "DU" or "AA" or "UU"   // the SEVEN unmerged pairs
+            or " M" or " T" or " D"                                 // worktree modifications
+            or "M " or "T " or "D "                                 // index modifications
+            or "A " or "AM" or "AD"                                 // index addition (+ worktree edit)
+            or "R " or "RM" or "RD"                                 // index rename (+ worktree edit)
+            or "C " or "CM" or "CD"                                 // index copy (+ worktree edit)
+            or "??" or "!!";                                        // untracked / ignored
+
+    /// <summary>
+    /// The SEVEN unmerged porcelain pairs git reports while a merge is in progress:
+    /// <c>DD</c>, <c>AU</c>, <c>UD</c>, <c>UA</c>, <c>DU</c>, <c>AA</c> and <c>UU</c>.
+    /// </summary>
+    private static bool IsUnmergedPorcelainStatus(string xy) =>
+        xy is "DD" or "AU" or "UD" or "UA" or "DU" or "AA" or "UU";
+
+    /// <summary>
+    /// Whether an UNMERGED status path has the resolvable shape: a direct child
+    /// <c>agents/&lt;name&gt;.agents.md</c> whose name carries no <c>/</c>, <c>"</c> or backslash.
+    /// The <c>"</c> rule is belt-and-braces here — the CALLER already fails the whole
+    /// classification closed on a C-quoted path (which always begins with a quote) — but it is
+    /// stated in the path domain too, because a name git chose to escape can never be carried as
+    /// one plain argument.
+    /// </summary>
+    private static bool IsResolvableAgentsMdConflictPath(string path)
+    {
+        if (path.Length == 0)
+            return false;
+
+        if (!path.StartsWith(AgentsRelativeDir, StringComparison.Ordinal))
+            return false;
+
+        var name = path[AgentsRelativeDir.Length..];
+        if (!name.EndsWith(AgentsMdSuffix, StringComparison.Ordinal))
+            return false;
+
+        var stem = name[..^AgentsMdSuffix.Length];
+        if (stem.Length == 0)
+            return false;
+
+        return !stem.Contains('/') && !stem.Contains('"') && !stem.Contains('\\');
+    }
+
+    /// <summary>
+    /// Resolves ONE qualifying agents.md merge conflict: sends the SINGLE resolution prompt,
+    /// records its answer as evidence, and runs the post-resolution CONTENT GATE before any
+    /// staging happens.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE GATE, in order and AFTER every agent edit of the resolution path: the shared
+    /// <see cref="EnsureAgentsMdWithinLimitsAsync"/> size enforcement (which may prompt again),
+    /// then the conflict-marker scan over <c>agents/*.agents.md</c>. A failure of either check
+    /// aborts the merge and reports a <see cref="ResolutionFailurePrefix"/> reason naming the
+    /// conflicted files and the cause — the unverified content is NEVER staged and NEVER pushed.
+    /// Only when BOTH checks pass are the resolved files staged and committed (the commit
+    /// concludes the merge while <c>MERGE_HEAD</c> exists), after which the caller continues to a
+    /// FRESH publication-HEAD check.
+    /// </para>
+    /// <para>
+    /// A THROWN resolution prompt (other than a REQUESTED cancellation, which propagates
+    /// unchanged) aborts the merge, keeps the accumulated evidence, and fails with the same
+    /// prefix. The prompt never tells the agent to pick one side wholesale.
+    /// </para>
+    /// </remarks>
+    /// <returns><c>null</c> on success; otherwise the sanitized failure reason.</returns>
+    private async Task<string?> ResolveConfigRepoConflictAsync(
+        IReadOnlyList<string> conflictedFiles, AgentOutputEvidence evidence, CancellationToken ct)
+    {
+        var namedFiles = RenderConflictFiles(conflictedFiles);
+        var fileLines = string.Join("\n", conflictedFiles.Select(f => $"  - {LogSanitizer.SanitizePath(f)}"));
+
+        var resolutionPrompt = $"""
+            The config repository has an in-progress merge that git could not complete on its own.
+            These guidance files still contain merge conflicts:
+            {fileLines}
+
+            Resolve them by MERGING BOTH SIDES of every conflict:
+            - Keep the lessons the incoming (remote) side added.
+            - Add the new lessons this run produced that are still missing.
+            - Remove EVERY conflict marker (<<<<<<<, =======, >>>>>>>) from the files.
+            - Preserve the protected safety guidance (git workflow, test requirements, output-format
+              compliance) in full — never drop or weaken it.
+            - Do NOT choose one side wholesale: neither side may delete the other side's content.
+            - Keep every file within {WorkerConstants.AgentsMdMaxCharacters} characters.
+            """;
+
+        string resolutionOutput;
+        try
+        {
+            resolutionOutput = await agentRunner.SendPromptAsync(resolutionPrompt, _configAgentsDir, ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            // An OCE that is NOT a requested execution cancellation is an ordinary resolution
+            // failure (an API timeout, for example) — never a silent skip. A REQUESTED
+            // cancellation does not enter this filter and propagates unchanged.
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"git pull conflict resolution prompt was interrupted without a requested cancellation [{safe}]");
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return BuildResolutionFailure(namedFiles, $"the resolution prompt failed with an error [{safe}]");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"git pull conflict resolution prompt threw [{safe}]");
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return BuildResolutionFailure(namedFiles, $"the resolution prompt failed with an error [{safe}]");
+        }
+
+        evidence.Append($"{ResolutionEvidenceHeader}\n{resolutionOutput}");
+
+        // ── (1) SIZE ENFORCEMENT (this may prompt again) ────────────────────────────
+        // A throwing enforcement — the condensation prompt itself or the filesystem read behind
+        // the limit check — is a resolution failure too: the content is then UNVERIFIED and must
+        // never be staged.
+        AgentsMdLimitDecision limits;
+        try
+        {
+            limits = await EnsureAgentsMdWithinLimitsAsync(evidence, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"git pull conflict resolution size enforcement threw [{safe}]");
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return BuildResolutionFailure(namedFiles, $"the size enforcement failed with an error [{safe}]");
+        }
+
+        if (!limits.Satisfied)
+        {
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return BuildResolutionFailure(
+                namedFiles,
+                $"the resolved content is still over the {WorkerConstants.AgentsMdMaxCharacters}-character limit " +
+                $"({RenderRemainingViolationsForLog(limits.Remaining)}), so nothing was staged or pushed");
+        }
+
+        // ── (2) THE CONFLICT-MARKER SCAN ─────────────────────────────────────────────
+        var (markersVerified, markedFiles) = FindAgentsMdFilesWithConflictMarkers();
+        if (!markersVerified)
+        {
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return BuildResolutionFailure(
+                namedFiles,
+                "the resolved content could not be verified for conflict markers, so nothing was staged or pushed");
+        }
+
+        if (markedFiles.Count > 0)
+        {
+            _log.Error("Config repo conflict resolution: conflict markers remain in " +
+                       LogSanitizer.FormatPathList(markedFiles, markedFiles.Count));
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return BuildResolutionFailure(
+                namedFiles,
+                $"conflict markers remain in {LogSanitizer.FormatPathList(markedFiles, markedFiles.Count)}, " +
+                "so nothing was staged or pushed");
+        }
+
+        // ── (3) STAGE + CONCLUDE THE MERGE ───────────────────────────────────────────
+        // The staging add, then the merge-concluding commit: while MERGE_HEAD exists this commit
+        // completes the in-progress merge instead of creating an ordinary commit.
+        var (_, addFailure) = await RunResolutionCommandAsync(
+            ["add", "agents/*.agents.md"], "add agents/*.agents.md", namedFiles, ct);
+        if (addFailure is not null)
+            return addFailure;
+
+        var (commitResult, commitFailure) = await RunResolutionCommandAsync(
+            ["commit", "-m", ImproverCommitMessage],
+            $"commit -m \"{ImproverCommitMessage}\"",
+            namedFiles,
+            ct);
+        if (commitFailure is not null)
+            return commitFailure;
+
+        _log.Info($"Committed the resolved config repo merge: {RenderForLog(commitResult!.Stdout)}");
+        return null;
+    }
+
+    /// <summary>
+    /// Runs ONE command of the conflict-resolution path (the staging add or the merge-concluding
+    /// commit). A failure — nonzero exit or a throw — aborts the merge (best effort) and returns
+    /// the sanitized <see cref="ResolutionFailurePrefix"/> reason naming the conflicted files and
+    /// the cause. A REQUESTED execution cancellation propagates unchanged.
+    /// </summary>
+    private async Task<(ConfigRepoOpResult? Result, string? FailureReason)> RunResolutionCommandAsync(
+        IReadOnlyList<string> tokenizedForm,
+        string legacyOpaqueForm,
+        string namedFiles,
+        CancellationToken ct)
+    {
+        ConfigRepoOpResult result;
+        try
+        {
+            result = await RunConfigRepoCommandAsync(tokenizedForm, legacyOpaqueForm, ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"git {legacyOpaqueForm} (conflict resolution) was interrupted without a requested cancellation [{safe}]");
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return (null, BuildResolutionFailure(
+                namedFiles, $"{legacyOpaqueForm} failed with an error [{safe}]"));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"git {legacyOpaqueForm} (conflict resolution) threw [{safe}]");
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return (null, BuildResolutionFailure(
+                namedFiles, $"{legacyOpaqueForm} failed with an error [{safe}]"));
+        }
+
+        if (!result.Success)
+        {
+            var rendered = RenderForLog(result.SanitizedError);
+            _log.Error($"git {legacyOpaqueForm} (conflict resolution) failed: {rendered}");
+            await AbortConfigRepoMergeBestEffortAsync(ct);
+            return (null, BuildResolutionFailure(
+                namedFiles, $"{legacyOpaqueForm} failed (exit {result.ExitCode}): {rendered}"));
+        }
+
+        return (result, null);
+    }
+
+    /// <summary>
+    /// Scans every file the resolution's staging add actually covers — every file UNDER
+    /// <c>agents/</c>, recursively, whose name ends in <c>.agents.md</c> — for a line starting with
+    /// one of the three conflict markers. A file that cannot be read fails the scan CLOSED: the
+    /// content is then UNVERIFIED and must never be staged.
+    /// </summary>
+    /// <remarks>
+    /// THE SCAN DOMAIN IS THE STAGING DOMAIN. The resolution stages with the literal pathspec
+    /// <c>agents/*.agents.md</c>, and git's wildcard <c>*</c> ALSO matches path separators, so that
+    /// ONE command stages a nested <c>agents/sub/x.agents.md</c> exactly as it stages the direct
+    /// child <c>agents/coder.agents.md</c> (verified against real git). A marker scan limited to
+    /// direct children would therefore pass a resolution that cleaned the role guidance file while
+    /// leaving <c>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</c> in a nested file — and publish it. This scan uses the
+    /// SAME recursive enumeration (and the SAME <c>.agents.md</c> suffix rule) that
+    /// <see cref="AgentsWorktreeHasNoCandidateFile"/> already uses for that pathspec, and it reports
+    /// the COMPLETE config-repo-relative path so a nested offender is named as
+    /// <c>agents/sub/x.agents.md</c>.
+    /// <para>
+    /// WHY THE SIZE LIMIT DOES NOT MATCH THIS DOMAIN: <see cref="EnsureAgentsMdWithinLimitsAsync"/>
+    /// stays deliberately limited to the DIRECT children. It also runs on the FIRST publication,
+    /// whose behaviour must not change, and the 8,000-character limit applies to the role GUIDANCE
+    /// files — the direct children. Markers, by contrast, are scanned in everything the add will
+    /// stage, because a published marker corrupts ANY file it lands in.
+    /// </para>
+    /// </remarks>
+    /// <returns>
+    /// <c>(Verified, Files)</c> — whether the scan completed, and the config-repo-relative paths
+    /// that still carry a marker.
+    /// </returns>
+    private (bool Verified, List<string> Files) FindAgentsMdFilesWithConflictMarkers()
+    {
+        List<string> marked = [];
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(
+                _configAgentsDir, "*", SearchOption.AllDirectories))
+            {
+                if (!file.EndsWith(AgentsMdSuffix, StringComparison.Ordinal))
+                    continue;
+
+                foreach (var line in File.ReadAllLines(file))
+                {
+                    if (ConflictMarkerPrefixes.Any(p => line.StartsWith(p, StringComparison.Ordinal)))
+                    {
+                        marked.Add(Path.GetRelativePath(_configRepoDir, file).Replace('\\', '/'));
+                        break;
+                    }
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or NotSupportedException or ArgumentException or SecurityException)
+        {
+            _log.Error($"Config repo conflict resolution: the marker scan failed [{SafeExceptionLog.Describe(ex)}]");
+            return (false, []);
+        }
+
+        return (true, marked);
+    }
+
+    /// <summary>
+    /// Renders the conflicted-file list for a resolution FAILURE reason: each path sanitized with
+    /// the shared helper (the paths come from git output and are therefore untrusted) and joined
+    /// on a single line, so the reason never forges a log line.
+    /// </summary>
+    private static string RenderConflictFiles(IReadOnlyList<string> conflictedFiles) =>
+        conflictedFiles.Count == 0
+            ? "(no conflicted file reported)"
+            : string.Join(", ", conflictedFiles.Select(LogSanitizer.SanitizePath));
+
+    /// <summary>
+    /// Builds a resolution FAILURE reason: the fixed prefix, the conflicted files, then the cause.
+    /// </summary>
+    private static string BuildResolutionFailure(string namedFiles, string cause) =>
+        $"{ResolutionFailurePrefix}{namedFiles} — {cause}.";
+
+    /// <summary>
+    /// Whether a FAILED push is a genuine NON-FAST-FORWARD rejection — the ONLY push failure that
+    /// starts a second publication attempt. git must have named a rejected ref
+    /// (<c>[rejected]</c>) together with either the <c>(fetch first)</c> or the
+    /// <c>(non-fast-forward)</c> explanation, in stdout OR stderr. Every other failure — an auth
+    /// error, a transport error, a hook rejection, an ambiguous message — is NOT retryable.
+    /// </summary>
+    private static bool IsNonFastForwardPushRejection(ConfigRepoOpResult pushResult)
+    {
+        var combined = pushResult.Stdout + "\n" + pushResult.SanitizedError;
+        if (!combined.Contains("[rejected]", StringComparison.Ordinal))
+            return false;
+
+        return combined.Contains("(fetch first)", StringComparison.Ordinal)
+            || combined.Contains("(non-fast-forward)", StringComparison.Ordinal);
     }
 }
