@@ -1532,6 +1532,38 @@ public sealed class DistributedBrainTests
     }
 
     /// <summary>
+    /// The WORKER PROMPT RULES must name each role's mandatory report tool. The coder's
+    /// report_code_changes tool (role-gated to the coder worker) was omitted, so the Brain was
+    /// never told to ask coders for it. The tester rule must keep naming report_test_results —
+    /// and none of the coder's tool — so the two roles' report tools cannot be confused.
+    /// Asserted over the built prompt text via the builder (no Brain instance needed).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BuildSystemPrompt_WorkerPromptRules_NameCoderAndTesterReportTools(bool subAgentsEnabled)
+    {
+        var prompt = BrainPromptBuilder.BuildSystemPrompt(subAgentsEnabled);
+
+        // (a) The coder rule names the coder's mandatory report tool.
+        Assert.Contains(
+            "- Coders: Tell them to implement immediately, read files, use build/test skills, "
+            + "commit with git add -A && git commit, and call report_code_changes after committing. "
+            + "Never include git branch or push commands.",
+            prompt,
+            StringComparison.Ordinal);
+
+        // (b) The tester rule still names the tester's report tool, and only that tool.
+        var testerRuleStart = prompt.IndexOf("- Testers:", StringComparison.Ordinal);
+        var reviewerRuleStart = prompt.IndexOf("- Reviewers:", StringComparison.Ordinal);
+        Assert.True(testerRuleStart >= 0, "The tester worker-prompt rule is missing from the built prompt.");
+        Assert.True(reviewerRuleStart > testerRuleStart, "The reviewer rule must follow the tester rule.");
+        var testerRule = prompt[testerRuleStart..reviewerRuleStart];
+        Assert.Contains("call report_test_results", testerRule, StringComparison.Ordinal);
+        Assert.DoesNotContain("report_code_changes", testerRule, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// BuildSystemPrompt returns the policy that governs both Brain jobs: planning
     /// phase_instructions and crafting worker prompts. It must assign conditional test ownership
     /// without making Coder the exclusive test author, and its neighboring Reviewer rule must

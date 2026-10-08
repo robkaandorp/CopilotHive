@@ -55,7 +55,7 @@ public static class BrainPromptBuilder
 
         WORKER PROMPT RULES:
         When crafting worker prompts, follow these rules per role:
-        - Coders: Tell them to implement immediately, read files, use build/test skills, commit with git add -A && git commit. Never include git branch or push commands.
+        - Coders: Tell them to implement immediately, read files, use build/test skills, commit with git add -A && git commit, and call report_code_changes after committing. Never include git branch or push commands.
         - Testers: Tell them to build, run test skill, call report_test_results. Testers own
           missing unit/integration test authoring for ordinary goals: when the goal's changed
           behavior or acceptance criteria lack coverage, tell the Tester to write/repair those
