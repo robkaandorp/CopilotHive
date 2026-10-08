@@ -21,6 +21,7 @@ public sealed class BackupService
     private readonly string _stateDir;
     private readonly IDbContextFactory<CopilotHiveDbContext> _dbContextFactory;
     private readonly ILogger<BackupService> _logger;
+    private readonly TimeProvider _timeProvider;
 
     private static readonly JsonSerializerOptions ManifestOptions = new()
     {
@@ -32,14 +33,21 @@ public sealed class BackupService
     /// <param name="stateDir">The state directory whose contents are backed up.</param>
     /// <param name="dbContextFactory">Factory used to resolve the SQLite database path.</param>
     /// <param name="logger">Logger instance.</param>
+    /// <param name="timeProvider">
+    /// Clock used for the backup archive names and the manifest timestamp; defaults to
+    /// <see cref="TimeProvider.System"/>. Tests inject a manual clock so distinct archive names
+    /// are obtained deterministically instead of by waiting on the wall clock.
+    /// </param>
     public BackupService(
         string stateDir,
         IDbContextFactory<CopilotHiveDbContext> dbContextFactory,
-        ILogger<BackupService> logger)
+        ILogger<BackupService> logger,
+        TimeProvider? timeProvider = null)
     {
         _stateDir = stateDir;
         _dbContextFactory = dbContextFactory;
         _logger = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>The directory where backup archives are stored.</summary>
@@ -63,7 +71,7 @@ public sealed class BackupService
     {
         Directory.CreateDirectory(BackupDirectory);
 
-        var timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
+        var timestamp = _timeProvider.GetUtcNow().UtcDateTime.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
         var tempDir = Path.Combine(BackupDirectory, $"tmp-{timestamp}");
         Directory.CreateDirectory(tempDir);
 
@@ -106,7 +114,7 @@ public sealed class BackupService
             // 7. Manifest
             var manifest = new
             {
-                timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                timestamp = _timeProvider.GetUtcNow().UtcDateTime.ToString("o", CultureInfo.InvariantCulture),
                 copilothiveVersion = Assembly.GetExecutingAssembly()
                     .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "unknown",
                 sharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly
@@ -184,7 +192,7 @@ public sealed class BackupService
 
         Directory.CreateDirectory(BackupDirectory);
 
-        var timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
+        var timestamp = _timeProvider.GetUtcNow().UtcDateTime.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
         var tempDir = Path.Combine(BackupDirectory, $"restore-tmp-{timestamp}");
         Directory.CreateDirectory(tempDir);
 

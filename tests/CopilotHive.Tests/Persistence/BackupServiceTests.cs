@@ -16,9 +16,32 @@ namespace CopilotHive.Tests.Persistence;
 /// Tests for <see cref="BackupService"/> verifying that tar.gz archives are created with
 /// the database, Brain/Composer session files, metrics, and keys, that a manifest is written,
 /// and that old backups are pruned.
+/// <para>
+/// Every service built by <see cref="CreateService"/> runs on the shared manual
+/// <see cref="ControlledTimeProvider"/>, whose UTC timestamp is embedded in the archive names:
+/// a test that needs a distinct backup name advances that clock rather than sleeping on the
+/// wall clock, so name distinctness is deterministic instead of a race against the second-
+/// resolution timestamp format.
+/// </para>
 /// </summary>
 public sealed class BackupServiceTests
 {
+    /// <summary>
+    /// Manual clock shared by every <see cref="BackupService"/> this class builds (a fresh
+    /// instance per test, so nothing leaks between tests). Its default <c>now</c> is
+    /// 2025-01-01T00:00:00Z; <see cref="ControlledTimeProvider.Advance"/> moves the timestamps
+    /// that <see cref="BackupService"/> reads.
+    /// </summary>
+    private readonly ControlledTimeProvider _clock = new();
+
+    /// <summary>
+    /// Advance applied wherever a test creates a SECOND <c>copilothive-backup-*</c> archive: the
+    /// archive name embeds a second-resolution <c>yyyyMMddTHHmmss</c> UTC stamp, so moving the
+    /// manual clock by 2 s is what keeps the names distinct (two creations without an advance
+    /// would collide on one file name).
+    /// </summary>
+    private static readonly TimeSpan DistinctNameAdvance = TimeSpan.FromSeconds(2);
+
     /// <summary>
     /// Builds the SQLite connection string for a test database. Uses <c>Pooling=False</c> to mirror
     /// the production backup path: a pooled native handle can outlive the restore file swap and
@@ -33,7 +56,7 @@ public sealed class BackupServiceTests
         public CopilotHiveDbContext CreateDbContext() => new(_options);
     }
 
-    private static (string stateDir, BackupService service) CreateService()
+    private (string stateDir, BackupService service) CreateService()
     {
         var stateDir = Path.Combine(Path.GetTempPath(), $"backup-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(stateDir);
@@ -49,7 +72,7 @@ public sealed class BackupServiceTests
         }
 
         var factory = new TestDbContextFactory(options);
-        var service = new BackupService(stateDir, factory, NullLogger<BackupService>.Instance);
+        var service = new BackupService(stateDir, factory, NullLogger<BackupService>.Instance, _clock);
         return (stateDir, service);
     }
 
@@ -235,6 +258,114 @@ public sealed class BackupServiceTests
         }
     }
 
+    /// <summary>
+    /// Pins the ARCHIVE NAME to the injected clock: it must be
+    /// <c>copilothive-backup-{manual stamp}.tar.gz</c>, and advancing the manual clock must be the
+    /// ONLY thing that produces a second, distinct name. The wall-clock read this seam replaced
+    /// yields today's date instead of the manual stamp, so both assertions fail there — and no
+    /// amount of advancing the manual clock could produce <c>...T000002</c>.
+    /// </summary>
+    [Fact]
+    public async Task CreateBackupAsync_NamesArchiveFromInjectedClock()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+
+            var firstPath = await service.CreateBackupAsync(ct);
+            Assert.Equal(
+                "copilothive-backup-20250101T000000.tar.gz",
+                Path.GetFileName(firstPath));
+
+            // Only the manual advance makes the second name distinct — this is exactly what the
+            // removed wall-clock wait used to buy.
+            _clock.Advance(DistinctNameAdvance);
+            var secondPath = await service.CreateBackupAsync(ct);
+
+            Assert.Equal(
+                "copilothive-backup-20250101T000002.tar.gz",
+                Path.GetFileName(secondPath));
+            Assert.True(File.Exists(firstPath));
+            Assert.True(File.Exists(secondPath));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Pins the MANIFEST timestamp to the injected clock, read independently for two backups:
+    /// the invariant round-trip ("o") stamp of the manual UTC clock. The wall-clock read this seam
+    /// replaced writes today's date in the same format, so the literal pins below fail there.
+    /// </summary>
+    [Fact]
+    public async Task CreateBackupAsync_ManifestTimestampFromInjectedClock()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+
+            var firstPath = await service.CreateBackupAsync(ct);
+            Assert.Equal(
+                "2025-01-01T00:00:00.0000000Z",
+                await ReadManifestTimestampAsync(firstPath));
+
+            _clock.Advance(DistinctNameAdvance);
+            var secondPath = await service.CreateBackupAsync(ct);
+            Assert.Equal(
+                "2025-01-01T00:00:02.0000000Z",
+                await ReadManifestTimestampAsync(secondPath));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Pins the RESTORE temp-directory name (<c>restore-tmp-{stamp}</c>) to the injected clock by
+    /// pre-occupying the exact path the manual stamp predicts with a FILE: the restore must then
+    /// fail deterministically, because creating a directory where that file sits throws. On the
+    /// wall-clock read this seam replaced, the computed name is today's date, the path is free, the
+    /// restore succeeds and no exception is observed.
+    /// </summary>
+    [Fact]
+    public async Task RestoreBackupAsync_TempDirectoryNameFromInjectedClock()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            var backupPath = await service.CreateBackupAsync(ct);
+
+            Directory.CreateDirectory(service.BackupDirectory);
+            var predictedTempDir = Path.Combine(service.BackupDirectory, "restore-tmp-20250101T000000");
+            await File.WriteAllTextAsync(predictedTempDir, "occupied", ct);
+
+            await Assert.ThrowsAnyAsync<IOException>(
+                () => service.RestoreBackupAsync(backupPath, ct));
+
+            // The colliding path is still the test's file — the restore never took it over.
+            Assert.True(File.Exists(predictedTempDir));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    /// <summary>Reads the <c>timestamp</c> property out of an archive's manifest.</summary>
+    private static async Task<string?> ReadManifestTimestampAsync(string archivePath)
+    {
+        var manifestJson = await ReadArchiveEntry(archivePath, "backup-manifest.json");
+        Assert.NotNull(manifestJson);
+        using var doc = JsonDocument.Parse(manifestJson!);
+        return doc.RootElement.GetProperty("timestamp").GetString();
+    }
+
     [Fact]
     public async Task CreateBackupAsync_CleansUpOldBackups()
     {
@@ -245,10 +376,25 @@ public sealed class BackupServiceTests
             for (var i = 0; i < 12; i++)
             {
                 await service.CreateBackupAsync(ct);
-                await Task.Delay(1100, ct);
+
+                // Each archive name embeds the manual clock's second-resolution stamp: without
+                // this advance every iteration would reuse one file name and pruning (which
+                // orders by name) would never be exercised.
+                _clock.Advance(DistinctNameAdvance);
             }
 
-            Assert.True(service.ListBackups().Count <= 10);
+            // 12 distinct-stamped archives were created and pruning keeps the newest 10: an exact
+            // count (not just "<= 10") fails if any advance is dropped, because the colliding names
+            // would leave a single archive behind.
+            Assert.Equal(10, service.ListBackups().Count);
+
+            var files = Directory.GetFiles(service.BackupDirectory, "copilothive-backup-*.tar.gz");
+            Assert.Equal(10, files.Length);
+
+            // The newest stamp (i = 11 → 22 s) survived; the oldest two (0 s, 2 s) were pruned.
+            Assert.Contains(files, f => Path.GetFileName(f) == "copilothive-backup-20250101T000022.tar.gz");
+            Assert.DoesNotContain(files, f => Path.GetFileName(f) == "copilothive-backup-20250101T000000.tar.gz");
+            Assert.DoesNotContain(files, f => Path.GetFileName(f) == "copilothive-backup-20250101T000002.tar.gz");
         }
         finally
         {
@@ -266,7 +412,7 @@ public sealed class BackupServiceTests
             for (var i = 0; i < 3; i++)
             {
                 await service.CreateBackupAsync(ct);
-                await Task.Delay(1100, ct);
+                _clock.Advance(DistinctNameAdvance);
             }
 
             var backups = service.ListBackups();
@@ -276,6 +422,16 @@ public sealed class BackupServiceTests
             {
                 Assert.True(backups[i].CreatedAt >= backups[i + 1].CreatedAt);
             }
+
+            // The three archives carry the three distinct manual stamps (ListBackups orders by
+            // filesystem creation time, so compare the SET of names, not their order).
+            Assert.Equal(
+                [
+                    "copilothive-backup-20250101T000000.tar.gz",
+                    "copilothive-backup-20250101T000002.tar.gz",
+                    "copilothive-backup-20250101T000004.tar.gz",
+                ],
+                backups.Select(b => b.FileName).Order(StringComparer.Ordinal).ToArray());
         }
         finally
         {
@@ -385,10 +541,14 @@ public sealed class BackupServiceTests
             var ct = TestContext.Current.CancellationToken;
             var backupPath = await service.CreateBackupAsync(ct);
 
-            // Ensure distinct timestamp so the safety backup is a separate archive.
-            await Task.Delay(1100, ct);
+            // The manual advance is what gives the safety backup a distinct name; both stamps are
+            // pinned literally so a wall-clock read (or a dropped advance) fails here.
+            _clock.Advance(DistinctNameAdvance);
 
             var result = await service.RestoreBackupAsync(backupPath, ct);
+
+            Assert.Equal("copilothive-backup-20250101T000000.tar.gz", Path.GetFileName(backupPath));
+            Assert.Equal("pre-restore-20250101T000002.tar.gz", Path.GetFileName(result.SafetyBackupPath));
 
             Assert.True(File.Exists(result.SafetyBackupPath));
             Assert.NotEqual(Path.GetFullPath(backupPath), Path.GetFullPath(result.SafetyBackupPath));
@@ -421,13 +581,17 @@ public sealed class BackupServiceTests
             {
                 // Restore the most recent (last-created) backup so it survives pruning.
                 backupToRestore = await service.CreateBackupAsync(ct);
-                await Task.Delay(1100, ct);
+                _clock.Advance(DistinctNameAdvance);
             }
 
-            // After pruning, normal backups are capped at 10.
-            Assert.True(service.ListBackups().Count <= 10);
+            // 11 distinct-stamped archives, pruned to exactly the newest 10: the count is exact so
+            // a dropped advance (all names colliding) fails here instead of passing vacuously.
+            Assert.Equal(10, service.ListBackups().Count);
+            Assert.Equal("copilothive-backup-20250101T000020.tar.gz", Path.GetFileName(backupToRestore!));
 
             var result = await service.RestoreBackupAsync(backupToRestore!, ct);
+
+            Assert.Equal("pre-restore-20250101T000022.tar.gz", Path.GetFileName(result.SafetyBackupPath));
 
             // The safety backup must survive: it is excluded from normal pruning.
             Assert.True(File.Exists(result.SafetyBackupPath));
@@ -787,7 +951,7 @@ public sealed class BackupServiceTests
 
             // Step 3: Restore backup A. This should create a safety backup containing
             // the current (modified) state — i.e., the goal that was added.
-            await Task.Delay(1100, ct); // Ensure distinct timestamp.
+            _clock.Advance(DistinctNameAdvance); // Ensure distinct timestamp.
             var result = await service.RestoreBackupAsync(backupAPath, ct);
             Assert.True(File.Exists(result.SafetyBackupPath));
 
@@ -995,8 +1159,7 @@ public sealed class BackupServiceTests
             await File.WriteAllTextAsync(Path.Combine(stateDir, "brain-master.json"), "{\"v\":1}", ct);
 
             var backupPath = await service.CreateBackupAsync(ct);
-            await Task.Delay(1100, ct); // Distinct timestamp for safety backup.
-
+            _clock.Advance(DistinctNameAdvance); // Distinct timestamp for safety backup.
             var result = await service.RestoreBackupAsync(backupPath, ct);
 
             // The safety backup path must exist and use the pre-restore prefix.
@@ -1035,7 +1198,7 @@ public sealed class BackupServiceTests
 
             // Create a backup to restore later.
             var backupToRestore = await service.CreateBackupAsync(ct);
-            await Task.Delay(1100, ct);
+            _clock.Advance(DistinctNameAdvance);
 
             // Restore — creates a pre-restore-* safety backup.
             var result = await service.RestoreBackupAsync(backupToRestore, ct);
@@ -1047,17 +1210,18 @@ public sealed class BackupServiceTests
             for (var i = 0; i < 12; i++)
             {
                 await service.CreateBackupAsync(ct);
-                await Task.Delay(1100, ct);
+                _clock.Advance(DistinctNameAdvance);
             }
 
             // The safety backup must still exist — it is excluded from pruning.
+            Assert.Equal("pre-restore-20250101T000002.tar.gz", Path.GetFileName(safetyPath));
             Assert.True(File.Exists(safetyPath),
                 $"Safety backup was pruned: {safetyPath}");
 
-            // Normal backups should be pruned to <= 10, but safety backup is separate.
+            // Normal backups are pruned to exactly the newest 10 (an exact count, so a dropped
+            // advance cannot pass vacuously); the safety backup is separate.
             var normalBackups = service.ListBackups();
-            Assert.True(normalBackups.Count <= 10,
-                $"Normal backups should be pruned to <= 10, but found {normalBackups.Count}");
+            Assert.Equal(10, normalBackups.Count);
             Assert.DoesNotContain(normalBackups, b => b.FileName == Path.GetFileName(safetyPath));
 
             // Verify the pre-restore file still exists on disk (not just in the list).
