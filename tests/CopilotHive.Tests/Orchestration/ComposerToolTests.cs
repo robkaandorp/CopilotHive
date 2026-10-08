@@ -2323,11 +2323,11 @@ public sealed class ComposerToolTests : IDisposable
             await _store.UpdateGoalAsync(goal, ct);
 
             // Use a shared PipelineStore so the dispatcher can restore the persisted Failed pipeline.
-            await using var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+            await using var harness = TestPipelineStore.Create();
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var goalManager = new GoalManager();
             goalManager.AddSource(new FakeGoalSource(goal, _store));
-            var pipelineManager = new GoalPipelineManager(pipelineStore);
+            var pipelineManager = new GoalPipelineManager(harness.Store);
             var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
             while (pipeline.IterationBudget.TryConsume()) { }
             pipeline.AdvanceTo(GoalPhase.Failed);
@@ -2701,11 +2701,11 @@ public sealed class ComposerToolTests : IDisposable
             goal.FailureReason = "Exceeded max iterations";
             await _store.UpdateGoalAsync(goal, ct);
 
-            await using var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+            await using var harness = TestPipelineStore.Create();
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var goalManager = new GoalManager();
             goalManager.AddSource(new FakeGoalSource(goal, _store));
-            var pipelineManager = new GoalPipelineManager(pipelineStore);
+            var pipelineManager = new GoalPipelineManager(harness.Store);
             var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
             while (pipeline.IterationBudget.TryConsume()) { }
             pipeline.AdvanceTo(GoalPhase.Failed);
@@ -2765,11 +2765,11 @@ public sealed class ComposerToolTests : IDisposable
             goal.FailureReason = "Review rejected the changes and testing failed";
             await _store.UpdateGoalAsync(goal, ct);
 
-            await using var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+            await using var harness = TestPipelineStore.Create();
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var goalManager = new GoalManager();
             goalManager.AddSource(new FakeGoalSource(goal, _store));
-            var pipelineManager = new GoalPipelineManager(pipelineStore);
+            var pipelineManager = new GoalPipelineManager(harness.Store);
             var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
             while (pipeline.IterationBudget.TryConsume()) { }
             pipeline.CoderBranch = $"copilothive/{goal.Id}";

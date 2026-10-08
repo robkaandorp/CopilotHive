@@ -21,15 +21,15 @@ namespace CopilotHive.Tests;
 
 public sealed class PipelineStoreTests : IAsyncDisposable
 {
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
 
     public PipelineStoreTests()
     {
         // Use in-memory SQLite for test isolation
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        _harness = TestPipelineStore.Create();
     }
 
-    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _harness.DisposeAsync();
 
     private static Goal CreateGoal(string id = "goal-1", string desc = "Test goal") =>
         new() { Id = id, Description = desc, RepositoryNames = ["test-repo"] };
@@ -52,8 +52,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.TestRetryBudget.TryConsume();
         pipeline.SetActiveTask("task-42", "feature/g1");
 
-        _store.SavePipeline(pipeline);
-        var snapshots = _store.LoadActivePipelines();
+        _harness.Store.SavePipeline(pipeline);
+        var snapshots = _harness.Store.LoadActivePipelines();
 
         var snap = Assert.Single(snapshots);
         Assert.Equal("g1", snap.GoalId);
@@ -72,8 +72,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline("g2", "Fix bug in parser");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal("g2", snap.Goal.Id);
         Assert.Equal("Fix bug in parser", snap.Goal.Description);
@@ -88,8 +88,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Hello! Ready."));
         pipeline.Conversation.Add(new ConversationEntry("user", "Plan this goal"));
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal(3, snap.Conversation.Count);
         Assert.Equal("user", snap.Conversation[0].Role);
@@ -107,8 +107,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Here is the plan", Iteration: 1, Purpose: "planning"));
         pipeline.Conversation.Add(new ConversationEntry("system", "Error occurred", Iteration: 1, Purpose: "error"));
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal(1, snap.Conversation[0].Iteration);
         Assert.Equal("planning", snap.Conversation[0].Purpose);
@@ -125,8 +125,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         // Legacy-style entry with no metadata
         pipeline.Conversation.Add(new ConversationEntry("user", "Legacy message"));
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Single(snap.Conversation);
         Assert.Null(snap.Conversation[0].Iteration);
@@ -150,8 +150,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
             WorkerOutput = "test output",
         });
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal(2, snap.PhaseLog.Count);
         Assert.Equal("code output", snap.PhaseLog[0].WorkerOutput);
@@ -188,8 +188,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
             WorkerOutput = "review output without narratives",
         });
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal(2, snap.PhaseLog.Count);
 
@@ -221,8 +221,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.Metrics.FailedTests = 2;
         pipeline.Metrics.CoveragePercent = 85.5;
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.True(snap.Metrics.BuildSuccess);
         Assert.Equal(50, snap.Metrics.TotalTests);
@@ -237,8 +237,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         var pipeline = CreatePipeline();
         var createdAt = pipeline.CreatedAt;
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         // Round-trip through ISO 8601 may lose sub-millisecond precision
         Assert.Equal(createdAt, snap.CreatedAt, TimeSpan.FromMilliseconds(1));
@@ -261,11 +261,11 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         var failed = CreatePipeline("g-failed", "Failed");
         failed.AdvanceTo(GoalPhase.Failed);
 
-        _store.SavePipeline(active);
-        _store.SavePipeline(done);
-        _store.SavePipeline(failed);
+        _harness.Store.SavePipeline(active);
+        _harness.Store.SavePipeline(done);
+        _harness.Store.SavePipeline(failed);
 
-        var snapshots = _store.LoadActivePipelines();
+        var snapshots = _harness.Store.LoadActivePipelines();
 
         Assert.Single(snapshots);
         Assert.Equal("g-active", snapshots[0].GoalId);
@@ -274,7 +274,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     [Fact]
     public void LoadActivePipelines_EmptyStore_ReturnsEmpty()
     {
-        var snapshots = _store.LoadActivePipelines();
+        var snapshots = _harness.Store.LoadActivePipelines();
 
         Assert.Empty(snapshots);
     }
@@ -288,14 +288,14 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline();
         pipeline.Conversation.Add(new ConversationEntry("user", "Hello"));
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
         // Mutate state and save state-only
         pipeline.AdvanceTo(GoalPhase.Review);
         pipeline.IterationBudget.TryConsume();
-        _store.SavePipelineState(pipeline);
+        _harness.Store.SavePipelineState(pipeline);
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal(GoalPhase.Review, snap.Phase);
         Assert.Equal(2, snap.Iteration);
         // Conversation should still be intact
@@ -312,12 +312,12 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline();
         pipeline.Conversation.Add(new ConversationEntry("user", "First"));
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
-        _store.AppendConversation("goal-1", new ConversationEntry("assistant", "Second"));
-        _store.AppendConversation("goal-1", new ConversationEntry("user", "Third"));
+        _harness.Store.AppendConversation("goal-1", new ConversationEntry("assistant", "Second"));
+        _harness.Store.AppendConversation("goal-1", new ConversationEntry("user", "Third"));
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal(3, snap.Conversation.Count);
         Assert.Equal("First", snap.Conversation[0].Content);
         Assert.Equal("Second", snap.Conversation[1].Content);
@@ -328,11 +328,11 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void AppendConversation_PersistsMetadata()
     {
         var pipeline = CreatePipeline();
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
-        _store.AppendConversation("goal-1", new ConversationEntry("user", "Craft prompt", Iteration: 2, Purpose: "craft-prompt"));
+        _harness.Store.AppendConversation("goal-1", new ConversationEntry("user", "Craft prompt", Iteration: 2, Purpose: "craft-prompt"));
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Single(snap.Conversation);
         Assert.Equal(2, snap.Conversation[0].Iteration);
         Assert.Equal("craft-prompt", snap.Conversation[0].Purpose);
@@ -346,12 +346,12 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void SaveTaskMapping_ThenLoad_RestoresTaskMappings()
     {
         var pipeline = CreatePipeline();
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
-        _store.SaveTaskMapping("task-1", "goal-1");
-        _store.SaveTaskMapping("task-2", "goal-1");
+        _harness.Store.SaveTaskMapping("task-1", "goal-1");
+        _harness.Store.SaveTaskMapping("task-2", "goal-1");
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal(2, snap.TaskMappings.Count);
         Assert.Contains(("task-1", "goal-1"), snap.TaskMappings);
         Assert.Contains(("task-2", "goal-1"), snap.TaskMappings);
@@ -366,18 +366,18 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline();
         pipeline.Conversation.Add(new ConversationEntry("user", "test"));
-        _store.SavePipeline(pipeline);
-        _store.SaveTaskMapping("task-1", "goal-1");
+        _harness.Store.SavePipeline(pipeline);
+        _harness.Store.SaveTaskMapping("task-1", "goal-1");
 
-        _store.RemovePipeline("goal-1");
+        _harness.Store.RemovePipeline("goal-1");
 
-        Assert.Empty(_store.LoadActivePipelines());
+        Assert.Empty(_harness.Store.LoadActivePipelines());
     }
 
     [Fact]
     public void RemovePipeline_NonexistentGoal_DoesNotThrow()
     {
-        var ex = Record.Exception(() => _store.RemovePipeline("nonexistent"));
+        var ex = Record.Exception(() => _harness.Store.RemovePipeline("nonexistent"));
 
         Assert.Null(ex);
     }
@@ -390,13 +390,13 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void SavePipeline_CalledTwice_UpsertsPipelineRow()
     {
         var pipeline = CreatePipeline();
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
         pipeline.AdvanceTo(GoalPhase.Testing);
         pipeline.IterationBudget.TryConsume();
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal(GoalPhase.Testing, snap.Phase);
         Assert.Equal(2, snap.Iteration);
     }
@@ -412,8 +412,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.AdvanceTo(GoalPhase.Merging);
         pipeline.MergeCommitHash = "abc123def456";
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal("abc123def456", snap.MergeCommitHash);
     }
@@ -423,8 +423,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline("g-hash-2");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Null(snap.MergeCommitHash);
     }
@@ -433,13 +433,13 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void SavePipelineState_UpdatesMergeCommitHash()
     {
         var pipeline = CreatePipeline("g-hash-3");
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
         pipeline.AdvanceTo(GoalPhase.Merging);
         pipeline.MergeCommitHash = "updated-merge-hash";
-        _store.SavePipelineState(pipeline);
+        _harness.Store.SavePipelineState(pipeline);
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal("updated-merge-hash", snap.MergeCommitHash);
     }
 
@@ -450,8 +450,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.AdvanceTo(GoalPhase.Merging);
         pipeline.MergeCommitHash = "cafebabe9876";
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         var restored = new GoalPipeline(snap);
 
         Assert.Equal("cafebabe9876", restored.MergeCommitHash);
@@ -465,11 +465,11 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void LoadPipeline_LoadsFailedPipeline()
     {
         var pipeline = CreatePipeline("g-failed", "Failed goal");
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
         pipeline.AdvanceTo(GoalPhase.Failed);
-        _store.SavePipelineState(pipeline);
+        _harness.Store.SavePipelineState(pipeline);
 
-        var snap = _store.LoadPipeline("g-failed");
+        var snap = _harness.Store.LoadPipeline("g-failed");
 
         Assert.NotNull(snap);
         Assert.Equal(GoalPhase.Failed, snap!.Phase);
@@ -478,7 +478,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     [Fact]
     public void LoadPipeline_NonexistentGoal_ReturnsNull()
     {
-        var snap = _store.LoadPipeline("nonexistent");
+        var snap = _harness.Store.LoadPipeline("nonexistent");
 
         Assert.Null(snap);
     }
@@ -489,10 +489,10 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         var pipeline = CreatePipeline("g-full", "Full load");
         pipeline.Conversation.Add(new ConversationEntry("user", "Hello"));
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Hi"));
-        _store.SavePipeline(pipeline);
-        _store.SaveTaskMapping("task-x", "g-full");
+        _harness.Store.SavePipeline(pipeline);
+        _harness.Store.SaveTaskMapping("task-x", "g-full");
 
-        var snap = _store.LoadPipeline("g-full");
+        var snap = _harness.Store.LoadPipeline("g-full");
 
         Assert.NotNull(snap);
         Assert.Equal(2, snap!.Conversation.Count);
@@ -504,12 +504,12 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void DeleteTaskMapping_RemovesMapping()
     {
         var pipeline = CreatePipeline("g-del", "Delete mapping");
-        _store.SavePipeline(pipeline);
-        _store.SaveTaskMapping("task-del", "g-del");
+        _harness.Store.SavePipeline(pipeline);
+        _harness.Store.SaveTaskMapping("task-del", "g-del");
 
-        _store.DeleteTaskMapping("task-del");
+        _harness.Store.DeleteTaskMapping("task-del");
 
-        var snap = _store.LoadPipeline("g-del");
+        var snap = _harness.Store.LoadPipeline("g-del");
         Assert.NotNull(snap);
         Assert.Empty(snap!.TaskMappings);
     }
@@ -517,7 +517,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     [Fact]
     public void DeleteTaskMapping_NonexistentTask_DoesNotThrow()
     {
-        var ex = Record.Exception(() => _store.DeleteTaskMapping("nonexistent-task"));
+        var ex = Record.Exception(() => _harness.Store.DeleteTaskMapping("nonexistent-task"));
 
         Assert.Null(ex);
     }
@@ -536,11 +536,11 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         var pipeline2 = CreatePipeline("goal-2", "Second goal");
         pipeline2.Conversation.Add(new ConversationEntry("user", "Hello from goal 2"));
 
-        _store.SavePipeline(pipeline1);
-        _store.SavePipeline(pipeline2);
+        _harness.Store.SavePipeline(pipeline1);
+        _harness.Store.SavePipeline(pipeline2);
 
-        var conversation1 = _store.GetConversation("goal-1");
-        var conversation2 = _store.GetConversation("goal-2");
+        var conversation1 = _harness.Store.GetConversation("goal-1");
+        var conversation2 = _harness.Store.GetConversation("goal-2");
 
         Assert.Equal(2, conversation1.Count);
         Assert.Equal("user", conversation1[0].Role);
@@ -555,9 +555,9 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void GetConversation_NoEntries_ReturnsEmptyList()
     {
         var pipeline = CreatePipeline("goal-empty", "Empty goal");
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
-        var conversation = _store.GetConversation("goal-empty");
+        var conversation = _harness.Store.GetConversation("goal-empty");
 
         Assert.Empty(conversation);
     }
@@ -565,7 +565,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     [Fact]
     public void GetConversation_NonExistentGoal_ReturnsEmptyList()
     {
-        var conversation = _store.GetConversation("nonexistent-goal");
+        var conversation = _harness.Store.GetConversation("nonexistent-goal");
 
         Assert.Empty(conversation);
     }
@@ -580,9 +580,9 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Worker task for coder", Iteration: 2, Purpose: "craft-prompt"));
         pipeline.Conversation.Add(new ConversationEntry("coder", "Done!", Iteration: 2, Purpose: "worker-output"));
 
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
-        var conversation = _store.GetConversation("goal-meta");
+        var conversation = _harness.Store.GetConversation("goal-meta");
 
         Assert.Equal(5, conversation.Count);
         Assert.Equal(1, conversation[0].Iteration);
@@ -676,16 +676,16 @@ public sealed class GoalPipelineSnapshotRestorationTests
 }
 
 public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
     private readonly GoalPipelineManager _manager;
 
     public GoalPipelineManagerPersistenceTests()
     {
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
-        _manager = new GoalPipelineManager(_store);
+        _harness = TestPipelineStore.Create();
+        _manager = new GoalPipelineManager(_harness.Store);
     }
 
-    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _harness.DisposeAsync();
 
     private static Goal CreateGoal(string id = "goal-1", string desc = "Test goal") =>
         new() { Id = id, Description = desc, RepositoryNames = ["test-repo"] };
@@ -695,7 +695,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     {
         _manager.CreatePipeline(CreateGoal("g1", "Persisted"));
 
-        var snapshots = _store.LoadActivePipelines();
+        var snapshots = _harness.Store.LoadActivePipelines();
         Assert.Single(snapshots);
         Assert.Equal("g1", snapshots[0].GoalId);
     }
@@ -721,7 +721,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
         Assert.Same(pipeline, _manager.GetByTaskId("task-1"));
 
         // …but nothing was persisted.
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.DoesNotContain(("task-1", "g1"), snap.TaskMappings);
     }
 
@@ -734,9 +734,9 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     public void SaveTaskMapping_PersistsMappingLoadedByLoadActivePipelines()
     {
         _manager.CreatePipeline(CreateGoal("g1", "Task mapping"));
-        _store.SaveTaskMapping("task-1", "g1");
+        _harness.Store.SaveTaskMapping("task-1", "g1");
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Contains(("task-1", "g1"), snap.TaskMappings);
     }
 
@@ -749,7 +749,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
 
         _manager.PersistState(pipeline);
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal(GoalPhase.Testing, snap.Phase);
         Assert.Equal(2, snap.Iteration);
     }
@@ -762,7 +762,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
 
         _manager.RemovePipeline("g1");
 
-        Assert.Empty(_store.LoadActivePipelines());
+        Assert.Empty(_harness.Store.LoadActivePipelines());
     }
 
     [Fact]
@@ -772,11 +772,11 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
         var original = new GoalPipeline(CreateGoal("g-restored", "Restored pipeline"));
         original.AdvanceTo(GoalPhase.Review);
         original.SetActiveTask("task-old", "feature/restored");
-        _store.SavePipeline(original);
-        _store.SaveTaskMapping("task-old", "g-restored");
+        _harness.Store.SavePipeline(original);
+        _harness.Store.SaveTaskMapping("task-old", "g-restored");
 
         // Create a fresh manager with the same store
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
 
         Assert.Single(restored);
@@ -791,7 +791,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     [Fact]
     public void RestoreFromStore_WithNoActivePipelines_ReturnsEmpty()
     {
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
 
         Assert.Empty(restored);
@@ -802,13 +802,13 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     {
         var done = new GoalPipeline(CreateGoal("g-done", "Completed"));
         done.AdvanceTo(GoalPhase.Done);
-        _store.SavePipeline(done);
+        _harness.Store.SavePipeline(done);
 
         var active = new GoalPipeline(CreateGoal("g-active", "In progress"));
         active.AdvanceTo(GoalPhase.Coding);
-        _store.SavePipeline(active);
+        _harness.Store.SavePipeline(active);
 
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
 
         Assert.Single(restored);
@@ -818,14 +818,14 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
 
 public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
 {
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
 
     public PipelineStoreRoleSessionTests()
     {
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        _harness = TestPipelineStore.Create();
     }
 
-    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _harness.DisposeAsync();
 
     private static Goal CreateGoal(string id = "goal-1") =>
         new() { Id = id, Description = "Test goal", RepositoryNames = ["repo"] };
@@ -843,8 +843,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         pipeline.SetRoleSession("coder", """{"msg":"hello"}""");
         pipeline.SetRoleSession("reviewer", """{"msg":"reviewed"}""");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Equal("""{"msg":"hello"}""", snap.RoleSessions["coder"]);
         Assert.Equal("""{"msg":"reviewed"}""", snap.RoleSessions["reviewer"]);
@@ -855,8 +855,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline("g1");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Empty(snap.RoleSessions);
     }
@@ -865,13 +865,13 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
     public void SavePipelineState_ThenLoad_RoleSessionsArePreserved()
     {
         var pipeline = CreatePipeline("g1");
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
         // Now set a session and save state only
         pipeline.SetRoleSession("tester", "tester-session");
-        _store.SavePipelineState(pipeline);
+        _harness.Store.SavePipelineState(pipeline);
 
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         Assert.Equal("tester-session", snap.RoleSessions["tester"]);
     }
 
@@ -882,8 +882,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         pipeline.SetRoleSession("coder", "coder-data");
         pipeline.SetRoleSession("Tester", "tester-data");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         var restored = new GoalPipeline(snap);
 
         Assert.Equal("coder-data",  restored.GetRoleSession("coder"));
@@ -896,8 +896,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         var pipeline = CreatePipeline("g1");
         pipeline.SetRoleSession("CODER", "uppercase-stored");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         var restored = new GoalPipeline(snap);
 
         // Any casing should work
@@ -916,8 +916,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         pipeline.IterationStartSha = sha;
 
         // Act — save and reload
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         // Assert — snapshot carries the SHA
         Assert.Equal(sha, snap.IterationStartSha);
@@ -936,8 +936,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         // IterationStartSha is not set — defaults to null
 
         // Act
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         // Assert — null survives the round-trip
         Assert.Null(snap.IterationStartSha);
@@ -955,14 +955,14 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         pipeline.IterationStartSha = sha1;
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
         // Simulate a new iteration: update SHA
         pipeline.IterationStartSha = sha2;
-        _store.SavePipeline(pipeline);
+        _harness.Store.SavePipeline(pipeline);
 
         // Act — reload
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         // Assert — latest SHA wins
         Assert.Equal(sha2, snap.IterationStartSha);

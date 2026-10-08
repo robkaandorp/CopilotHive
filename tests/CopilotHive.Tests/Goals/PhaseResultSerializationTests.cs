@@ -292,9 +292,9 @@ public sealed class PhaseResultSerializationTests : IDisposable
     // ─── Test 4: IterationPlan GoalPhase serialization ─────────────────────────
 
     [Fact]
-    public void IterationPlan_GoalPhases_RoundTripThroughPipelineStore()
+    public async Task IterationPlan_GoalPhases_RoundTripThroughPipelineStore()
     {
-        var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
 
         var goal = new Goal
         {
@@ -309,10 +309,10 @@ public sealed class PhaseResultSerializationTests : IDisposable
             Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Coding],
         });
 
-        store.SavePipeline(pipeline);
+        harness.Store.SavePipeline(pipeline);
 
         // Load back
-        var snapshots = store.LoadActivePipelines();
+        var snapshots = harness.Store.LoadActivePipelines();
         var snap = Assert.Single(snapshots);
         Assert.NotNull(snap.Plan);
         Assert.Equal(4, snap.Plan.Phases.Count);

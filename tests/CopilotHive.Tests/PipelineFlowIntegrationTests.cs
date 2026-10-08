@@ -1,9 +1,7 @@
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
-using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
 
@@ -13,14 +11,14 @@ namespace CopilotHive.Tests;
 /// </summary>
 public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
 {
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
 
     public PipelineFlowIntegrationTests()
     {
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        _harness = TestPipelineStore.Create();
     }
 
-    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _harness.DisposeAsync();
 
     private static readonly List<GoalPhase> StandardPlan =
         [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
@@ -48,7 +46,7 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
     [Fact]
     public void FullHappyPath_AllPhasesSucceed_PipelineCompletesAndRestores()
     {
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var goal = CreateGoal("goal-happy");
         var pipeline = manager.CreatePipeline(goal);
         var repo = CreateRepository();
@@ -115,7 +113,7 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
         manager.PersistFull(pipeline);
 
         // A Done pipeline is not restored (LoadActivePipelines filters terminal phases).
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
         Assert.Empty(restored);
     }
@@ -127,7 +125,7 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
     [Fact]
     public void MultiIterationFailureRecovery_TestFailsInIteration1_Iteration2Succeeds()
     {
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var goal = CreateGoal("goal-multi");
         var pipeline = manager.CreatePipeline(goal);
         var repo = CreateRepository();
@@ -200,7 +198,7 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
     {
         // maxRetries = 3: TestRetryBudget.TryConsume() returns true for all three calls
         // and false on the fourth (budget exhausted).
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var goal = CreateGoal("goal-exhaust");
         var pipeline = manager.CreatePipeline(goal, maxRetries: 3);
 
@@ -243,7 +241,7 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
         pipeline.AdvanceTo(GoalPhase.Failed);
         manager.PersistFull(pipeline);
 
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
         Assert.Empty(restored);
     }

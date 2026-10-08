@@ -1,6 +1,5 @@
 using CopilotHive.Git;
 using CopilotHive.Goals;
-using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Worker;
 using CopilotHive.Workers;
@@ -20,18 +19,18 @@ namespace CopilotHive.Tests;
 public sealed class IterationShaIntegrationTests : IAsyncDisposable
 {
     private readonly string _tempDir;
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
 
     public IterationShaIntegrationTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(_tempDir);
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        _harness = TestPipelineStore.Create();
     }
 
     public async ValueTask DisposeAsync()
     {
-        await _store.DisposeAsync();
+        await _harness.DisposeAsync();
         if (Directory.Exists(_tempDir))
             TestHelpers.ForceDeleteDirectory(_tempDir);
     }

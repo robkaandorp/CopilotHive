@@ -1,7 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
 
@@ -222,14 +221,14 @@ public sealed class GoalPipelinePhaseLogTests
 
 public sealed class PipelineStorePhaseLogTests : IAsyncDisposable
 {
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
 
     public PipelineStorePhaseLogTests()
     {
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        _harness = TestPipelineStore.Create();
     }
 
-    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _harness.DisposeAsync();
 
     private static Goal CreateGoal(string id = "goal-1") =>
         new() { Id = id, Description = "Test goal", RepositoryNames = ["repo"] };
@@ -268,8 +267,8 @@ public sealed class PipelineStorePhaseLogTests : IAsyncDisposable
             Verdict = "FAIL",
         });
 
-        _store.SavePipeline(pipeline);
-        var snapshots = _store.LoadActivePipelines();
+        _harness.Store.SavePipeline(pipeline);
+        var snapshots = _harness.Store.LoadActivePipelines();
 
         var snap = Assert.Single(snapshots);
         Assert.Equal(2, snap.PhaseLog.Count);
@@ -302,8 +301,8 @@ public sealed class PipelineStorePhaseLogTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline("g-empty-phaselog");
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
 
         Assert.Empty(snap.PhaseLog);
     }
@@ -325,8 +324,8 @@ public sealed class PipelineStorePhaseLogTests : IAsyncDisposable
             Verdict = "PASS",
         });
 
-        _store.SavePipeline(pipeline);
-        var snap = Assert.Single(_store.LoadActivePipelines());
+        _harness.Store.SavePipeline(pipeline);
+        var snap = Assert.Single(_harness.Store.LoadActivePipelines());
         var restored = new GoalPipeline(snap);
 
         // DurationSeconds should be computed from timestamps

@@ -879,7 +879,8 @@ public sealed class GoalPipelineManagerTests
     public async Task RemovePipeline_NotInMemory_CleansUpStoreRecord()
     {
         // Create a manager backed by a real in-memory store
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         // Create and persist a pipeline, then manually remove it from memory
@@ -1054,7 +1055,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task RestorePipeline_FromStore_LoadsFailedPipeline()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var pipeline = manager.CreatePipeline(CreateGoal("g-failed", "Failed goal"));
@@ -1073,7 +1075,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task RestorePipeline_NotInStore_ReturnsNull()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var restored = manager.RestorePipeline("nonexistent");
@@ -1094,7 +1097,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task UnregisterTask_RemovesFromMemoryAndStore()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         manager.CreatePipeline(CreateGoal("g1", "desc"));
@@ -1129,7 +1133,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task RestorePipeline_FailedPipeline_RoundTripsThroughStore()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var pipeline = manager.CreatePipeline(CreateGoal("g-rt", "Round-trip goal"));
@@ -1154,7 +1159,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task RestorePipeline_AlreadyInMemory_DoesNotDuplicate()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var pipeline = manager.CreatePipeline(CreateGoal("g-dup", "Duplicate check"));
@@ -1174,7 +1180,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task RestorePipeline_MidSecondCoding_RoundTripsAtOccurrenceTwo()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var pipeline = manager.CreatePipeline(CreateGoal("g-occ2", "Mid-second-coding round trip"));
@@ -1205,7 +1212,8 @@ public sealed class GoalPipelineManagerTests
     [Fact]
     public async Task UnregisterTask_PersistedMappingDeleted()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         manager.CreatePipeline(CreateGoal("g-unreg", "Unregister test"));
@@ -1402,7 +1410,8 @@ public sealed class GoalPipelineManagerTests
     public async Task SetRoleSession_WithStore_SessionSurvivesPipelineReload()
     {
         // Arrange — create a manager backed by a real in-memory SQLite store
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var goal = new Goal { Id = "persist-goal", Description = "Persistence test" };

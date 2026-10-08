@@ -59,6 +59,34 @@ public sealed class CopilotHiveDbContextTests
         Assert.Equal(System.Data.ConnectionState.Closed, conn.State);
     }
 
+    /// <summary>
+    /// Verifies that disposing <see cref="TestPipelineStore"/> closes the in-memory SQLite
+    /// connection. The harness is the single owner of the context created by
+    /// <see cref="CopilotHiveDbContext.CreateInMemory"/> (<see cref="PipelineStore.DisposeAsync"/>
+    /// is a no-op for a caller-owned context), so WITHOUT the harness's context disposal the
+    /// connection — and its in-memory database — would remain open after teardown.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: replacing the harness's <c>DbContext.DisposeAsync()</c> with a no-op
+    /// (or dropping the context from the harness altogether) leaves the connection open and
+    /// makes the final assertion fail.
+    /// </remarks>
+    [Fact]
+    public async Task TestPipelineStore_DisposingHarness_ClosesInMemoryConnection()
+    {
+        // Intentionally NOT held in an `await using`: the harness is disposed explicitly in the
+        // middle of the test so the connection's state can be observed before and after that
+        // disposal, mirroring CreateInMemory_DisposingContext_DisposesItsConnection.
+        var harness = TestPipelineStore.Create();
+        var conn = (SqliteConnection)harness.DbContext.Database.GetDbConnection();
+
+        Assert.Equal(System.Data.ConnectionState.Open, conn.State);
+
+        await harness.DisposeAsync();
+
+        Assert.Equal(System.Data.ConnectionState.Closed, conn.State);
+    }
+
     // ── 1. Goal round-trip ────────────────────────────────────────────────
 
     [Fact]

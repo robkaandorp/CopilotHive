@@ -1,8 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
-using CopilotHive.Persistence;
 using CopilotHive.Services;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
 
@@ -13,16 +11,16 @@ namespace CopilotHive.Tests;
 /// </summary>
 public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
 {
-    private readonly PipelineStore _store;
+    private readonly TestPipelineStore _harness;
 
     /// <summary>Initialises the test with a fresh in-memory SQLite store.</summary>
     public PipelineLifecycleIntegrationTests()
     {
-        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        _harness = TestPipelineStore.Create();
     }
 
     /// <inheritdoc/>
-    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _harness.DisposeAsync();
 
     private static Goal CreateGoal(string id, string description = "Integration test goal") =>
         new()
@@ -43,7 +41,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
     [Fact]
     public void MultipleConcurrentPipelines_ThreePipelines_RestoredWithCorrectPhaseAndTaskMapping()
     {
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var planPhases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
         // ── Pipeline A: advance to Coding ────────────────────────────────────
@@ -74,16 +72,16 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         manager.RegisterTask("task-a-1", "goal-a");
         manager.RegisterTask("task-b-1", "goal-b");
         manager.RegisterTask("task-c-1", "goal-c");
-        _store.SaveTaskMapping("task-a-1", "goal-a");
-        _store.SaveTaskMapping("task-b-1", "goal-b");
-        _store.SaveTaskMapping("task-c-1", "goal-c");
+        _harness.Store.SaveTaskMapping("task-a-1", "goal-a");
+        _harness.Store.SaveTaskMapping("task-b-1", "goal-b");
+        _harness.Store.SaveTaskMapping("task-c-1", "goal-c");
 
         manager.PersistState(pipelineA);
         manager.PersistState(pipelineB);
         manager.PersistState(pipelineC);
 
         // ── Simulate restart: fresh manager backed by the same store ─────────
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
 
         // Exactly 3 pipelines must be restored
@@ -124,7 +122,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
     [Fact]
     public void FullLifecycle_PipelineAdvancesToDoneAndIsRemovedFromStore()
     {
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var planPhases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
         // ── Create pipeline and drive through Coding + Testing ───────────────
@@ -149,7 +147,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         manager.PersistFull(pipeline);
 
         // ── Simulate mid-lifecycle restart ───────────────────────────────────
-        var freshManager1 = new GoalPipelineManager(_store);
+        var freshManager1 = new GoalPipelineManager(_harness.Store);
         var restored1 = freshManager1.RestoreFromStore();
         Assert.Single(restored1);
 
@@ -181,7 +179,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         freshManager1.RemovePipeline(restoredPipeline.GoalId);
 
         // ── Second restart: store must now be empty ───────────────────────────
-        var freshManager2 = new GoalPipelineManager(_store);
+        var freshManager2 = new GoalPipelineManager(_harness.Store);
         var restored2 = freshManager2.RestoreFromStore();
         Assert.Empty(restored2);
     }
@@ -198,7 +196,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
     [Fact]
     public void ConversationAndPhaseOutputAccumulation_BothBatchesAndOutputsSurvivedRestart()
     {
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var plan = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging };
 
         var pipeline = manager.CreatePipeline(CreateGoal("goal-conv", "Conversation accumulation goal"));
@@ -229,7 +227,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         manager.PersistState(pipeline);
 
         // ── Simulate restart ─────────────────────────────────────────────────
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
 
         var restoredPipeline = Assert.Single(restored);
@@ -261,7 +259,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
     [Fact]
     public void MetricsSurvival_AllMetricFieldsSurvivedRestart()
     {
-        var manager = new GoalPipelineManager(_store);
+        var manager = new GoalPipelineManager(_harness.Store);
         var pipeline = manager.CreatePipeline(CreateGoal("goal-metrics", "Metrics survival goal"));
 
         // ── Set metrics ──────────────────────────────────────────────────────
@@ -274,7 +272,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         manager.PersistState(pipeline);
 
         // ── Simulate restart ─────────────────────────────────────────────────
-        var freshManager = new GoalPipelineManager(_store);
+        var freshManager = new GoalPipelineManager(_harness.Store);
         var restored = freshManager.RestoreFromStore();
 
         var restoredPipeline = Assert.Single(restored);

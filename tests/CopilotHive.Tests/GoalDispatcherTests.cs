@@ -4804,7 +4804,8 @@ public sealed class GoalDispatcherResumeTests
     [Fact]
     public async Task ResumeGoalAsync_MaxIterationsPersists_AfterExtension()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var goalStore = new ResumeFakeGoalStore();
@@ -4953,7 +4954,8 @@ public sealed class GoalDispatcherResumeTests
     [Fact]
     public async Task ResumeGoalAsync_StaleTaskMapping_RemovedFromStore()
     {
-        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        await using var harness = TestPipelineStore.Create();
+        var store = harness.Store;
         var manager = new GoalPipelineManager(store);
 
         var goalStore = new ResumeFakeGoalStore();
