@@ -1852,6 +1852,73 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     /// <summary>
+    /// THE COOPERATIVE BOUNDED-ARRIVAL LOOP over an arbitrary PREDICATE — the same observation-only
+    /// pattern <see cref="WaitForCarriedDeliveryAsync"/> uses: it returns as soon as the predicate
+    /// holds, and its <see cref="Failsafe"/> bound is a FAILURE GUARD only, so a milestone that never
+    /// arrives fails BY NAME (with the caller's own words) instead of hanging the suite.
+    /// </summary>
+    /// <remarks>
+    /// WHY AWAITED ARRIVALS RATHER THAN CHECKS AFTER A GATE RELEASE. Completing a gate never promises
+    /// that the parked continuation runs INLINE on the releasing thread — the runtime may queue it
+    /// instead (a captured context, or a declined inline run) — so every post-release milestone in
+    /// this fixture is AWAITED here rather than read once immediately after the release returned.
+    /// </remarks>
+    /// <param name="arrived">The milestone predicate, evaluated on the test thread.</param>
+    /// <param name="because">The failure message naming the milestone that must arrive.</param>
+    private static async Task WaitForArrivalAsync(Func<bool> arrived, string because)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!arrived())
+        {
+            if (stopwatch.Elapsed > Failsafe)
+                throw new Xunit.Sdk.XunitException(
+                    $"{because} (the milestone did not arrive within the failsafe bound).");
+
+            TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+            await Task.Yield();
+        }
+    }
+
+    /// <summary>
+    /// BOUNDED WAIT for the REPORTING task to reach its termination: the <see cref="Failsafe"/>
+    /// bound is a FAILURE GUARD only — on the correct path the reporting is already terminated —
+    /// and a bound that expires is converted into a failure that NAMES the expectation instead of a
+    /// bare timeout.
+    /// </summary>
+    /// <remarks>
+    /// The termination is AWAITED rather than read (a single <c>IsCompleted</c> check): the runtime
+    /// does not guarantee that a continuation runs inline inside the call that completed its
+    /// antecedent, so the fact must not be inferred from some release call having returned.
+    /// </remarks>
+    private static async Task WaitForReportingTerminatedAsync(Task reporting, string because)
+    {
+        try
+        {
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            throw new Xunit.Sdk.XunitException(
+                $"{because} (the reporting did not terminate within the failsafe bound).");
+        }
+    }
+
+    /// <summary>
+    /// BOUNDED ARRIVAL OBSERVATION for the carried delivery's PARKED ADOPTION WAIT over
+    /// <see cref="IsAdoptionWaitArmed"/>. A mutant that never parks fails BY NAME within the bound
+    /// instead of hanging the suite.
+    /// </summary>
+    /// <remarks>
+    /// WHY AN AWAITED OBSERVATION AND NOT A SINGLE POST-RELEASE CHECK. The wait is entered by the
+    /// delivery's own continuation of the REPORTING task, and the runtime does NOT guarantee that
+    /// continuation runs inline inside the call that completed the reporting (a captured context,
+    /// or a declined inline run, queues it instead). So the milestone is awaited rather than
+    /// inferred from some release call having returned.
+    /// </remarks>
+    private static Task WaitForAdoptionWaitArmedAsync(WorkerService service, string because) =>
+        WaitForArrivalAsync(() => IsAdoptionWaitArmed(service), because);
+
+    /// <summary>
     /// BOUNDED ARRIVAL OBSERVATION for the early retire: the read-await site's retirement is an
     /// async consequence of the EOF, so the test waits for the fact to appear instead of racing
     /// it. The bound is a FAILURE GUARD only.
@@ -2286,10 +2353,11 @@ public sealed class WorkerServiceReconnectSurvivalTests
 
         /// <summary>
         /// The managed thread id each Complete write was RECORDED on, index-aligned with
-        /// <see cref="Completes"/>. Observation only: a test that releases production from its own
-        /// thread through a synchronously-continuing gate uses it to PROVE the released continuation
-        /// ran INLINE (and therefore reached its next incomplete await before the release returned),
-        /// instead of assuming it.
+        /// <see cref="Completes"/>. OBSERVATION ONLY: when the runtime honors an inline run, a test
+        /// that releases production from its own thread through a gate can record WHICH thread the
+        /// released continuation wrote on. No assertion may depend on that — inline continuation
+        /// execution is not guaranteed — so the fixture's post-release milestones are always AWAITED
+        /// (see <c>WaitForArrivalAsync</c>) rather than read off this observation.
         /// </summary>
         internal IReadOnlyList<int> CompleteWriteThreadIds
         {
@@ -3893,23 +3961,26 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// </summary>
     /// <remarks>
     /// <para>
-    /// THE ORDERING PROOF IS AN INLINE RELEASE, NOT THE LOG LINE. The sanitized diagnostic is written
-    /// BEFORE production records the tried connection and re-enters its adoption wait, so it is no
-    /// settled-state barrier. Instead the delivery is held at <see
-    /// cref="WorkerService.CarriedBeforeCompleteSendHook"/> by a gate whose continuations run
-    /// SYNCHRONOUSLY, and the test releases it on its OWN thread while stream 2 is still OPEN. Every
-    /// step after the gate is synchronous up to the next incomplete await — the free send gate, the
-    /// fake's un-held faulting write, the sanitized report and the retry decision — so the release
-    /// call returns only once the delivery has either PARKED (correct: a wait for a DIFFERENT
-    /// connection, while the published adoption is still stream 2) or already RETRIED stream 2 (the
-    /// injected failure is one-shot, so that retry succeeds). The fake records the writing thread,
-    /// which PROVES the inline premise instead of assuming it.
+    /// THE ORDERING PROOF IS AN AWAITED POST-RELEASE ARRIVAL, NOT THE LOG LINE. The sanitized
+    /// diagnostic is written BEFORE production records the tried connection and re-enters its adoption
+    /// wait, so it is no settled-state barrier. Instead the delivery is held at <see
+    /// cref="WorkerService.CarriedBeforeCompleteSendHook"/> by a gate the test releases on its OWN
+    /// thread while stream 2 is still OPEN, and the decision that follows is then AWAITED: the loop
+    /// returns as soon as the delivery has either PARKED (correct: a wait for a DIFFERENT connection,
+    /// while the published adoption is still stream 2) or TERMINATED (the wrong-turn consequence of a
+    /// same-connection retry — the injected failure is one-shot, so that retry succeeds and the
+    /// delivery runs to completion). Nothing is inferred from the release call having returned: the
+    /// runtime does NOT guarantee that completing a gate runs the parked continuation INLINE on the
+    /// releasing thread (a captured context or a declined inline run queues it instead), so only the
+    /// ARRIVAL of a state may be used as the barrier.
     /// </para>
     /// <para>
-    /// THE DISCRIMINATORS, checked with stream 2 still open: exactly ONE pre-send hook entry and ONE
-    /// Complete on stream 2 (a same-connection retry fails both BY NAME), and the delivery parked on
-    /// production's current adoption-change signal (<see cref="IsAdoptionWaitArmed"/>) — the
-    /// post-retry-decision milestone only the different-connection wait produces.
+    /// THE DISCRIMINATORS, checked with stream 2 still open and the decision settled: exactly ONE
+    /// pre-send hook entry and ONE Complete on stream 2 (a same-connection retry fails both BY NAME),
+    /// and the delivery parked on production's current adoption-change signal
+    /// (<see cref="IsAdoptionWaitArmed"/>) — the post-retry-decision milestone only the
+    /// different-connection wait produces. The ONE-SHOT failure being CONSUMED proves the first
+    /// attempt really faulted rather than being skipped.
     /// </para>
     /// </remarks>
     [Fact]
@@ -3926,8 +3997,9 @@ public sealed class WorkerServiceReconnectSurvivalTests
         var hookEntries = new int[1];
         var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        // DELIBERATELY WITHOUT RunContinuationsAsynchronously: completing it runs the parked delivery's
-        // continuation INLINE on the releasing thread (see the release below).
+        // The pre-send gate. A plain TCS WITHOUT RunContinuationsAsynchronously, so the runtime MAY run
+        // the released delivery continuation on the releasing thread — but nothing here depends on
+        // that: the post-release milestones are AWAITED with bounded waits.
         var firstGate = new TaskCompletionSource();
         Task? execution = null;
         try
@@ -3951,11 +4023,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
             plan.PendingFailCompleteWrite = new InvalidOperationException(RawMarker);
 
             // INSTALL THE PRE-SEND GATE BEFORE THE DELIVERY CAN REACH IT (no adoption exists yet, so the
-            // delivery is parked in its adoption wait). Its FIRST entry returns a gate whose
-            // continuations run SYNCHRONOUSLY (no RunContinuationsAsynchronously), so the test can
-            // release the delivery ON ITS OWN THREAD and have the whole attempt — the faulting write,
-            // the sanitized report and the retry decision — run INLINE inside that release call. Every
-            // later entry passes straight through.
+            // delivery is parked in its adoption wait). Its FIRST entry returns a gate the test holds
+            // and later releases on its OWN thread; every later entry passes straight through.
             plan.Service.CarriedBeforeCompleteSendHook = _ =>
             {
                 if (Interlocked.Increment(ref hookEntries[0]) != 1)
@@ -3976,21 +4045,37 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 IsAdoptionWaitArmed(plan.Service),
                 "Nothing waits on the current adoption signal while the delivery is at the gate.");
 
-            // THE RELEASE, ON THIS THREAD. What follows it in production is synchronous up to the next
-            // INCOMPLETE await: the send gate is free, the fake's un-held write faults synchronously, the
-            // failure is reported, and the retry decision re-enters the adoption wait. For a correct
-            // delivery that wait is for a DIFFERENT connection, so it parks on the adoption signal; a
-            // delivery that retries the SAME connection instead gets stream 2 back immediately and writes
-            // a SECOND Complete (the injected failure was one-shot, so that one succeeds) — still inside
-            // this call. Stream 2 stays OPEN throughout, so such a retry could never be masked by EOF.
-            var releasingThread = Environment.CurrentManagedThreadId;
+            // THE RELEASE, ON THIS THREAD, FOLLOWED BY THE AWAITED DECISION. After the gate the
+            // delivery's attempt proceeds through the free send gate, the fake's un-held faulting
+            // write, the sanitized report and the retry decision. The test WAITS for that decision to
+            // ARRIVE rather than assuming the release ran it inline: for a correct delivery the wait is
+            // for a DIFFERENT connection, so it parks on production's adoption signal; a delivery that
+            // retries the SAME adopted connection instead is handed stream 2 again and WRITES A SECOND
+            // Complete (the injected failure is one-shot, so that one succeeds) — the state the loop
+            // exits on. Stream 2 stays OPEN throughout, so such a retry could never be masked by EOF.
             firstGate.SetResult();
+            await WaitForArrivalAsync(
+                () => IsAdoptionWaitArmed(plan.Service)
+                    || delivery.IsCompleted
+                    || Volatile.Read(ref hookEntries[0]) != 1
+                    || plan.Requests[1].Completes.Count >= 2,
+                "After the released pre-send gate the delivery must settle its retry decision: either "
+                + "parking on production's adoption signal (a wait for a DIFFERENT connection) or "
+                + "showing the wrong-turn consequence of retrying the SAME connection (a second hook "
+                + "entry / a second Complete on stream 2 / a terminated delivery)");
 
-            // (1) THE INLINE PREMISE: the FIRST (faulted) attempt was written on THIS thread, inside the
-            // release — so everything production did after it up to its next incomplete await is done.
-            var writeThreads = plan.Requests[1].CompleteWriteThreadIds;
-            Assert.NotEmpty(writeThreads);
-            Assert.Equal(releasingThread, writeThreads[0]);
+            // (1) THE FAULTED ATTEMPT REALLY HAPPENED AND REALLY FAULTED: exactly one Complete reached
+            // stream 2, and the ONE-SHOT failure that attempt must have consumed is GONE from the fake
+            // — so the discriminator below is never vacuous. The writing thread the fake also records
+            // is carried into the failure message as DIAGNOSTICS only; NO assertion here depends on
+            // that continuation having run inline on the releasing thread.
+            Assert.True(
+                plan.Requests[1].Completes.Count == 1 && plan.Requests[1].CompleteWriteThreadIds.Count == 1,
+                "The first carried Complete attempt must have reached stream 2 exactly once before the "
+                + $"retry decision settled (writes: {plan.Requests[1].Completes.Count}, "
+                + $"recorded threads: {string.Join(",", plan.Requests[1].CompleteWriteThreadIds)}, "
+                + $"this thread: {Environment.CurrentManagedThreadId}).");
+            Assert.Null(plan.Requests[1].FailNextCompleteWrite);
 
             // (2) THE DISCRIMINATOR — NO SECOND ATTEMPT ON THE STILL-OPEN STREAM 2.
             Assert.True(
@@ -4020,8 +4105,12 @@ public sealed class WorkerServiceReconnectSurvivalTests
             AssertNoAssignmentWrites(
                 plan.Requests[0], "The retired first stream must still receive nothing");
 
-            // THE SANITIZED LINE WAS WRITTEN (inline, by the same failure path); THE RAW MESSAGE WAS NOT.
-            Assert.True(capture.Signalled.IsCompleted, "The failure must have been reported inline.");
+            // THE SANITIZED LINE WAS WRITTEN (by the same failure path, before the retry decision that
+            // the wait above settled on); THE RAW MESSAGE WAS NOT. Awaited, not read once: only the
+            // ARRIVAL of the diagnostic is a barrier.
+            await WaitForArrivalAsync(
+                () => capture.Signalled.IsCompleted,
+                "The failed attempt must have been reported through the sanitized diagnostic");
             Assert.Contains(
                 "Carried completion delivery failed", capture.ToString(), StringComparison.Ordinal);
             Assert.Contains("InvalidOperationException", capture.ToString(), StringComparison.Ordinal);
@@ -4085,15 +4174,20 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// bounded await on the drain only detects a hang, never an omitted join.
     /// </para>
     /// <para>
-    /// THE ARMING RENDEZVOUS (no polling). The delivery's adoption wait is entered from the delivery's
-    /// own continuation of the REPORTING task, so the test controls exactly when that happens: the
-    /// reporter is held at <see cref="WorkerService.ReportBeforeCompleteSendHook"/> by a gate whose
-    /// continuations run SYNCHRONOUSLY, and the test releases it on its OWN thread. The reporter's
-    /// Complete attempt on the retired connection then fails disconnected synchronously and the
-    /// reporting completes, which runs the delivery inline into its adoption wait — so by the time the
-    /// release call returns, the wait (and its cancellation callback on the ASSIGNMENT token) is
-    /// registered. That is asserted with ONE check each (the reporting is complete; the wait is armed),
-    /// strictly BEFORE the test registers its blocking callback.
+    /// THE ARMING RENDEZVOUS (awaited, never inferred from the release returning). The delivery's
+    /// adoption wait is entered from the delivery's own continuation of the REPORTING task, so the test
+    /// controls exactly when that happens: the reporter is held at
+    /// <see cref="WorkerService.ReportBeforeCompleteSendHook"/> by a gate the test releases on its OWN
+    /// thread. The reporter's Complete attempt on the retired connection then fails disconnected
+    /// synchronously and the reporting completes, which is what lets the delivery run into its adoption
+    /// wait. The runtime does NOT guarantee that either continuation runs INLINE inside the release call
+    /// (a captured context or a declined inline run queues it instead), so neither fact is inferred from
+    /// the release having returned: the reporting task is AWAITED to termination and the armed wait is
+    /// observed through the class's cooperative bounded-arrival loop
+    /// (<see cref="WaitForAdoptionWaitArmedAsync"/>), whose <see cref="Failsafe"/> bound is a FAILURE
+    /// GUARD only — on the correct path both are already satisfied when the awaits are reached. Both
+    /// waits complete strictly BEFORE the test registers its blocking callback, which is what the
+    /// JOIN-BEFORE-RETURN proof below requires.
     /// </para>
     /// <para>
     /// THE JOIN-BEFORE-RETURN PROOF. The test registers a callback on the assignment token AFTER the
@@ -4122,8 +4216,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
         var plan = ReconnectPlan.StartAsync("task-A", register2Adopted: true);
         var reporterAtHook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        // DELIBERATELY WITHOUT RunContinuationsAsynchronously: completing it on the test thread runs the
-        // parked reporter — and, through the reporting task's completion, the parked delivery — INLINE.
+        // The reporter gate. It is deliberately a plain TCS WITHOUT RunContinuationsAsynchronously so
+        // the release happens on this thread, but NOTHING here depends on the continuation running
+        // inline: the two milestones below are AWAITED with bounded waits, never read as a single
+        // completed-synchronously check.
         var reporterGate = new TaskCompletionSource();
 
         // The interleaved drain callback's registration. It is disposed in the finally; the callback never
@@ -4160,21 +4256,24 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 IsAdoptionWaitArmed(plan.Service),
                 "The delivery is still observing the reporting: it has not reached its adoption wait yet.");
 
-            // THE ARMING RENDEZVOUS, ON THIS THREAD. Releasing the gate runs the reporter inline: its
-            // Complete attempt on the RETIRED connection fails disconnected synchronously (free send
-            // gate, then the retirement check), its handlers publish, and the reporting task COMPLETES.
-            // That completion runs the delivery's STEP-0 continuation inline too, straight into
-            // AwaitAdoptedConnectionAsync — which finds no adoption and parks on the adoption signal via
-            // WaitAsync(assignmentToken), registering its cancellation callback on the ASSIGNMENT token.
-            // All of it happens before SetResult returns, so the two facts below are single checks.
+            // THE ARMING RENDEZVOUS: release the gate on THIS thread. The reporter's Complete attempt
+            // on the RETIRED connection then fails disconnected (free send gate, then the retirement
+            // check), its handlers publish, and the reporting task terminates — which is what lets the
+            // delivery's STEP-0 continuation run, straight into AwaitAdoptedConnectionAsync. That finds
+            // no adoption and parks on the adoption signal via WaitAsync(assignmentToken), registering
+            // its cancellation callback on the ASSIGNMENT token. The two facts are AWAITED, not read as
+            // single checks: the runtime may queue either continuation instead of running it inline
+            // inside this release call, and only the arrival of the facts — not the release returning —
+            // is what the ordering proof needs.
             reporterGate.SetResult();
-            Assert.True(
-                reporting.IsCompleted,
-                "Releasing the gate must have run the reporter to completion INLINE on the test thread.");
-            Assert.True(
-                IsAdoptionWaitArmed(plan.Service),
-                "The delivery must have REGISTERED its adoption wait (and with it its cancellation "
-                + "callback on the assignment token) before the test's own callback is registered.");
+            await WaitForReportingTerminatedAsync(
+                reporting,
+                "Releasing the gate must run the reporter to completion (the held Complete attempt "
+                + "fails on the retired connection)");
+            await WaitForAdoptionWaitArmedAsync(
+                plan.Service,
+                "The delivery must REGISTER its adoption wait (and with it its cancellation callback on "
+                + "the assignment token) before the test's own callback is registered");
             Assert.False(delivery.IsCompleted, "The delivery must be PARKED awaiting an adoption.");
             Assert.Null(GetAdoptedConnectionOrNull(plan.Service));
             Assert.Equal(1, plan.StreamOpenCount); // the run has returned: no stream is open
@@ -6575,14 +6674,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// <see cref="WorkerService.CarriedBeforeReadyClaimHook"/>) were passed BEFORE the held write,
     /// <see cref="WorkerService.ReportingFinallyBeforeClearHook"/> belongs to the already-finished
     /// reporting, and <see cref="WorkerService.ExecutionStartHook"/> fires only AFTER the drain. So the
-    /// window is established by an INLINE RENDEZVOUS instead: run 2's FIRST READ is gated by a
-    /// synchronous gate, the successor is queued behind it, and the test completes that gate on its OWN
-    /// thread. Production then runs inline — dispatch, pre-Ready boundary, replacement drain — up to its
-    /// FIRST INCOMPLETE await, which (the predecessor's execution, reporting and retransmission having
-    /// been joined first) can only be the join of the carried delivery parked in the held Ready write.
-    /// The PRODUCTION-CAUSED evidence of that join is checked once the release returns: the parked
-    /// delivery carries an awaiting continuation (asserted ABSENT before the release) and the loop has
-    /// not re-armed its next read.
+    /// window is established by a GATED FIRST READ: run 2's FIRST READ is held by a gate the test
+    /// releases on its OWN thread, and the successor is queued behind it. The milestone inside the
+    /// window is then AWAITED rather than read straight after the release: the parked carried delivery
+    /// carries an awaiting continuation (asserted ABSENT before the release) — the await production's
+    /// drain attached — and the loop has not re-armed its next read. The runtime does not guarantee
+    /// that the released read continuation runs INLINE on the releasing thread (a captured context or
+    /// a declined inline run queues it instead), so the arrival of the milestone is the barrier.
     /// </para>
     /// <para>
     /// THE ORDER write → drain → start is then recorded by production itself:
@@ -6599,9 +6697,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// </para>
     /// <para>
     /// MUTANT: a replacement path that did NOT join the held delivery (the handler begins the successor
-    /// instead of waiting) re-arms its read and attaches nothing inside the release call, so both
-    /// in-window assertions fail by name — and the successor's recorded start would see an incomplete
-    /// delivery.
+    /// instead of waiting) re-arms its read and attaches nothing, so the awaited in-window milestone
+    /// fails by name — and the successor's recorded start would see an incomplete delivery.
     /// </para>
     /// </remarks>
     [Fact]
@@ -6627,9 +6724,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
             plan.PendingHoldReadiesFrom = 0;
 
             // RUN 2's FIRST READ IS GATED — installed before the run starts, because the adopted run can
-            // reach that read synchronously inside StartSecondRun. DELIBERATELY WITHOUT
-            // RunContinuationsAsynchronously: completing it on this thread runs the parked read, and
-            // everything production does after it up to its next INCOMPLETE await, INLINE.
+            // reach that read synchronously inside StartSecondRun. The gate is a plain TCS: the test
+            // releases it on its own thread, and the milestones that follow are AWAITED, never inferred
+            // from the release returning (the released continuation may be queued rather than run
+            // inline).
             plan.PendingBeforeFirstRead = () => firstReadGate.Task;
             plan.StartSecondRun(RegisterResponseFor(adopted: true, bothFlags: true));
             var delivery = await WaitForCarriedDeliveryAsync(plan.Service, "The carried delivery must run.");
@@ -6677,19 +6775,26 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 };
                 plan.Push(ResultAssignment("task-B"));
 
-                // RELEASE THE FIRST READ ON THIS THREAD. The gate runs its continuations SYNCHRONOUSLY, so
-                // production runs INLINE inside this call — the read completes, the loop dispatches the
-                // assignment, the pre-Ready boundary passes, and the replacement drain joins the owned
-                // tasks — up to its FIRST INCOMPLETE await, which for an accepted successor is the join of
-                // the carried delivery still parked in the held Ready write. So when this call returns
-                // the handler is provably INSIDE the replacement path, blocked while the hold is in force.
+                // RELEASE THE FIRST READ ON THIS THREAD, THEN AWAIT THE IN-WINDOW MILESTONE. The
+                // released read dispatches the assignment, passes the pre-Ready boundary and enters the
+                // replacement drain, whose join of the carried delivery (still parked in the held Ready
+                // write) attaches the awaiting continuation observed below. That continuation is AWAITED
+                // rather than checked once after the release: the runtime may queue the released read
+                // continuation instead of running it inline on this thread.
                 firstReadGate.SetResult();
+                await WaitForArrivalAsync(
+                    () => (!delivery.IsCompleted && IsAwaitedByAContinuation(delivery))
+                        || plan.Responses.ReadsStarted != readsBeforePush,
+                    "The accepted successor's handler must be parked in the replacement drain, joining "
+                    + "the carried delivery that is held in its Ready write (a handler that did not join "
+                    + "it returns and re-arms its next read instead)");
 
-                // THE IN-WINDOW, PRODUCTION-CAUSED MILESTONE: the parked carried delivery now carries a
-                // continuation — the await production's drain attached — and the loop has NOT re-armed its
-                // next read, so the handler has not returned. A handler that began its successor instead of
-                // waiting (a drain that did not join the delivery) re-arms that read inline and attaches
-                // nothing, and fails both assertions BY NAME.
+                // THE IN-WINDOW, PRODUCTION-CAUSED MILESTONE (the arrival is what the wait above
+                // established; this keeps the claim named in the assertion): the parked carried delivery
+                // now carries a continuation — the await production's drain attached — and the loop has
+                // NOT re-armed its next read, so the handler has not returned. A handler that began its
+                // successor instead of waiting (a drain that did not join the delivery) re-arms that
+                // read and attaches nothing, and fails the assertions below BY NAME.
                 Assert.True(
                     IsAwaitedByAContinuation(delivery),
                     "The accepted successor's handler must be parked in the replacement drain, joining the "
@@ -7531,8 +7636,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// <see cref="StartNextRun"/> call and installed as that run's reader
         /// <see cref="ChannelResponseReader.BeforeNextRead"/> BEFORE the run starts — an adopted run
         /// reaches its first read synchronously inside <see cref="StartNextRun"/>, so installing it any
-        /// later would race the very read it must hold. A test that completes a SYNCHRONOUS gate on its
-        /// own thread then drives the message loop INLINE up to its next incomplete await.
+        /// later would race the very read it must hold. A test that completes this gate on its own
+        /// thread drives the message loop towards its next incomplete await; the milestones that follow
+        /// are AWAITED (never inferred from the release returning), because the runtime does not
+        /// guarantee that the released read continuation runs INLINE on the releasing thread.
         /// </summary>
         internal Func<Task>? PendingBeforeFirstRead { get; set; }
 

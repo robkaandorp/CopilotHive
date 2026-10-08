@@ -4927,8 +4927,13 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// SEAM path, THROWN post-commit pull — ordinary exception, not a non-zero exit (converse
-    /// of the legacy thrown case): no merge --abort, no push, staged diagnostics preserved.
+    /// SEAM path, THROWN post-commit pull. The seam's launch boundary turns the launcher exception
+    /// into its FIXED rejection result — <c>exit -1</c> with an empty stdout and a fixed
+    /// <c>SanitizedError</c> — so the pull is a RETURNED NON-ZERO result and takes the ordinary
+    /// failed-pull path: the conflict CLASSIFICATION <c>status</c> query runs, the conflict does not
+    /// qualify (no unmerged agents.md record exists), a best-effort <c>merge --abort</c> follows, and
+    /// the reason is the non-zero form <c>git pull failed (exit -1) … push not attempted after the
+    /// failed pull</c>. No raw message text escapes and push NEVER launches.
     /// </summary>
     [Fact]
     public async Task Improver_SeamPath_ThrownPostCommitPull_NeverPushes()
@@ -4950,8 +4955,26 @@ public sealed class TaskExecutorTests
         var (result, _, _) = await RunImproverWithSeamAsync(
             "improver-seam-pull-throw", configRepoDir, seam, fake, git, agentRunner: agentRunner);
 
-        // The seam maps an unlaunchable command to its exit -1 rejection — so the merge-abort
-        // attempt from the non-zero-pull path does not fire here either; push NEVER launches.
+        // The seam maps an unlaunchable command to its exit -1 rejection, so the launcher exception
+        // becomes a RETURNED NON-ZERO pull and the launched sequence after it is that path's: the
+        // classification status query, then the best-effort merge --abort, then the step-end cleanup
+        // (no confirmed push, so the captured fetched baseline is the restore target). Push NEVER
+        // launches.
+        AssertLaunchedSequence(fake,
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                // The classification of the exit -1 pull: the verbose status query proves that no
+                // unmerged agents.md record exists, so the failed pull is NOT resolvable and the
+                // established abort/no-push outcome follows.
+                ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+                ["merge", "--abort"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
+            ]);
         Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
