@@ -2867,7 +2867,7 @@ public sealed class TaskExecutorTests
     /// <summary>
     /// An ABSENT origin is ADDED by the seam before the transport command; a CREDENTIAL-BEARING
     /// but equivalent origin is REPAIRED with <c>set-url</c>. Both variants carry the SANITIZED
-    /// URL and precede the canonicalized pull.
+    /// URL and precede the preparation FETCH — the only transport command this flow launches.
     /// </summary>
     [Theory]
     [InlineData(true)]
@@ -2885,7 +2885,8 @@ public sealed class TaskExecutorTests
                 ? ""
                 : "https://x-access-token:ghp_secret@github.com/org/config-repo.git",
             OriginStderr = originAbsent ? "fatal: no such remote 'origin'" : "",
-            // No staged changes: the flow stops after add + diff, isolating the FIRST pull.
+            // No staged changes: the flow stops after add + diff, so the preparation fetch is the
+            // only transport command.
             Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
         };
         using var seam = CreateConfigRepoSeam(configRepoDir);
@@ -4027,9 +4028,9 @@ public sealed class TaskExecutorTests
     /// <summary>
     /// TRUTHFUL PREPARATION: the <c>Directory.Exists(.git)</c> absence check FAILS the task
     /// BEFORE the agent is prompted — a worker must never be given permission to edit a
-    /// non-repository directory. NEITHER the pull NOR the commit/push sequence launches
-    /// anything, and the result is a truthful Failed outcome with a FAIL verdict (never a
-    /// normal no-change completion).
+    /// non-repository directory. NEITHER the preparation fetch NOR the commit/push sequence
+    /// launches anything, and the result is a truthful Failed outcome with a FAIL verdict (never
+    /// a normal no-change completion).
     /// </summary>
     [Fact]
     public async Task Improver_SeamPath_MissingGitMarker_LaunchesNothing()

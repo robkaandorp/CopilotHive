@@ -1480,9 +1480,12 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// </remarks>
     /// <param name="configRepoUrl">The origin URL the config-repo probe must observe.</param>
     /// <returns>
-    /// The temp config-repo directory, plus the restore handle for the static
+    /// The temp config-repo directory, plus the release handle for the static
     /// <see cref="GitOperations.ProcessRunner"/> override the helper installed — the CALLER owns
-    /// that handle and must dispose it on every exit path.
+    /// that handle and must dispose it on every exit path. Disposing the handle restores the
+    /// previous <see cref="GitOperations.ProcessRunner"/> value FIRST and then DELETES the temp
+    /// config-repo directory (best effort), so a fixture that owns the handle to completion leaks
+    /// neither the seam nor a directory.
     /// </returns>
     private static (string ConfigRepoDir, IDisposable GitRestore) CreateHermeticConfigRepo(
         string configRepoUrl)
@@ -1501,7 +1504,96 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 return new GitProcessResult(0, configRepoUrl + "\n", string.Empty);
             return new GitProcessResult(0, string.Empty, string.Empty);
         });
-        return (configRepoDir, WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher));
+        return (configRepoDir, new HermeticConfigRepoHandle(
+            WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher), configRepoDir));
+    }
+
+    /// <summary>
+    /// THE RELEASE HANDLE of <see cref="CreateHermeticConfigRepo"/>: the seam it installed has to
+    /// come off the static <see cref="GitOperations.ProcessRunner"/> AND the temp directory it
+    /// created has to leave the filesystem, so neither a fake launcher nor a
+    /// <c>reconnect-config-*</c> directory outlives the fixture that created it.
+    /// </summary>
+    /// <remarks>
+    /// ORDER: the process-runner restore runs FIRST, so the static seam is back to its previous
+    /// value even when the directory removal cannot complete. The removal is BEST EFFORT — a
+    /// directory still held open somewhere must never turn a fixture's teardown into a failure —
+    /// so it swallows <see cref="IOException"/> (which covers
+    /// <see cref="DirectoryNotFoundException"/>) and <see cref="UnauthorizedAccessException"/>.
+    /// IDEMPOTENT, because a fixture may be released by more than one teardown path.
+    /// </remarks>
+    /// <param name="processRunnerRestore">The restore callback installed for this seam.</param>
+    /// <param name="configRepoDir">The temp config-repo directory the helper created.</param>
+    private sealed class HermeticConfigRepoHandle(
+        IDisposable processRunnerRestore, string configRepoDir) : IDisposable
+    {
+        /// <summary>0 = not yet released; 1 = released. Guarded by <see cref="Interlocked"/>.</summary>
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) != 0)
+                return;
+
+            processRunnerRestore.Dispose();
+
+            try
+            {
+                Directory.Delete(configRepoDir, recursive: true);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
+    /// THE FULL RELEASE CONTRACT of <see cref="CreateHermeticConfigRepo"/>'s handle — the two facts
+    /// every fixture here depends on. Disposing it restores the static
+    /// <see cref="GitOperations.ProcessRunner"/> override to the value captured BEFORE the helper
+    /// ran (so a handle that left its fake launcher installed fails this test rather than matching
+    /// itself) and removes the temp config-repo directory it created, so a run leaves no
+    /// <c>reconnect-config-*</c> directory behind.
+    /// </summary>
+    [Fact]
+    public void CreateHermeticConfigRepo_Dispose_RestoresProcessRunnerAndDeletesTheTempDirectory()
+    {
+        // Captured FIRST: the restore assertion is only real when it names a value the helper did
+        // not install.
+        var priorRunner = GitOperations.ProcessRunner;
+
+        var (configRepoDir, gitRestore) = CreateHermeticConfigRepo(
+            "https://github.com/org/config-repo.git");
+
+        try
+        {
+            Assert.True(
+                Directory.Exists(configRepoDir),
+                "The helper must create the temp config-repo directory it reports.");
+
+            // THE PREMISE: the helper really installed its own launcher. Without this the restore
+            // assertion below could pass on a handle that never installed anything.
+            Assert.NotEqual(priorRunner, GitOperations.ProcessRunner);
+
+            gitRestore.Dispose();
+
+            // RESTORED: the static seam is back to the previous delegate.
+            Assert.Equal(priorRunner, GitOperations.ProcessRunner);
+
+            // DELETED: not merely "Directory.Exists says false" — an eager enumeration of the path
+            // must fail with the runtime's own not-found error, so nothing (a file, a link or a
+            // reparse point) survives where the directory used to be.
+            Assert.False(
+                Directory.Exists(configRepoDir),
+                "Disposing the handle must delete the temp config-repo directory.");
+            Assert.Throws<DirectoryNotFoundException>(
+                () => Directory.GetFileSystemEntries(configRepoDir));
+        }
+        finally
+        {
+            // IDEMPOTENT: a no-op on every already-released path, and the release that still has to
+            // happen when an assertion above failed.
+            gitRestore.Dispose();
+        }
     }
 
     /// <summary>
