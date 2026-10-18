@@ -3807,6 +3807,78 @@ public sealed class WorkSlotRegistryStorageTests : IDisposable
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // (9) Same-context tracked-entity coherence after the column-scoped write
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE TRACKED-ENTITY REFRESH, on ONE test-owned context (the direct-context path): the
+    /// column-scoped <c>ExecuteUpdate</c> inside <c>SaveWorkSlotRegistry</c> bypasses the change
+    /// tracker, so a <see cref="PipelineEntity"/> loaded BEFORE the write would keep the stale
+    /// pre-write blob — and <c>LoadPipeline</c> resolves through <c>Find</c>, which hands back
+    /// that very tracked instance on the same context. After the store call the tracked copy must
+    /// carry the encoded payload, its ORIGINAL value must be the same payload (so the property is
+    /// not "modified" against a stale original), the property must be unmodified, and the
+    /// same-context load must return the fresh payload. The final unrelated
+    /// <c>SaveChanges</c> (a <c>Description</c> edit) is what proves the refresh did not leave the
+    /// context able to re-flush a stale registry value: the durable blob is read back on a FRESH
+    /// connection and must still be byte-exact.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF — both mutants were run for real and both fail this test:
+    /// delete the <c>RefreshTrackedRegistryBlob</c> call and the tracked entity (plus the
+    /// same-context <c>LoadPipeline</c>) keeps the stale SQL-NULL blob; delete only the
+    /// <c>OriginalValue = encoded</c> assignment and the original stays NULL, so clearing
+    /// <c>IsModified</c> rolls the current value back off the encoded payload. Every other
+    /// <c>SaveWorkSlotRegistry</c> test calls <c>WithStore</c> once per operation — a fresh
+    /// connection/context per call — so nothing is ever tracked and this path is unexercised there.
+    /// </remarks>
+    [Fact]
+    public void SaveWorkSlotRegistry_RefreshesTheTrackedEntity_OnTheSameContext()
+    {
+        const string goalId = "wsr-tracked-refresh";
+        var snapshot = BuildRichSourcePipeline(goalId + "-src").CaptureRegistry();
+        var encoded = WorkSlotRegistryCodec.Encode(snapshot);
+
+        // The row must exist first, and an ordinary save leaves the blob column SQL NULL.
+        WithStore((store, _) => store.SavePipeline(NewPipeline(goalId)));
+        Assert.Null(RawBlob(goalId));
+
+        WithStore((store, context) =>
+        {
+            // THE PREMISE: the entity is TRACKED on this context and carries the stale (NULL) blob,
+            // so it is genuinely stale-able by the ExecuteUpdate below.
+            var tracked = context.Pipelines.Find(goalId)!;
+            Assert.Null(tracked.WorkSlotRegistryJson);
+            Assert.Contains(context.ChangeTracker.Entries<PipelineEntity>(),
+                entry => ReferenceEquals(entry.Entity, tracked));
+
+            Assert.True(store.SaveWorkSlotRegistry(goalId, snapshot));
+
+            // THE REFRESH, in place: the tracked copy carries what was actually written.
+            Assert.Equal(encoded, tracked.WorkSlotRegistryJson);
+
+            // …and the refreshed property is UNMODIFIED against a matching original, so no later
+            // unrelated flush re-writes (or rolls back) the registry column.
+            var property = context.Entry(tracked).Property(p => p.WorkSlotRegistryJson);
+            Assert.Equal(encoded, property.OriginalValue);
+            Assert.False(property.IsModified);
+
+            // THE SAME-CONTEXT LOAD resolves through Find, i.e. this very tracked instance — it must
+            // not hand back the stale blob.
+            Assert.Equal(encoded, store.LoadPipeline(goalId)!.WorkSlotRegistryJson);
+
+            // THE UNRELATED EDIT: a real, flusheable change on the tracked entity.
+            tracked.Description = "edited";
+            context.SaveChanges();
+        });
+
+        // On a FRESH connection (no EF, no tracker): the unrelated SaveChanges really persisted —
+        // and it did NOT write a stale registry value back over the column.
+        Assert.Equal("edited", RawScalar($"SELECT description FROM pipelines WHERE goal_id = '{goalId}'"));
+        Assert.Equal(encoded, RawBlob(goalId));
+    }
+
     /// <summary>
     /// BOTH registry dictionaries are empty. The empty-restore probe is the strong form: a restore
     /// into a nonempty registry — INCLUDING a counter-only one, which no capture would reveal
