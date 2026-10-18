@@ -1593,6 +1593,86 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     /// <summary>
+    /// <see cref="ReconnectPlan.StartFresh"/>'s FAILED-BUILD CONTRACT for a throw BEFORE the plan
+    /// exists (the per-test wiring): the factory releases everything it acquired — a fake
+    /// <see cref="GitOperations.ProcessRunner"/> must NOT stay installed for the later tests of
+    /// this serialized collection, the temp config-repo directory must be DELETED, and the service
+    /// (which owns the installed runner) must be DISPOSED — while the caller still observes the
+    /// ORIGINAL exception instance, unchanged.
+    /// </summary>
+    /// <remarks>
+    /// The premises are captured INSIDE the wiring callback rather than asserted there: an
+    /// assertion thrown from the callback would travel through the very catch under test and mask
+    /// which fact failed. They prove the test is not vacuous — the hermetic seam really was
+    /// installed and its directory really existed immediately before the throw, so the restored
+    /// seam and the deleted directory are OBSERVABLE changes made by the failure path, not the
+    /// state the fixture started in.
+    /// </remarks>
+    [Fact]
+    public void StartFresh_ConfigureThrows_RestoresProcessRunnerAndDeletesConfigDir()
+    {
+        // Captured FIRST: the restore assertion is only real when it names a delegate the fixture
+        // did not install.
+        var prior = GitOperations.ProcessRunner;
+
+        // THE SAME INSTANCE is thrown and compared, so Assert.Same below proves the rethrow kept the
+        // original exception rather than producing an equivalent one.
+        var sentinel = new InvalidOperationException("configure-sentinel");
+
+        WorkerService? builtService = null;
+        string? configRepoDir = null;
+        Func<GitProcessRequest, CancellationToken, Task<GitProcessResult>>? seamDuringConfigure = null;
+        var dirExistedDuringConfigure = false;
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            ReconnectPlan.StartFresh(
+                RegisterResponseFor(adopted: false),
+                configure: service =>
+                {
+                    builtService = service;
+
+                    // The private readonly value the service captured at construction — the
+                    // directory the fixture's own hermetic seam created.
+                    configRepoDir = (string)typeof(WorkerService)
+                        .GetField("_configRepoDir", BindingFlags.NonPublic | BindingFlags.Instance)!
+                        .GetValue(service)!;
+                    dirExistedDuringConfigure = Directory.Exists(configRepoDir);
+                    seamDuringConfigure = GitOperations.ProcessRunner;
+                    throw sentinel;
+                }));
+
+        // NON-VACUITY: the seam WAS installed and the directory DID exist before the throw.
+        var service = Assert.IsType<WorkerService>(builtService);
+        var dir = Assert.IsType<string>(configRepoDir);
+        Assert.NotEqual(prior, seamDuringConfigure);
+        Assert.True(
+            dirExistedDuringConfigure,
+            "The hermetic seam must have created the config-repo directory before the wiring threw.");
+
+        // THE ORIGINAL EXCEPTION, unchanged: same instance, same message.
+        Assert.Same(sentinel, thrown);
+        Assert.Equal("configure-sentinel", thrown.Message);
+
+        // THE SEAM IS RESTORED: the fake launcher is off the static ProcessRunner.
+        Assert.Equal(prior, GitOperations.ProcessRunner);
+
+        // THE SERVICE WAS DISPOSED — the observing runner the factory installed was disposed by the
+        // service's disposal, which only the pre-plan cleanup path performs.
+        var installedRunner = (ObservingRunner)typeof(WorkerService)
+            .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service)!;
+        Assert.Equal(1, installedRunner.DisposeCount);
+
+        // THE TEMP DIRECTORY IS GONE — and not merely "Directory.Exists says false": an eager
+        // enumeration of the path must fail with the runtime's own not-found error, so no leftover
+        // file or link survives where the directory used to be.
+        Assert.False(
+            Directory.Exists(dir),
+            "The fixture's failure path must delete the temp config-repo directory.");
+        Assert.Throws<DirectoryNotFoundException>(() => Directory.GetFileSystemEntries(dir));
+    }
+
+    /// <summary>
     /// THE CARRY HARNESS: one service, one REAL sequential run, a fake duplex stream whose
     /// pending writes fault on dispose and honor write tokens, and the reflection observers the
     /// focused tests share. The run starts in <see cref="Create"/>, so every test observes the
@@ -7841,6 +7921,18 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// <see cref="WorkerService.TestProvisioner"/> or <see cref="WorkerService.ExecutionStartHook"/>
         /// in time for run 1 to observe them. It is invoked exactly once and never invoked again.
         /// </param>
+        /// <remarks>
+        /// OWNERSHIP RULE: the hermetic seam's release handle and the newly constructed service
+        /// belong to THIS factory until it RETURNS. A failure BEFORE the plan exists (service
+        /// construction, the runner install, the per-test wiring) releases both HERE — the service
+        /// through <see cref="TryDispose"/> and the seam through its own idempotent handle — so no
+        /// fake <see cref="GitOperations.ProcessRunner"/> is left installed for the later tests of
+        /// this serialized collection. A failure AFTER the plan exists (the run start, the
+        /// initial-write wait) unwinds through the plan's own <see cref="TeardownAsync"/> instead,
+        /// because the plan is by then the thing that owns the started run; that teardown runs
+        /// inside its OWN swallow-all catch so a teardown fault can never mask the original
+        /// failure. Only the SUCCESS path transfers ownership to the returned plan.
+        /// </remarks>
         internal static ReconnectPlan StartFresh(
             RegisterResponse firstResponse,
             WorkerConfigProvisioner? provisioner = null,
@@ -7853,36 +7945,77 @@ public sealed class WorkerServiceReconnectSurvivalTests
             var (configRepoDir, gitRestore) =
                 WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(ConfigRepoUrl);
 
-            var service = new WorkerService(
-                "http://localhost:9999", WorkerId, ["coder"], configRepoDir);
-            var runner = new ObservingRunner();
-            InstallRunner(service, runner);
-            service.HeartbeatTaskFactory = (_, _) => Task.CompletedTask;
+            // Both locals stay null until their step runs, so the catch below knows exactly which
+            // cleanup shape applies: no plan means "release what was acquired here", a plan means
+            // "unwind through the plan".
+            WorkerService? service = null;
+            ReconnectPlan? plan = null;
+            try
+            {
+                service = new WorkerService(
+                    "http://localhost:9999", WorkerId, ["coder"], configRepoDir);
+                var runner = new ObservingRunner();
+                InstallRunner(service, runner);
+                service.HeartbeatTaskFactory = (_, _) => Task.CompletedTask;
 
-            // THE PROVISIONER SEAM — installed BEFORE the first run's connection is constructed,
-            // because the connection CAPTURES it at construction and the assignment body reaches
-            // only that captured instance. A later assignment of the property therefore cannot
-            // change which provisioner the first run's body uses, which is what makes a fixture
-            // whose provisioner PARKS deterministic instead of racy. A null value is exactly the
-            // previous behavior (the connection's own production provisioner).
-            service.TestProvisioner = provisioner;
+                // THE PROVISIONER SEAM — installed BEFORE the first run's connection is constructed,
+                // because the connection CAPTURES it at construction and the assignment body reaches
+                // only that captured instance. A later assignment of the property therefore cannot
+                // change which provisioner the first run's body uses, which is what makes a fixture
+                // whose provisioner PARKS deterministic instead of racy. A null value is exactly the
+                // previous behavior (the connection's own production provisioner).
+                service.TestProvisioner = provisioner;
 
-            // THE PER-TEST WIRING, still strictly BEFORE run 1 is started (the connection of that
-            // run does not exist yet), so a hook or override armed here is in force for run 1.
-            configure?.Invoke(service);
+                // THE PER-TEST WIRING, still strictly BEFORE run 1 is started (the connection of that
+                // run does not exist yet), so a hook or override armed here is in force for run 1.
+                configure?.Invoke(service);
 
-            var plan = new ReconnectPlan(service, runner, gitRestore);
-            plan.StartNextRun(firstResponse);
+                plan = new ReconnectPlan(service, runner, gitRestore);
+                plan.StartNextRun(firstResponse);
 
-            // THE RUN-1 STARTUP MILESTONE. The run has been STARTED above, but its registration
-            // and initial-Ready writes are asynchronous: a test that observes anything BEFORE
-            // they land would race correct production behavior — the classic symptoms being an
-            // eager-provisioning fetch count that is still 0 (RetargetCallTime_p's baseline) or
-            // an adopted run that has not published its adoption yet. Gating on the CURRENT
-            // run's first write makes the plan's every later observation read settled state,
-            // exactly like the handler-return milestone below gates per-message work.
-            plan.WaitForInitialWriteAsync().GetAwaiter().GetResult();
-            return plan;
+                // THE RUN-1 STARTUP MILESTONE. The run has been STARTED above, but its registration
+                // and initial-Ready writes are asynchronous: a test that observes anything BEFORE
+                // they land would race correct production behavior — the classic symptoms being an
+                // eager-provisioning fetch count that is still 0 (RetargetCallTime_p's baseline) or
+                // an adopted run that has not published its adoption yet. Gating on the CURRENT
+                // run's first write makes the plan's every later observation read settled state,
+                // exactly like the handler-return milestone below gates per-message work.
+                plan.WaitForInitialWriteAsync().GetAwaiter().GetResult();
+
+                // TRANSFER: the returned plan owns the service and the seam, and releases both in
+                // its own TeardownAsync.
+                return plan;
+            }
+            catch
+            {
+                if (plan is not null)
+                {
+                    // A failure AFTER the plan exists: it owns the started run and the seam, so the
+                    // plan's own teardown is the unwind. Its errors are SWALLOWED here — a teardown
+                    // fault must never mask the original failure, which the `throw;` below preserves
+                    // with its identity and stack trace intact.
+                    try
+                    {
+                        plan.TeardownAsync().GetAwaiter().GetResult();
+                    }
+                    catch
+                    {
+                        // Best effort: the plan's teardown is not the fixture's failure.
+                    }
+                }
+                else
+                {
+                    // A failure BEFORE the plan exists: nothing else can release what steps 2–3
+                    // acquired, so the service goes first (it may own the observing runner) and the
+                    // hermetic seam last — its handle is idempotent, so a repeated release is a
+                    // no-op.
+                    if (service is not null)
+                        TryDispose(service);
+                    gitRestore.Dispose();
+                }
+
+                throw;
+            }
         }
 
         private readonly IDisposable _gitRestore;

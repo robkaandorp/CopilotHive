@@ -3854,38 +3854,36 @@ public sealed class WorkerConnectionLifecycleTests : IDisposable
     [Fact]
     public void ConstructionHelpers_BothUseTheHermeticConfigRepoDirectory_NeverTheAmbientDefault()
     {
-        var viaBuildService = BuildService(
+        // ONE `using var` PER SERVICE, each declared before the next one is built. The compiler
+        // lowers this to nested try/finally blocks, so the FIRST service is disposed even when the
+        // SECOND construction throws, and it is disposed even when the SECOND service's disposal
+        // throws. A "construct both, then dispose sequentially in one finally" shape gives neither
+        // guarantee.
+        using var viaBuildService = BuildService(
             new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var viaBuildServiceWithRunner = BuildServiceWithRunner(new ProvisionerCapturingRunner());
-        try
-        {
-            var fromBuildService = ReadConfigRepoDir(viaBuildService);
-            var fromBuildServiceWithRunner = ReadConfigRepoDir(viaBuildServiceWithRunner);
+        using var viaBuildServiceWithRunner = BuildServiceWithRunner(new ProvisionerCapturingRunner());
 
-            // BOTH helpers resolved to THIS test's hermetic directory...
-            Assert.Equal(_configRepoDir, fromBuildService);
-            Assert.Equal(_configRepoDir, fromBuildServiceWithRunner);
+        var fromBuildService = ReadConfigRepoDir(viaBuildService);
+        var fromBuildServiceWithRunner = ReadConfigRepoDir(viaBuildServiceWithRunner);
 
-            // ...which really exists, so a preparation over it can succeed...
-            Assert.True(
-                Directory.Exists(fromBuildService),
-                "The hermetic config-repo directory must exist on disk.");
-            Assert.True(
-                Directory.Exists(fromBuildServiceWithRunner),
-                "The hermetic config-repo directory must exist on disk.");
+        // BOTH helpers resolved to THIS test's hermetic directory...
+        Assert.Equal(_configRepoDir, fromBuildService);
+        Assert.Equal(_configRepoDir, fromBuildServiceWithRunner);
 
-            // ...and NEITHER inherited the production ambient default. THE NEGATIVE ASSERTION: this
-            // local is the ONLY place in this file's code that names the production default, and
-            // the two assertions below are what prove it ABSENT.
-            const string AmbientDefault = "/config-repo";
-            Assert.NotEqual(AmbientDefault, fromBuildService);
-            Assert.NotEqual(AmbientDefault, fromBuildServiceWithRunner);
-        }
-        finally
-        {
-            viaBuildService.Dispose();
-            viaBuildServiceWithRunner.Dispose();
-        }
+        // ...which really exists, so a preparation over it can succeed...
+        Assert.True(
+            Directory.Exists(fromBuildService),
+            "The hermetic config-repo directory must exist on disk.");
+        Assert.True(
+            Directory.Exists(fromBuildServiceWithRunner),
+            "The hermetic config-repo directory must exist on disk.");
+
+        // ...and NEITHER inherited the production ambient default. THE NEGATIVE ASSERTION: this
+        // local is the ONLY place in this file's code that names the production default, and
+        // the two assertions below are what prove it ABSENT.
+        const string AmbientDefault = "/config-repo";
+        Assert.NotEqual(AmbientDefault, fromBuildService);
+        Assert.NotEqual(AmbientDefault, fromBuildServiceWithRunner);
     }
 
     /// <summary>
