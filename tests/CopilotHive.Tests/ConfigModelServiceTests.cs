@@ -1070,6 +1070,176 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Contains("remove repository", repo.Commits[0].Message);
     }
 
+    // ── Copy-on-write: published lists and objects are never mutated ─────────
+    //
+    // Lock-free readers (BrainRepoManager's configured-URL lookup, the CI and NuGet monitors, task
+    // dispatch, the dashboard, the facade) enumerate HiveConfigFile.Repositories and read its
+    // RepositoryConfig objects without taking ConfigOperationLock. An in-place Add/Remove/element
+    // write therefore risks "Collection was modified", a missed entry while Remove re-packs the
+    // backing array, or a torn read (new Url with old DefaultBranch). The three tests below hold a
+    // reference to the list and object published BEFORE the call and prove neither was touched:
+    // every mutator swaps in a NEW list (and Update a NEW element object) instead.
+    //
+    // Each test is single-threaded and deterministic: the pre-call snapshot is the only observation
+    // point, so no timing-based synchronization is involved.
+
+    /// <summary>
+    /// ADD is copy-on-write: the previously published list keeps its original contents and the new
+    /// state is a DIFFERENT list holding the old entries in order plus the new one.
+    /// </summary>
+    [Fact]
+    public async Task AddRepositoryAsync_NeverMutatesPublishedList()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig { Name = "repo-first", Url = "https://github.com/org/first.git", DefaultBranch = "main" },
+                new RepositoryConfig { Name = "repo-second", Url = "https://github.com/org/second.git", DefaultBranch = "develop" }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // The snapshot a lock-free reader could have taken immediately before the call.
+        var before = config.Repositories;
+        Assert.Equal(2, before.Count);
+
+        await svc.AddRepositoryAsync("repo-added", "https://github.com/org/added.git", "main",
+            release: null, ct: TestContext.Current.CancellationToken);
+
+        // The published list was REPLACED, never extended.
+        Assert.NotSame(before, config.Repositories);
+        Assert.Equal(2, before.Count);
+        Assert.DoesNotContain(before, r => r.Name == "repo-added");
+
+        // The new list holds the old entries in their original order, plus the new one.
+        Assert.Equal(3, config.Repositories.Count);
+        Assert.Same(before[0], config.Repositories[0]);
+        Assert.Same(before[1], config.Repositories[1]);
+        Assert.Equal(("repo-first", "repo-second", "repo-added"),
+            (config.Repositories[0].Name, config.Repositories[1].Name, config.Repositories[2].Name));
+        Assert.Equal(("repo-added", "https://github.com/org/added.git", "main"),
+            (config.Repositories[2].Name, config.Repositories[2].Url, config.Repositories[2].DefaultBranch));
+    }
+
+    /// <summary>
+    /// UPDATE is copy-on-write for BOTH the list and the element: the previously published list and
+    /// its <see cref="RepositoryConfig"/> keep their old values, and the new state is a DIFFERENT
+    /// list holding a DIFFERENT object at the SAME INDEX (order preserved) that copies every
+    /// property — including <see cref="RepositoryConfig.PublishNuGet"/> — and applies the update.
+    /// </summary>
+    [Fact]
+    public async Task UpdateRepositoryAsync_NeverMutatesPublishedListOrObject()
+    {
+        var oldRelease = new ReleaseRepoConfig { MergeTo = "develop", TagBranch = "develop" };
+        var publishNuGet = new NuGetPublishConfig
+        {
+            Packages = [new NuGetPackageEntry { PackageId = "My.Library" }]
+        };
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig { Name = "repo-first", Url = "https://github.com/org/first.git", DefaultBranch = "main" },
+                new RepositoryConfig
+                {
+                    Name = "repo-target",
+                    Url = "https://github.com/org/old.git",
+                    DefaultBranch = "main",
+                    MonitorCi = false,
+                    CiTimeoutMinutes = 30,
+                    Release = oldRelease,
+                    PublishNuGet = publishNuGet
+                },
+                new RepositoryConfig { Name = "repo-last", Url = "https://github.com/org/last.git", DefaultBranch = "main" }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // The snapshot a lock-free reader could have taken immediately before the call.
+        var before = config.Repositories;
+        var oldObj = before[1];
+
+        await svc.UpdateRepositoryAsync("repo-target", "https://github.com/org/new.git", "develop",
+            release: null, monitorCi: true, ciTimeoutMinutes: 60, ct: TestContext.Current.CancellationToken);
+
+        // The published list was REPLACED, never re-pointed, and the published OBJECT kept every
+        // one of its old values (no field was written in place).
+        Assert.NotSame(before, config.Repositories);
+        Assert.Equal(3, before.Count);
+        Assert.Same(oldObj, before[1]);
+        Assert.Equal(("repo-target", "https://github.com/org/old.git", "main"),
+            (oldObj.Name, oldObj.Url, oldObj.DefaultBranch));
+        Assert.False(oldObj.MonitorCi);
+        Assert.Equal(30, oldObj.CiTimeoutMinutes);
+        Assert.Same(oldRelease, oldObj.Release);
+        Assert.Equal(("develop", "develop"), (oldObj.Release!.MergeTo, oldObj.Release!.TagBranch));
+
+        // A DIFFERENT object now sits at the SAME index, carrying the new values...
+        Assert.Equal(3, config.Repositories.Count);
+        var updated = config.Repositories[1];
+        Assert.NotSame(oldObj, updated);
+        Assert.Equal(("repo-target", "https://github.com/org/new.git", "develop"),
+            (updated.Name, updated.Url, updated.DefaultBranch));
+        Assert.True(updated.MonitorCi);
+        Assert.Equal(60, updated.CiTimeoutMinutes);
+
+        // ...with EVERY other property copied: the preserved Release, the untouched
+        // PublishNuGet sub-object, and the element's original position.
+        Assert.Same(oldRelease, updated.Release);
+        Assert.Same(publishNuGet, updated.PublishNuGet);
+        Assert.Equal("My.Library", Assert.Single(updated.PublishNuGet!.Packages).PackageId);
+
+        // The surrounding entries are the SAME references, in their original order.
+        Assert.Same(before[0], config.Repositories[0]);
+        Assert.Same(before[2], config.Repositories[2]);
+        Assert.Equal(("repo-first", "repo-target", "repo-last"),
+            (config.Repositories[0].Name, config.Repositories[1].Name, config.Repositories[2].Name));
+    }
+
+    /// <summary>
+    /// REMOVE is copy-on-write: the previously published list still contains the removed entry and
+    /// the new state is a DIFFERENT list holding the remaining entries in their original order.
+    /// </summary>
+    [Fact]
+    public async Task RemoveRepositoryAsync_NeverMutatesPublishedList()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig { Name = "repo-first", Url = "https://github.com/org/first.git", DefaultBranch = "main" },
+                new RepositoryConfig { Name = "repo-middle", Url = "https://github.com/org/middle.git", DefaultBranch = "main" },
+                new RepositoryConfig { Name = "repo-last", Url = "https://github.com/org/last.git", DefaultBranch = "main" }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // The snapshot a lock-free reader could have taken immediately before the call.
+        var before = config.Repositories;
+        var removed = before[1];
+
+        Assert.True(await svc.RemoveRepositoryAsync("repo-middle", TestContext.Current.CancellationToken));
+
+        // The published list was REPLACED and still contains the removed entry.
+        Assert.NotSame(before, config.Repositories);
+        Assert.Equal(3, before.Count);
+        Assert.Same(removed, before[1]);
+
+        // The new list keeps the others in their original order, as the same references.
+        Assert.Equal(2, config.Repositories.Count);
+        Assert.Same(before[0], config.Repositories[0]);
+        Assert.Same(before[2], config.Repositories[1]);
+        Assert.Equal(("repo-first", "repo-last"),
+            (config.Repositories[0].Name, config.Repositories[1].Name));
+    }
+
     // ── UpdateOrchestratorSettingsAsync tests ────────────────────────────────
 
     [Fact]

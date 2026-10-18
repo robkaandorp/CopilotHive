@@ -622,7 +622,16 @@ public sealed class ConfigModelService
             };
             if (monitorCi.HasValue) newRepo.MonitorCi = monitorCi.Value;
             if (ciTimeoutMinutes.HasValue) newRepo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
-            _config.Repositories.Add(newRepo);
+
+            // COPY-ON-WRITE: a published Repositories list (and every RepositoryConfig in it) is
+            // NEVER mutated. Lock-free readers — the BrainRepoManager configured-URL lookup, the
+            // CI and NuGet monitors, task dispatch and the dashboard — may be enumerating it, so an
+            // in-place Add/Remove/element write could throw "Collection was modified", skip an
+            // entry while Remove shifts the list, or observe a torn object. Every mutator instead
+            // swaps in a NEW list under ConfigOperationLock (a reference assignment is atomic, so a
+            // reader sees either the complete old catalog or the complete new one), mirroring
+            // HiveConfigFile.ReloadFrom.
+            _config.Repositories = [.. _config.Repositories, newRepo];
 
             var message = $"chore: add repository '{name}'";
             _logger.LogInformation("Adding repository: {Name} ({Url})", name, url);
@@ -663,8 +672,8 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
-        // Captured INSIDE the lock from the LIVE RepositoryConfig, because a concurrent reload may
-        // replace that object once the lock is released; consumed after the release (see below).
+        // Captured INSIDE the lock from the entry that was just published, so they describe exactly
+        // what was committed; consumed after the release (see below).
         string? cloneName = null, cloneUrl = null, cloneBranch = null;
 
         await _configRepo.ConfigOperationLock.WaitAsync(ct);
@@ -682,12 +691,34 @@ public sealed class ConfigModelService
             if (repo is null)
                 throw new InvalidOperationException($"Repository '{name}' not found");
 
-            repo.Url = url;
-            repo.DefaultBranch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
+            // COPY-ON-WRITE (see AddRepositoryAsync): the published object is never written to.
+            // A NEW RepositoryConfig copies EVERY property, so no field can be dropped, and the
+            // replacement list keeps the element at its ORIGINAL INDEX so ordering is preserved.
+            // The Release and PublishNuGet sub-objects are SHARED with the old entry: nothing
+            // mutates them in place on the live config (Release is only ever replaced wholesale),
+            // so sharing cannot leak a partial update to a lock-free reader.
+            var updatedRepo = new RepositoryConfig
+            {
+                Name = repo.Name,
+                Url = url,
+                DefaultBranch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch,
+                MonitorCi = repo.MonitorCi,
+                CiTimeoutMinutes = repo.CiTimeoutMinutes,
+                Release = repo.Release,
+                PublishNuGet = repo.PublishNuGet
+            };
             if (release is not null)
-                repo.Release = NormalizeRelease(release);
-            if (monitorCi.HasValue) repo.MonitorCi = monitorCi.Value;
-            if (ciTimeoutMinutes.HasValue) repo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
+                updatedRepo.Release = NormalizeRelease(release);
+            if (monitorCi.HasValue) updatedRepo.MonitorCi = monitorCi.Value;
+            if (ciTimeoutMinutes.HasValue) updatedRepo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
+
+            // ONE capture of the published list: the copy is built entirely from that generation,
+            // so the index of the entry being replaced is preserved.
+            var current = _config.Repositories;
+            var replacement = new List<RepositoryConfig>(current.Count);
+            foreach (var existing in current)
+                replacement.Add(ReferenceEquals(existing, repo) ? updatedRepo : existing);
+            _config.Repositories = replacement;
 
             var message = $"chore: update repository '{name}'";
             _logger.LogInformation("Updating repository: {Name} ({Url})", name, url);
@@ -695,9 +726,9 @@ public sealed class ConfigModelService
             await _configRepo.WriteConfigAsync(_config, ct);
             await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
 
-            cloneName = repo.Name;
-            cloneUrl = repo.Url;
-            cloneBranch = repo.DefaultBranch;
+            cloneName = updatedRepo.Name;
+            cloneUrl = updatedRepo.Url;
+            cloneBranch = updatedRepo.DefaultBranch;
         }
         finally
         {
@@ -727,7 +758,9 @@ public sealed class ConfigModelService
             if (repo is null)
                 return false;
 
-            _config.Repositories.Remove(repo);
+            // COPY-ON-WRITE (see AddRepositoryAsync): the published list is never mutated, because
+            // an in-place Remove re-packs the backing array while a lock-free reader enumerates it.
+            _config.Repositories = [.. _config.Repositories.Where(r => !ReferenceEquals(r, repo))];
 
             var message = $"chore: remove repository '{name}'";
             _logger.LogInformation("Removing repository: {Name}", name);
