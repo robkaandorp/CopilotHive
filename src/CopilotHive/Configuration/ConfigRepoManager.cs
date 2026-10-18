@@ -29,6 +29,28 @@ public class ConfigRepoManager
     private readonly SemaphoreSlim _gitLock = new(1, 1);
 
     /// <summary>
+    /// Serialises the MULTI-STEP operations that span <c>hive-config.yaml</c> and the live
+    /// <see cref="HiveConfigFile"/>: every <see cref="ConfigModelService"/> read-modify-write-commit
+    /// transaction (and the live Brain update that follows it), plus the dispatcher's periodic
+    /// config-repo sync/reload. One participant can therefore never interleave with the other.
+    /// <para>
+    /// It lives on this manager because this manager is the ONE instance the two participants
+    /// share; it is deliberately NOT a service field.
+    /// </para>
+    /// <para>
+    /// <b>Lock order:</b> this semaphore → <c>_gitLock</c> → the short-lived
+    /// <see cref="HiveConfigFile"/> catalog monitor. It is NEVER acquired from inside
+    /// <c>_gitLock</c>, so a single git/file call can never wait on a whole config operation.
+    /// </para>
+    /// <para>
+    /// <b>Not reentrant.</b> A caller that already holds it must not enter another region that
+    /// acquires it — that includes every lock-taking <see cref="ConfigModelService"/> method and
+    /// <c>DispatcherMaintenance.SyncAgentsFromConfigRepoAsync</c>.
+    /// </para>
+    /// </summary>
+    public SemaphoreSlim ConfigOperationLock { get; } = new(1, 1);
+
+    /// <summary>
     /// The result of a single git invocation. A NON-ZERO exit code is RETURNED here — never
     /// thrown — so the calling wrapper decides whether that exit code is a failure.
     /// </summary>
@@ -420,8 +442,14 @@ public class ConfigRepoManager
     /// permit is acquired, so a write queued behind a sync serializes the caller's state as of
     /// the moment it actually owns the lock — never a pre-lock generation — and its file write
     /// and cache publication are ordered after the sync's invalidation. A cancelled or failed
-    /// acquisition performs no snapshot, no file access and releases nothing. Lock order is
-    /// <see cref="ConfigModelService"/> save semaphore → <c>_gitLock</c> → the short-lived
+    /// acquisition performs no snapshot, no file access and releases nothing.
+    /// </para>
+    /// <para>
+    /// <b>Scope.</b> This is a single git/file call: it takes ONLY <c>_gitLock</c>. The
+    /// whole-operation serialization (the config read-modify-write-commit transaction and the
+    /// dispatcher's config-repo sync/reload) is the caller's <see cref="ConfigOperationLock"/>,
+    /// which is acquired BEFORE this method is entered and is never taken here. Lock order is
+    /// <see cref="ConfigOperationLock"/> → <c>_gitLock</c> → the short-lived
     /// <see cref="HiveConfigFile"/> catalog monitor, which the synchronous
     /// <see cref="HiveConfigFile.CaptureConfigSnapshot"/> takes and drops without any await; no
     /// other lock-taking manager entry point is called from inside the region.

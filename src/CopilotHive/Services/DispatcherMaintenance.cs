@@ -71,13 +71,32 @@ internal sealed class DispatcherMaintenance
     /// <summary>
     /// Pulls the latest config repo and broadcasts any AGENTS.md changes to connected workers.
     /// Best-effort: failures are logged but do not block the main dispatch loop.
+    /// <para>
+    /// The WHOLE operation — the pull, the AGENTS.md loop and its broadcasts, the knowledge-graph
+    /// reload with its reset recovery, and the final <see cref="HiveConfigFile.ReloadFrom"/> —
+    /// holds <see cref="ConfigRepoManager.ConfigOperationLock"/>, the SAME semaphore every
+    /// in-app config mutation takes. The sync and a save can therefore never interleave: a save
+    /// cannot land between the load and the reload and be overwritten in memory, its mutation
+    /// cannot be undone by the reload before its write, and the reset recovery cannot wipe a
+    /// save's written-but-uncommitted <c>hive-config.yaml</c>.
+    /// </para>
+    /// <para>
+    /// The acquisition is INSIDE the try so a cancelled wait stays on the best-effort path: it is
+    /// logged by the catch below and never thrown. The <c>finally</c> releases only when the
+    /// acquisition actually completed, so a cancelled wait can never over-release the semaphore.
+    /// </para>
     /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task SyncAgentsFromConfigRepoAsync(CancellationToken ct)
     {
         if (_configRepo is null || _agentsManager is null) return;
 
+        var lockAcquired = false;
         try
         {
+            await _configRepo.ConfigOperationLock.WaitAsync(ct);
+            lockAcquired = true;
+
             await _configRepo.SyncRepoAsync(ct);
 
             foreach (var role in WorkerRoles.AgentRoles)
@@ -140,6 +159,13 @@ internal sealed class DispatcherMaintenance
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to sync agents from config repo");
+        }
+        finally
+        {
+            // Released ONLY when the acquisition completed: a cancelled wait never took a permit,
+            // so releasing there would over-release the semaphore.
+            if (lockAcquired)
+                _configRepo.ConfigOperationLock.Release();
         }
 
         LastAgentsSync = DateTime.UtcNow;

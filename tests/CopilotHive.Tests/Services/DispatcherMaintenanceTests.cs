@@ -1103,4 +1103,165 @@ public sealed class DispatcherMaintenanceSyncTests : IDisposable
         // Assert — LastAgentsSync was still updated
         Assert.True(maintenance.LastAgentsSync > DateTime.MinValue);
     }
+
+    // ── The sync and an in-app save share ONE config operation lock ───────────
+
+    /// <summary>
+    /// Timeout-only bound applied to every gate/observation wait in the shared-lock test. It is a
+    /// hang guard, never evidence: a stuck gate or a stranded operation surfaces as a
+    /// <see cref="TimeoutException"/> failure instead of hanging the run, and the bound can never
+    /// manufacture the outcome an assertion looks for.
+    /// </summary>
+    private static readonly TimeSpan GateBound = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// THE INTERLEAVE TEST for <c>coordinate-config-saves-with-sync-reload</c>. One real
+    /// <see cref="ConfigRepoManager"/> and ONE live <see cref="HiveConfigFile"/> are shared by a
+    /// <see cref="DispatcherMaintenance"/> (the sync) and a <see cref="ConfigModelService"/> (the
+    /// save) — the exact production wiring. The manager's <see cref="ConfigRepoManager.GitRunner"/>
+    /// seam parks on <c>pull</c>, so the sync owns
+    /// <see cref="ConfigRepoManager.ConfigOperationLock"/> across its pull, its AGENTS.md loop and
+    /// its <see cref="HiveConfigFile.ReloadFrom"/>, exactly as it does for a real git pull.
+    /// <para>
+    /// The save is issued while the pull gate is closed. Its <c>max_iterations</c> mutation MUST
+    /// wait: asserted synchronously, before anything is released, because the lock acquisition is
+    /// the mutator's first await.
+    /// </para>
+    /// <para>
+    /// THE DIRECT DISCRIMINATOR IS THE MID-LOCK STATE, NOT THE END STATE. While the pull gate is
+    /// closed the sync is parked INSIDE <see cref="ConfigRepoManager.SyncRepoAsync"/> and therefore
+    /// still holds <c>_gitLock</c> as well as the shared operation lock: the save cannot run ahead
+    /// of the pull in any interleaving. What the acquisition is proved by is the state observed at
+    /// that moment — <c>ConfigOperationLock.CurrentCount == 0</c> plus the save's still-incomplete
+    /// task and its unmutated <c>max_iterations</c>. Removing the sync's acquisition breaks exactly
+    /// those mid-lock assertions.
+    /// </para>
+    /// <para>
+    /// THE FINAL-STATE CHECKS ARE HEALTHY-CODE INVARIANTS, NOT MUTANT KILLERS. After the gate
+    /// opens, the sync reloads a YAML carrying a DIFFERENT <c>max_iterations</c> and only then does
+    /// the queued save run, so both the in-memory config and the on-disk <c>hive-config.yaml</c>
+    /// end on the SAVE's value. Those two checks pin the correct end state the lock is there to
+    /// guarantee, but they do not by themselves fail when the acquisition is removed — the pull's
+    /// <c>_gitLock</c> alone can keep the ordering intact for this schedule. They are asserted
+    /// because they are what the feature promises, not because they are the mutant discriminator.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SyncAgentsFromConfigRepoAsync_HoldingSharedLock_KeepsSaveFromBeingOverwrittenByReload()
+    {
+        const int initialIterations = 5;
+        const int pullIterations = 911;
+        const int saveIterations = 42;
+
+        // A .git directory routes SyncRepoAsync through the pull path; that pull is the gate.
+        Directory.CreateDirectory(Path.Combine(_tempDir, ".git"));
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // What the "remote" brings down: a DIFFERENT max_iterations than the save's.
+        var pullYaml = $"""
+            version: "2.0-PULL"
+            orchestrator:
+              max_iterations: {pullIterations}
+              model: pull-model
+            """;
+
+        var configRepo = new ConfigRepoManager("https://example.com/config.git", _tempDir)
+        {
+            GitRunner = async (_, args, _) =>
+            {
+                if (args.Length > 0 && args[0] == "pull")
+                {
+                    pullEntered.TrySetResult();
+                    await releasePull.Task.WaitAsync(GateBound);
+                    await File.WriteAllTextAsync(configPath, pullYaml, CancellationToken.None);
+                }
+
+                return new ConfigRepoManager.GitRunResult(0, "", "");
+            }
+        };
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxIterations = initialIterations }
+        };
+        var agentsManager = new AgentsManager(Path.Combine(_tempDir, "agents"), logger: null);
+
+        var maintenance = CreateMaintenance(configRepo, agentsManager, knowledgeGraph: null, config: config);
+        var svc = new ConfigModelService(config, configRepo, NullLogger<ConfigModelService>.Instance);
+
+        Task syncTask = Task.CompletedTask;
+        Task saveTask = Task.CompletedTask;
+        Exception? syncFault;
+        Exception? saveFault;
+        try
+        {
+            syncTask = maintenance.SyncAgentsFromConfigRepoAsync(TestContext.Current.CancellationToken);
+            await pullEntered.Task.WaitAsync(GateBound, TestContext.Current.CancellationToken);
+
+            // THE DIRECT DISCRIMINATOR: parked in the pull => the shared lock is HELD (CurrentCount 0).
+            Assert.Equal(0, configRepo.ConfigOperationLock.CurrentCount);
+
+            saveTask = svc.UpdateOrchestratorSettingsAsync(
+                new OrchestratorSettingsUpdate(saveIterations, null, null, null, null, null),
+                TestContext.Current.CancellationToken);
+
+            // SYNCHRONOUS, with the gate still closed: the save is queued behind the held lock and
+            // has mutated NOTHING yet. Together with the CurrentCount check above this is what
+            // fails when the sync's acquisition is removed.
+            Assert.False(saveTask.IsCompleted);
+            Assert.Equal(initialIterations, config.Orchestrator.MaxIterations);
+        }
+        finally
+        {
+            // Released unconditionally, then BOTH operations drained: a failed mid-lock assertion
+            // can neither strand the gate nor leave a write in flight past the test.
+            releasePull.TrySetResult();
+            syncFault = await ObserveBoundedAsync(syncTask);
+            saveFault = await ObserveBoundedAsync(saveTask);
+        }
+
+        Assert.Null(syncFault);
+        Assert.Null(saveFault);
+
+        // LastAgentsSync keeps its log-and-continue contract even on this locked path.
+        Assert.True(maintenance.LastAgentsSync > DateTime.MinValue);
+
+        // ── HEALTHY-CODE FINAL-STATE INVARIANTS (not the mutant discriminator; see the summary) ──
+
+        // IN MEMORY: the SAVE's value — the reload ran BEFORE the save, so it was not overwritten.
+        Assert.Equal(saveIterations, config.Orchestrator.MaxIterations);
+
+        // ON DISK (mandatory): the same value. The save's write followed the reload.
+        var disk = await File.ReadAllTextAsync(configPath, TestContext.Current.CancellationToken);
+        Assert.Equal(saveIterations, ConfigRepoManager.ParseConfig(disk).Orchestrator.MaxIterations);
+
+        // The pull's generation must appear in NEITHER observable end state.
+        Assert.DoesNotContain($"max_iterations: {pullIterations}", disk, StringComparison.Ordinal);
+
+        // No permit leaked by either participant.
+        Assert.Equal(1, configRepo.ConfigOperationLock.CurrentCount);
+    }
+
+    /// <summary>
+    /// Observes <paramref name="task"/> under <see cref="GateBound"/> and returns the exception it
+    /// produced, or <c>null</c> when it completed successfully — so a caller can drain an operation
+    /// inside a <c>finally</c> without replacing the body's own, authoritative failure.
+    /// </summary>
+    private static async Task<Exception?> ObserveBoundedAsync(Task task)
+    {
+        try
+        {
+#pragma warning disable xUnit1051 // Timeout-only by design: a token would manufacture OperationCanceledException.
+            await task.WaitAsync(GateBound);
+#pragma warning restore xUnit1051
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
 }

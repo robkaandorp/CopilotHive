@@ -3193,6 +3193,252 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal("high", config.Orchestrator.ReasoningEffort);
     }
 
+    // ── The SHARED config operation lock gates every mutator ──────────────────
+    //
+    // Goal: coordinate-config-saves-with-sync-reload. The five mutators that used to mutate the
+    // live HiveConfigFile without serialization now take ConfigRepoManager.ConfigOperationLock —
+    // the SAME semaphore the dispatcher's sync/reload takes. Each test below holds that lock and
+    // proves the mutator's LIVE-CONFIG mutation waits for it; the discriminating assertion is the
+    // mid-lock live-config value, because the mutant that drops the acquisition still returns an
+    // incomplete task (its first await is then the real file write) but has already mutated.
+
+    [Fact]
+    public async Task AddRepositoryAsync_WaitsForHeldConfigOperationLock_ThenAppliesAndPersists()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var fault = await RunMutatorUnderHeldConfigOperationLockAsync(
+            repo,
+            () => svc.AddRepositoryAsync("locked-repo", "https://github.com/org/locked.git", "main",
+                release: null, ct: TestContext.Current.CancellationToken),
+            pending =>
+            {
+                Assert.False(pending.IsCompleted);
+                // The mutation is what the lock gates: it happens strictly before the write.
+                Assert.Empty(config.Repositories);
+            });
+
+        Assert.Null(fault);
+        var added = Assert.Single(config.Repositories);
+        Assert.Equal(("locked-repo", "https://github.com/org/locked.git", "main"),
+            (added.Name, added.Url, added.DefaultBranch));
+
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        var persistedRepo = Assert.Single(persisted.Repositories);
+        Assert.Equal(("locked-repo", "https://github.com/org/locked.git", "main"),
+            (persistedRepo.Name, persistedRepo.Url, persistedRepo.DefaultBranch));
+        Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_WaitsForHeldConfigOperationLock_ThenAppliesAndPersists()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories = [new RepositoryConfig { Name = "existing", Url = "https://github.com/org/old.git", DefaultBranch = "main" }]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var fault = await RunMutatorUnderHeldConfigOperationLockAsync(
+            repo,
+            () => svc.UpdateRepositoryAsync("existing", "https://github.com/org/new.git", "develop",
+                release: null, ct: TestContext.Current.CancellationToken),
+            pending =>
+            {
+                Assert.False(pending.IsCompleted);
+                // Unchanged in BOTH fields the mutator rewrites: neither may be applied early.
+                var existing = Assert.Single(config.Repositories);
+                Assert.Equal(("https://github.com/org/old.git", "main"),
+                    (existing.Url, existing.DefaultBranch));
+            });
+
+        Assert.Null(fault);
+        var updated = Assert.Single(config.Repositories);
+        Assert.Equal(("existing", "https://github.com/org/new.git", "develop"),
+            (updated.Name, updated.Url, updated.DefaultBranch));
+
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        var persistedRepo = Assert.Single(persisted.Repositories);
+        Assert.Equal(("existing", "https://github.com/org/new.git", "develop"),
+            (persistedRepo.Name, persistedRepo.Url, persistedRepo.DefaultBranch));
+        Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+    }
+
+    [Fact]
+    public async Task RemoveRepositoryAsync_WaitsForHeldConfigOperationLock_ThenAppliesAndPersists()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories = [new RepositoryConfig { Name = "removable", Url = "https://github.com/org/removable.git" }]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var fault = await RunMutatorUnderHeldConfigOperationLockAsync(
+            repo,
+            async () => Assert.True(await svc.RemoveRepositoryAsync("removable", TestContext.Current.CancellationToken)),
+            pending =>
+            {
+                Assert.False(pending.IsCompleted);
+                // Still present: the removal cannot land before the lock is granted.
+                Assert.Equal("removable", Assert.Single(config.Repositories).Name);
+            });
+
+        Assert.Null(fault);
+        Assert.Empty(config.Repositories);
+        Assert.Empty(ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync()).Repositories);
+        Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+    }
+
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WaitsForHeldConfigOperationLock_ThenAppliesAndPersists()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig { MaxIterations = 3 } };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var fault = await RunMutatorUnderHeldConfigOperationLockAsync(
+            repo,
+            () => svc.UpdateOrchestratorSettingsAsync(
+                new OrchestratorSettingsUpdate(7, null, null, null, null, null),
+                TestContext.Current.CancellationToken),
+            pending =>
+            {
+                Assert.False(pending.IsCompleted);
+                // The pre-lock value survives: a dropped acquisition would already be 7 here.
+                Assert.Equal(3, config.Orchestrator.MaxIterations);
+            });
+
+        Assert.Null(fault);
+        Assert.Equal(7, config.Orchestrator.MaxIterations);
+        Assert.Equal(7, ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync()).Orchestrator.MaxIterations);
+        Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+    }
+
+    [Fact]
+    public async Task UpdateWorkerContextWindowsAsync_WaitsForHeldConfigOperationLock_ThenAppliesAndPersists()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Workers = new Dictionary<string, WorkerConfig> { ["coder"] = new WorkerConfig { ContextWindow = 1000 } }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var fault = await RunMutatorUnderHeldConfigOperationLockAsync(
+            repo,
+            () => svc.UpdateWorkerContextWindowsAsync(
+                new Dictionary<string, int> { ["coder"] = 2000 }, TestContext.Current.CancellationToken),
+            pending =>
+            {
+                Assert.False(pending.IsCompleted);
+                // The existing window survives: the loop mutates synchronously before any await.
+                Assert.Equal(1000, config.Workers["coder"].ContextWindow);
+            });
+
+        Assert.Null(fault);
+        Assert.Equal(2000, config.Workers["coder"].ContextWindow);
+        Assert.Equal(2000, ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync()).Workers["coder"].ContextWindow);
+        Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+    }
+
+    /// <summary>
+    /// THE LOCK-HOLD RIG for the five mutator tests above: acquires the manager's shared
+    /// <see cref="ConfigRepoManager.ConfigOperationLock"/> in the TEST, invokes the mutator, and
+    /// invokes <paramref name="assertNotStarted"/> with the mutator's task while the permit is
+    /// still held.
+    /// <para>
+    /// FAILURE-PATH OWNERSHIP IS COMPLETE. Every task the rig starts is registered BEFORE any
+    /// mid-lock assertion can throw, the permit is released FIRST inside the <c>finally</c>, and
+    /// every registered task is then observed THERE under <see cref="ObservationTimeout"/>. That
+    /// ordering matters on exactly the path the lock-removal mutants exercise: a failed mid-lock
+    /// assertion must never abandon a mutator that is still writing <c>hive-config.yaml</c>,
+    /// because the test class's disposal deletes the temp directory — an unobserved in-flight
+    /// write would become a nondeterministic cleanup fault. Releasing before observing is also
+    /// what lets that drain finish: a parked mutator can only run once the permit is back.
+    /// </para>
+    /// <para>
+    /// ORIGINAL FAILURE PRECEDENCE IS PRESERVED. The FIRST exception — the assertion that failed,
+    /// or a fault raised while starting the mutator — is captured and rethrown AFTER the
+    /// <c>finally</c> has released and drained, so it is always the exception the test reports,
+    /// even when the observation itself faults or times out. A secondary observation fault is
+    /// retained on the primary exception's <see cref="Exception.Data"/> instead of replacing it;
+    /// nothing is swallowed.
+    /// </para>
+    /// </summary>
+    /// <param name="repo">The manager whose shared lock the test holds.</param>
+    /// <param name="mutate">Starts the mutator whose lock acquisition is under test.</param>
+    /// <param name="assertNotStarted">
+    /// Asserts, synchronously and with the permit still held, that the mutator has neither
+    /// completed nor mutated the live config.
+    /// </param>
+    /// <returns>The exception the released mutator produced, or <c>null</c> when it completed.</returns>
+    private static async Task<Exception?> RunMutatorUnderHeldConfigOperationLockAsync(
+        ConfigRepoManager repo, Func<Task> mutate, Action<Task> assertNotStarted)
+    {
+        await repo.ConfigOperationLock.WaitAsync(TestContext.Current.CancellationToken);
+
+        // Every started task is registered HERE, before the mid-lock assertions run, so the
+        // finally below always owns the complete set and can never abandon one.
+        var started = new List<Task>();
+        Exception? primaryFailure = null;
+        Exception? mutatorFault = null;
+
+        try
+        {
+            var pending = mutate();
+            started.Add(pending);
+
+            assertNotStarted(pending);
+            // The held permit is the ONLY one: the mutator really queued behind it.
+            Assert.Equal(0, repo.ConfigOperationLock.CurrentCount);
+        }
+        catch (Exception ex)
+        {
+            // The FIRST failure wins. It is rethrown AFTER the finally, never from inside it, so
+            // the release and the drain always happen before it surfaces.
+            primaryFailure = ex;
+        }
+        finally
+        {
+            // Released FIRST and unconditionally: the parked mutator can only finish once the
+            // permit is back, so the observation below depends on this line having run.
+            repo.ConfigOperationLock.Release();
+
+            // Boundedly observe EVERY started task. ObserveAsync RETURNS the fault instead of
+            // throwing, so this drain can never replace primaryFailure.
+            var faults = new List<Exception>();
+            foreach (var task in started)
+            {
+                var fault = await ObserveAsync(task);
+                if (fault is not null)
+                    faults.Add(fault);
+            }
+
+            if (faults.Count > 0)
+            {
+                mutatorFault = faults.Count == 1
+                    ? faults[0]
+                    : new AggregateException(faults);
+
+                // A secondary observation fault is RETAINED, never substituted for the primary.
+                if (primaryFailure is not null)
+                    primaryFailure.Data["observationFaults"] = faults;
+            }
+        }
+
+        if (primaryFailure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+
+        return mutatorFault;
+    }
+
     // ── Fix 4: persisted-YAML regression coverage ────────────────────────────
 
     [Fact]

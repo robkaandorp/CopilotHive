@@ -9,6 +9,36 @@ namespace CopilotHive.Services;
 /// <summary>
 /// Applies model configuration changes in-memory, writes the config file,
 /// and commits the result to the config repository.
+/// <para>
+/// <b>Whole-operation serialization.</b> The shared <see cref="HiveConfigFile"/> singleton is the
+/// runtime source of truth, so concurrent requests must not interleave validation, mutation, file
+/// writes, commits or the live Brain update. Every mutator of this service therefore holds
+/// <see cref="ConfigRepoManager.ConfigOperationLock"/> — the single lock the manager shares with the
+/// dispatcher's periodic config-repo sync/reload, so a save and a reload can never interleave. The
+/// lock lives on <see cref="ConfigRepoManager"/> rather than here because that manager is the one
+/// instance both participants share.
+/// </para>
+/// <para>
+/// <b>Thirteen participants hold it:</b> the six catalog CRUD writers
+/// (<see cref="AddAvailableModelAsync(string,int?,string?,bool?,CancellationToken)"/>,
+/// <see cref="UpdateAvailableModelAsync(string,int?,string?,bool?,CancellationToken)"/>,
+/// <see cref="RemoveAvailableModelAsync"/>,
+/// <see cref="AddSubAgentModelAsync(string,int?,ReasoningEffort?,string?,bool?,CancellationToken)"/>,
+/// <see cref="UpdateSubAgentModelAsync(string,int?,ReasoningEffort?,string?,bool?,CancellationToken)"/>
+/// and <see cref="RemoveSubAgentModelAsync"/>), <see cref="SaveModelConfigAsync"/>,
+/// <see cref="UpdateComposerSettingsAsync"/>, and the five repository/orchestrator/worker mutators
+/// (<see cref="AddRepositoryAsync"/>, <see cref="UpdateRepositoryAsync"/>,
+/// <see cref="RemoveRepositoryAsync"/>, <see cref="UpdateOrchestratorSettingsAsync"/> and
+/// <see cref="UpdateWorkerContextWindowsAsync"/>). The compatibility overloads delegate to their
+/// full-arity counterparts and must NEVER acquire the lock themselves — it is not reentrant, so a
+/// nested acquisition would deadlock.
+/// </para>
+/// <para>
+/// Lock order: <see cref="ConfigRepoManager.ConfigOperationLock"/> is always acquired BEFORE any
+/// <see cref="HiveConfigFile"/> catalog operation. Those APIs take their own internal monitor for
+/// the duration of a single synchronous mutation only; that monitor is never held across async
+/// file, git or Brain calls.
+/// </para>
 /// </summary>
 public sealed class ConfigModelService
 {
@@ -17,31 +47,6 @@ public sealed class ConfigModelService
     private readonly ILogger<ConfigModelService> _logger;
     private readonly IDistributedBrain? _brain;
     private readonly IBrainRepoManager? _repoManager;
-
-    /// <summary>
-    /// Serialises the authoritative read-modify-write-commit transactions of this service. The
-    /// shared <see cref="HiveConfigFile"/> singleton is the runtime source of truth, so concurrent
-    /// requests must not interleave validation, mutation, file writes, commits or the live Brain
-    /// update.
-    /// <para>
-    /// Eight substantive participants hold this semaphore: the six catalog CRUD writers
-    /// (<see cref="AddAvailableModelAsync(string,int?,string?,bool?,CancellationToken)"/>,
-    /// <see cref="UpdateAvailableModelAsync(string,int?,string?,bool?,CancellationToken)"/>,
-    /// <see cref="RemoveAvailableModelAsync"/>,
-    /// <see cref="AddSubAgentModelAsync(string,int?,ReasoningEffort?,string?,bool?,CancellationToken)"/>,
-    /// <see cref="UpdateSubAgentModelAsync(string,int?,ReasoningEffort?,string?,bool?,CancellationToken)"/>
-    /// and <see cref="RemoveSubAgentModelAsync"/>), plus <see cref="SaveModelConfigAsync"/> and
-    /// <see cref="UpdateComposerSettingsAsync"/>. The compatibility overloads delegate to their
-    /// full-arity counterparts and must NEVER acquire the semaphore themselves — a nested
-    /// acquisition would deadlock.
-    /// </para>
-    /// <para>
-    /// Lock order: this semaphore is always acquired BEFORE any <see cref="HiveConfigFile"/>
-    /// catalog operation. Those APIs take their own internal monitor for the duration of a single
-    /// synchronous mutation only; that monitor is never held across async file, git or Brain calls.
-    /// </para>
-    /// </summary>
-    private readonly SemaphoreSlim _saveLock = new(1, 1);
 
     /// <summary>
     /// Initialises a new <see cref="ConfigModelService"/>.
@@ -193,7 +198,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task SaveModelConfigAsync(ModelConfigUpdate update, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             // ── Step 1: validate everything before mutating anything ────────
@@ -319,7 +324,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -345,7 +350,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task AddAvailableModelAsync(string name, int? contextWindow, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             if (!_config.TryAddAvailableModel(new AvailableModelRequest(name, contextWindow, description, supportsVision)))
@@ -359,7 +364,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -385,7 +390,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             if (!_config.TryUpdateAvailableModel(name, new AvailableModelRequest(name, contextWindow, description, supportsVision)))
@@ -399,7 +404,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -410,7 +415,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task<bool> RemoveAvailableModelAsync(string name, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             if (!_config.TryRemoveAvailableModel(name))
@@ -425,7 +430,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -453,7 +458,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task AddSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             // Reasoning effort comes exclusively from the explicit request field (already a validated
@@ -472,7 +477,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -499,7 +504,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             // ModelEntry stays YAML-bound (string?): the catalog API formats the enum to its
@@ -516,7 +521,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -527,7 +532,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task<bool> RemoveSubAgentModelAsync(string name, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             if (!_config.TryRemoveSubAgentModel(name))
@@ -542,7 +547,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 
@@ -588,36 +593,46 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task AddRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
-        ValidateRepositoryName(name);
-        if (string.IsNullOrWhiteSpace(url))
-            throw new ArgumentException("Repository URL cannot be null or empty.", nameof(url));
-
-        if (ciTimeoutMinutes is < 1 or > 120)
-            throw new ArgumentException("CI timeout must be between 1 and 120 minutes.");
-
-        if (_config.Repositories.Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException($"Repository '{name}' already exists");
-
-        var branch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
-        var newRepo = new RepositoryConfig
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
+        try
         {
-            Name = name,
-            Url = url,
-            DefaultBranch = branch,
-            Release = NormalizeRelease(release)
-        };
-        if (monitorCi.HasValue) newRepo.MonitorCi = monitorCi.Value;
-        if (ciTimeoutMinutes.HasValue) newRepo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
-        _config.Repositories.Add(newRepo);
+            ValidateRepositoryName(name);
+            if (string.IsNullOrWhiteSpace(url))
+                throw new ArgumentException("Repository URL cannot be null or empty.", nameof(url));
 
-        var message = $"chore: add repository '{name}'";
-        _logger.LogInformation("Adding repository: {Name} ({Url})", name, url);
+            if (ciTimeoutMinutes is < 1 or > 120)
+                throw new ArgumentException("CI timeout must be between 1 and 120 minutes.");
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            if (_config.Repositories.Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"Repository '{name}' already exists");
 
-        if (_repoManager is not null)
-            await _repoManager.EnsureCloneAsync(name, url, branch, ct);
+            var branch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
+            var newRepo = new RepositoryConfig
+            {
+                Name = name,
+                Url = url,
+                DefaultBranch = branch,
+                Release = NormalizeRelease(release)
+            };
+            if (monitorCi.HasValue) newRepo.MonitorCi = monitorCi.Value;
+            if (ciTimeoutMinutes.HasValue) newRepo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
+            _config.Repositories.Add(newRepo);
+
+            var message = $"chore: add repository '{name}'";
+            _logger.LogInformation("Adding repository: {Name} ({Url})", name, url);
+
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+
+            // The clone stays INSIDE the locked region: the persisted config entry and the clone it
+            // promises must not be separated by an interleaved sync/reload.
+            if (_repoManager is not null)
+                await _repoManager.EnsureCloneAsync(name, url, branch, ct);
+        }
+        finally
+        {
+            _configRepo.ConfigOperationLock.Release();
+        }
     }
 
     /// <summary>
@@ -634,33 +649,43 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
-        ValidateRepositoryName(name);
-        if (string.IsNullOrWhiteSpace(url))
-            throw new ArgumentException("Repository URL cannot be null or empty.", nameof(url));
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
+        try
+        {
+            ValidateRepositoryName(name);
+            if (string.IsNullOrWhiteSpace(url))
+                throw new ArgumentException("Repository URL cannot be null or empty.", nameof(url));
 
-        if (ciTimeoutMinutes is < 1 or > 120)
-            throw new ArgumentException("CI timeout must be between 1 and 120 minutes.");
+            if (ciTimeoutMinutes is < 1 or > 120)
+                throw new ArgumentException("CI timeout must be between 1 and 120 minutes.");
 
-        var repo = _config.Repositories
-            .FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (repo is null)
-            throw new InvalidOperationException($"Repository '{name}' not found");
+            var repo = _config.Repositories
+                .FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (repo is null)
+                throw new InvalidOperationException($"Repository '{name}' not found");
 
-        repo.Url = url;
-        repo.DefaultBranch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
-        if (release is not null)
-            repo.Release = NormalizeRelease(release);
-        if (monitorCi.HasValue) repo.MonitorCi = monitorCi.Value;
-        if (ciTimeoutMinutes.HasValue) repo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
+            repo.Url = url;
+            repo.DefaultBranch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
+            if (release is not null)
+                repo.Release = NormalizeRelease(release);
+            if (monitorCi.HasValue) repo.MonitorCi = monitorCi.Value;
+            if (ciTimeoutMinutes.HasValue) repo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
 
-        var message = $"chore: update repository '{name}'";
-        _logger.LogInformation("Updating repository: {Name} ({Url})", name, url);
+            var message = $"chore: update repository '{name}'";
+            _logger.LogInformation("Updating repository: {Name} ({Url})", name, url);
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
 
-        if (_repoManager is not null)
-            await _repoManager.EnsureCloneAsync(repo.Name, repo.Url, repo.DefaultBranch, ct);
+            // The clone stays INSIDE the locked region: the persisted config entry and the clone it
+            // promises must not be separated by an interleaved sync/reload.
+            if (_repoManager is not null)
+                await _repoManager.EnsureCloneAsync(repo.Name, repo.Url, repo.DefaultBranch, ct);
+        }
+        finally
+        {
+            _configRepo.ConfigOperationLock.Release();
+        }
     }
 
     /// <summary>
@@ -670,19 +695,27 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task<bool> RemoveRepositoryAsync(string name, CancellationToken ct = default)
     {
-        var repo = _config.Repositories
-            .FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (repo is null)
-            return false;
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
+        try
+        {
+            var repo = _config.Repositories
+                .FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (repo is null)
+                return false;
 
-        _config.Repositories.Remove(repo);
+            _config.Repositories.Remove(repo);
 
-        var message = $"chore: remove repository '{name}'";
-        _logger.LogInformation("Removing repository: {Name}", name);
+            var message = $"chore: remove repository '{name}'";
+            _logger.LogInformation("Removing repository: {Name}", name);
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
-        return true;
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            return true;
+        }
+        finally
+        {
+            _configRepo.ConfigOperationLock.Release();
+        }
     }
 
     /// <summary>
@@ -692,26 +725,34 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateOrchestratorSettingsAsync(OrchestratorSettingsUpdate update, CancellationToken ct = default)
     {
-        if (update.MaxIterations is not null)
-            _config.Orchestrator.MaxIterations = update.MaxIterations.Value;
-        if (update.MaxRetriesPerTask is not null)
-            _config.Orchestrator.MaxRetriesPerTask = update.MaxRetriesPerTask.Value;
-        if (update.MaxParallelGoals is not null)
-            _config.Orchestrator.MaxParallelGoals = update.MaxParallelGoals.Value;
-        if (update.VerboseLogging is not null)
-            _config.Orchestrator.VerboseLogging = update.VerboseLogging.Value;
-        if (update.BrainMaxSteps is not null)
-            _config.Orchestrator.BrainMaxSteps = update.BrainMaxSteps.Value;
-        if (update.BranchCleanupDelayHours is not null)
-            _config.Orchestrator.BranchCleanupDelayHours = update.BranchCleanupDelayHours.Value;
-        if (update.WorkerTaskTimeoutMinutes is not null)
-            _config.Orchestrator.WorkerTaskTimeoutMinutes = update.WorkerTaskTimeoutMinutes.Value;
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
+        try
+        {
+            if (update.MaxIterations is not null)
+                _config.Orchestrator.MaxIterations = update.MaxIterations.Value;
+            if (update.MaxRetriesPerTask is not null)
+                _config.Orchestrator.MaxRetriesPerTask = update.MaxRetriesPerTask.Value;
+            if (update.MaxParallelGoals is not null)
+                _config.Orchestrator.MaxParallelGoals = update.MaxParallelGoals.Value;
+            if (update.VerboseLogging is not null)
+                _config.Orchestrator.VerboseLogging = update.VerboseLogging.Value;
+            if (update.BrainMaxSteps is not null)
+                _config.Orchestrator.BrainMaxSteps = update.BrainMaxSteps.Value;
+            if (update.BranchCleanupDelayHours is not null)
+                _config.Orchestrator.BranchCleanupDelayHours = update.BranchCleanupDelayHours.Value;
+            if (update.WorkerTaskTimeoutMinutes is not null)
+                _config.Orchestrator.WorkerTaskTimeoutMinutes = update.WorkerTaskTimeoutMinutes.Value;
 
-        var message = "chore: update orchestrator settings";
-        _logger.LogInformation("Updating orchestrator settings");
+            var message = "chore: update orchestrator settings";
+            _logger.LogInformation("Updating orchestrator settings");
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        }
+        finally
+        {
+            _configRepo.ConfigOperationLock.Release();
+        }
     }
 
     /// <summary>
@@ -722,22 +763,30 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateWorkerContextWindowsAsync(Dictionary<string, int> contextWindows, CancellationToken ct = default)
     {
-        foreach (var (role, contextWindow) in contextWindows)
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
+        try
         {
-            var key = role.ToLowerInvariant();
-            if (!_config.Workers.TryGetValue(key, out var wc))
+            foreach (var (role, contextWindow) in contextWindows)
             {
-                wc = new WorkerConfig();
-                _config.Workers[key] = wc;
+                var key = role.ToLowerInvariant();
+                if (!_config.Workers.TryGetValue(key, out var wc))
+                {
+                    wc = new WorkerConfig();
+                    _config.Workers[key] = wc;
+                }
+                wc.ContextWindow = contextWindow;
             }
-            wc.ContextWindow = contextWindow;
+
+            var message = "chore: update worker context windows";
+            _logger.LogInformation("Updating worker context windows");
+
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
         }
-
-        var message = "chore: update worker context windows";
-        _logger.LogInformation("Updating worker context windows");
-
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        finally
+        {
+            _configRepo.ConfigOperationLock.Release();
+        }
     }
 
     /// <summary>
@@ -848,7 +897,7 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateComposerSettingsAsync(ComposerSettingsUpdate update, CancellationToken ct = default)
     {
-        await _saveLock.WaitAsync(ct);
+        await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
             // ── Step 1: validate everything before mutating anything ────────
@@ -886,7 +935,7 @@ public sealed class ConfigModelService
         }
         finally
         {
-            _saveLock.Release();
+            _configRepo.ConfigOperationLock.Release();
         }
     }
 }
