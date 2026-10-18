@@ -554,8 +554,9 @@ internal sealed class PipelineDriver
     /// Applies a state-machine transition: advances to the next planned phase and dispatches it,
     /// opens the re-plan window for a new iteration, or completes the goal.
     /// <para>
-    /// Shared by the normal completion path and the non-blocking failed-Improve path so both use
-    /// EXACTLY the same advancement semantics — no second copy of the switch exists.
+    /// Shared by the normal completion path and BOTH non-blocking Improve paths (a failed Improve
+    /// RESULT, and a thrown Improve DISPATCH) so all three use EXACTLY the same advancement
+    /// semantics — no second copy of the switch exists.
     /// </para>
     /// </summary>
     /// <param name="pipeline">The pipeline to advance.</param>
@@ -563,9 +564,12 @@ internal sealed class PipelineDriver
     /// <param name="verdict">
     /// The worker verdict that drove the transition; consumed ONLY by the
     /// <see cref="TransitionEffect.NewIteration"/> path (retry classification and the iteration
-    /// summary text). It is <c>null</c> on the failed-Improve path, where no verdict is extracted
-    /// at all: <see cref="PhaseInput.Succeeded"/> on Improve can only yield
-    /// <see cref="TransitionEffect.Continue"/>, so the value is never consulted there.
+    /// summary text). It is <c>null</c> from both null-verdict callers, where no verdict is
+    /// extracted at all: (a) the failed-Improve RESULT path, whose
+    /// <see cref="PhaseInput.Succeeded"/> transition on Improve, and (b) the thrown-Improve
+    /// DISPATCH path, whose <see cref="PhaseInput.Failed"/> transition on Improve, can each only
+    /// yield <see cref="TransitionEffect.Continue"/> or <see cref="TransitionEffect.Completed"/> —
+    /// so the value is never consulted on either path.
     /// </param>
     /// <param name="ct">Cancellation token.</param>
     private async Task ApplyTransitionAsync(
@@ -583,9 +587,11 @@ internal sealed class PipelineDriver
             case TransitionEffect.NewIteration:
                 // Fail fast rather than substituting a placeholder verdict: the re-plan path reads
                 // the verdict to classify the retry and to label the iteration summary. The only
-                // caller allowed to pass null is the failed-Improve path, whose
-                // Improve + Succeeded transition can never yield NewIteration — so a null here is
-                // an invalid state, not a case to paper over.
+                // callers allowed to pass null are the two non-blocking Improve paths — the failed
+                // RESULT path (Improve + Succeeded) and the thrown DISPATCH path (Improve +
+                // Failed) — and on Improve both inputs yield AdvanceToNext, so neither can ever
+                // yield NewIteration. A null here is therefore an invalid state, not a case to
+                // paper over.
                 if (verdict is null)
                     throw new InvalidOperationException(
                         $"A {TransitionEffect.NewIteration} transition for goal {pipeline.GoalId} " +
@@ -1012,17 +1018,12 @@ internal sealed class PipelineDriver
                     };
                     await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, notesMeta, ct);
 
-                    // Advance past the failed Improve phase (non-blocking in state machine)
+                    // Advance past the failed Improve phase through the SHARED advancement path
+                    // (non-blocking in state machine: Improve + Failed advances to the next phase,
+                    // so only Continue or Completed can result). The verdict is null: none is
+                    // extracted on this path, and neither reachable effect consults it.
                     var skipResult = pipeline.StateMachine.Transition(PhaseInput.Failed);
-                    pipeline.AdvanceTo(skipResult.NextPhase);
-                    if (skipResult.Effect == TransitionEffect.Continue)
-                        await DispatchPhaseAsync(pipeline, skipResult.NextPhase, null, ct);
-                    else if (skipResult.Effect == TransitionEffect.Completed)
-                    {
-                        await AppendToProgressDocumentAsync(pipeline.GoalId,
-                            "### Brain Summary (Final)\n\nGoal completed successfully.", ct);
-                        await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
-                    }
+                    await ApplyTransitionAsync(pipeline, skipResult, verdict: null, ct);
                 }
                 break;
 

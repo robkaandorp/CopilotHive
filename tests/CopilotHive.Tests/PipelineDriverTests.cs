@@ -1558,6 +1558,84 @@ public sealed class PipelineDriverImproveSkipTests
         Assert.Equal("No coder branch set", failedUpdate.Metadata?.FailureReason);
     }
 
+    // ── Test 11d: a THROWING Improver dispatch is non-blocking and advances once ──
+
+    /// <summary>
+    /// A THROWN Improver dispatch (as opposed to a failed worker RESULT) reaches the
+    /// <c>catch</c> block around <c>DispatchImproverCoreAsync</c>. That catch must do its Skip
+    /// bookkeeping and goal-note write and then advance through the SAME shared
+    /// <c>ApplyTransitionAsync</c> path every other advancement uses — never its own copy of
+    /// AdvanceTo/DispatchPhaseAsync.
+    /// <para>
+    /// The throw is injected through the <c>syncAgents</c> seam, which
+    /// <c>DispatchImproverCoreAsync</c> awaits as its VERY FIRST step — so the catch is entered
+    /// before any prompt building or worker dispatch. The follow-up Merging phase then fails the
+    /// goal under the pre-existing null-CoderBranch contract, exactly as in
+    /// <see cref="DriveNextPhaseAsync_WhenImproveResultIsFailed_ContinuesToNextPhase"/>; that
+    /// failure is NOT caused by Improve and never carries the improver message.
+    /// </para>
+    /// Removal-proof: if the <c>ApplyTransitionAsync</c> call is removed from the catch, the
+    /// Merging phase is never dispatched — no Merging entry is appended, no progress/terminal
+    /// write happens — and the assertions below fail. If only the dispatch is skipped (advance
+    /// without the shared helper), the Merging-entry assertion fails.
+    /// </summary>
+    [Fact]
+    public async Task DispatchPhaseAsync_WhenImproverDispatchThrows_SkipsAndContinuesThroughSharedPath()
+    {
+        const string message = "improver sync exploded before any guidance was published";
+        var syncAttempts = 0;
+
+        // The Improver's first production step (await _syncAgents(ct)) throws, so the Improve
+        // dispatch catch block is entered with nothing but the phase entry bookkeeping done.
+        var (driver, pipeline, seededEntry, syncCount, goalStore) = CreateImproveDriver(
+            syncAgents: _ =>
+            {
+                Interlocked.Increment(ref syncAttempts);
+                throw new InvalidOperationException(message);
+            });
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        // Act: the catch swallows the throw, records the skip, and advances.
+        await driver.DispatchPhaseAsync(
+            pipeline, GoalPhase.Improve, null, TestContext.Current.CancellationToken);
+
+        // The throwing seam WAS the Improver's first step — exactly one attempt, and the default
+        // counting seam was not used (so its counter stays zero).
+        Assert.Equal(1, syncAttempts);
+        Assert.Equal(0, syncCount[0]);
+
+        // The Improvement entry the dispatch appended is marked skipped, with the failure verdict.
+        var improveEntries = pipeline.PhaseLog.Where(e => e.Name == GoalPhase.Improve).ToList();
+        Assert.Equal(2, improveEntries.Count); // the seeded entry + the entry DispatchPhaseAsync appended
+        var skippedEntry = improveEntries[^1];
+        Assert.NotSame(seededEntry, skippedEntry);
+        Assert.Equal(PhaseOutcome.Skip, skippedEntry.Result);
+        Assert.Equal($"Improver failed: {message}", skippedEntry.Verdict);
+        Assert.NotNull(skippedEntry.CompletedAt);
+
+        // The goal note recorded the skip with the FULL exception message.
+        var notesUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Metadata?.Notes is { Count: > 0 });
+        Assert.Equal(GoalStatus.InProgress, notesUpdate.Status);
+        Assert.Contains($"Improver skipped: {message}", notesUpdate.Metadata!.Notes!);
+
+        // The catch advanced through the SHARED path: the state machine moved past Improve and the
+        // next planned phase was actually DISPATCHED — a Merging entry exists for this iteration.
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        var mergingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Merging);
+        Assert.Equal(pipeline.Iteration, mergingEntry.Iteration);
+        Assert.Equal(phaseLogCountBefore + 2, pipeline.PhaseLog.Count);
+
+        // The single terminal write comes from the pre-existing Merging null-CoderBranch contract —
+        // never from the improver failure, whose message must appear in NO failure reason.
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+        Assert.Equal("No coder branch set", failedUpdate.Metadata?.FailureReason);
+        Assert.DoesNotContain(goalStore.StatusUpdates,
+            u => u.Metadata?.FailureReason?.Contains(message, StringComparison.Ordinal) == true);
+        Assert.DoesNotContain(message, pipeline.Goal.FailureReason ?? "");
+        Assert.DoesNotContain(goalStore.StatusUpdates,
+            u => u.Metadata?.FailureReason?.StartsWith("Worker failed: ", StringComparison.Ordinal) == true);
+    }
+
     // ── Test 12: a CANCELLED Improve result with a SKIP verdict is NOT a skip ──
 
     [Fact]
@@ -1708,10 +1786,23 @@ public sealed class PipelineDriverImproveSkipTests
     /// <c>[Improve, Merging]</c> because the state machine requires plans to end with Merging;
     /// the follow-up Merging phase then fails the goal via the pre-existing null-CoderBranch
     /// contract — the tests assert on the Improve entry and the transition position, not on
-    /// goal completion. Carries a counting <c>syncAgents</c> seam.
+    /// goal completion. Carries a counting <c>syncAgents</c> seam unless
+    /// <paramref name="syncAgents"/> replaces it.
     /// </summary>
+    /// <param name="phase">Phase the pipeline starts on.</param>
+    /// <param name="capturePromptContext">Optional capture of the Improve prompt context.</param>
+    /// <param name="syncAgents">
+    /// Optional replacement for the DEFAULT counting seam. The replaceable seam is what lets a
+    /// test make <c>DispatchImproverCoreAsync</c> throw at its very first step
+    /// (<c>await _syncAgents(ct)</c>) — the only way to reach the Improve dispatch catch block.
+    /// When supplied it IS the seam (so the counting counter stays at zero); when omitted the
+    /// counting seam is used unchanged by every existing caller.
+    /// </param>
     internal static (PipelineDriver Driver, GoalPipeline Pipeline, PhaseResult Entry, int[] SyncCount, PipelineDriverNoOpRetryTests.IterationCapturingGoalStore Store)
-        CreateImproveDriver(GoalPhase phase = GoalPhase.Improve, Action<string?>? capturePromptContext = null)
+        CreateImproveDriver(
+            GoalPhase phase = GoalPhase.Improve,
+            Action<string?>? capturePromptContext = null,
+            Func<CancellationToken, Task>? syncAgents = null)
     {
         var goal = new Goal { Id = $"goal-improve-skip-{Guid.NewGuid():N}", Description = "Improve skip recording test" };
         var goalStore = new PipelineDriverNoOpRetryTests.IterationCapturingGoalStore(goal);
@@ -1755,11 +1846,14 @@ public sealed class PipelineDriverImproveSkipTests
             },
             resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
             resolveRepositories: _ => [],
-            syncAgents: _ =>
+            // The DEFAULT counting seam — kept exactly as before for every existing caller. A test
+            // that must reach the Improve dispatch catch supplies its OWN seam (e.g. one that
+            // throws at this first step) through the optional parameter.
+            syncAgents: syncAgents ?? (_ =>
             {
                 Interlocked.Increment(ref syncCount[0]);
                 return Task.CompletedTask;
-            },
+            }),
             generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
             logger: NullLogger<PipelineDriver>.Instance);
 
