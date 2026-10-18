@@ -581,8 +581,10 @@ public sealed class ConfigModelService
 
     /// <summary>
     /// Adds a new repository to the config. Throws <see cref="InvalidOperationException"/>
-    /// if a repository with the same name already exists. After persisting the config,
-    /// triggers a clone of the new repository via the brain repo manager (when configured).
+    /// if a repository with the same name already exists. After persisting the config and
+    /// releasing <see cref="ConfigRepoManager.ConfigOperationLock"/>, triggers a clone of the
+    /// new repository via the brain repo manager (when configured) — the clone deliberately runs
+    /// outside the lock so a slow remote cannot block other config saves or the dispatcher's sync.
     /// </summary>
     /// <param name="name">Short repository name.</param>
     /// <param name="url">Remote clone URL.</param>
@@ -593,6 +595,10 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task AddRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
+        // Captured INSIDE the lock so they describe exactly the entry that was committed, and
+        // consumed AFTER the lock is released so the clone can never block other config saves.
+        string? cloneName = null, cloneUrl = null, cloneBranch = null;
+
         await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
@@ -624,21 +630,29 @@ public sealed class ConfigModelService
             await _configRepo.WriteConfigAsync(_config, ct);
             await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
 
-            // The clone stays INSIDE the locked region: the persisted config entry and the clone it
-            // promises must not be separated by an interleaved sync/reload.
-            if (_repoManager is not null)
-                await _repoManager.EnsureCloneAsync(name, url, branch, ct);
+            cloneName = name;
+            cloneUrl = url;
+            cloneBranch = branch;
         }
         finally
         {
             _configRepo.ConfigOperationLock.Release();
         }
+
+        // Clone AFTER releasing the lock: a slow or hung git clone must not block config saves or
+        // the dispatcher's sync. The clone writes no config. Its configured-URL credential lookup
+        // reads the live config lock-free, like every other BrainRepoManager operation, and
+        // BrainRepoManager serializes per repository.
+        if (_repoManager is not null && cloneName is not null)
+            await _repoManager.EnsureCloneAsync(cloneName, cloneUrl!, cloneBranch!, ct);
     }
 
     /// <summary>
     /// Updates an existing repository's URL, default branch, and optional release
     /// configuration. Throws <see cref="InvalidOperationException"/> if the repository
-    /// is not found.
+    /// is not found. The clone arguments are captured from the live config under
+    /// <see cref="ConfigRepoManager.ConfigOperationLock"/>, but the clone itself runs after the
+    /// lock is released so a slow remote cannot block other config saves or the dispatcher's sync.
     /// </summary>
     /// <param name="name">Repository name to update.</param>
     /// <param name="url">New remote clone URL.</param>
@@ -649,6 +663,10 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
+        // Captured INSIDE the lock from the LIVE RepositoryConfig, because a concurrent reload may
+        // replace that object once the lock is released; consumed after the release (see below).
+        string? cloneName = null, cloneUrl = null, cloneBranch = null;
+
         await _configRepo.ConfigOperationLock.WaitAsync(ct);
         try
         {
@@ -677,15 +695,21 @@ public sealed class ConfigModelService
             await _configRepo.WriteConfigAsync(_config, ct);
             await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
 
-            // The clone stays INSIDE the locked region: the persisted config entry and the clone it
-            // promises must not be separated by an interleaved sync/reload.
-            if (_repoManager is not null)
-                await _repoManager.EnsureCloneAsync(repo.Name, repo.Url, repo.DefaultBranch, ct);
+            cloneName = repo.Name;
+            cloneUrl = repo.Url;
+            cloneBranch = repo.DefaultBranch;
         }
         finally
         {
             _configRepo.ConfigOperationLock.Release();
         }
+
+        // Clone AFTER releasing the lock: a slow or hung git clone must not block config saves or
+        // the dispatcher's sync. The clone writes no config. Its configured-URL credential lookup
+        // reads the live config lock-free, like every other BrainRepoManager operation, and
+        // BrainRepoManager serializes per repository.
+        if (_repoManager is not null && cloneName is not null)
+            await _repoManager.EnsureCloneAsync(cloneName, cloneUrl!, cloneBranch!, ct);
     }
 
     /// <summary>

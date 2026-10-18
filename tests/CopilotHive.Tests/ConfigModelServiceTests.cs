@@ -2040,6 +2040,136 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal("develop", call.Branch);
     }
 
+    /// <summary>
+    /// The clone runs AFTER <see cref="ConfigRepoManager.ConfigOperationLock"/> is released, so a
+    /// slow or hung clone cannot block other config saves. The discriminating assertion is the lock
+    /// count observed while the clone is PARKED: moving the clone back inside the locked region
+    /// leaves the permit held there (count 0) and the second mutator unable to complete.
+    /// </summary>
+    [Fact]
+    public async Task AddRepositoryAsync_RunsCloneOutsideConfigOperationLock()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig { MaxIterations = 3 } };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var repoManager = new GatedBrainRepoManager();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        // Cleanup protection is established BEFORE the clone gate is entered, so a failed mid-clone
+        // assertion can never abandon the parked add or leave the temp directory behind.
+        try
+        {
+            var add = pending.Track("add", svc.AddRepositoryAsync(
+                "gated-repo", "https://github.com/org/gated.git", "main",
+                release: null, ct: TestContext.Current.CancellationToken));
+
+            await repoManager.CloneEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+
+            // The shared lock is FREE while the clone is parked, and the config was already
+            // committed before the clone started.
+            Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+            Assert.Equal("gated-repo", Assert.Single(config.Repositories).Name);
+            Assert.False(add.IsCompleted);
+
+            // A second mutator therefore completes while the clone is still parked.
+            var settings = pending.Track("settings", svc.UpdateOrchestratorSettingsAsync(
+                new OrchestratorSettingsUpdate(11, null, null, null, null, null),
+                TestContext.Current.CancellationToken));
+            await Bounded(settings);
+
+            Assert.Equal(11, config.Orchestrator.MaxIterations);
+            Assert.False(add.IsCompleted);
+            // The parked clone was called exactly once, with the added entry's arguments.
+            var cloneCall = Assert.Single(repoManager.CloneCalls);
+            Assert.Equal(("gated-repo", "https://github.com/org/gated.git", "main"),
+                (cloneCall.Name, cloneCall.Url, cloneCall.Branch));
+        }
+        finally
+        {
+            repoManager.ReleaseClone();
+            drained = await pending.DrainAllAsync();
+        }
+
+        AssertDrainedCleanly(drained);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.Equal(("gated-repo", "https://github.com/org/gated.git", "main"),
+            (added.Name, added.Url, added.DefaultBranch));
+
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        var persistedRepo = Assert.Single(persisted.Repositories);
+        Assert.Equal(("gated-repo", "https://github.com/org/gated.git", "main"),
+            (persistedRepo.Name, persistedRepo.Url, persistedRepo.DefaultBranch));
+        Assert.Equal(11, persisted.Orchestrator.MaxIterations);
+    }
+
+    /// <summary>
+    /// The update's clone also runs after the lock is released, and its arguments are the NEW url
+    /// and branch captured from the LIVE <see cref="RepositoryConfig"/> under the lock.
+    /// </summary>
+    [Fact]
+    public async Task UpdateRepositoryAsync_RunsCloneOutsideConfigOperationLock()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxIterations = 3 },
+            Repositories = [new RepositoryConfig { Name = "existing-repo", Url = "https://old.com/repo.git", DefaultBranch = "main" }]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var repoManager = new GatedBrainRepoManager();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            var update = pending.Track("update", svc.UpdateRepositoryAsync(
+                "existing-repo", "https://new.com/repo.git", "develop",
+                release: null, ct: TestContext.Current.CancellationToken));
+
+            await repoManager.CloneEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+
+            // The shared lock is FREE while the clone is parked, and the new values were already
+            // committed to the live config before the clone started.
+            Assert.Equal(1, repo.ConfigOperationLock.CurrentCount);
+            var liveWhileParked = Assert.Single(config.Repositories);
+            Assert.Equal(("https://new.com/repo.git", "develop"),
+                (liveWhileParked.Url, liveWhileParked.DefaultBranch));
+            Assert.False(update.IsCompleted);
+
+            // A second mutator therefore completes while the clone is still parked.
+            var settings = pending.Track("settings", svc.UpdateOrchestratorSettingsAsync(
+                new OrchestratorSettingsUpdate(11, null, null, null, null, null),
+                TestContext.Current.CancellationToken));
+            await Bounded(settings);
+
+            Assert.Equal(11, config.Orchestrator.MaxIterations);
+            Assert.False(update.IsCompleted);
+            // The clone carries the NEW url and branch, captured under the lock.
+            var cloneCall = Assert.Single(repoManager.CloneCalls);
+            Assert.Equal(("existing-repo", "https://new.com/repo.git", "develop"),
+                (cloneCall.Name, cloneCall.Url, cloneCall.Branch));
+        }
+        finally
+        {
+            repoManager.ReleaseClone();
+            drained = await pending.DrainAllAsync();
+        }
+
+        AssertDrainedCleanly(drained);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.Equal(("existing-repo", "https://new.com/repo.git", "develop"),
+            (updated.Name, updated.Url, updated.DefaultBranch));
+
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        var persistedRepo = Assert.Single(persisted.Repositories);
+        Assert.Equal(("existing-repo", "https://new.com/repo.git", "develop"),
+            (persistedRepo.Name, persistedRepo.Url, persistedRepo.DefaultBranch));
+        Assert.Equal(11, persisted.Orchestrator.MaxIterations);
+    }
+
     // ── Validation tests ───────────────────────────────────────────────────────
 
     [Fact]
@@ -4290,6 +4420,68 @@ file sealed class FakeBrainRepoManager : IBrainRepoManager
     {
         CloneCalls.Add((repoName, repoUrl, defaultBranch));
         return Task.FromResult($"/fake/work/{repoName}");
+    }
+
+    public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+        Task.FromResult("fake-sha");
+    public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+        Task.FromResult(BranchDeleteResult.Success);
+    public string GetClonePath(string repoName) => $"/fake/work/{repoName}";
+    public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+    public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+    public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+        Task.FromResult(false);
+    public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+        Task.FromResult(false);
+    /// <summary>Compatibility stub for the managed-fetch member; unused by this fake.</summary>
+    public Task<BrainFetchResult> FetchOriginAsync(string repoName, string? branch = null, CancellationToken ct = default) =>
+        Task.FromResult(new BrainFetchResult(true, string.Empty, null));
+
+    public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+        Task.FromResult(new List<string>());
+}
+
+/// <summary>
+/// Brain repo manager fake whose <see cref="EnsureCloneAsync"/> RECORDS the call arguments and then
+/// PARKS on a <see cref="TaskCompletionSource"/> gate until the test releases it, so a test can
+/// observe the config operation lock and run other config mutators while a clone is in flight.
+/// The gate is created with <see cref="TaskCreationOptions.RunContinuationsAsynchronously"/> so the
+/// parking clone never runs a test continuation inline.
+/// </summary>
+file sealed class GatedBrainRepoManager : IBrainRepoManager
+{
+    private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _observationsLock = new();
+    private readonly List<(string Name, string Url, string Branch)> _cloneCalls = [];
+
+    /// <summary>Completes when the clone call has been recorded and is parked on the gate.</summary>
+    public TaskCompletionSource CloneEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>The recorded clone arguments, snapshotted under the observation lock.</summary>
+    public IReadOnlyList<(string Name, string Url, string Branch)> CloneCalls
+    {
+        get
+        {
+            lock (_observationsLock)
+                return _cloneCalls.ToList();
+        }
+    }
+
+    /// <summary>Opens the gate so every parked clone call returns. Idempotent.</summary>
+    public void ReleaseClone() => _release.TrySetResult();
+
+    public string WorkDirectory => "/fake/work";
+
+    public async Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
+    {
+        lock (_observationsLock)
+            _cloneCalls.Add((repoName, repoUrl, defaultBranch));
+
+        CloneEntered.TrySetResult();
+        await _release.Task.WaitAsync(ct);
+        return $"/fake/work/{repoName}";
     }
 
     public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
