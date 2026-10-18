@@ -40,13 +40,63 @@ namespace CopilotHive.Tests.Worker;
 /// </para>
 /// </summary>
 [Collection("ConsoleOutput")]
-public sealed class WorkerConnectionLifecycleTests
+public sealed class WorkerConnectionLifecycleTests : IDisposable
 {
     private const string LocalWorkerId = "worker-local";
     private const string AssignedWorkerId = "worker-assigned";
 
     /// <summary>A deterministic provider prefix, so credential resolution never depends on the process env.</summary>
     private const string FixtureModel = "copilot/fixture-model";
+
+    /// <summary>
+    /// The origin URL every config-repo probe in this fixture observes. The hermetic launcher the
+    /// constructor installs answers <c>remote get-url origin</c> with exactly this value, so the
+    /// production origin reconciliation has nothing to reconcile and never reaches the network.
+    /// </summary>
+    private const string HermeticConfigRepoUrl = "https://github.com/org/config-repo.git";
+
+    /// <summary>
+    /// THIS TEST INSTANCE'S HERMETIC CONFIG-REPO DIRECTORY, created by the constructor. Every
+    /// service this fixture builds is constructed over it, so no test ever lands on the
+    /// production default <c>/config-repo</c> path — a path that does not exist on the CI runner
+    /// and that the per-assignment preparation would have to create.
+    /// </summary>
+    private readonly string _configRepoDir;
+
+    /// <summary>
+    /// The release handle of the constructor's hermetic seam: disposing it restores the static
+    /// <see cref="GitOperations.ProcessRunner"/> and best-effort deletes <see cref="_configRepoDir"/>.
+    /// </summary>
+    private readonly IDisposable _gitRestore;
+
+    /// <summary>
+    /// CREATES THIS TEST'S HERMETIC CONFIG-REPO SEAM — one unique temp directory plus a healthy
+    /// fake git launcher — BEFORE the test body runs, so every helper below can build a service
+    /// over it without touching the ambient filesystem or the real git binary.
+    /// </summary>
+    /// <remarks>
+    /// A per-test STATIC <see cref="GitOperations.ProcessRunner"/> swap is safe here: this class is
+    /// in the <c>ConsoleOutput</c> collection, whose definition sets
+    /// <c>DisableParallelization = true</c>, and the only OTHER collection that swaps the same seam
+    /// (<c>EnvVarMutation</c>) sets it too — so no test can observe this override from a parallel
+    /// collection. The two tests here that additionally install their OWN temp directory and
+    /// launcher compose correctly, because
+    /// <see cref="WorkerServiceConfigRepoHarness.InstallProcessRunner"/> NESTS — their <c>using</c>
+    /// restores this constructor's launcher, and <see cref="Dispose"/> then restores whatever
+    /// runner was in place before the constructor ran.
+    /// </remarks>
+    public WorkerConnectionLifecycleTests()
+    {
+        (_configRepoDir, _gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
+    }
+
+    /// <summary>
+    /// RELEASES THIS TEST'S HERMETIC SEAM: the <see cref="GitOperations.ProcessRunner"/> override
+    /// comes off FIRST and the temp config-repo directory is then deleted (best effort). The
+    /// handle is idempotent, so a second release is a no-op regardless of the test's outcome.
+    /// </summary>
+    public void Dispose() => _gitRestore.Dispose();
 
     /// <summary>Generous failsafe bound; never an ordering device.</summary>
     private static readonly TimeSpan Failsafe = TimeSpan.FromSeconds(30);
@@ -2713,7 +2763,8 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task QueuedSend_ChecksRetirementAfterGateAcquisition_AndWritesNothing()
     {
         var gated = new GatedOverlapDetectingRequestStream();
-        var service = new WorkerService("http://localhost:9999", LocalWorkerId, ["coder"]);
+        var service = new WorkerService(
+            "http://localhost:9999", LocalWorkerId, ["coder"], _configRepoDir);
         var connection = PublishStreamConnection(service, AssignedWorkerId, gated);
 
         Task? holder = null;
@@ -2780,7 +2831,8 @@ public sealed class WorkerConnectionLifecycleTests
         var gatedA = new GatedOverlapDetectingRequestStream();
         var requestsB = new RecordingRequestStream();
 
-        var service = new WorkerService("http://localhost:9999", SharedWorkerId, ["coder"]);
+        var service = new WorkerService(
+            "http://localhost:9999", SharedWorkerId, ["coder"], _configRepoDir);
 
         var connectionA = PublishStreamConnection(service, SharedWorkerId, gatedA);
         var connectionB = PublishStreamConnection(service, SharedWorkerId, requestsB);
@@ -3781,6 +3833,71 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // (5) The fixture is HERMETIC: neither construction helper inherits the
+    //     production default config-repo directory.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// BOTH CONSTRUCTION HELPERS ESCAPE THE PRODUCTION DEFAULT: a service built by
+    /// <see cref="BuildService"/> with NO explicit directory, and one built by
+    /// <see cref="BuildServiceWithRunner"/>, each carry this fixture's hermetic
+    /// <see cref="_configRepoDir"/> in <c>WorkerService._configRepoDir</c>, that directory really
+    /// exists, and NEITHER service carries the production ambient default.
+    /// </summary>
+    /// <remarks>
+    /// The reflected field is the private readonly value the service itself captured at
+    /// construction, so this observes what the service will actually use rather than a value the
+    /// test reconstructed. The negative assertion on the ambient path is the point of the test: a
+    /// helper that omitted the directory would capture the production default and fail HERE,
+    /// naming the regression, instead of failing later on a CI runner that has no such directory.
+    /// </remarks>
+    [Fact]
+    public void ConstructionHelpers_BothUseTheHermeticConfigRepoDirectory_NeverTheAmbientDefault()
+    {
+        var viaBuildService = BuildService(
+            new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
+        var viaBuildServiceWithRunner = BuildServiceWithRunner(new ProvisionerCapturingRunner());
+        try
+        {
+            var fromBuildService = ReadConfigRepoDir(viaBuildService);
+            var fromBuildServiceWithRunner = ReadConfigRepoDir(viaBuildServiceWithRunner);
+
+            // BOTH helpers resolved to THIS test's hermetic directory...
+            Assert.Equal(_configRepoDir, fromBuildService);
+            Assert.Equal(_configRepoDir, fromBuildServiceWithRunner);
+
+            // ...which really exists, so a preparation over it can succeed...
+            Assert.True(
+                Directory.Exists(fromBuildService),
+                "The hermetic config-repo directory must exist on disk.");
+            Assert.True(
+                Directory.Exists(fromBuildServiceWithRunner),
+                "The hermetic config-repo directory must exist on disk.");
+
+            // ...and NEITHER inherited the production ambient default. THE NEGATIVE ASSERTION: this
+            // local is the ONLY place in this file's code that names the production default, and
+            // the two assertions below are what prove it ABSENT.
+            const string AmbientDefault = "/config-repo";
+            Assert.NotEqual(AmbientDefault, fromBuildService);
+            Assert.NotEqual(AmbientDefault, fromBuildServiceWithRunner);
+        }
+        finally
+        {
+            viaBuildService.Dispose();
+            viaBuildServiceWithRunner.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Reads the private readonly <c>WorkerService._configRepoDir</c> — the directory the service
+    /// itself captured at construction, i.e. the one production will actually prepare.
+    /// </summary>
+    private static string ReadConfigRepoDir(WorkerService service) =>
+        (string)typeof(WorkerService)
+            .GetField("_configRepoDir", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service)!;
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Harness.
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -3869,10 +3986,21 @@ public sealed class WorkerConnectionLifecycleTests
         },
     };
 
-    private static WorkerService BuildService(
-        IAgentRunner runner, WorkerConfigProvisioner provisioner, string configRepoDir = "/config-repo")
+    /// <summary>
+    /// Builds a service over the supplied runner and provisioner, with the config-repo directory
+    /// defaulting to THIS test's hermetic directory.
+    /// </summary>
+    /// <remarks>
+    /// The directory parameter is nullable rather than optional-with-a-value because the default
+    /// must be the per-test instance field <see cref="_configRepoDir"/>, and an instance field
+    /// cannot be an optional-parameter default. Callers that pass nothing therefore get the
+    /// hermetic directory and never the production default.
+    /// </remarks>
+    private WorkerService BuildService(
+        IAgentRunner runner, WorkerConfigProvisioner provisioner, string? configRepoDir = null)
     {
-        var service = new WorkerService("http://localhost:9999", LocalWorkerId, ["coder"], configRepoDir);
+        var service = new WorkerService(
+            "http://localhost:9999", LocalWorkerId, ["coder"], configRepoDir ?? _configRepoDir);
         service.TestProvisioner = provisioner;
         ReplaceRunner(service, runner);
         return service;
@@ -3880,11 +4008,14 @@ public sealed class WorkerConnectionLifecycleTests
 
     /// <summary>
     /// Builds a service over a supplied runner WITHOUT touching the provisioner seam: the lifecycle
-    /// tests exercise the run/disposal guard, not config-repo preparation.
+    /// tests exercise the run/disposal guard, not config-repo preparation. The service still runs
+    /// over THIS test's hermetic config-repo directory, so a preparation that does happen never
+    /// lands on the production default path.
     /// </summary>
-    private static WorkerService BuildServiceWithRunner(IAgentRunner runner)
+    private WorkerService BuildServiceWithRunner(IAgentRunner runner)
     {
-        var service = new WorkerService("http://localhost:9999", LocalWorkerId, ["coder"]);
+        var service = new WorkerService(
+            "http://localhost:9999", LocalWorkerId, ["coder"], _configRepoDir);
         ReplaceRunner(service, runner);
         return service;
     }

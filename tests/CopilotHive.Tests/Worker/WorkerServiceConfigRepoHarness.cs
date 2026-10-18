@@ -110,6 +110,88 @@ internal static class WorkerServiceConfigRepoHarness
         return new Restore(() => GitOperations.ProcessRunner = original);
     }
 
+    /// <summary>
+    /// THE SHARED HERMETIC CONFIG-REPO SEAM for every fixture that runs a REAL assignment
+    /// through the production provisioner path: a unique temp directory plus a healthy
+    /// <see cref="FakeGitLauncher"/> installed through <see cref="InstallProcessRunner"/>.
+    /// </summary>
+    /// <remarks>
+    /// The per-assignment preparation (<c>WorkerService.PrepareConfigRepoAsync</c>) probes the
+    /// config repo with real git and then creates <c>&lt;dir&gt;/agents</c>, so a fixture that
+    /// hands the service an AMBIENT directory such as <c>/config-repo</c> depends on the host
+    /// filesystem (that path does not exist on the CI runner) and on the real git binary. The
+    /// temp directory exists and is writable everywhere, and the launcher answers the probe
+    /// deterministically: worktree root = the temp directory, origin = the configured URL, and
+    /// an empty successful result for every other command.
+    /// </remarks>
+    /// <param name="configRepoUrl">The origin URL the config-repo probe must observe.</param>
+    /// <returns>
+    /// The temp config-repo directory, plus the release handle for the static
+    /// <see cref="GitOperations.ProcessRunner"/> override the helper installed — the CALLER owns
+    /// that handle and must dispose it on every exit path. Disposing the handle restores the
+    /// previous <see cref="GitOperations.ProcessRunner"/> value FIRST and then DELETES the temp
+    /// config-repo directory (best effort), so a fixture that owns the handle to completion leaks
+    /// neither the seam nor a directory.
+    /// </returns>
+    internal static (string ConfigRepoDir, IDisposable GitRestore) CreateHermeticConfigRepo(
+        string configRepoUrl)
+    {
+        var configRepoDir = Path.Combine(
+            Path.GetTempPath(), "worker-config-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(configRepoDir);
+        var launcher = new FakeGitLauncher(tokens =>
+        {
+            var command = string.Join(' ', tokens);
+            if (command.Contains("rev-parse --is-inside-work-tree", StringComparison.Ordinal))
+                return new GitProcessResult(0, "true\n", string.Empty);
+            if (command.Contains("rev-parse --show-toplevel", StringComparison.Ordinal))
+                return new GitProcessResult(0, configRepoDir + "\n", string.Empty);
+            if (command.Contains("remote get-url origin", StringComparison.Ordinal))
+                return new GitProcessResult(0, configRepoUrl + "\n", string.Empty);
+            return new GitProcessResult(0, string.Empty, string.Empty);
+        });
+        return (configRepoDir, new HermeticConfigRepoHandle(
+            InstallProcessRunner(launcher), configRepoDir));
+    }
+
+    /// <summary>
+    /// THE RELEASE HANDLE of <see cref="CreateHermeticConfigRepo"/>: the seam it installed has to
+    /// come off the static <see cref="GitOperations.ProcessRunner"/> AND the temp directory it
+    /// created has to leave the filesystem, so neither a fake launcher nor a
+    /// <c>worker-config-*</c> directory outlives the fixture that created it.
+    /// </summary>
+    /// <remarks>
+    /// ORDER: the process-runner restore runs FIRST, so the static seam is back to its previous
+    /// value even when the directory removal cannot complete. The removal is BEST EFFORT — a
+    /// directory still held open somewhere must never turn a fixture's teardown into a failure —
+    /// so it swallows <see cref="IOException"/> (which covers
+    /// <see cref="DirectoryNotFoundException"/>) and <see cref="UnauthorizedAccessException"/>.
+    /// IDEMPOTENT, because a fixture may be released by more than one teardown path.
+    /// </remarks>
+    /// <param name="processRunnerRestore">The restore callback installed for this seam.</param>
+    /// <param name="configRepoDir">The temp config-repo directory the helper created.</param>
+    private sealed class HermeticConfigRepoHandle(
+        IDisposable processRunnerRestore, string configRepoDir) : IDisposable
+    {
+        /// <summary>0 = not yet released; 1 = released. Guarded by <see cref="Interlocked"/>.</summary>
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) != 0)
+                return;
+
+            processRunnerRestore.Dispose();
+
+            try
+            {
+                Directory.Delete(configRepoDir, recursive: true);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
     private sealed class Restore(Action restore) : IDisposable
     {
         public void Dispose() => restore();

@@ -60,6 +60,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// <summary>The expected <see cref="WorkerRunOutcome"/> of the carried run under test.</summary>
     private const WorkerRunOutcome RunCompletion = WorkerRunOutcome.WorkStreamEnded;
 
+    /// <summary>
+    /// THE ORIGIN URL every hermetic config-repo seam in this file is built with: the value the
+    /// production config-repo probe must observe and the contract test asserts on. It is a
+    /// NON-AMBIENT fixture URL — nothing here ever reaches the real <c>/config-repo</c> path.
+    /// </summary>
+    private const string HermeticConfigRepoUrl = "https://github.com/org/config-repo.git";
+
     // ══════════════════════════════════════════════════════════════════════════
     // 1. The ONE CAS state machine — transitions on the retained assignment.
     // ══════════════════════════════════════════════════════════════════════════
@@ -538,7 +545,14 @@ public sealed class WorkerServiceReconnectSurvivalTests
         var responses = new ChannelResponseReader();
         var stream = BuildFaultingStream(requests, responses);
         var connection = TestConnectionFactory.CreateUnpublished("worker-delivered", stream);
-        var service = new WorkerService("http://localhost:9999", "worker-delivered", ["coder"], "/config-repo");
+
+        // HERMETIC DIR, declared BEFORE the service: the using releases the ProcessRunner restore
+        // and deletes the temp directory on every exit path, including a thrown exception.
+        var (configRepoDir, gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
+        using var hermeticConfigRepo = gitRestore;
+        var service = new WorkerService(
+            "http://localhost:9999", "worker-delivered", ["coder"], configRepoDir);
         try
         {
             // THE FABRICATED DELIVERED OWNER, built through the production types: the same
@@ -835,7 +849,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
     [Fact]
     public async Task DrainCarriedAssignmentAsync_WithNothingRetained_IsANoOp()
     {
-        var service = new WorkerService("http://localhost:9999", "worker-1", ["coder"], "/config-repo");
+        // HERMETIC DIR, declared BEFORE the service: the using releases the ProcessRunner restore
+        // and deletes the temp directory on every exit path, including a thrown exception.
+        var (configRepoDir, gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
+        using var hermeticConfigRepo = gitRestore;
+        var service = new WorkerService(
+            "http://localhost:9999", "worker-1", ["coder"], configRepoDir);
         try
         {
             await service.DrainCarriedAssignmentAsync();
@@ -873,7 +893,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
         Assert.Equal(typeof(Func<CancellationToken, Task>), completeHook.PropertyType);
         Assert.Equal(typeof(Func<Task>), readyHook.PropertyType);
 
-        var service = new WorkerService("http://localhost:9999", "worker-1", ["coder"], "/config-repo");
+        // HERMETIC DIR, declared BEFORE the service: the using releases the ProcessRunner restore
+        // and deletes the temp directory on every exit path, including a thrown exception.
+        var (configRepoDir, gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
+        using var hermeticConfigRepo = gitRestore;
+        var service = new WorkerService(
+            "http://localhost:9999", "worker-1", ["coder"], configRepoDir);
         try
         {
             Assert.Null(completeHook.GetValue(service));
@@ -1331,85 +1357,110 @@ public sealed class WorkerServiceReconnectSurvivalTests
         var responses = new ChannelResponseReader();
         var stream = BuildFaultingStream(requests, responses);
         var connection = TestConnectionFactory.CreateUnpublished("worker-reconnect-a", stream);
-        var service = new WorkerService(
-            "http://localhost:9999", "worker-reconnect", ["coder"], "/config-repo");
-        InstallRunner(service, new CarryPromptRunner());
-        service.CallInvokerFactory =
-            () => new ScriptedInvoker(RegisterResponseFor(adopted: false, rejected: true));
 
-        var serviceType = typeof(WorkerService);
-        var holderType = serviceType.GetNestedType("TerminalResultHolder", BindingFlags.NonPublic)!;
-        var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
-        var receiptType = serviceType.GetNestedType("CompletionReceiptTracker", BindingFlags.NonPublic)!;
-        var ownerType = serviceType.GetNestedType("ActiveAssignment", BindingFlags.NonPublic)!;
-        var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
-        var readyClaim = Activator.CreateInstance(readyType, nonPublic: true)!;
-        var receipt = Activator.CreateInstance(
-            receiptType,
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            binder: null,
-            args: [connection],
-            culture: null)!;
-        var ordinaryReady = NewOrdinaryReadySlot(connection, CancellationToken.None, readyClaim);
-        var ownerCts = new CancellationTokenSource();
+        // HERMETIC DIR: the production config-repo preparation must never reach the ambient
+        // /config-repo path, so the returned handle OWNS this restore handle — its Dispose (the
+        // fixture's only exit path) restores the ProcessRunner and deletes the temp dir.
+        var (configRepoDir, gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
 
-        // THE PRODUCTION CONSTRUCTOR SHAPE, with a null retry and a null carried delivery: exactly the
-        // owner the assignment handler installs for a legacy (ungated, un-retransmitted) assignment —
-        // and the owner is left OPEN, i.e. NOT Carried, which is the whole premise of this vector.
-        var owner = Activator.CreateInstance(
-            ownerType,
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            binder: null,
-            args:
-            [
-                "task-A",
-                Task.CompletedTask,
-                Task.CompletedTask,
-                null,
-                ownerCts,
-                readyClaim,
-                holder,
-                receipt,
-                ordinaryReady,
-            ],
-            culture: null)!;
+        // Released here only when the fixture is never handed over, i.e. when the build below
+        // throws — the successful path transfers the handle to the caller.
+        var handedOff = false;
+        try
+        {
+            var service = new WorkerService(
+                "http://localhost:9999", "worker-reconnect", ["coder"], configRepoDir);
+            InstallRunner(service, new CarryPromptRunner());
+            service.CallInvokerFactory =
+                () => new ScriptedInvoker(RegisterResponseFor(adopted: false, rejected: true));
 
-        serviceType
-            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, owner);
-        serviceType
-            .GetField("_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, "task-A");
-        serviceType
-            .GetField("_currentRole", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, "coder");
+            var serviceType = typeof(WorkerService);
+            var holderType = serviceType.GetNestedType("TerminalResultHolder", BindingFlags.NonPublic)!;
+            var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+            var receiptType = serviceType.GetNestedType("CompletionReceiptTracker", BindingFlags.NonPublic)!;
+            var ownerType = serviceType.GetNestedType("ActiveAssignment", BindingFlags.NonPublic)!;
+            var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+            var readyClaim = Activator.CreateInstance(readyType, nonPublic: true)!;
+            var receipt = Activator.CreateInstance(
+                receiptType,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                args: [connection],
+                culture: null)!;
+            var ordinaryReady = NewOrdinaryReadySlot(connection, CancellationToken.None, readyClaim);
+            var ownerCts = new CancellationTokenSource();
 
-        return new RetainedNonCarriedOwner(service, connection, responses, requests, ownerCts);
+            // THE PRODUCTION CONSTRUCTOR SHAPE, with a null retry and a null carried delivery: exactly the
+            // owner the assignment handler installs for a legacy (ungated, un-retransmitted) assignment —
+            // and the owner is left OPEN, i.e. NOT Carried, which is the whole premise of this vector.
+            var owner = Activator.CreateInstance(
+                ownerType,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                args:
+                [
+                    "task-A",
+                    Task.CompletedTask,
+                    Task.CompletedTask,
+                    null,
+                    ownerCts,
+                    readyClaim,
+                    holder,
+                    receipt,
+                    ordinaryReady,
+                ],
+                culture: null)!;
+
+            serviceType
+                .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .SetValue(service, owner);
+            serviceType
+                .GetField("_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .SetValue(service, "task-A");
+            serviceType
+                .GetField("_currentRole", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .SetValue(service, "coder");
+
+            var prepared = new RetainedNonCarriedOwner(
+                service, connection, responses, requests, ownerCts, gitRestore);
+            handedOff = true;
+            return prepared;
+        }
+        finally
+        {
+            if (!handedOff)
+                gitRestore.Dispose();
+        }
     }
 
     /// <summary>
     /// THE FIXTURE HANDLE of <see cref="PrepareServiceWithRetainedNonCarriedOwner"/>: the service, the
     /// injected owner's ACTUAL cancellation source (the one the defensive drain cancels and disposes),
-    /// and the connection/reader/writer needed to release every seam on teardown.
+    /// the connection/reader/writer needed to release every seam on teardown, and the hermetic
+    /// config-repo seam's restore handle.
     /// </summary>
     private sealed class RetainedNonCarriedOwner
     {
         private readonly WorkerConnection _connection;
         private readonly ChannelResponseReader _responses;
         private readonly CarryRequestStream _requests;
+        private readonly IDisposable _gitRestore;
 
         internal RetainedNonCarriedOwner(
             WorkerService service,
             WorkerConnection connection,
             ChannelResponseReader responses,
             CarryRequestStream requests,
-            CancellationTokenSource ownerCts)
+            CancellationTokenSource ownerCts,
+            IDisposable gitRestore)
         {
             Service = service;
             _connection = connection;
             _responses = responses;
             _requests = requests;
             OwnerCts = ownerCts;
+            _gitRestore = gitRestore;
         }
 
         internal WorkerService Service { get; }
@@ -1419,8 +1470,10 @@ public sealed class WorkerServiceReconnectSurvivalTests
 
         /// <summary>
         /// TEARDOWN — the SAME shape the sibling injection test uses: retire the connection, end the
-        /// reader, release the writer, and dispose the service. IDEMPOTENT, because every exit path
-        /// calls it exactly once and a failure path must never leak the fixture.
+        /// reader, release the writer, and dispose the service, then release the hermetic config-repo
+        /// seam (restore the <see cref="GitOperations.ProcessRunner"/> override and delete the temp
+        /// directory). IDEMPOTENT, because every exit path calls it exactly once, its handle is
+        /// idempotent, and a failure path must never leak the fixture.
         /// </summary>
         internal void Dispose()
         {
@@ -1428,6 +1481,7 @@ public sealed class WorkerServiceReconnectSurvivalTests
             _responses.TryComplete();
             _requests.ReleaseAll();
             TryDispose(Service);
+            _gitRestore.Dispose();
         }
     }
 
@@ -1463,96 +1517,13 @@ public sealed class WorkerServiceReconnectSurvivalTests
     }
 
     /// <summary>
-    /// THE SHARED HERMETIC CONFIG-REPO SEAM for every fixture that runs a REAL assignment
-    /// through the production provisioner path (the <see cref="CarryHarness"/> runs and the
-    /// <see cref="ReconnectPlan"/> runs): a unique temp directory plus a healthy
-    /// <see cref="FakeGitLauncher"/> installed through
-    /// <see cref="WorkerServiceConfigRepoHarness.InstallProcessRunner"/>.
-    /// </summary>
-    /// <remarks>
-    /// The per-assignment preparation (<c>WorkerService.PrepareConfigRepoAsync</c>) probes the
-    /// config repo with real git and then creates <c>&lt;dir&gt;/agents</c>, so a fixture that
-    /// hands the service an AMBIENT directory such as <c>/config-repo</c> depends on the host
-    /// filesystem (that path does not exist on the CI runner) and on the real git binary. The
-    /// temp directory exists and is writable everywhere, and the launcher answers the probe
-    /// deterministically: worktree root = the temp directory, origin = the configured URL, and
-    /// an empty successful result for every other command.
-    /// </remarks>
-    /// <param name="configRepoUrl">The origin URL the config-repo probe must observe.</param>
-    /// <returns>
-    /// The temp config-repo directory, plus the release handle for the static
-    /// <see cref="GitOperations.ProcessRunner"/> override the helper installed — the CALLER owns
-    /// that handle and must dispose it on every exit path. Disposing the handle restores the
-    /// previous <see cref="GitOperations.ProcessRunner"/> value FIRST and then DELETES the temp
-    /// config-repo directory (best effort), so a fixture that owns the handle to completion leaks
-    /// neither the seam nor a directory.
-    /// </returns>
-    private static (string ConfigRepoDir, IDisposable GitRestore) CreateHermeticConfigRepo(
-        string configRepoUrl)
-    {
-        var configRepoDir = Path.Combine(
-            Path.GetTempPath(), "reconnect-config-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(configRepoDir);
-        var launcher = new FakeGitLauncher(tokens =>
-        {
-            var command = string.Join(' ', tokens);
-            if (command.Contains("rev-parse --is-inside-work-tree", StringComparison.Ordinal))
-                return new GitProcessResult(0, "true\n", string.Empty);
-            if (command.Contains("rev-parse --show-toplevel", StringComparison.Ordinal))
-                return new GitProcessResult(0, configRepoDir + "\n", string.Empty);
-            if (command.Contains("remote get-url origin", StringComparison.Ordinal))
-                return new GitProcessResult(0, configRepoUrl + "\n", string.Empty);
-            return new GitProcessResult(0, string.Empty, string.Empty);
-        });
-        return (configRepoDir, new HermeticConfigRepoHandle(
-            WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher), configRepoDir));
-    }
-
-    /// <summary>
-    /// THE RELEASE HANDLE of <see cref="CreateHermeticConfigRepo"/>: the seam it installed has to
-    /// come off the static <see cref="GitOperations.ProcessRunner"/> AND the temp directory it
-    /// created has to leave the filesystem, so neither a fake launcher nor a
-    /// <c>reconnect-config-*</c> directory outlives the fixture that created it.
-    /// </summary>
-    /// <remarks>
-    /// ORDER: the process-runner restore runs FIRST, so the static seam is back to its previous
-    /// value even when the directory removal cannot complete. The removal is BEST EFFORT — a
-    /// directory still held open somewhere must never turn a fixture's teardown into a failure —
-    /// so it swallows <see cref="IOException"/> (which covers
-    /// <see cref="DirectoryNotFoundException"/>) and <see cref="UnauthorizedAccessException"/>.
-    /// IDEMPOTENT, because a fixture may be released by more than one teardown path.
-    /// </remarks>
-    /// <param name="processRunnerRestore">The restore callback installed for this seam.</param>
-    /// <param name="configRepoDir">The temp config-repo directory the helper created.</param>
-    private sealed class HermeticConfigRepoHandle(
-        IDisposable processRunnerRestore, string configRepoDir) : IDisposable
-    {
-        /// <summary>0 = not yet released; 1 = released. Guarded by <see cref="Interlocked"/>.</summary>
-        private int _released;
-
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _released, 1) != 0)
-                return;
-
-            processRunnerRestore.Dispose();
-
-            try
-            {
-                Directory.Delete(configRepoDir, recursive: true);
-            }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-        }
-    }
-
-    /// <summary>
-    /// THE FULL RELEASE CONTRACT of <see cref="CreateHermeticConfigRepo"/>'s handle — the two facts
-    /// every fixture here depends on. Disposing it restores the static
+    /// THE FULL RELEASE CONTRACT of
+    /// <see cref="WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo"/>'s handle — the two
+    /// facts every fixture here depends on. Disposing it restores the static
     /// <see cref="GitOperations.ProcessRunner"/> override to the value captured BEFORE the helper
     /// ran (so a handle that left its fake launcher installed fails this test rather than matching
     /// itself) and removes the temp config-repo directory it created, so a run leaves no
-    /// <c>reconnect-config-*</c> directory behind.
+    /// <c>worker-config-*</c> directory behind.
     /// </summary>
     [Fact]
     public void CreateHermeticConfigRepo_Dispose_RestoresProcessRunnerAndDeletesTheTempDirectory()
@@ -1561,8 +1532,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         // not install.
         var priorRunner = GitOperations.ProcessRunner;
 
-        var (configRepoDir, gitRestore) = CreateHermeticConfigRepo(
-            "https://github.com/org/config-repo.git");
+        var (configRepoDir, gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
 
         try
         {
@@ -1573,6 +1544,11 @@ public sealed class WorkerServiceReconnectSurvivalTests
             // THE PREMISE: the helper really installed its own launcher. Without this the restore
             // assertion below could pass on a handle that never installed anything.
             Assert.NotEqual(priorRunner, GitOperations.ProcessRunner);
+
+            // Real assignment preparation populates this directory; disposal must delete its
+            // contents recursively, not merely remove an empty directory.
+            var agentsDir = Directory.CreateDirectory(Path.Combine(configRepoDir, "agents"));
+            File.WriteAllText(Path.Combine(agentsDir.FullName, "coder.agents.md"), "fixture-agent-marker");
 
             gitRestore.Dispose();
 
@@ -1587,6 +1563,26 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 "Disposing the handle must delete the temp config-repo directory.");
             Assert.Throws<DirectoryNotFoundException>(
                 () => Directory.GetFileSystemEntries(configRepoDir));
+
+            // A second release must not undo a later runner override or delete a new directory
+            // at the same path. Merely calling Dispose twice cannot distinguish either bug.
+            using var laterRestore = WorkerServiceConfigRepoHarness.InstallProcessRunner(
+                new FakeGitLauncher(_ => new GitProcessResult(0, "later-runner-marker", string.Empty)));
+            var laterRunner = GitOperations.ProcessRunner;
+            Directory.CreateDirectory(configRepoDir);
+            try
+            {
+                gitRestore.Dispose();
+                Assert.Equal(laterRunner, GitOperations.ProcessRunner);
+                Assert.True(
+                    Directory.Exists(configRepoDir),
+                    "An already released handle must not delete a later directory at its old path.");
+            }
+            finally
+            {
+                if (Directory.Exists(configRepoDir))
+                    Directory.Delete(configRepoDir, recursive: true);
+            }
         }
         finally
         {
@@ -1602,7 +1598,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
     /// focused tests share. The run starts in <see cref="Create"/>, so every test observes the
     /// real <see cref="WorkerService.RunAsync"/> lifecycle (registration, publication, heartbeat
     /// seam, initial Ready) rather than a synthetic publication. The service is built over the
-    /// SHARED hermetic config-repo directory (<see cref="CreateHermeticConfigRepo"/>), so the
+    /// SHARED hermetic config-repo directory
+    /// (<see cref="WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo"/>), so the
     /// production per-assignment preparation never touches the ambient filesystem; the harness
     /// owns that seam's restore handle and releases it through
     /// <see cref="DisposeGitRestore"/>.
@@ -1642,7 +1639,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// <summary>
         /// THE HERMETIC SEAM'S RESTORE HANDLE: the static
         /// <see cref="GitOperations.ProcessRunner"/> override
-        /// <see cref="CreateHermeticConfigRepo"/> installed for THIS harness's service.
+        /// <see cref="WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo"/> installed for THIS
+        /// harness's service.
         /// </summary>
         private readonly IDisposable _gitRestore;
 
@@ -1688,8 +1686,9 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// </summary>
         /// <remarks>
         /// The service runs over the SHARED HERMETIC CONFIG-REPO SEAM
-        /// (<see cref="CreateHermeticConfigRepo"/>), so the production per-assignment preparation
-        /// never touches the ambient filesystem or the real git binary. The returned harness OWNS
+        /// (<see cref="WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo"/>), so the
+        /// production per-assignment preparation never touches the ambient filesystem or the real
+        /// git binary. The returned harness OWNS
         /// that seam's restore handle — released through <see cref="DisposeGitRestore"/> — and
         /// every failure path below releases it in the outer <c>finally</c>, after unwinding a run
         /// that had already started: no live producer and no leaked
@@ -1698,7 +1697,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
         /// </remarks>
         internal static CarryHarness Create()
         {
-            var (configRepoDir, gitRestore) = CreateHermeticConfigRepo(ConfigRepoUrl);
+            var (configRepoDir, gitRestore) =
+                WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(ConfigRepoUrl);
 
             // Set ONLY once the fully built harness is on its way to the caller: the outer
             // finally reads it as the ONE fact deciding whether the hermetic seam travels with
@@ -3058,6 +3058,16 @@ public sealed class WorkerServiceReconnectSurvivalTests
         internal string? LastSaveSessionId { get { lock (_gate) return _lastSaveSessionId; } }
         internal string? LastSavedJson { get { lock (_gate) return _lastSavedJson; } }
 
+        /// <summary>
+        /// How many Register waiters are still PENDING on this invoker: the entries
+        /// <see cref="WaitForRegisterCountAsync"/> installed for a threshold that no Register has
+        /// satisfied yet. Read under <see cref="_gate"/>, so a caller observes a settled count.
+        /// </summary>
+        internal int PendingRegisterWaiterCount
+        {
+            get { lock (_gate) return _registerWaiters.Count; }
+        }
+
         /// <summary>Completes once at least <paramref name="count"/> Register RPCs were made.</summary>
         internal Task WaitForRegisterCountAsync(int count, CancellationToken ct)
         {
@@ -3150,9 +3160,20 @@ public sealed class WorkerServiceReconnectSurvivalTests
             return new SaveSessionResponse { Success = true };
         }
 
+        /// <summary>
+        /// RECORDS one Register and completes the waiters whose THRESHOLD this registration
+        /// satisfies, removing them by that SAME threshold.
+        /// </summary>
+        /// <remarks>
+        /// The dictionary is keyed by the register-count THRESHOLD, so the removal key must be the
+        /// threshold too. A completed waiter therefore cannot outlive its own registration, and a
+        /// removal can never take a PENDING waiter with it: the keys are disjoint integers, while
+        /// a <see cref="Task.Id"/> lives in an unrelated id space and could collide with any
+        /// pending threshold.
+        /// </remarks>
         private object RespondRegister<TRequest>(TRequest request)
         {
-            List<TaskCompletionSource> ready = [];
+            List<(int Threshold, TaskCompletionSource Waiter)> ready = [];
             lock (_gate)
             {
                 if (request is RegisterRequest registerRequest)
@@ -3161,14 +3182,14 @@ public sealed class WorkerServiceReconnectSurvivalTests
                 foreach (var (threshold, waiter) in _registerWaiters)
                 {
                     if (_registers.Count >= threshold)
-                        ready.Add(waiter);
+                        ready.Add((threshold, waiter));
                 }
 
-                foreach (var waiter in ready)
-                    _registerWaiters.Remove(waiter.Task.Id);
+                foreach (var (threshold, _) in ready)
+                    _registerWaiters.Remove(threshold);
             }
 
-            foreach (var waiter in ready)
+            foreach (var (_, waiter) in ready)
                 waiter.TrySetResult();
 
             return registerResponse;
@@ -3187,6 +3208,59 @@ public sealed class WorkerServiceReconnectSurvivalTests
             throw new NotSupportedException(
                 $"Unexpected duplex call {method.FullName} — the fixture supplies the stream explicitly.");
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // The ScriptedInvoker's OWN register-waiter bookkeeping, driven DIRECTLY —
+    // no service, no stream, no assignment: the fake invoker is the subject.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A SATISFIED register waiter is REMOVED from the invoker's pending set, keyed by the
+    /// register-count THRESHOLD it was installed for. Nothing is left behind, so the observable
+    /// is a settled, exact fact.
+    /// </summary>
+    /// <remarks>
+    /// THE REMOVAL PROOF IS DETERMINISTIC, not statistical. <see cref="Task.Id"/> is assigned
+    /// lazily from a process-wide increasing counter, so the FIRST materialization here
+    /// (<c>floor</c>) pins the counter at a value >= 1, and every id first read later is strictly
+    /// greater than it. The waiter's underlying TCS task id is FIRST read inside
+    /// <c>RespondRegister</c> in the wrong-key mutant, so it is > <c>floor</c> >= 1 and can never
+    /// equal threshold 1: that mutant therefore always leaves the entry in place, which the
+    /// pending-count assertion catches. The fixed removal can only key on the threshold, so it
+    /// always finds the entry.
+    /// </remarks>
+    [Fact]
+    public async Task ScriptedInvoker_RespondRegister_RemovesTheSatisfiedWaiterByItsThreshold()
+    {
+        var invoker = new ScriptedInvoker(RegisterFor("worker-reconnect-a"));
+
+        // STEP 1 — materialize a FRESH task id BEFORE anything else reads one: it pins the id
+        // counter, so every id first read later is > floor >= 1.
+        var floor = new TaskCompletionSource().Task.Id;
+        Assert.True(floor >= 1, "Task ids start at 1, so floor is a real lower bound.");
+
+        // STEP 2 — a waiter for the FIRST register (threshold 1) is pending before any Register;
+        // the positive control that makes the empty set below meaningful.
+        var registerWaiter =
+            invoker.WaitForRegisterCountAsync(1, TestContext.Current.CancellationToken);
+        Assert.Equal(1, invoker.PendingRegisterWaiterCount);
+
+        // STEP 3 — ONE Register, performed THROUGH the invoker whose bookkeeping is under test.
+        using var call = new HiveOrchestrator.HiveOrchestratorClient(invoker).RegisterAsync(
+            new RegisterRequest { WorkerId = "worker-reconnect-a" },
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        // STEP 4 — the RPC and the pending waiter both settle.
+        var response = await call.ResponseAsync;
+        Assert.True(response.Accepted, "The scripted register answer is an ACCEPTED registration.");
+        await registerWaiter;
+
+        // STEP 5 — REMOVAL PROOF: the waiter's TCS id is first read inside RespondRegister in the
+        // Task.Id mutant, so it is > floor >= 1 and can never equal threshold 1 — that mutant
+        // always leaves the entry in place, which this count catches.
+        Assert.Equal(0, invoker.PendingRegisterWaiterCount);
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // THE MANDATORY ACCEPTANCE CRITERIA (a)–(n) — the reconnect path (goal D),
     // the fail-closed lazy-provisioner interim (goal E) and Program.cs (goal F).
@@ -3998,7 +4072,14 @@ public sealed class WorkerServiceReconnectSurvivalTests
         var events = new List<string>();
         var failure = new InvalidOperationException("sensitive marker from carried drain");
         var runner = new ObservingRunner();
-        var service = new WorkerService("http://localhost:9999", "worker-1", ["coder"], "/config-repo");
+
+        // HERMETIC DIR, declared BEFORE the service: the using releases the ProcessRunner restore
+        // and deletes the temp directory on every exit path, including a thrown exception.
+        var (configRepoDir, gitRestore) =
+            WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(HermeticConfigRepoUrl);
+        using var hermeticConfigRepo = gitRestore;
+        var service = new WorkerService(
+            "http://localhost:9999", "worker-1", ["coder"], configRepoDir);
         InstallRunner(service, runner);
         var attempts = 0;
         var disposalAttempts = 0;
@@ -7769,7 +7850,8 @@ public sealed class WorkerServiceReconnectSurvivalTests
             // connections whose production provisioner is live, so the config-repo
             // preparation reaches the git layer - the SHARED hermetic seam keeps that
             // deterministic and off the real filesystem.
-            var (configRepoDir, gitRestore) = CreateHermeticConfigRepo(ConfigRepoUrl);
+            var (configRepoDir, gitRestore) =
+                WorkerServiceConfigRepoHarness.CreateHermeticConfigRepo(ConfigRepoUrl);
 
             var service = new WorkerService(
                 "http://localhost:9999", WorkerId, ["coder"], configRepoDir);
