@@ -18,6 +18,14 @@ public sealed class TestHelpersForceDeleteDirectoryTests : IDisposable
 {
     private readonly string _tempDir;
 
+    /// <summary>
+    /// A test-only seam over the shared cleanup helper this fixture's own Dispose calls. It is NULL
+    /// in every normal run, so the Dispose below takes the helper's ordinary production path. A
+    /// test sets it to force the helper's loud failure deterministically and then observes how the
+    /// Dispose reports it.
+    /// </summary>
+    internal TestCleanupSeam? CleanupSeam { get; set; }
+
     public TestHelpersForceDeleteDirectoryTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-forcedelete-{Guid.NewGuid():N}");
@@ -26,8 +34,34 @@ public sealed class TestHelpersForceDeleteDirectoryTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_tempDir))
-            Directory.Delete(_tempDir, recursive: true);
+        // This fixture's OWN tests create a read-only file (ForceDeleteDirectory_ReadOnlyFile_*) and
+        // a plain one-shot Directory.Delete cannot remove it: if a test threw before the helper
+        // cleared the attribute, the delete would fail inside Dispose and a cleanup problem would
+        // replace the test's primary assertion failure. Calling the SHARED helper here is
+        // deliberately SELF-REFERENTIAL — this is the helper's own contract fixture — and it is
+        // safe: the helper's production path (no seams) only deletes and retries; it never
+        // recurses back into this fixture. Its loud failure is converted into a DIAGNOSTIC that
+        // keeps BOTH the directory path and the exception, so residue is reported rather than
+        // silently swallowed (and a diagnostic can never fail the test).
+        try
+        {
+            TestHelpers.ForceDeleteDirectory(
+                _tempDir,
+                deleteOverride: CleanupSeam?.Delete,
+                waitOverride: CleanupSeam?.Wait);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                TestContext.Current.SendDiagnosticMessage(
+                    $"Temp directory '{_tempDir}' survived cleanup after Dispose: {ex}");
+            }
+            catch
+            {
+                // A diagnostic channel that is unavailable must not fail the test either.
+            }
+        }
     }
 
     /// <summary>
@@ -173,13 +207,18 @@ public sealed class TestHelpersForceDeleteDirectoryTests : IDisposable
     /// objects (the Windows git default for pack files) can be removed. The clearing is observable
     /// through the file's attributes after the helper ran over a tree containing a read-only file.
     /// </summary>
+    /// <remarks>
+    /// Both assertions target the ReadOnly BIT rather than the whole <see cref="FileAttributes"/>
+    /// value: the helper manages exactly that flag, and whole-value equality would fail spuriously
+    /// on filesystems that set attributes it does not manage (NTFS Compressed/Encrypted, say).
+    /// </remarks>
     [Fact]
     public void ForceDeleteDirectory_ReadOnlyFile_ClearsAttributesBeforeDeleting()
     {
         var readOnlyFile = Path.Combine(_tempDir, "pack-file");
         File.WriteAllText(readOnlyFile, "git object");
         File.SetAttributes(readOnlyFile, FileAttributes.ReadOnly);
-        Assert.Equal(FileAttributes.ReadOnly, File.GetAttributes(readOnlyFile));
+        Assert.True(File.GetAttributes(readOnlyFile).HasFlag(FileAttributes.ReadOnly));
 
         // The delete seam observes the tree AFTER the read-only clearing, so the clearing is
         // asserted from the production source, not from a copy of it.
@@ -193,7 +232,10 @@ public sealed class TestHelpersForceDeleteDirectoryTests : IDisposable
             },
             waitOverride: _ => { });
 
-        Assert.Equal(FileAttributes.Normal, observed);
+        // NULLABLE-SAFE: the seam must have run at all, and the observed value must no longer carry
+        // the ReadOnly bit the helper is responsible for clearing.
+        Assert.True(observed.HasValue);
+        Assert.False(observed.Value.HasFlag(FileAttributes.ReadOnly));
     }
 
     /// <summary>

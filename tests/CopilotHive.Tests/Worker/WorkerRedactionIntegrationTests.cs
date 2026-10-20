@@ -443,7 +443,13 @@ public sealed class WorkerRedactionIntegrationTests
             stdOut.Dispose();
         }
 
-        TryDeleteDir(configRepoDir);
+        // The shared hardened helper (bounded retries + loud failure), called directly because the
+        // single call site is setup/assert flow: it runs in the test body BEFORE the assertions (it
+        // is not a Dispose call site). Nothing holds handles on the directory — the git seam here is
+        // the in-memory FakeGitLauncher, and the class's real killed-process-tree test writes nothing
+        // under this path — so the first delete attempt normally succeeds; if it somehow did not, the
+        // loud failure is the correct report rather than silent %TEMP% residue.
+        TestHelpers.ForceDeleteDirectory(configRepoDir);
 
         // THE RETRY CLASSIFICATION FIRED, THEN A SECOND ATTEMPT RAN — both on the SAME service.
         Assert.Equal(1, retryCatchEntered);
@@ -985,19 +991,6 @@ public sealed class WorkerRedactionIntegrationTests
                 return false;
         }
         return true;
-    }
-
-    private static void TryDeleteDir(string path)
-    {
-        try
-        {
-            if (Directory.Exists(path))
-                Directory.Delete(path, recursive: true);
-        }
-        catch
-        {
-            // Best effort: a leaked temp directory must never fail a test.
-        }
     }
 
     /// <summary>

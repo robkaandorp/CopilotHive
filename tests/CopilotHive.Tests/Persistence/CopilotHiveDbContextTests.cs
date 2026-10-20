@@ -766,15 +766,20 @@ public sealed class CopilotHiveDbContextTests
     /// Creates a DbContext backed by an open in-memory SQLite connection WITHOUT calling
     /// <c>EnsureCreated()</c>. This simulates a database file that exists but is missing tables,
     /// allowing <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> to be exercised against it.
-    /// The connection is kept open by the returned DbContext for the lifetime of the database.
     /// </summary>
+    /// <remarks>
+    /// The context OWNS its connection (<c>contextOwnsConnection: true</c>), so every test that
+    /// disposes the context with <c>using</c> also closes — and thereby destroys — the in-memory
+    /// database. The caller-owns overload would leave the connection open forever, because disposing
+    /// an EF context never closes an externally supplied connection.
+    /// </remarks>
     private static CopilotHiveDbContext CreateEmptyDbContext()
     {
         var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
 
         var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-            .UseSqlite(connection)
+            .UseSqlite(connection, contextOwnsConnection: true)
             .Options;
 
         return new CopilotHiveDbContext(options);
@@ -1953,8 +1958,9 @@ public sealed class CopilotHiveDbContextTests
         };
 
         // One open in-memory connection shared by BOTH contexts, so the fresh context reads
-        // the same database rather than its own empty :memory: database.
-        var connection = new SqliteConnection("Data Source=:memory:");
+        // the same database rather than its own empty :memory: database. CALLER-OWNED: EF never
+        // closes an externally supplied connection, so this test disposes it itself via `using`.
+        using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
         var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
             .UseSqlite(connection)
@@ -2046,7 +2052,11 @@ public sealed class CopilotHiveDbContextTests
             Assert.NotEqual(DateTime.SpecifyKind(local, DateTimeKind.Utc), expectedUtc);
         }
 
-        var connection = new SqliteConnection("Data Source=:memory:");
+        // CALLER-OWNED connection: EF does not close an externally supplied connection, so disposing
+        // the contexts below leaves it open unless this test disposes it itself. `using` releases the
+        // in-memory database deterministically on every exit path, including a failing assertion
+        // between the write and the read.
+        using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
         var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
             .UseSqlite(connection)
@@ -2131,7 +2141,9 @@ public sealed class CopilotHiveDbContextTests
     [Fact]
     public void CompletionReceipts_SurvivePipelineAndTaskMappingDeletions_NoCascade()
     {
-        var connection = new SqliteConnection("Data Source=:memory:");
+        // CALLER-OWNED in-memory connection shared by every context below (EF never closes an
+        // externally supplied connection), so this test disposes it itself via `using`.
+        using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
         using (var ctx = ContextOn(connection))
         {
@@ -2531,7 +2543,9 @@ public sealed class CopilotHiveDbContextTests
     [Fact]
     public void WorkerAssignmentContexts_SurvivePipelineAndTaskMappingDeletions_NoCascade()
     {
-        var connection = new SqliteConnection("Data Source=:memory:");
+        // CALLER-OWNED in-memory connection shared by every context below (EF never closes an
+        // externally supplied connection), so this test disposes it itself via `using`.
+        using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
         using (var ctx = ContextOn(connection))
         {

@@ -10868,6 +10868,19 @@ public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
     private readonly CopilotHiveDbContext _dbContext;
     private readonly GoalStore _store;
 
+    /// <summary>
+    /// A test-only seam over the shared cleanup helper. It is NULL in every normal run, so the
+    /// Dispose below takes the helper's ordinary production path. A test sets it to force the
+    /// helper's loud failure deterministically and then observes how the Dispose reports it.
+    /// </summary>
+    internal TestCleanupSeam? CleanupSeam { get; set; }
+
+    /// <summary>
+    /// The config-repo directory this fixture created. Exposed so a test can assert which
+    /// directory the Dispose's cleanup diagnostic names.
+    /// </summary>
+    internal string ConfigRepoDir => _configRepoDir;
+
     public ComposerConfigRepoGitIntegrationTests()
     {
         _dbContext = CopilotHiveDbContext.CreateInMemory();
@@ -10889,7 +10902,31 @@ public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
         var baseDir = Path.GetDirectoryName(_configRepoDir);
         if (baseDir is not null)
         {
-            try { Directory.Delete(baseDir, recursive: true); } catch { /* best-effort */ }
+            // SWEPT TO THE SHARED HELPER: unlike the other fixture classes in this file, these
+            // directories are REAL git repositories that REAL spawned git processes wrote into (a
+            // bare remote and a working clone with .git objects/pack files), so the helper's
+            // read-only-attribute clearing and bounded transient retry genuinely apply here. Inside
+            // Dispose its loud failure must never replace the test's primary assertion failure, so it
+            // becomes a DIAGNOSTIC keeping BOTH the path and the exception — never a silent swallow.
+            try
+            {
+                TestHelpers.ForceDeleteDirectory(
+                    baseDir,
+                    deleteOverride: CleanupSeam?.Delete,
+                    waitOverride: CleanupSeam?.Wait);
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    TestContext.Current.SendDiagnosticMessage(
+                        $"Temp directory '{baseDir}' survived cleanup after Dispose: {ex}");
+                }
+                catch
+                {
+                    // A diagnostic channel that is unavailable must not fail the test either.
+                }
+            }
         }
     }
 

@@ -26,10 +26,14 @@ public sealed class ConfigRepoManagerCancellationTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_tempDir))
-        {
-            try { Directory.Delete(_tempDir, recursive: true); } catch { /* best-effort */ }
-        }
+        // Same shared cleanup helper as every other temp-directory fixture: it checks existence,
+        // clears read-only attributes, retries a transient filesystem failure on a fixed bounded
+        // schedule and fails loudly (path + last error) if the directory survives. Note this
+        // fixture does NOT need the killed-process-tree rationale: its real-process test skips on
+        // Windows (the blocking command is a POSIX shell alias), so no dying git process holds
+        // handles here on Windows. The adoption is consistency with the other fixtures plus
+        // robustness to ordinary transient I/O errors.
+        TestHelpers.ForceDeleteDirectory(_tempDir);
     }
 
     /// <summary>

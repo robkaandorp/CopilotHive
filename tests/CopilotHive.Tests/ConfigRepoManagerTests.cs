@@ -14,6 +14,16 @@ public class ConfigRepoManagerTests : IDisposable
 {
     private readonly string _tempDir;
 
+    /// <summary>
+    /// A test-only seam over the shared cleanup helper. It is NULL in every normal run, so the
+    /// Dispose below takes the helper's ordinary production path (clear read-only attributes,
+    /// delete, retry a transient failure, fail loudly). A test sets it to force the helper's loud
+    /// failure deterministically and then observes how the Dispose reports it — a real locked
+    /// directory cannot be produced on every platform, and waiting out the helper's real backoff
+    /// would make such a test a timing test.
+    /// </summary>
+    internal TestCleanupSeam? CleanupSeam { get; set; }
+
     public ConfigRepoManagerTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-cfgtest-{Guid.NewGuid():N}");
@@ -22,8 +32,53 @@ public class ConfigRepoManagerTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_tempDir))
-            Directory.Delete(_tempDir, recursive: true);
+        // The SHARED hardened helper (TestHelpers.ForceDeleteDirectory) replaces this fixture's
+        // one-shot Directory.Delete: it checks existence, clears read-only attributes, retries a
+        // transient filesystem failure on a fixed bounded schedule and fails loudly with the path
+        // plus the last error.
+        //
+        // WHY THE RETRY IS REAL HERE, even though nothing is KILLED: several tests drive a REAL
+        // ConfigRepoManager over _tempDir as the clone destination WITHOUT installing the GitRunner
+        // seam (for example SyncRepoAsync_ConcurrentCalls_AreSerializedBySemaphore, whose
+        // SyncRepoAsync reaches the real `git clone` at ConfigRepoManager.cs:187). git initialises
+        // .git inside that destination and then writes objects there — for a FAILED clone too — via
+        // a real spawned process, so a delete that races the process's own handle release can fail
+        // transiently. This is a SPAWNED-CLONE handle race, not a killed-process race: this fixture
+        // never kills a process.
+        //
+        // Inside Dispose the helper's loud failure must never FAIL the test — a disposable's
+        // exception would replace the test's own primary assertion failure — so it is converted into
+        // a DIAGNOSTIC that keeps BOTH the path and the exception. Nothing is silently swallowed:
+        // the residue is reported, not discarded.
+        try
+        {
+            TestHelpers.ForceDeleteDirectory(
+                _tempDir,
+                deleteOverride: CleanupSeam?.Delete,
+                waitOverride: CleanupSeam?.Wait);
+        }
+        catch (Exception ex)
+        {
+            ReportCleanupFailure(_tempDir, ex);
+        }
+    }
+
+    /// <summary>
+    /// Records a best-effort cleanup failure on the test's diagnostic channel, preserving the
+    /// directory path and the exception. Diagnostics must never throw (that would turn a cleanup
+    /// problem into a test failure), so the reporting itself is contained.
+    /// </summary>
+    private static void ReportCleanupFailure(string path, Exception failure)
+    {
+        try
+        {
+            TestContext.Current.SendDiagnosticMessage(
+                $"Temp directory '{path}' survived cleanup after Dispose: {failure}");
+        }
+        catch
+        {
+            // A diagnostic channel that is unavailable must not fail the test either.
+        }
     }
 
     // ── YAML parsing ─────────────────────────────────────────────────────────
