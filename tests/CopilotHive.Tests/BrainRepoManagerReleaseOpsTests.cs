@@ -794,14 +794,52 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         if (File.Exists(markerPath))
             File.Delete(markerPath);
 
-        // Install a prepare-commit-msg hook that (1) touches the marker, then (2) sleeps long
-        // enough to be killed. The hook file MUST be named exactly "prepare-commit-msg" (no
-        // extension) — git discovers hooks by this exact name on all platforms, and git on Windows
-        // (via Git Bash) executes "#!/bin/sh" scripts without an extension or chmod.
+        // Install a prepare-commit-msg hook that (0) RELOCATES ITS OWN WORKING DIRECTORY OUT OF THE
+        // FIXTURE TREE, then (1) touches the marker, then (2) sleeps long enough to be killed. The
+        // hook file MUST be named exactly "prepare-commit-msg" (no extension) — git discovers hooks
+        // by this exact name on all platforms, and git on Windows (via Git Bash) executes
+        // "#!/bin/sh" scripts without an extension or chmod.
+        //
+        // WHY THE RELOCATION COMES FIRST — THE WORKING-DIRECTORY HOLD (working hypothesis, pending
+        // confirmation by the Windows re-run). Git runs a hook with the CLONE as its working
+        // directory, and the hook's `sleep` is an EXTERNAL child of the hook shell, so anything that
+        // survives the merge PROCESS kill can still be holding the CLONE as its CURRENT WORKING
+        // DIRECTORY. That distinction matters twice over: production's 30-second wait
+        // (BrainRepoManager.cs:1417-1422) bounds the MERGE PROCESS ITSELF and makes no claim about
+        // its descendants, and the 10-second bound below is only the MARKER POLL — neither one
+        // proves the hook shell (or the sleep it forked) terminated. On POSIX a surviving CWD is
+        // harmless, but Windows REFUSES TO DELETE A DIRECTORY THAT IS A LIVE PROCESS'S CURRENT
+        // WORKING DIRECTORY, so such a survivor defeats the hardened ForceDeleteDirectory retry
+        // budget in Dispose for as long as it lives — no number of retries can fix a CWD hold; only
+        // never holding the tree can. A CWD in a PARENT directory does not block deletion of a
+        // child; only a CWD INSIDE the deleted tree does.
+        //
+        // `cd /` IS THE RELOCATION AND IT IS VERIFIED. On POSIX "/" is the real filesystem root. On
+        // Windows, MSYS/Cygwin path conversion resolves "/" to the MSYS mounting prefix — the Git
+        // for Windows installation root (e.g. "C:/Program Files/Git") — because the runtime maps the
+        // POSIX root onto that prefix ("/" <-> the MSYS root directory); either way it is a real
+        // directory OUTSIDE this fixture's tree, so a survivor parked there cannot block the
+        // fixture's deletion.
+        //
+        // `|| exit 1` IS THE LOUD-FAILURE GUARD — NO SILENT FALLBACK. If the relocation ever fails,
+        // the hook exits NON-ZERO BEFORE the marker is created and BEFORE any blocking: git treats
+        // a non-zero hook as a failed merge, so this test fails VISIBLY on its own assertions
+        // (the marker never appears, the poll's timeout guard cancels, and the cancellation
+        // assertions fail). It must never keep the fixture tree as its CWD and then block inside it.
+        //
+        // THE BLOCKER STAYS BOUNDED: a plain `sleep 30`, never a busy loop, so a survivor dies by
+        // itself within 30 seconds even if every kill path fails. The marker touch keeps the
+        // ABSOLUTE path, so the poller below — which watches that same absolute path — is completely
+        // unaffected by the relocation, and the poll-then-cancel protocol is unchanged.
         var hooksDir = Path.Combine(clonePath, ".git", "hooks");
         Directory.CreateDirectory(hooksDir);
         var hookPath = Path.Combine(hooksDir, "prepare-commit-msg");
-        File.WriteAllText(hookPath, $"#!/bin/sh\ntouch \"{markerPath}\"\nsleep 30\n");
+        File.WriteAllText(
+            hookPath,
+            "#!/bin/sh\n"
+            + "cd / || exit 1\n"
+            + $"touch \"{markerPath}\"\n"
+            + "sleep 30\n");
         if (!OperatingSystem.IsWindows())
         {
             var chmodPsi = new ProcessStartInfo("chmod")
@@ -848,6 +886,178 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         // The merge process was killed and the finally-block cleanup aborted the MERGE state.
         Assert.False(File.Exists(Path.Combine(clonePath, ".git", "MERGE_HEAD")),
             "MERGE_HEAD should not exist after cancellation cleanup");
+    }
+
+    /// <summary>
+    /// THE HOOK'S WORKING-DIRECTORY RELOCATION, PROVEN DIRECTLY. The cancellation test above
+    /// installs a <c>prepare-commit-msg</c> hook that RELOCATES ITS OWN WORKING DIRECTORY out of the
+    /// fixture tree before it touches the marker and blocks, because a blocker that holds the
+    /// fixture tree as its current working directory is what Windows refuses to delete (the
+    /// orphaned-blocker hypothesis — a working hypothesis pending the user's Windows re-run, not an
+    /// established fact).
+    /// <para>
+    /// WHY THIS TEST EXISTS. The cancellation test itself CANNOT observe the relocation: the hook
+    /// writes the marker with an ABSOLUTE path, so the marker appears whether or not the working
+    /// directory moved, and on POSIX a retained working directory inside the tree does not block
+    /// deletion at all. That means the relocation — the whole point of the fix — had NO test
+    /// coverage: reverting it would leave the suite green. This test closes that gap by observing
+    /// the hook's working directory DIRECTLY, on every platform.
+    /// </para>
+    /// <para>
+    /// WHAT IT ASSERTS. (1) The hook's working directory, as seen by the hook itself, is NOT inside
+    /// the fixture tree — the relocation took effect. (2) The marker is still created at its
+    /// ABSOLUTE path — the relocation did not break the poller the cancellation test depends on.
+    /// (3) The NEGATIVE CONTROL: the very same hook WITHOUT the relocation DOES run with the
+    /// fixture tree as its working directory — which is precisely the condition the fix exists to
+    /// eliminate, and which makes the positive assertion non-vacuous (a hook that never ran, or a
+    /// hook that ran somewhere else by accident, would not reproduce it).
+    /// </para>
+    /// <para>
+    /// WHY THE OBSERVATION IS A WORD, NOT A PATH. The hook reports MEMBERSHIP ("inside" / "outside")
+    /// rather than a directory path, and it computes that membership INSIDE THE SHELL, against the
+    /// shell's own <c>$PWD</c>. This is deliberate, and it is what makes the test platform-neutral:
+    /// <list type="bullet">
+    ///   <item>On POSIX, <c>$PWD</c> is the physical path and the comparison is exact.</item>
+    ///   <item>On Windows, Git Bash's <c>$PWD</c> is the MSYS POSIX form (<c>/c/Users/...</c>). The
+    ///   test never converts it and never compares it to a native fixture path, so the MSYS form can
+    ///   never be mistaken for a native one — which is exactly the defect a path-shaped observation
+    ///   carries, because <c>Path.GetFullPath</c> does NOT translate an MSYS mount path.</item>
+    ///   <item>The tree path is captured from the shell's OWN <c>$PWD</c> at hook entry (that is
+    ///   the directory git runs the hook in), so the two values being compared are always in the
+    ///   SAME namespace, whatever that namespace is on the host.</item>
+    /// </list>
+    /// An earlier shape of this test recorded a path with <c>pwd -W</c> and compared it in .NET.
+    /// That is NOT portable: <c>pwd -W</c> is an MSYS/Cygwin extension of the EXTERNAL
+    /// <c>coreutils</c> <c>pwd</c>, and the SHELL BUILTIN <c>pwd</c> — which shadows the external
+    /// one in the hook's <c>/bin/sh</c> — supports only <c>-L</c> and <c>-P</c>. The builtin
+    /// therefore rejects <c>-W</c> with a non-zero status and leaves the recorded file EMPTY,
+    /// which would make the positive assertion pass VACUOUSLY and the negative control FAIL on the
+    /// very platform this goal fixes. The membership-word observation has no such failure mode: it
+    /// cannot silently produce an empty result, because the shell writes one of two literal words,
+    /// and an unexpected value fails the assertion by name.
+    /// </para>
+    /// <para>
+    /// NO TIMING IS INVOLVED. Each hook writes its membership word and exits immediately, so both
+    /// observations are plain file reads after git has returned; there is no sleep, no polling and
+    /// no elapsed-time assumption.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void PrepareCommitMsgHook_RelocatesItsWorkingDirectory_AndStillTouchesTheAbsoluteMarker()
+    {
+        var repoDir = Path.Combine(_tempDir, "hook-cwd-repo");
+        Directory.CreateDirectory(repoDir);
+        Git(repoDir, "init", "-b", "main");
+        ConfigureIdentity(repoDir);
+        File.WriteAllText(Path.Combine(repoDir, "seed.txt"), "seed\n");
+        Git(repoDir, "add", "seed.txt");
+        Git(repoDir, "commit", "-m", "Seed");
+
+        var hooksDir = Path.Combine(repoDir, ".git", "hooks");
+        Directory.CreateDirectory(hooksDir);
+        var hookPath = Path.Combine(hooksDir, "prepare-commit-msg");
+        var markerPath = Path.Combine(repoDir, "marker.txt");
+        var cwdPath = Path.Combine(repoDir, "hook-cwd.txt");
+
+        // THE OBSERVATION IS A MEMBERSHIP WORD, COMPUTED IN THE SHELL. The tree path is captured
+        // from the shell's own $PWD at hook entry - the directory git runs the hook in - and the
+        // comparison is made there too, so both sides are always in the SAME namespace (the POSIX
+        // one on Linux, the MSYS one on Windows) and no path ever crosses the .NET boundary. The
+        // hook therefore needs no path-translation option at all, and cannot silently produce an
+        // empty observation the way a rejected `pwd -W` would.
+        // The output path is EMBEDDED in the script, not passed as an argument: git invokes a
+        // hook with the commit-message path as $1, so a positional argument would be wrong.
+        // The TREE is captured FIRST, while $PWD is still the directory git ran the hook in
+        // (the fixture tree); only then does the relocation move $PWD, and the membership is
+        // judged against the captured TREE.
+
+        // The relocating hook: capture the tree, relocate, THEN judge the membership, then touch
+        // the marker. This is the exact order the cancellation test's blocker relies on.
+        string RelocatingHook(string outputPath) =>
+            "#!/bin/sh\n"
+            + "TREE=\"$PWD\"\n"
+            + "cd / || exit 1\n"
+            + "case \"$PWD\" in\n"
+            + "  \"$TREE\"|\"$TREE\"/*) echo inside > \"" + outputPath + "\" ;;\n"
+            + "  *) echo outside > \"" + outputPath + "\" ;;\n"
+            + "esac\n"
+            + "touch \"" + markerPath + "\"\n";
+
+        // The control hook: the SAME membership logic with NO relocation, so $PWD never moves.
+        string ControlHook(string outputPath) =>
+            "#!/bin/sh\n"
+            + "TREE=\"$PWD\"\n"
+            + "case \"$PWD\" in\n"
+            + "  \"$TREE\"|\"$TREE\"/*) echo inside > \"" + outputPath + "\" ;;\n"
+            + "  *) echo outside > \"" + outputPath + "\" ;;\n"
+            + "esac\n"
+            + "touch \"" + markerPath + "\"\n";
+
+        // THE RELOCATING HOOK - the exact shape the cancellation test installs: relocate FIRST,
+        // then touch the marker. The membership is recorded AFTER the relocation, because that is
+        // the directory the blocker would hold.
+        WriteHook(hookPath, RelocatingHook(cwdPath));
+
+        File.WriteAllText(Path.Combine(repoDir, "changed.txt"), "changed\n");
+        Git(repoDir, "add", "changed.txt");
+        Git(repoDir, "commit", "-m", "Changed");
+
+        // (1) THE RELOCATION TOOK EFFECT: the hook's working directory is NOT inside the fixture
+        // tree. A hook that ran with the clone as its working directory would report "inside" here,
+        // and that is exactly the hold the fix removes.
+        Assert.True(File.Exists(cwdPath), "The hook must have recorded its membership observation.");
+        var hookCwd = File.ReadAllText(cwdPath).Trim();
+        Assert.True(
+            string.Equals("outside", hookCwd, StringComparison.Ordinal),
+            $"The hook's working directory must be OUTSIDE the fixture tree, but the hook reported "
+            + $"'{hookCwd}'. A blocker holding the fixture tree as its current working directory is "
+            + "what Windows refuses to delete.");
+
+        // (2) THE MARKER IS STILL TOUCHED AT ITS ABSOLUTE PATH - the relocation did not break the
+        // absolute-path poller the cancellation test depends on.
+        Assert.True(File.Exists(markerPath), "The hook must still create the marker.");
+
+        // (3) THE NEGATIVE CONTROL. The SAME hook WITHOUT the relocation runs with the fixture
+        // tree as its working directory. This is what makes assertion (1) non-vacuous: it proves
+        // the relocation is what moved the directory, not an accident of the environment.
+        File.Delete(cwdPath);
+        File.Delete(markerPath);
+        WriteHook(hookPath, ControlHook(cwdPath));
+
+        File.WriteAllText(Path.Combine(repoDir, "changed2.txt"), "changed2\n");
+        Git(repoDir, "add", "changed2.txt");
+        Git(repoDir, "commit", "-m", "Changed2");
+
+        Assert.True(File.Exists(cwdPath), "The control hook must have recorded its membership observation.");
+        var controlCwd = File.ReadAllText(cwdPath).Trim();
+        Assert.True(
+            string.Equals("inside", controlCwd, StringComparison.Ordinal),
+            $"The control hook WITHOUT the relocation must run with the fixture tree as its "
+            + $"working directory, but the hook reported '{controlCwd}'. Without this control the "
+            + "relocation assertion would prove nothing.");
+    }
+
+    /// <summary>
+    /// Writes a hook script and makes it executable on the platforms that require it. Git on
+    /// Windows (via Git Bash) executes <c>#!/bin/sh</c> scripts without an extension or a chmod,
+    /// so the chmod is guarded exactly as the cancellation test guards it.
+    /// </summary>
+    private void WriteHook(string hookPath, string body)
+    {
+        File.WriteAllText(hookPath, body);
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var chmodPsi = new ProcessStartInfo("chmod")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        chmodPsi.ArgumentList.Add("+x");
+        chmodPsi.ArgumentList.Add(hookPath);
+        using var chmod = Process.Start(chmodPsi)!;
+        chmod.WaitForExit();
     }
 
     // ---------- Helpers ----------

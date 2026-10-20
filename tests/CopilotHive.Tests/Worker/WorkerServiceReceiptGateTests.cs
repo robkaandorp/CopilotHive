@@ -103,6 +103,12 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
@@ -111,6 +117,7 @@ public sealed class WorkerServiceReceiptGateTests
             // eligibility and terminated-write facts are published, but NO ACK has arrived.
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -200,11 +207,18 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -279,12 +293,19 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
 
             // The Complete write is HELD: the original local write has NOT terminated yet.
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -375,11 +396,18 @@ public sealed class WorkerServiceReceiptGateTests
         try
         {
             Console.SetError(stdErr);
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
 
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -493,11 +521,18 @@ public sealed class WorkerServiceReceiptGateTests
         Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -601,11 +636,18 @@ public sealed class WorkerServiceReceiptGateTests
             // holding reporting before its outer finally can publish eligibility.
             Console.SetOut(successThrower);
             Console.SetError(diagnosticGate);
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             var receipt = GetOwnerReceipt(service);
@@ -969,8 +1011,15 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(taskId));
             await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // Drive the REAL executor to the outcome under test: Cancelled from the assignment's
             // own token while the prompt is parked; Failed from an agent exception; Completed from
@@ -1175,11 +1224,18 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1267,11 +1323,18 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? reporting = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1330,11 +1393,18 @@ public sealed class WorkerServiceReceiptGateTests
         System.Threading.Tasks.Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1421,11 +1491,18 @@ public sealed class WorkerServiceReceiptGateTests
             // Predecessor A: locally completed report, NO ACK — retained, eligible, but the Ready
             // write has never been started. This is the UNCONFIRMED refusal state, distinct from
             // the full-predicate reader-first vector below.
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA)); // message 1
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1544,11 +1621,18 @@ public sealed class WorkerServiceReceiptGateTests
             Console.SetOut(successThrower);
             Console.SetError(reportingDiagnostic);
 
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA)); // message 1
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             owner = GetActiveAssignment(service);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
@@ -1678,10 +1762,17 @@ public sealed class WorkerServiceReceiptGateTests
         var drainEnteredRegistration = default(CancellationTokenRegistration);
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
 
@@ -1772,10 +1863,17 @@ public sealed class WorkerServiceReceiptGateTests
         try
         {
             // A completes its report and the exact ACK authorizes the ONE Ready write.
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionA = GetActiveExecution(service);
             reportingA = GetActiveReporting(service);
             await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1913,10 +2011,17 @@ public sealed class WorkerServiceReceiptGateTests
         {
             Console.SetError(stdErr);
 
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA)); // message 1
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionA = GetActiveExecution(service);
             reportingA = GetActiveReporting(service);
             await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2045,11 +2150,20 @@ public sealed class WorkerServiceReceiptGateTests
             await reader.ReadStarted(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Null(GetActiveAssignment(service));
 
-            // THE POST-CANCEL-CLEAR assignment: ordinary path, no refusal.
+            // THE POST-CANCEL-CLEAR assignment: ordinary path, no refusal. Message order on this
+            // stream is A (1), ACK (2), cancel (3), probe (4), B (5) — so B is message 5 and the
+            // read re-armed after B's handler returned is read #6.
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var successorInstalled = ArmHandlerReturnMilestone(reader, 6);
+
             reader.Push(ResultAssignment(TaskB));
             await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskB);
             await writer.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await successorInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionB = GetActiveExecution(service);
             reportingB = GetActiveReporting(service);
             reader.Push(ReceiptAck(TaskB, connection.AssignedId));
@@ -2115,8 +2229,15 @@ public sealed class WorkerServiceReceiptGateTests
             // PREDECESSOR A is retained BEFORE any Ready task starts: its prompt is still held, so
             // execution/reporting are live and OrdinaryReadySlot.Write is null. This is the exact
             // pre-Ready state that a guard with the MODE CHECK REMOVED would wrongly refuse.
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA)); // message 1
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionA = GetActiveExecution(service);
             reportingA = GetActiveReporting(service);
             var ownerA = GetActiveAssignment(service);
@@ -2239,10 +2360,17 @@ public sealed class WorkerServiceReceiptGateTests
         Task? fallbackWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2370,8 +2498,15 @@ public sealed class WorkerServiceReceiptGateTests
             writer.ReleaseReady(0);
             await authorizedA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var successorInstalled = ArmHandlerReturnMilestone(reader, 4);
+
             reader.Push(ResultAssignment(TaskB));
             await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await successorInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionB = GetActiveExecution(service);
             reportingB = GetActiveReporting(service);
 
@@ -2419,6 +2554,566 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     /// <summary>
+    /// A NARROW ORDERING WITNESS for the owner-installation milestone. It proves exactly two facts
+    /// and nothing more: (1) the owner slot is ABSENT when production's session reset is entered
+    /// (the reset is the assignment handler's last await before the execution task is started and
+    /// before <c>InstallActiveAssignment</c>, WorkerService.cs:3244), and (2) the owner slot is
+    /// PRESENT once the re-arm milestone <c>ReadStarted(2)</c> has been observed.
+    /// <para>
+    /// WHAT IT DOES NOT CLAIM. It does not drive <c>PromptStarted</c> or <c>CompleteEntered</c>
+    /// while the slot is null — while the reset is parked the execution task has not even been
+    /// started, so neither milestone can occur in this window; that those two milestones are
+    /// reachable before the install is a fact about production's source order (the execution task
+    /// and the reporting flow are started before the install), not something this test
+    /// demonstrates. Nor does it claim the slot is published ONLY after the handler returns: it
+    /// observes absence at the reset and presence after the re-arm, which brackets the install
+    /// without pinning the instant it happens.
+    /// </para>
+    /// <para>
+    /// The runner's <see cref="GatedRunner.ResetGate"/> parks the handler at the reset, so the
+    /// observation is a deterministic rendezvous — no sleep, no polling, no elapsed-time
+    /// assumption.
+    /// </para>
+    /// <para>
+    /// TEARDOWN. The reader is never ended with a live loop token: production treats that EOF as
+    /// stream loss and CARRIES the open assignment (leaving execution and reporting running). The
+    /// loop therefore runs on a linked token that the <c>finally</c> cancels BEFORE ending the
+    /// reader, which selects the non-carry cancel-and-drain teardown; the retained assignment is
+    /// nevertheless drained explicitly (<c>DrainCarriedAssignmentAsync</c>, a no-op when nothing is
+    /// retained), every owned task is joined under a bounded wait with a named failure, and the
+    /// service is disposed only after quiescence. Cleanup never replaces a propagating failure.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OwnerSlot_IsUnpublishedUntilTheAssignmentHandlerReturns_AndPublishedAfterTheReArm()
+    {
+        var outcome = await RunOwnerSlotWitnessAsync(injectedFailure: null);
+
+        // The witness's own two facts.
+        Assert.True(outcome.Failure is null, "The witness must not fail on its own.");
+        Assert.True(outcome.OwnerAbsentAtReset, "The owner slot must be absent at session-reset entry.");
+        Assert.True(outcome.MilestoneUnsatisfiedAtReset,
+            "The re-arm milestone must stay unsatisfied while the handler is parked.");
+        Assert.True(outcome.OwnerPresentAfterReArm,
+            "The owner slot must be present once the re-arm milestone has been observed.");
+        Assert.Equal(TaskA, outcome.OwnerTaskId);
+
+        // The teardown's own guarantees, observed on the SUCCESS path.
+        Assert.True(
+            outcome.TeardownFailure is null,
+            "The teardown must not fail on the success path.");
+        Assert.True(outcome.GateReleased, "The teardown must release the parked reset gate.");
+        Assert.True(outcome.LoopCompleted, "The teardown must join the message loop.");
+        Assert.True(outcome.SlotCleared, "The teardown must clear the ownership slot.");
+        Assert.True(outcome.HeartbeatCleared, "The teardown must clear the heartbeat task state.");
+        Assert.True(outcome.ServiceDisposed, "The teardown must dispose the service after quiescence.");
+
+        // The outer safety net is a NO-OP after a successful complete teardown.
+        Assert.False(outcome.SafetyNetRan, "The safety net must be a no-op after a complete teardown.");
+    }
+
+    /// <summary>
+    /// THE WITNESS BODY AND ITS TEARDOWN, shared by the ordering witness and by its failure-path
+    /// probe so that BOTH exercise the SAME teardown code. The probe is not a copy of the
+    /// teardown: it calls this helper, which is what makes the probe evidence about the real code
+    /// rather than about a parallel implementation.
+    /// </summary>
+    private async Task<OwnerSlotWitnessOutcome> RunOwnerSlotWitnessAsync(
+        Exception? injectedFailure, Exception? injectedTeardownFailure = null,
+        bool carryBeforeFailure = false, Exception? injectedSafetyNetFailure = null)
+    {
+        var resetGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = new GatedRunner { ResetGate = resetGate };
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessages(service, connection, loopCts.Token);
+
+        Task? execution = null;
+        Task? reporting = null;
+        var primaryInFlight = false;
+        var outcome = new OwnerSlotWitnessOutcome();
+        Task? ownerInstalled = null;
+        if (injectedFailure is not null)
+        {
+            // Observe the ACTUAL runner-disposal entry, not a flag set after calling Dispose.
+            runner.OnDispose = () => outcome.OuterQuiescentAtDisposal =
+                loop.IsCompleted && loopCts.IsCancellationRequested
+                && GetActiveAssignment(service) is null && service.HeartbeatTaskIdForTest is null
+                && outcome.CapturedProducers.Count > 0
+                && outcome.CapturedProducers.All(p => p.Producer.IsCompleted)
+                && outcome.CapturedProducers.All(p => outcome.JoinedProducers.Contains(p.Name));
+        }
+
+        // TWO-PHASE TEARDOWN. The OUTER try/finally below guarantees the safety net runs on EVERY
+        // exit path. The INNER try/catch/finally is the ordinary teardown, and it may abort part-way
+        // (the probe injects a failure into it on purpose, to exercise the precedence rule
+        // mid-cleanup). The net is reached after the inner phase no matter how it ended, and it is
+        // a no-op when the inner phase already completed a full teardown.
+        try
+        {
+            try
+            {
+                // The RE-ARM milestone, created and proved UNSATISFIED BEFORE the push that can satisfy it.
+                ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
+                reader.Push(ResultAssignment(TaskA));
+
+                // THE HANDLER IS REACHED AND PARKED at the session reset, before the install.
+                await runner.AwaitResetCountAsync(1, Failsafe, TestContext.Current.CancellationToken);
+
+                if (carryBeforeFailure)
+                {
+                    // An ADDITIONAL path through this SAME helper/net. EOF is delivered while the
+                    // prompt is held and the loop token is live: carry cannot race with Ready.
+                    resetGate.TrySetResult();
+                    await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                    await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                    CaptureWitnessProducers(service, outcome);
+                    reader.TryComplete();
+                    await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                    var carried = GetActiveAssignment(service)!;
+                    var state = carried.GetType().GetProperty("State")!.GetValue(carried)!;
+                    outcome.CarriedBeforeFailure = (bool)state.GetType().GetProperty("IsCarried")!.GetValue(state)!;
+                    CaptureWitnessProducers(service, outcome);
+                    var delivery = outcome.CapturedProducers.Single(p => p.Name == "carried delivery").Producer;
+                    outcome.CarriedDeliveryPendingBeforeCleanup = !delivery.IsCompleted;
+                }
+
+                // THE INJECTION POINT. The original path raises this while the handler is parked;
+                // the additive carried path raises it after live-token EOF, before any cleanup.
+                if (injectedFailure is not null)
+                    throw injectedFailure;
+
+                // FACT 1: the owner slot is absent at session-reset entry.
+                outcome.OwnerAbsentAtReset = GetActiveAssignment(service) is null;
+
+                // The re-arm milestone is still unsatisfied while the handler is parked.
+                outcome.MilestoneUnsatisfiedAtReset = !ownerInstalled.IsCompleted;
+
+                // FACT 2: after the re-arm milestone the SAME owner read succeeds.
+                resetGate.TrySetResult();
+                await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+                var owner = GetActiveAssignment(service);
+                outcome.OwnerPresentAfterReArm = owner is not null;
+                if (owner is not null)
+                    outcome.OwnerTaskId = TaskIdOf(owner);
+
+                // Capture every owned task NOW so teardown can join them even after the slot clears.
+                execution = GetActiveExecution(service);
+                reporting = GetActiveReporting(service);
+            }
+            catch (Exception ex)
+            {
+                primaryInFlight = true;
+                outcome.Failure = ex;
+            }
+            finally
+            {
+                try
+                {
+                    // Release every parked seam unconditionally, on every exit path.
+                    resetGate.TrySetResult();
+                    outcome.GateReleased = resetGate.Task.IsCompleted;
+                    runner.ReleaseAll();
+                    writer.ReleaseAll();
+
+                    // THE INJECTED TEARDOWN FAILURE: raised while the primary failure is still
+                    // propagating, which is the only way to prove the PRECEDENCE rule (the primary
+                    // must keep precedence over a teardown failure).
+                    if (injectedTeardownFailure is not null)
+                        throw injectedTeardownFailure;
+
+                    // CANCEL BEFORE ENDING THE READER: with the loop token already cancelled the EOF is
+                    // not a stream loss, so the non-carry cancel-and-drain teardown is selected.
+                    await loopCts.CancelAsync();
+                    reader.TryComplete();
+
+                    try
+                    {
+                        await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // The expected outcome of the run being cancelled.
+                    }
+
+                    // If an assignment was nevertheless retained or carried, drain it explicitly.
+                    await service.DrainCarriedAssignmentAsync()
+                        .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+                    outcome.LoopCompleted = loop.IsCompleted;
+                    outcome.SlotCleared = GetActiveAssignment(service) is null;
+                    outcome.HeartbeatCleared = service.HeartbeatTaskIdForTest is null;
+
+                    // Join every owned task under a bounded wait; JoinAllForTeardownAsync names any
+                    // still-live producer and disposes the service only after quiescence.
+                    await JoinAllForTeardownAsync(service,
+                        ("assignment execution", execution),
+                        ("assignment reporting", reporting),
+                        ("loop", loop));
+                    outcome.ServiceDisposed = true;
+                }
+                catch (Exception ex)
+                {
+                    outcome.TeardownFailure = ex;
+
+                    // The teardown's failure is OBSERVED, never allowed to replace a propagating
+                    // primary failure: the primary keeps precedence, exactly as the contract requires.
+                    if (!primaryInFlight)
+                        outcome.Failure = ex;
+                }
+            }
+        }
+        finally
+        {
+            // PHASE 2 — THE OUTER SAFETY NET. Finally-scoped, so neither the injected teardown
+            // failure nor any other inner-phase outcome can bypass it. It never throws: its own
+            // failure is RECORDED on the outcome (and never replaces a primary failure).
+            await RunOwnerSlotWitnessSafetyNetAsync(
+                outcome, service, runner, writer, reader, loopCts, resetGate, loop,
+                execution, reporting, primaryInFlight, ownerInstalled, injectedSafetyNetFailure);
+        }
+
+        return outcome;
+    }
+
+    /// <summary>Whether the service's own lifecycle state says it was disposed (reflection, read only).</summary>
+    private static bool IsServiceDisposed(WorkerService service)
+    {
+        var type = typeof(WorkerService);
+        var state = (int)type.GetField("_lifecycleState", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service)!;
+        var disposed = (int)type.GetField("LifecycleDisposed", BindingFlags.NonPublic | BindingFlags.Static)!
+            .GetRawConstantValue()!;
+        return state == disposed;
+    }
+
+    /// <summary>
+    /// PHASE 2 OF THE WITNESS TEARDOWN: the unconditional safety net. When the inner teardown
+    /// completed (the service was disposed after quiescence) this is a NO-OP. Otherwise — the inner
+    /// teardown aborted, e.g. on an injected failure — it does the whole job itself, in the order
+    /// that preserves the non-carry teardown: release every gate; CANCEL the linked loop token
+    /// BEFORE completing the reader (so the pending read is cancelled rather than treated as
+    /// EOF-as-stream-loss, and production takes the cancel-and-drain branch instead of carrying the
+    /// assignment); bounded-join the loop; explicitly drain any retained or carried assignment;
+    /// bounded-join every owned task with named failures; and dispose the service ONLY after
+    /// quiescence. No sleeps, no polling. Its failure is recorded, never thrown, and never replaces
+    /// a primary failure.
+    /// </summary>
+    private async Task RunOwnerSlotWitnessSafetyNetAsync(
+        OwnerSlotWitnessOutcome outcome,
+        WorkerService service,
+        GatedRunner runner,
+        GatedWriter writer,
+        ChannelResponseReader reader,
+        CancellationTokenSource loopCts,
+        TaskCompletionSource resetGate,
+        Task loop,
+        Task? execution,
+        Task? reporting,
+        bool primaryInFlight,
+        Task? ownerInstalled,
+        Exception? injectedSafetyNetFailure)
+    {
+        if (outcome.ServiceDisposed)
+            return;
+
+        outcome.SafetyNetRan = true;
+
+        // Each step retains its failure and lets the remaining cleanup run. A cancellation callback
+        // or a drain diagnostic must not prevent later joins. Never replace a primary failure.
+        async Task AttemptAsync(Func<Task> operation)
+        {
+            try { await operation(); }
+            catch (Exception ex)
+            {
+                outcome.SafetyNetFailure ??= ex;
+                if (!primaryInFlight && outcome.Failure is null)
+                    outcome.Failure = ex;
+            }
+        }
+
+        resetGate.TrySetResult();
+        runner.ReleaseAll();
+        writer.ReleaseAll();
+        // These references must survive even a failed re-arm observation.
+        outcome.Capture("loop", loop);
+        if (execution is not null) outcome.Capture("assignment execution", execution);
+        if (reporting is not null) outcome.Capture("assignment reporting", reporting);
+        await AttemptAsync(async () =>
+        {
+            // Retain the REAL producer references before cancel/drain can clear the ownership slot.
+            // The parked-handler path needs the handler's re-arm before that capture is possible.
+            if (!loop.IsCompleted && ownerInstalled is not null)
+                await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        });
+        await AttemptAsync(() => { CaptureWitnessProducers(service, outcome); return Task.CompletedTask; });
+
+        await AttemptAsync(() => loopCts.CancelAsync());
+        outcome.OuterCancellationObservedBeforeNetReaderCompletion = loopCts.IsCancellationRequested;
+        reader.TryComplete();
+
+        await AttemptAsync(() => JoinWitnessProducerAsync(outcome, "loop", loop));
+        outcome.OuterSlotEmptyAfterLoopJoin = GetActiveAssignment(service) is null;
+        await AttemptAsync(() => { CaptureWitnessProducers(service, outcome); return Task.CompletedTask; });
+
+        // Never race an explicit drain against a still-running loop's ownership transition.
+        // A failed bounded loop join leaves a named failure and the service undisposed.
+        if (loop.IsCompleted)
+        {
+            await AttemptAsync(async () =>
+            {
+                await service.DrainCarriedAssignmentAsync()
+                    .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            });
+        }
+
+        outcome.OuterLoopCompleted = loop.IsCompleted;
+        outcome.OuterSlotCleared = GetActiveAssignment(service) is null;
+        outcome.OuterHeartbeatCleared = service.HeartbeatTaskIdForTest is null;
+
+        foreach (var (name, producer) in outcome.CapturedProducers.Where(p => p.Name != "loop"))
+            await AttemptAsync(() => JoinWitnessProducerAsync(outcome, name, producer));
+        await AttemptAsync(() =>
+        {
+            // Opt-in failure AFTER the real joins, but BEFORE disposal. The probe proves a net
+            // failure is recorded, does not replace the primary, and cannot bypass final disposal.
+            if (injectedSafetyNetFailure is not null)
+                throw injectedSafetyNetFailure;
+            return Task.CompletedTask;
+        });
+        outcome.OuterOwnedTasksTerminal = outcome.CapturedProducers.Count > 0
+            && outcome.CapturedProducers.All(p => p.Producer.IsCompleted);
+
+        // Do not let Dispose hide live work. On a failed bounded join keep the service undisposed
+        // and report the retained named failure, rather than claiming cleanup succeeded.
+        if (loop.IsCompleted && outcome.OuterOwnedTasksTerminal
+            && GetActiveAssignment(service) is null && service.HeartbeatTaskIdForTest is null)
+        {
+            await AttemptAsync(() => { service.Dispose(); return Task.CompletedTask; });
+        }
+        outcome.OuterServiceDisposed = IsServiceDisposed(service);
+    }
+
+    // This is an actual forwarding join, not an outcome flag inferred from terminal tasks. Recording
+    // entry here proves each captured producer was observed even if the production drain joined it
+    // already. That defense-in-depth must not make a missing fixture join invisible.
+    private static async Task JoinWitnessProducerAsync(
+        OwnerSlotWitnessOutcome outcome, string name, Task producer)
+    {
+        outcome.JoinedProducers.Add(name);
+        try { await producer.WaitAsync(Failsafe); }
+        catch (TimeoutException) when (!producer.IsCompleted)
+        {
+            throw new Xunit.Sdk.XunitException($"Safety net: bounded join timed out for '{name}'.");
+        }
+        catch (Exception) when (producer.IsCompleted) { /* Terminal faults/cancellation are observed. */ }
+        if (!producer.IsCompleted)
+            throw new Xunit.Sdk.XunitException($"Safety net: still-live producer '{name}'.");
+    }
+
+    private static void CaptureWitnessProducers(WorkerService service, OwnerSlotWitnessOutcome outcome)
+    {
+        if (GetActiveAssignment(service) is not { } owner)
+            return;
+        outcome.Capture("assignment execution", OwnerTask(owner, "Execution"));
+        outcome.Capture("assignment reporting", OwnerTask(owner, "Reporting"));
+        foreach (var property in new[] { "Retry", "CarriedDelivery" })
+            if (owner.GetType().GetProperty(property)!.GetValue(owner) is Task task)
+                outcome.Capture(property == "Retry" ? "assignment retry" : "carried delivery", task);
+        if (GetRetainedReadinessWrite(service) is { } readiness)
+            outcome.Capture("readiness write", readiness);
+    }
+
+    /// <summary>
+    /// What the shared witness body observed, so both the witness and its failure-path probe can
+    /// assert on the SAME facts without duplicating the teardown.
+    /// </summary>
+    private sealed class OwnerSlotWitnessOutcome
+    {
+        /// <summary>The failure that surfaced out of the witness body, if any.</summary>
+        internal Exception? Failure { get; set; }
+
+        /// <summary>The failure the teardown itself raised, if any.</summary>
+        internal Exception? TeardownFailure { get; set; }
+
+        internal bool OwnerAbsentAtReset { get; set; }
+        internal bool MilestoneUnsatisfiedAtReset { get; set; }
+        internal bool OwnerPresentAfterReArm { get; set; }
+        internal string? OwnerTaskId { get; set; }
+        internal bool GateReleased { get; set; }
+        internal bool LoopCompleted { get; set; }
+        internal bool SlotCleared { get; set; }
+        internal bool HeartbeatCleared { get; set; }
+        /// <summary>The INNER teardown completed a full teardown and disposed the service.</summary>
+        internal bool ServiceDisposed { get; set; }
+
+        /// <summary>The outer safety net had work to do (the inner teardown did not finish).</summary>
+        internal bool SafetyNetRan { get; set; }
+
+        /// <summary>The failure the outer safety net itself raised, if any (recorded, never thrown).</summary>
+        internal Exception? SafetyNetFailure { get; set; }
+
+        internal bool OuterLoopCompleted { get; set; }
+
+        /// <summary>The assignment was already cleared when the loop join returned (cancel-and-drain, not carry).</summary>
+        internal bool OuterSlotEmptyAfterLoopJoin { get; set; }
+        internal bool OuterSlotCleared { get; set; }
+        internal bool OuterHeartbeatCleared { get; set; }
+        internal bool OuterOwnedTasksTerminal { get; set; }
+
+        /// <summary>The outer safety net disposed the service, after quiescence.</summary>
+        internal bool OuterServiceDisposed { get; set; }
+        internal bool OuterCancellationObservedBeforeNetReaderCompletion { get; set; }
+        internal bool OuterQuiescentAtDisposal { get; set; }
+        internal bool CarriedBeforeFailure { get; set; }
+        internal bool CarriedDeliveryPendingBeforeCleanup { get; set; }
+        internal List<(string Name, Task Producer)> CapturedProducers { get; } = [];
+        internal List<string> JoinedProducers { get; } = [];
+
+        internal void Capture(string name, Task producer)
+        {
+            if (!CapturedProducers.Any(p => ReferenceEquals(p.Producer, producer)))
+                CapturedProducers.Add((name, producer));
+        }
+    }
+
+    /// <summary>
+    /// THE FAILURE-PATH PROBE for the ordering witness's TWO-PHASE teardown. The witness parks the
+    /// assignment handler at the session reset and asserts on the owner slot; if something in that
+    /// window throws, the primary failure must survive and nothing may be leaked.
+    /// <para>
+    /// THE DESIGN UNDER TEST. Phase 1 is the ordinary inner teardown, which may ABORT part-way (the
+    /// probe injects a failure into it deliberately, so the precedence rule is exercised
+    /// MID-cleanup rather than after quiescence). Phase 2 is an outer, finally-scoped safety net
+    /// the injected failure cannot bypass: it releases the gates, cancels the linked loop token
+    /// BEFORE completing the reader (so production takes the cancel-and-drain branch instead of
+    /// carrying the assignment as stream loss), bounded-joins the loop, explicitly drains any
+    /// retained or carried assignment, bounded-joins the owned tasks with named failures, and
+    /// disposes the service only after quiescence. On a successful inner teardown the net is a
+    /// no-op.
+    /// </para>
+    /// <para>
+    /// WHAT IT PROVES. (1) The injected failure SURFACES as the very instance raised (identity,
+    /// not a teardown error or a cancellation). (2) The injected TEARDOWN failure is observed, not
+    /// swallowed, and did not replace the primary. (3) The inner phase genuinely aborted — it
+    /// claims no disposal. (4) The OUTER net ran anyway and completed: loop joined, slot cleared,
+    /// heartbeat cleared, every owned task terminal, service disposed after quiescence, and the
+    /// net recorded no failure of its own. Everything is bounded by the failsafe — no sleep, no
+    /// polling, no elapsed-time assumption.
+    /// </para>
+    /// <para>
+    /// ADDITIVE PATHS. The same helper also ends the stream while a real installed assignment is
+    /// held in its prompt with a live loop token, positively observes Carried plus a nonterminal
+    /// carried delivery, and injects the failures only then. This makes the explicit drain observable
+    /// instead of a no-op after the loop's cancel-and-drain. One variant additionally injects a net
+    /// failure after its real joins but before disposal: that failure must be retained without
+    /// replacing the primary or skipping final disposal. Actual producer references and forwarding
+    /// join entries survive the slot clear, and the runner's disposal entry observes quiescence.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OwnerSlotWitness_FailureWhileTheHandlerIsParked_StillReleasesJoinsAndPreservesTheFailure()
+    {
+        var injected = new Xunit.Sdk.XunitException("INJECTED-PROBE-FAILURE");
+        var injectedTeardown = new Xunit.Sdk.XunitException("INJECTED-TEARDOWN-FAILURE");
+        var outcome = await RunOwnerSlotWitnessAsync(injected, injectedTeardown);
+
+        // (1) THE ORIGINAL FAILURE SURFACES — the very instance the probe raised, not a teardown
+        // error, not a cancellation, and not a swallowed exception. The teardown ALSO failed
+        // (asserted below), so the PRIMARY really does win the precedence here.
+        Assert.NotNull(outcome.Failure);
+        Assert.Same(injected, outcome.Failure);
+        Assert.Equal("INJECTED-PROBE-FAILURE", outcome.Failure!.Message);
+
+        // (2) THE TEARDOWN FAILURE IS OBSERVED, NOT SWALLOWED — it is reported, but it did NOT
+        // replace the primary. This is the precedence rule under test.
+        Assert.NotNull(outcome.TeardownFailure);
+        Assert.Same(injectedTeardown, outcome.TeardownFailure);
+        Assert.Equal("INJECTED-TEARDOWN-FAILURE", outcome.TeardownFailure!.Message);
+
+        // (4) THE PARKED SEAMS WERE RELEASED BEFORE THE TEARDOWN FAILED. The teardown then
+        // ABORTED at the injected failure, so the loop was NOT joined and the service was NOT
+        // disposed on this path - which is precisely what a real teardown failure looks like.
+        // The probe asserts that inner-phase truth separately from the outer net's completed
+        // joins/disposal below; the ordering witness retains its ordinary success-path checks.
+        Assert.True(outcome.GateReleased, "The teardown must release the parked reset gate.");
+        Assert.False(
+            outcome.ServiceDisposed,
+            "A teardown that failed must not claim the service was disposed.");
+
+        // (5) THE OUTER SAFETY NET RAN DESPITE THE ABORTED INNER TEARDOWN AND COMPLETED IT. The net
+        // disposing the service afterwards does not contradict the inner assertion above: the
+        // inner phase never claimed disposal, the net did it after quiescence.
+        Assert.True(outcome.SafetyNetRan, "The outer safety net must run when the inner teardown aborts.");
+        Assert.True(
+            outcome.SafetyNetFailure is null,
+            $"The outer safety net must not fail itself, but it raised: {outcome.SafetyNetFailure}");
+        Assert.True(outcome.OuterLoopCompleted, "The safety net must join the message loop.");
+        Assert.True(
+            outcome.OuterSlotEmptyAfterLoopJoin,
+            "The safety net must select the non-carry cancel-and-drain teardown: cancelling the "
+            + "linked token BEFORE completing the reader means the assignment is already cleared "
+            + "when the loop join returns; a carried assignment would still be retained.");
+        Assert.True(outcome.OuterSlotCleared, "The safety net must clear the ownership slot.");
+        Assert.True(outcome.OuterHeartbeatCleared, "The safety net must clear the heartbeat task state.");
+        Assert.True(outcome.OuterOwnedTasksTerminal, "The safety net must join every owned task.");
+        Assert.True(
+            outcome.OuterServiceDisposed,
+            "The safety net must dispose the service after quiescence.");
+        AssertWitnessCleanup(outcome);
+
+        // Additional deterministic paths through the SAME two-phase helper. A real carried owner
+        // makes the explicit drain load-bearing; a net fault proves observed-not-swallowed precedence.
+        foreach (var netFailure in new Exception?[] { null, new Xunit.Sdk.XunitException("INJECTED-NET-FAILURE") })
+        {
+            var carried = await RunOwnerSlotWitnessAsync(
+                injected, injectedTeardown, carryBeforeFailure: true, injectedSafetyNetFailure: netFailure);
+            Assert.Same(injected, carried.Failure);
+            Assert.Same(injectedTeardown, carried.TeardownFailure);
+            Assert.False(carried.ServiceDisposed);
+            Assert.True(carried.CarriedBeforeFailure, "The extra cleanup path must retain a genuinely carried owner.");
+            Assert.True(carried.CarriedDeliveryPendingBeforeCleanup,
+                "The carried delivery must be live before cleanup, not an already-joined task.");
+            Assert.True(carried.SafetyNetRan, "The carried fixture also requires the outer cleanup net.");
+            Assert.True(ReferenceEquals(netFailure, carried.SafetyNetFailure),
+                "Safety net cleanup failure must be observed without replacing the primary.");
+            Assert.Same(netFailure, carried.SafetyNetFailure);
+            Assert.True(carried.OuterLoopCompleted);
+            Assert.True(carried.OuterSlotCleared, "The safety net must explicitly drain the carried ownership slot.");
+            Assert.True(carried.OuterHeartbeatCleared, "The carried cleanup must clear heartbeat state.");
+            Assert.True(carried.OuterOwnedTasksTerminal, "The carried cleanup must terminate all captured producers.");
+            Assert.True(carried.OuterServiceDisposed, "The carried cleanup must dispose only after quiescence.");
+            AssertWitnessCleanup(carried);
+        }
+    }
+
+    private static void AssertWitnessCleanup(OwnerSlotWitnessOutcome outcome)
+    {
+        Assert.True(outcome.OuterCancellationObservedBeforeNetReaderCompletion,
+            "Safety net cleanup must cancel the linked CTS before its reader-completion call (carried EOF may predate the net).");
+        Assert.True(outcome.OuterQuiescentAtDisposal,
+            "Safety net cleanup must join all captured producers and clear ownership BEFORE actual runner disposal.");
+        Assert.Contains(outcome.CapturedProducers, p => p.Name == "assignment execution");
+        Assert.Contains(outcome.CapturedProducers, p => p.Name == "assignment reporting");
+        Assert.Contains(outcome.CapturedProducers, p => p.Name == "assignment retry");
+        Assert.Contains(outcome.CapturedProducers, p => p.Name == "loop");
+        foreach (var (name, producer) in outcome.CapturedProducers)
+        {
+            Assert.True(producer.IsCompleted, $"Safety net cleanup left still-live producer '{name}'.");
+            Assert.True(outcome.JoinedProducers.Contains(name), $"Safety net cleanup skipped the explicit join for '{name}'.");
+        }
+    }
+
+    /// <summary>
     /// RUN CANCELLATION (the loop token) drains and clears WITHOUT any ACK wait: with a completed
     /// but unconfirmed report retained, cancelling the token completes the loop on its own bounded
     /// join, emits NO ordinary Ready (the gate holds — the same gate every drain consults), and
@@ -2449,10 +3144,17 @@ public sealed class WorkerServiceReceiptGateTests
         Task? reporting = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2510,7 +3212,21 @@ public sealed class WorkerServiceReceiptGateTests
         Task? reporting = null;
         try
         {
-            reader.Push(ResultAssignment(TaskA));
+            // THE OWNER-INSTALLATION BOUNDARY. `FaultingResponseReader` (a SHARED double outside this
+            // test file, so it is deliberately not extended here) exposes no read counter, so the
+            // same PROOF is taken through its delivery counter instead: the probe pushed as message 2
+            // can only be DELIVERED by read #2, and the loop re-arms that read only AFTER the
+            // Assignment handler returned (WorkerService.cs:3345-3346) — and that handler's last
+            // statement is InstallActiveAssignment (WorkerService.cs:3244). `PromptStarted` and
+            // `CompleteEntered` are both reachable from the execution/reporting tasks production
+            // starts BEFORE that install, so neither can serve as this boundary.
+            var ownerInstalled = reader.Consumed(2);
+            Assert.False(
+                ownerInstalled.IsCompleted,
+                "The delivery milestone Consumed(2) must not be already satisfied before either push.");
+            reader.Push(ResultAssignment(TaskA)); // message 1
+            reader.Push(Probe("installed")); // message 2
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2632,10 +3348,17 @@ public sealed class WorkerServiceReceiptGateTests
         try
         {
             Console.SetError(stdErr);
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2734,11 +3457,18 @@ public sealed class WorkerServiceReceiptGateTests
         Task? readinessWrite = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2887,10 +3617,17 @@ public sealed class WorkerServiceReceiptGateTests
         Task? reporting = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2991,10 +3728,17 @@ public sealed class WorkerServiceReceiptGateTests
         Task? reporting = null;
         try
         {
+            // THE OWNER-INSTALLATION MILESTONE: created, and proved UNSATISFIED, BEFORE the push
+            // that can satisfy it — PromptStarted/CompleteEntered above are reachable from the
+            // execution/reporting tasks production starts BEFORE InstallActiveAssignment, so they
+            // prove nothing about the owner slot (see ArmHandlerReturnMilestone).
+            var ownerInstalled = ArmHandlerReturnMilestone(reader, 2);
+
             reader.Push(ResultAssignment(TaskA));
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerInstalled.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -3864,6 +4608,52 @@ public sealed class WorkerServiceReceiptGateTests
             ? [.. aggregate.Flatten().InnerExceptions]
             : [exception];
 
+    /// <summary>
+    /// THE OWNER-INSTALLATION MILESTONE. Returns the milestone for read #<paramref name="readNumber"/>
+    /// STARTING — the ONE positive proof that <c>InstallActiveAssignment</c> has PUBLISHED the owner
+    /// slot — and asserts on the spot that it is NOT already satisfied.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY A RE-ARMED READ IS POSITIVE INSTALLATION EVIDENCE. In
+    /// <c>WorkerService.ProcessMessagesAsync</c> the loop keeps ONE owned pending read that it
+    /// RE-ARMS exactly once per dispatched message, and it does so only AFTER that message's
+    /// handler returned (WorkerService.cs:3345-3346, immediately after the
+    /// <c>switch (message.PayloadCase)</c> block). The <c>Assignment</c> handler installs the owner
+    /// slot in its very last statement (<c>InstallActiveAssignment</c>, WorkerService.cs:3244), so
+    /// the NEXT read starting can only happen once that handler — and therefore the installation —
+    /// has completed. Read #1 is the initial pre-loop read (WorkerService.cs:2946) and read #n+1 is
+    /// re-armed after message n, so <c>ReadStarted(n + 1)</c> is the boundary that follows message n.
+    /// </para>
+    /// <para>
+    /// WHY THE OLDER MILESTONES ARE NOT. <c>runner.PromptStarted</c> fires from the EXECUTION task
+    /// (<c>Task.Run</c>, WorkerService.cs:3153) and <c>writer.CompleteEntered</c> fires from the
+    /// REPORTING task (WorkerService.cs:3228) — BOTH are started BEFORE
+    /// <c>InstallActiveAssignment</c> runs (WorkerService.cs:3244), so either can be reached while
+    /// <c>_activeAssignment</c> is still null. Reading the owner at that instant throws
+    /// "Expected an active assignment owner." That is a timing race, not a flake: the fix replaces a
+    /// milestone that is PROVABLY reachable pre-install with one that is PROVABLY post-install.
+    /// </para>
+    /// <para>
+    /// ANTI-VACUOUS. The milestone is asserted incomplete at CREATION time — before the caller
+    /// pushes the message that could satisfy it — so a threshold that was already met (which would
+    /// prove nothing, because the loop could have re-armed that read long before this test asked)
+    /// fails loudly instead of silently weakening the barrier.
+    /// </para>
+    /// </remarks>
+    /// <param name="reader">The fixture reader the REAL loop is consuming.</param>
+    /// <param name="readNumber">The read whose START is the post-handler boundary to await.</param>
+    private static Task ArmHandlerReturnMilestone(ChannelResponseReader reader, int readNumber)
+    {
+        var milestone = reader.ReadStarted(readNumber);
+        Assert.False(
+            milestone.IsCompleted,
+            $"The post-handler re-arm milestone ReadStarted({readNumber}) must not be an "
+            + "already-satisfied milestone: an already-re-armed read cannot prove that the handler "
+            + "which installs the owner slot has returned.");
+        return milestone;
+    }
+
     private static async Task AwaitRendezvousAsync(Task rendezvous, string because)
     {
         try
@@ -4249,6 +5039,15 @@ public sealed class WorkerServiceReceiptGateTests
         /// </summary>
         internal bool FailOnRelease { get; init; }
 
+        /// <summary>
+        /// THE SESSION-RESET GATE. When set, production's session reset parks inside the assignment
+        /// handler — at its last await BEFORE the execution task is started and BEFORE the owner
+        /// slot is installed. A test that awaits the reset's arrival can therefore observe the
+        /// handler in exactly that window, deterministically and without any elapsed-time
+        /// assumption. <c>null</c> (the default) keeps every other user's behavior unchanged.
+        /// </summary>
+        internal TaskCompletionSource? ResetGate { get; set; }
+
         internal bool WasCancelled(string taskId)
         {
             lock (_gate) return _cancelled.Contains(taskId);
@@ -4392,10 +5191,25 @@ public sealed class WorkerServiceReceiptGateTests
             foreach (var waiter in ready)
                 waiter.TrySetResult();
 
+            // THE SESSION-RESET GATE. When set, the reset parks HERE — inside production's
+            // assignment handler, at its LAST await before the execution task is started and
+            // before the owner slot is installed. It is the only deterministic seam that lets a
+            // test hold the handler in exactly that window, and it is what makes the
+            // pre-install owner-slot observation deterministic instead of a timing race.
+            var gate = ResetGate;
+            if (gate is not null)
+                return gate.Task.WaitAsync(ct);
+
             return Task.CompletedTask;
         }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        // Null in all existing users; the failure probe observes the actual disposal boundary.
+        internal Action? OnDispose { get; set; }
+        public ValueTask DisposeAsync()
+        {
+            OnDispose?.Invoke();
+            return ValueTask.CompletedTask;
+        }
     }
 
     /// <summary>
