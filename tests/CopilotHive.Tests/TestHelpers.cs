@@ -39,29 +39,93 @@ internal static class TestHelpers
     /// Recursively deletes a directory, clearing read-only attributes first so that
     /// <c>.git</c> pack-files and other locked objects can be removed on Windows.
     /// </summary>
-    internal static void ForceDeleteDirectory(string path, int maxRetries = 3)
+    /// <remarks>
+    /// <para>
+    /// Retries on a BOUNDED, generous schedule: the first delete attempt is immediate, then up to
+    /// eight further attempts follow linear waits of 100, 200, … 800 ms — 3.6 s of total wait across
+    /// nine delete attempts. This is bounded handle-release retry, NOT elapsed-time flakiness
+    /// masking: the only waiters this exists for are processes the fixture itself just killed (e.g.
+    /// the mid-merge git process tree in <c>BrainRepoManagerReleaseOpsTests</c>), and Windows can
+    /// hold their file handles for a short while after the process dies, so the delete can
+    /// transiently fail with <see cref="IOException"/> / <see cref="UnauthorizedAccessException"/>.
+    /// The budget is fixed — there is no polling loop that grows until a flaky condition happens to
+    /// pass.
+    /// </para>
+    /// <para>
+    /// Fails LOUDLY: if the directory still exists after the final attempt, an
+    /// <see cref="InvalidOperationException"/> naming the full path and carrying the last delete
+    /// exception is thrown. Residue is never left silently, because a silent failure only moves the
+    /// symptom to an unrelated later test.
+    /// </para>
+    /// <para>
+    /// <paramref name="deleteOverride"/> and <paramref name="waitOverride"/> are TEST SEAMS: they let
+    /// a test drive the retry/loud-failure contract deterministically (a real locked directory
+    /// cannot be produced on every platform, and a real retry schedule would make the test depend
+    /// on elapsed time). When both are <c>null</c> — the production path used by every fixture —
+    /// the behaviour is exactly the real recursive delete with a real bounded sleep.
+    /// </para>
+    /// </remarks>
+    /// <param name="path">Directory to delete.</param>
+    /// <param name="maxAttempts">Total number of delete attempts, including the immediate first one.</param>
+    /// <param name="deleteOverride">Test seam replacing the recursive delete; receives the path.</param>
+    /// <param name="waitOverride">Test seam replacing the backoff sleep; receives the delay in milliseconds.</param>
+    internal static void ForceDeleteDirectory(
+        string path,
+        int maxAttempts = 9,
+        Action<string>? deleteOverride = null,
+        Action<int>? waitOverride = null)
     {
-        for (var i = 0; i < maxRetries; i++)
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             if (!Directory.Exists(path))
                 return;
 
             try
             {
-                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
-                    File.SetAttributes(file, FileAttributes.Normal);
-                Directory.Delete(path, recursive: true);
+                ClearReadOnlyAttributes(path);
+                if (deleteOverride is not null)
+                    deleteOverride(path);
+                else
+                    Directory.Delete(path, recursive: true);
                 return;
             }
-            catch (UnauthorizedAccessException) when (i < maxRetries - 1)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                Thread.Sleep(200 * (i + 1));
-            }
-            catch (IOException) when (i < maxRetries - 1)
-            {
-                Thread.Sleep(200 * (i + 1));
+                lastError = ex;
+
+                // Linear backoff BETWEEN attempts only: attempt 1 is immediate, and the final
+                // attempt's failure is reported rather than slept on.
+                if (attempt < maxAttempts)
+                {
+                    var delayMs = 100 * attempt;
+                    if (waitOverride is not null)
+                        waitOverride(delayMs);
+                    else
+                        Thread.Sleep(delayMs);
+                }
             }
         }
+
+        if (!Directory.Exists(path))
+            return;
+
+        throw new InvalidOperationException(
+            $"Failed to delete the temporary directory '{Path.GetFullPath(path)}' after {maxAttempts} "
+            + "attempts — a killed process is presumably still holding its file handles. The last "
+            + "delete error is attached as the inner exception.",
+            lastError);
+    }
+
+    /// <summary>
+    /// Resets every file under <paramref name="path"/> to <see cref="FileAttributes.Normal"/> so a
+    /// checkout with read-only git objects (the Windows git default for pack files) can be deleted.
+    /// </summary>
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+            File.SetAttributes(file, FileAttributes.Normal);
     }
 }
 

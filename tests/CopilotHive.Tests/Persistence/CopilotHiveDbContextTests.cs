@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Globalization;
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Persistence.Entities;
@@ -1985,58 +1986,96 @@ public sealed class CopilotHiveDbContextTests
     }
 
     /// <summary>
-    /// Offset-sensitive proof for the Local branch. The process timezone is temporarily isolated to
-    /// UTC-07:00, making <c>ToUniversalTime</c> change ticks by seven hours. A mutant that merely
-    /// relabels Local ticks as Utc therefore persists 12:34 rather than the required 19:34.
+    /// Offset-derived, machine-zone-agnostic proof for the Local branch of the UTC normalization.
+    /// The expected instant is computed from the machine's ACTUAL local zone
+    /// (<see cref="TimeZoneInfo.Local"/>.<see cref="TimeZoneInfo.GetUtcOffset(DateTime)"/>), which is
+    /// exactly the offset conversion production's <c>NormalizeToUtc</c> performs, so the stored value
+    /// must equal the CONVERTED instant on every machine regardless of its timezone. No process
+    /// timezone is imposed: the previous form set the POSIX-only <c>TZ</c> variable, which .NET
+    /// ignores on Windows, leaving Windows in the machine zone and the UTC-07 expectation unsatisfied.
     /// </summary>
+    /// <remarks>
+    /// KIND-RELABELING DISCRIMINATOR: a mutant that merely relabels the Local ticks as Utc
+    /// (<c>DateTime.SpecifyKind(local, DateTimeKind.Utc)</c>) keeps the wall-clock reading, so it
+    /// persists a value that differs from the converted instant by the zone's offset. On any machine
+    /// with a NON-ZERO local offset that mutant is rejected by the two UNCONDITIONAL equality
+    /// assertions — the raw-storage text comparison and the read-back
+    /// <c>Assert.Equal(expectedUtc, read.FirstStoredAtUtc)</c> — because both hold
+    /// <c>stored == expectedUtc</c> on every machine while the mutant stores the relabeled value.
+    /// <para>
+    /// PREMISE, NOT A KILL: the guarded inequality inside <c>if (offset != TimeSpan.Zero)</c>
+    /// (<c>Assert.NotEqual(DateTime.SpecifyKind(local, DateTimeKind.Utc), expectedUtc)</c>) compares
+    /// only locally derived expected values BEFORE any production call, so it cannot observe
+    /// production behaviour and passes under the relabeling mutant as well. It establishes the
+    /// premise — the converted value differs from the relabeled value — that makes the equality
+    /// assertions above discriminating; it is not the mutant kill itself.
+    /// </para>
+    /// <para>
+    /// INTENTIONAL, DOCUMENTED REDUCTION IN DISCRIMINATION: on a machine whose local zone is UTC the
+    /// offset is <see cref="TimeSpan.Zero"/>, so the relabeled value EQUALS the converted one — no
+    /// assertion can separate conversion from relabeling there, and the guarded premise inequality is
+    /// therefore asserted only when the offset is non-zero (the unconditional equality assertions
+    /// still apply). This is the single accepted exception to "no test weakened", traded for
+    /// machine-zone-agnosticism across Linux, macOS and Windows.
+    /// </para>
+    /// </remarks>
     [Fact]
     public void CompletionReceipts_FirstStoredAtUtc_LocalInputUsesOffsetConversion_NotKindRelabeling()
     {
-        var originalTz = Environment.GetEnvironmentVariable("TZ");
-        try
+        // 12:34:56 local is an unambiguous, valid local time in every zone, so the offset lookup
+        // below has a single well-defined answer.
+        var local = new DateTime(2025, 1, 15, 12, 34, 56, DateTimeKind.Local).AddTicks(7);
+
+        // Derive the expected UTC instant from the machine's actual offset — the same offset
+        // conversion production's NormalizeToUtc applies to a Local value.
+        var offset = TimeZoneInfo.Local.GetUtcOffset(local);
+        var expectedUtc = DateTime.SpecifyKind(local - offset, DateTimeKind.Utc);
+
+        // The offset formula must agree with the framework conversion production delegates to.
+        Assert.Equal(local.ToUniversalTime().Ticks, expectedUtc.Ticks);
+
+        if (offset != TimeSpan.Zero)
         {
-            Environment.SetEnvironmentVariable("TZ", "Etc/GMT+7");
-            TimeZoneInfo.ClearCachedData();
+            // PREMISE only (these compare locally derived expected values before any production
+            // call, so they cannot observe — and never fail on — a production mutant): the converted
+            // instant really moved, and it differs from the relabeled value. That difference is what
+            // makes the unconditional equality assertions below discriminating. Conditional on a
+            // non-zero offset because on a UTC machine the two implementations are observationally
+            // identical (see the remarks).
+            Assert.NotEqual(local.Ticks, expectedUtc.Ticks);
+            Assert.NotEqual(DateTime.SpecifyKind(local, DateTimeKind.Utc), expectedUtc);
+        }
 
-            var local = new DateTime(2025, 1, 15, 12, 34, 56, DateTimeKind.Local).AddTicks(7);
-            Assert.Equal(TimeSpan.FromHours(-7), TimeZoneInfo.Local.GetUtcOffset(local));
-            var expectedUtc = local.ToUniversalTime();
-            Assert.Equal(new DateTime(2025, 1, 15, 19, 34, 56, DateTimeKind.Utc).AddTicks(7), expectedUtc);
-            Assert.NotEqual(local.Ticks, expectedUtc.Ticks); // anti-vacuous: conversion changes the instant's ticks
+        var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .Options;
 
-            var connection = new SqliteConnection("Data Source=:memory:");
-            connection.Open();
-            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite(connection)
-                .Options;
-
-            using (var writeContext = new CopilotHiveDbContext(options))
+        using (var writeContext = new CopilotHiveDbContext(options))
+        {
+            writeContext.Database.EnsureCreated();
+            writeContext.CompletionReceipts.Add(new CompletionReceiptEntity
             {
-                writeContext.Database.EnsureCreated();
-                writeContext.CompletionReceipts.Add(new CompletionReceiptEntity
-                {
-                    TaskId = "task-offset-local",
-                    GoalId = "goal-offset-local",
-                    PayloadJson = "{}",
-                    FirstStoredAtUtc = local,
-                });
-                writeContext.SaveChanges();
-            }
-
-            Assert.Equal("2025-01-15T19:34:56.0000007Z", ScalarOn(connection,
-                "SELECT first_stored_at_utc FROM completion_receipts WHERE task_id = 'task-offset-local'"));
-
-            using var readContext = new CopilotHiveDbContext(options);
-            var read = readContext.CompletionReceipts.Single(r => r.TaskId == "task-offset-local");
-            Assert.Equal(DateTimeKind.Utc, read.FirstStoredAtUtc.Kind);
-            Assert.Equal(expectedUtc, read.FirstStoredAtUtc);
-            Assert.Equal(expectedUtc.Ticks, read.FirstStoredAtUtc.Ticks);
+                TaskId = "task-offset-local",
+                GoalId = "goal-offset-local",
+                PayloadJson = "{}",
+                FirstStoredAtUtc = local,
+            });
+            writeContext.SaveChanges();
         }
-        finally
-        {
-            Environment.SetEnvironmentVariable("TZ", originalTz);
-            TimeZoneInfo.ClearCachedData();
-        }
+
+        // Raw-storage check: the persisted TEXT is the expected UTC instant in invariant "O"
+        // (round-trip) format — seven fractional digits plus the trailing 'Z' — independent of which
+        // zone this machine happens to use.
+        Assert.Equal(expectedUtc.ToString("O", CultureInfo.InvariantCulture), ScalarOn(connection,
+            "SELECT first_stored_at_utc FROM completion_receipts WHERE task_id = 'task-offset-local'"));
+
+        using var readContext = new CopilotHiveDbContext(options);
+        var read = readContext.CompletionReceipts.Single(r => r.TaskId == "task-offset-local");
+        Assert.Equal(DateTimeKind.Utc, read.FirstStoredAtUtc.Kind);
+        Assert.Equal(expectedUtc, read.FirstStoredAtUtc);
+        Assert.Equal(expectedUtc.Ticks, read.FirstStoredAtUtc.Ticks);
     }
 
     /// <summary>

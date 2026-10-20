@@ -33,10 +33,12 @@ public sealed class BrainRepoManagerCancellationTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_tempDir))
-        {
-            try { Directory.Delete(_tempDir, recursive: true); } catch { /* best-effort */ }
-        }
+        // This fixture kills a REAL git process tree (TryKillProcess), and on Windows a dying
+        // process can hold its file handles for a short while. A one-shot
+        // "try { Directory.Delete } catch { }" therefore silently left residue behind; use the
+        // shared bounded-retry helper, which clears read-only attributes, retries the transient
+        // lock on a fixed schedule, and throws loudly (path + last error) if the directory survives.
+        TestHelpers.ForceDeleteDirectory(_tempDir);
     }
 
     /// <summary>
