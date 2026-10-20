@@ -2756,7 +2756,14 @@ public sealed class CompletionReceiptAckTests
             var candidate = Path.Combine(
                 directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
             if (File.Exists(candidate))
-                return new OrchestratorSource { Text = File.ReadAllText(candidate) };
+            {
+                // Normalize to LF: a Windows checkout stores this file with CRLF (per .gitattributes
+                // text=auto), while every structural expectation below is written with "\n".
+                return new OrchestratorSource
+                {
+                    Text = File.ReadAllText(candidate).Replace("\r\n", "\n"),
+                };
+            }
 
             directory = directory.Parent;
         }
@@ -3148,7 +3155,11 @@ public sealed class CompletionReceiptAckTests
             var candidate = Path.Combine(
                 directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
             if (File.Exists(candidate))
-                return File.ReadAllText(candidate);
+            {
+                // Normalize to LF: a Windows checkout stores repository files with CRLF (per
+                // .gitattributes text=auto), while every structural expectation is written with "\n".
+                return File.ReadAllText(candidate).Replace("\r\n", "\n");
+            }
 
             directory = directory.Parent;
         }

@@ -2027,12 +2027,29 @@ public sealed class ConfigRepoGitOperationsTests
     /// Creates an isolated temporary git repository (init + initial commit) and returns its
     /// path. The caller disposes via <see cref="TempRepo.Dispose"/> in a finally block.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The repository carries its OWN <c>core.autocrlf=false</c> so that EVERY git process running in
+    /// it keeps the committed LF bytes on checkout — including the ones the SUT
+    /// (<see cref="ConfigRepoGitOperations"/>) spawns. Without it, a host whose global
+    /// <c>core.autocrlf=true</c> makes the SUT's <c>reset --hard</c>/<c>clean</c> rewrite the working
+    /// tree to CRLF, and the LF expectations in the real-Git vectors then read the byte difference as
+    /// a modification.
+    /// </para>
+    /// <para>
+    /// WHY NOT ONLY A PER-INVOCATION PIN. This fixture's <see cref="RunGit"/> passes no <c>-c</c>
+    /// settings, and even if it did, those would cover only the FIXTURE's calls — never the SUT's.
+    /// Only a repo-local setting reaches every process, however it was launched. This is
+    /// deterministic TEST-FIXTURE configuration, not a claim that production pins autocrlf.
+    /// </para>
+    /// </remarks>
     private static TempRepo CreateTempRepo()
     {
         var path = Directory.CreateTempSubdirectory("cghive-cfgrepo-").FullName;
         RunGit(path, "init", "-b", "main");
         RunGit(path, "config", "user.email", "test@example.com");
         RunGit(path, "config", "user.name", "CopilotHive Tests");
+        RunGit(path, "config", "core.autocrlf", "false");
         Directory.CreateDirectory(Path.Combine(path, "agents"));
         File.WriteAllText(
             Path.Combine(path, "agents", "orchestrator.agents.md"), "baseline\n");
@@ -2144,6 +2161,9 @@ public sealed class ConfigRepoGitOperationsTests
             RunGit(nestedPath, "init", "-b", "main");
             RunGit(nestedPath, "config", "user.email", "test@example.com");
             RunGit(nestedPath, "config", "user.name", "CopilotHive Tests");
+            // The nested repository is its OWN repository, so it needs its own line-ending policy:
+            // the SUT's clean/status invocations run INSIDE it and never see the parent's setting.
+            RunGit(nestedPath, "config", "core.autocrlf", "false");
             File.WriteAllText(Path.Combine(nestedPath, "content.txt"), "nested\n");
             RunGit(nestedPath, "add", ".");
             RunGit(nestedPath, "commit", "-m", "nested baseline");

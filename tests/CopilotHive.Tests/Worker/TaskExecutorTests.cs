@@ -7102,9 +7102,13 @@ public sealed class TaskExecutorTests
             Directory.CreateDirectory(outsideDir);
 
             RealGit(root, "init", "--bare", "-b", "main", remoteDir);
+            // The bare remote has no working tree, but it is a fixture repository whose own git
+            // invocations (the fixture's pushes/rev-parses and the SUT's fetch source) must see the
+            // same line-ending policy as every other fixture repo.
+            ConfigureLineEndings(remoteDir);
 
             RealGit(stagingDir, "init", "-b", "main");
-            ConfigureIdentity(stagingDir);
+            ConfigureFixtureRepo(stagingDir);
             if (seedAgentsGuidanceFile)
             {
                 Directory.CreateDirectory(Path.Combine(stagingDir, "agents"));
@@ -7138,7 +7142,7 @@ public sealed class TaskExecutorTests
             RealGit(stagingDir, "push", "origin", "main");
 
             RealGit(root, "clone", remoteDir, workerDir);
-            ConfigureIdentity(workerDir);
+            ConfigureFixtureRepo(workerDir);
 
             File.WriteAllText(
                 Path.Combine(outsideDir, "outside-sentinel.txt"), "outside-untouched\n");
@@ -7184,7 +7188,7 @@ public sealed class TaskExecutorTests
             var pusherDir = Path.Combine(Root, $"pusher-{Guid.NewGuid():N}");
             Directory.CreateDirectory(pusherDir);
             RealGit(Root, "clone", RemoteDir, pusherDir);
-            ConfigureIdentity(pusherDir);
+            ConfigureFixtureRepo(pusherDir);
             Directory.CreateDirectory(Path.Combine(pusherDir, "agents"));
             File.WriteAllText(
                 Path.Combine(pusherDir, "agents", "coder.agents.md"), newGuidanceContent);
@@ -7205,7 +7209,7 @@ public sealed class TaskExecutorTests
             var pusherDir = Path.Combine(Root, $"pusher-{Guid.NewGuid():N}");
             Directory.CreateDirectory(pusherDir);
             RealGit(Root, "clone", RemoteDir, pusherDir);
-            ConfigureIdentity(pusherDir);
+            ConfigureFixtureRepo(pusherDir);
             writeFiles(pusherDir);
             RealGit(pusherDir, "add", "-A");
             RealGit(pusherDir, "commit", "-m", message);
@@ -7226,12 +7230,54 @@ public sealed class TaskExecutorTests
             }
         }
 
-        private static void ConfigureIdentity(string workDir)
+        /// <summary>
+        /// Applies EVERY repo-local setting a fixture repository needs: the committer identity AND
+        /// the line-ending policy.
+        /// </summary>
+        /// <remarks>
+        /// ONE FUNNEL, so a fixture repo cannot accidentally receive the identity while missing the
+        /// line-ending policy — the omission that makes the real-Git vectors fail on a Windows host.
+        /// </remarks>
+        /// <param name="workDir">The fixture repository's working directory.</param>
+        private static void ConfigureFixtureRepo(string workDir)
         {
             RealGit(workDir, "config", "user.email", "realgit@copilothive.test");
             RealGit(workDir, "config", "user.name", "CopilotHive RealGit Tests");
+            ConfigureLineEndings(workDir);
         }
+
     }
+
+    /// <summary>
+    /// Pins the repository's OWN line-ending policy to <c>core.autocrlf=false</c>, so checked-out
+    /// files keep the LF bytes that are committed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY REPO-LOCAL AND NOT ONLY PER-INVOCATION. <see cref="RealGitResult"/> already passes
+    /// <c>-c core.autocrlf=false</c> for the FIXTURE's own git calls, but that <c>-c</c> applies
+    /// to those processes only. The SUT — the worker's GitOperations runner — spawns its OWN git
+    /// processes (<c>reset --hard</c>, <c>fetch</c>, <c>checkout</c>, <c>status</c>) that never see
+    /// that pinning. On a host whose GLOBAL <c>core.autocrlf=true</c> those working-tree
+    /// operations rewrite the checkout to CRLF, and the fixture's LF-pinned <c>status</c>/
+    /// <c>show</c> comparisons then report the CRLF-vs-LF byte difference as a MODIFICATION — so
+    /// an end state that is genuinely clean reads as dirty.
+    /// </para>
+    /// <para>
+    /// A repo-local setting applies to EVERY git process that runs inside this repository,
+    /// however it was launched — including every process the SUT starts. Configuring the repo
+    /// once, before the SUT ever touches it, is therefore what makes the LF expectations hold on
+    /// both platforms.
+    /// </para>
+    /// <para>
+    /// SCOPE BOUNDARY: this is deterministic TEST-FIXTURE configuration. It is NOT a claim that
+    /// production pins <c>core.autocrlf</c> on its git invocations — production does not, and
+    /// that gap is a known, accepted boundary fixed here rather than by changing <c>src/</c>.
+    /// </para>
+    /// </remarks>
+    /// <param name="workDir">The fixture repository to configure.</param>
+    private static void ConfigureLineEndings(string workDir) =>
+        RealGit(workDir, "config", "core.autocrlf", "false");
 
     /// <summary>
     /// Runs a real git subprocess and THROWS when it fails, so fixture setup can never proceed
@@ -7592,6 +7638,10 @@ public sealed class TaskExecutorTests
         RealGit(nestedDir, "init", "-b", "main");
         RealGit(nestedDir, "config", "user.email", "nested@copilothive.test");
         RealGit(nestedDir, "config", "user.name", "Nested");
+        // A nested repository is its OWN repository, so it needs its own line-ending policy: the
+        // SUT's post-restore status/clean runs observe it, and on a Windows host without this the
+        // CRLF rewrite of its tracked content would surface as residue.
+        ConfigureLineEndings(nestedDir);
         File.WriteAllText(Path.Combine(nestedDir, "nested-content.txt"), "nested-precious\n");
         RealGit(nestedDir, "add", "-A");
         RealGit(nestedDir, "commit", "-m", "nested baseline");
@@ -7799,6 +7849,7 @@ public sealed class TaskExecutorTests
               rm -rf '{pusherScriptDir}/clone'
               git -c protocol.file.allow=always clone -q '{playground.RemoteDir}' '{pusherScriptDir}/clone'
               cd '{pusherScriptDir}/clone' || exit 0
+              git config core.autocrlf false
               git config user.email hook@copilothive.test
               git config user.name Hook
               printf '{interloperContent.Replace("\n", "\\n")}' > agents/coder.agents.md
@@ -8860,6 +8911,8 @@ public sealed class TaskExecutorTests
                 var nestedDir = Path.Combine(worker, "nested-repo");
                 Directory.CreateDirectory(nestedDir);
                 RealGit(nestedDir, "init", "-b", "main");
+                // Configured AT CREATION, before the SUT's cleanup ever runs against it.
+                ConfigureLineEndings(nestedDir);
                 File.WriteAllText(Path.Combine(nestedDir, "nested-content.txt"), "nested-precious\n");
                 RealGit(nestedDir, "add", "-A");
                 return Task.FromResult("Mock agent response");
@@ -11949,9 +12002,14 @@ public sealed class TaskExecutorTests
         Directory.CreateDirectory(Path.GetDirectoryName(nestedFile)!);
 
         // PREMISE: the nested offender really exists at the expected COMPLETE relative path and really
-        // carries a marker line of its own.
+        // carries a marker line of its own. The premise path is composed from NATIVE segments so it is
+        // byte-identical to `nestedFile` on every platform: combining the forward-slash literal
+        // "agents/sub/x.agents.md" onto a native directory would produce a MIXED-separator path on
+        // Windows ("...\agents/sub/x.agents.md") that never equals the real native path. The
+        // forward-slash git path stays a SEPARATE constant because git reports repository-relative
+        // paths with forward slashes on every platform (asserted below).
         File.WriteAllText(nestedFile, ConflictMarkerContent);
-        Assert.Equal(nestedFile, Path.Combine(configRepoDir, NestedRelativePath));
+        Assert.Equal(nestedFile, Path.Combine(configRepoDir, "agents", "sub", "x.agents.md"));
         Assert.Contains(
             SplitLines(File.ReadAllText(nestedFile)),
             l => l.StartsWith("<<<<<<<", StringComparison.Ordinal));

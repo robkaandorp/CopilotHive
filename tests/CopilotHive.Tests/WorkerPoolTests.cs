@@ -2495,8 +2495,10 @@ public sealed class WorkerPoolTests
 
     /// <summary>Reads the production <c>WorkerPool</c> source, walking up to the repository root.</summary>
     /// <remarks>A MISSING FILE IS A LOUD FAILURE: a structural vector that cannot find its subject
-    /// proves nothing and must say so rather than silently skipping.</remarks>
-    /// <returns>The file's text.</returns>
+    /// proves nothing and must say so rather than silently skipping. The text is LF-NORMALIZED
+    /// because a Windows checkout stores the file with CRLF while the structural expectations here
+    /// are written with <c>"\n"</c>.</remarks>
+    /// <returns>The file's text, with CRLF line endings normalized to LF.</returns>
     private static string ReadPoolSource()
     {
         const string relative = "src/CopilotHive/Services/WorkerPool.cs";
@@ -2507,7 +2509,11 @@ public sealed class WorkerPoolTests
             var candidate = Path.Combine(
                 directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
             if (File.Exists(candidate))
-                return File.ReadAllText(candidate);
+            {
+                // Normalize to LF: a Windows checkout stores this file with CRLF, while every
+                // structural expectation is written with "\n".
+                return File.ReadAllText(candidate).Replace("\r\n", "\n");
+            }
 
             directory = directory.Parent;
         }
