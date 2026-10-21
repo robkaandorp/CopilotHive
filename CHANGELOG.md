@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+## [0.43.0] — 2026-10-21
+
+### Added
+
+- **Deterministic backup timestamps in tests** — `BackupService` accepts an optional `TimeProvider`, defaulting to `TimeProvider.System`, so archive timestamps can be controlled without changing production clock behavior. (`backup-tests-timeprovider`)
+- **Brain coder prompt tool requirement** — The Brain's coder instructions now explicitly require calling `report_code_changes` after committing. (`brain-prompt-coder-tool-name`)
+- **Serialized config saves and config-repo sync/reload** — In-app configuration mutations and the dispatcher's periodic sync/reload use the same `ConfigOperationLock`, preventing the reload from interleaving with writes. Repository add/update now persist their copy-on-write configuration changes under that lock and perform the git clone after releasing it, so a slow clone does not hold up other saves or sync. (`coordinate-config-saves-with-sync-reload`; `clone-repository-outside-config-lock`; `copy-on-write-repository-mutations`)
+- **Improver dispatch transition consistency** — If Improver dispatch throws, the pipeline advances through the shared `ApplyTransitionAsync` path rather than a separate duplicated transition block. (`improve-catch-use-apply-transition`)
+- **Configuration setting in the README** — The Full In-App Configuration bullet now includes `worker_task_timeout_minutes` in the Orchestrator settings list.
+
+### Changed
+
+- **Windows and Linux test portability** — Tests normalize source text and use repository-local Git settings and native path segments where needed; Windows cleanup uses bounded retries with an explicit failure, and the local-time test no longer depends on POSIX `TZ`. Related fixture cleanup, isolation and synchronization changes make worker and SQLite tests more robust across platforms. The full test suite now passes on Windows as well as Linux (verified by the maintainer's Windows full-suite run). (Test/tooling work: `deflake-worker-reconnect-tests`; `dispose-test-sqlite-contexts`; `tests-platform-neutral-newlines-and-real-git`; `tests-platform-neutral-windows-cleanup-and-timezone`; `adopt-hardened-force-delete-and-helper-test-hardening`; `fix-windows-rerun-failures`; `bound-merge-hook-blocker-below-delete-budget`; `tidy-worker-test-comments-and-temp-dirs`; `isolate-worker-test-config-repo-dirs`; `reconnect-plan-startfresh-failure-cleanup`; `registry-blob-tracker-refresh-test`)
+
 ## [0.42.0] — 2026-10-07
 
 ### Added
