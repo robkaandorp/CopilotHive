@@ -800,37 +800,66 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         // by this exact name on all platforms, and git on Windows (via Git Bash) executes
         // "#!/bin/sh" scripts without an extension or chmod.
         //
-        // WHY THE RELOCATION COMES FIRST — THE WORKING-DIRECTORY HOLD (working hypothesis, pending
-        // confirmation by the Windows re-run). Git runs a hook with the CLONE as its working
-        // directory, and the hook's `sleep` is an EXTERNAL child of the hook shell, so anything that
-        // survives the merge PROCESS kill can still be holding the CLONE as its CURRENT WORKING
-        // DIRECTORY. That distinction matters twice over: production's 30-second wait
-        // (BrainRepoManager.cs:1417-1422) bounds the MERGE PROCESS ITSELF and makes no claim about
-        // its descendants, and the 10-second bound below is only the MARKER POLL — neither one
-        // proves the hook shell (or the sleep it forked) terminated. On POSIX a surviving CWD is
-        // harmless, but Windows REFUSES TO DELETE A DIRECTORY THAT IS A LIVE PROCESS'S CURRENT
-        // WORKING DIRECTORY, so such a survivor defeats the hardened ForceDeleteDirectory retry
-        // budget in Dispose for as long as it lives — no number of retries can fix a CWD hold; only
-        // never holding the tree can. A CWD in a PARENT directory does not block deletion of a
-        // child; only a CWD INSIDE the deleted tree does.
+        // THE FIX IS THE BLOCKER'S BOUNDED LIFETIME — a plain, single-external-child `sleep 2`,
+        // never a busy loop. The test only needs the merge process to still be mid-flight INSIDE
+        // THE HOOK when cancellation propagates, and 2s is many times the typical
+        // marker->cancel latency. Decisively, a sleeper that survives the merge process kill now
+        // dies well INSIDE the deletion budget described below, so Dispose's cleanup succeeds even
+        // when the process kill misses it. Nothing else in this test changed: the relocation, the
+        // absolute-path marker touch, the 10-second poll-then-cancel protocol, the
+        // OperatingSystem.IsWindows() chmod guard and every assertion are exactly as they were.
         //
-        // `cd /` IS THE RELOCATION AND IT IS VERIFIED. On POSIX "/" is the real filesystem root. On
-        // Windows, MSYS/Cygwin path conversion resolves "/" to the MSYS mounting prefix — the Git
-        // for Windows installation root (e.g. "C:/Program Files/Git") — because the runtime maps the
-        // POSIX root onto that prefix ("/" <-> the MSYS root directory); either way it is a real
-        // directory OUTSIDE this fixture's tree, so a survivor parked there cannot block the
-        // fixture's deletion.
+        // THREE OBSERVATIONS FROM THE USER'S WINDOWS DIAGNOSTICS (re-run #3, tasklist, and a
+        // delayed-delete experiment) — these are VERIFIED FACTS:
+        //   (a) `sleep.exe` / `sh.exe` / `git.exe` processes are STILL ALIVE immediately after the
+        //       failure. The hook's blocker DOES survive the merge tree-kill on Windows.
+        //   (b) The leftover directory (repos\cancel-mid-repo) becomes deletable after roughly
+        //       30-60 seconds — the hold lasts the surviving sleeper's REMAINING LIFETIME (it was a
+        //       30-second sleeper).
+        //   (c) The merged `cd / || exit 1` relocation (09bdc46) did NOT prevent the hold.
         //
-        // `|| exit 1` IS THE LOUD-FAILURE GUARD — NO SILENT FALLBACK. If the relocation ever fails,
-        // the hook exits NON-ZERO BEFORE the marker is created and BEFORE any blocking: git treats
-        // a non-zero hook as a failed merge, so this test fails VISIBLY on its own assertions
-        // (the marker never appears, the poll's timeout guard cancels, and the cancellation
-        // assertions fail). It must never keep the fixture tree as its CWD and then block inside it.
+        // THE LEADING — BUT UNVERIFIED — MECHANISM IS THE MSYS DUAL CWD. MSYS/Cygwin processes track
+        // TWO current directories: a POSIX-visible one and a separate Windows-visible one. `cd /`
+        // changes only the POSIX one, while the spawned `sleep.exe` inherits the CLONE as its
+        // Windows-visible CWD at spawn — and the Windows CWD is what blocks deletion (Windows
+        // REFUSES TO DELETE A DIRECTORY THAT IS A LIVE PROCESS'S CURRENT WORKING DIRECTORY, and a CWD
+        // in a PARENT directory does not block deletion of a child; only a CWD INSIDE the deleted
+        // tree does). This is the most plausible explanation of (a)-(c), NOT confirmed fact: the
+        // tasklist output and the delayed-delete correlation show WHICH PROCESSES SURVIVE and WHEN
+        // the tree becomes deletable, but they do not identify which process holds which handle. The
+        // fix below is justified by the OBSERVATIONS ALONE and does not depend on this explanation.
         //
-        // THE BLOCKER STAYS BOUNDED: a plain `sleep 30`, never a busy loop, so a survivor dies by
-        // itself within 30 seconds even if every kill path fails. The marker touch keeps the
-        // ABSOLUTE path, so the poller below — which watches that same absolute path — is completely
-        // unaffected by the relocation, and the poll-then-cancel protocol is unchanged.
+        // THE EARLIER WORKING HYPOTHESIS IS REFUTED. "The hook relocates out of the tree, so no
+        // survivor holds the tree as its CWD, so Windows can delete it" was believed to be THE FIX.
+        // Observation (c) refutes it: the relocation is POSIX HYGIENE ONLY and is NOT what makes this
+        // test pass on Windows. It stays because it is harmless, because `|| exit 1` keeps the
+        // failure loud (a failed relocation exits NON-ZERO before the marker exists and before any
+        // blocking, so the assertions fail visibly rather than silently), and because it keeps this
+        // hook's shape identical to the relocation test below.
+        //
+        // THE DELETE BUDGET, CORRECTED. TestHelpers.ForceDeleteDirectory makes 9 attempts with a
+        // linear 100ms step between them, so the attempts occur after cumulative waits of
+        // 0, 0.1, 0.3, 0.6, 1.0, 1.5, 2.1, 2.8 and 3.6 seconds (excluding deletion overhead). A
+        // sleeper of duration S that starts at Dispose time therefore dies before attempt k where
+        // cumulative_wait[k] >= S. For S = 2s that is attempt 7 (cumulative 2.1s), leaving attempts
+        // 7-9 — about 1.5 seconds of remaining budget, a nominal headroom of ~1.8x over the sleeper
+        // lifetime. (Contrast: a 30-second sleeper outlives ALL 9 attempts, which is precisely the
+        // Windows failure; even a 3-second sleeper would leave only attempt 9 — no real headroom.)
+        //
+        // WHY 2s IS ENOUGH — A REDUCED MARGIN, NOT A GUARANTEE. The marker poller below sees the
+        // marker typically within ~100ms and settles another ~100ms before cancelling (~200ms
+        // typical), so 2s is roughly a 10x window, and the merge process must merely still be alive
+        // inside the hook when cancellation propagates. That is a margin, not a bound: Task.Run
+        // scheduling under load can delay detection, so this change REDUCES the timing margin rather
+        // than making the protocol literally deterministic. The user's Windows re-run #4 is the
+        // REQUIRED VALIDATION of this shape. The marker touch keeps the ABSOLUTE path, so the poller
+        // below — which watches that same absolute path — is unaffected by the relocation, the
+        // 10-second poll bound is unchanged, and production's 30-second wait on the MERGE PROCESS
+        // (BrainRepoManager.cs:1417-1422) still bounds only that process and makes no claim about its
+        // descendants.
+        //
+        // Process-killing surviving hook children remains available as a FUTURE design if evidence
+        // ever demands it; the short bound is the simpler fix that makes it unnecessary.
         var hooksDir = Path.Combine(clonePath, ".git", "hooks");
         Directory.CreateDirectory(hooksDir);
         var hookPath = Path.Combine(hooksDir, "prepare-commit-msg");
@@ -839,7 +868,7 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             "#!/bin/sh\n"
             + "cd / || exit 1\n"
             + $"touch \"{markerPath}\"\n"
-            + "sleep 30\n");
+            + "sleep 2\n");
         if (!OperatingSystem.IsWindows())
         {
             var chmodPsi = new ProcessStartInfo("chmod")
@@ -891,26 +920,44 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
     /// <summary>
     /// THE HOOK'S WORKING-DIRECTORY RELOCATION, PROVEN DIRECTLY. The cancellation test above
     /// installs a <c>prepare-commit-msg</c> hook that RELOCATES ITS OWN WORKING DIRECTORY out of the
-    /// fixture tree before it touches the marker and blocks, because a blocker that holds the
-    /// fixture tree as its current working directory is what Windows refuses to delete (the
-    /// orphaned-blocker hypothesis — a working hypothesis pending the user's Windows re-run, not an
-    /// established fact).
+    /// fixture tree before it touches the marker and blocks. This test pins that relocation on every
+    /// platform, because it is the hook's shape and it is POSIX hygiene for any surviving child.
+    /// <para>
+    /// WHAT THE RELOCATION IS NOT. It is NOT the Windows fix, and this comment must not be read that
+    /// way. The user's Windows diagnostics (re-run #3, tasklist, delayed-delete) CONFIRMED that the
+    /// hook's blocker processes survive the merge tree-kill on Windows, that the leftover directory
+    /// becomes deletable after roughly 30-60 seconds (matching the surviving sleeper's remaining
+    /// lifetime), and that this very <c>cd /</c> relocation did NOT prevent the hold. The earlier
+    /// "relocation is the fix" hypothesis is therefore REFUTED. The LEADING but UNVERIFIED
+    /// explanation is the MSYS dual CWD: MSYS/Cygwin processes track a POSIX-visible current
+    /// directory and a separate Windows-visible one, <c>cd /</c> changes only the POSIX one, and the
+    /// spawned <c>sleep.exe</c> keeps the clone as its Windows CWD — which is what blocks deletion.
+    /// The observations do not identify which process holds which handle, so that remains a
+    /// hypothesis. What actually makes the cancellation test pass on Windows is the bounded
+    /// <c>sleep 2</c> blocker: any surviving orphan dies inside Dispose's delete budget. The
+    /// attempts occur after cumulative waits of 0, 0.1, 0.3, 0.6, 1.0, 1.5, 2.1, 2.8 and 3.6
+    /// seconds (linear 100ms steps between attempts, excluding deletion overhead), so a 2s sleeper
+    /// dies by attempt 7, leaving attempts 7-9 — about 1.5 seconds of budget. Whether that makes the
+    /// test pass on Windows is the EXPECTED outcome pending the user's Windows re-run #4, not a
+    /// verified result. Do NOT extend the delete budget, weaken its loud failure, or add Windows
+    /// process-kill machinery on the strength of a relocation.
+    /// </para>
     /// <para>
     /// WHY THIS TEST EXISTS. The cancellation test itself CANNOT observe the relocation: the hook
     /// writes the marker with an ABSOLUTE path, so the marker appears whether or not the working
     /// directory moved, and on POSIX a retained working directory inside the tree does not block
-    /// deletion at all. That means the relocation — the whole point of the fix — had NO test
-    /// coverage: reverting it would leave the suite green. This test closes that gap by observing
-    /// the hook's working directory DIRECTLY, on every platform.
+    /// deletion at all. Without this test, reverting the relocation would leave the suite green. This
+    /// test closes that gap by observing the hook's working directory DIRECTLY, on every platform —
+    /// it pins the hook's committed shape against a silent regression, not a Windows cleanup claim.
     /// </para>
     /// <para>
     /// WHAT IT ASSERTS. (1) The hook's working directory, as seen by the hook itself, is NOT inside
     /// the fixture tree — the relocation took effect. (2) The marker is still created at its
     /// ABSOLUTE path — the relocation did not break the poller the cancellation test depends on.
     /// (3) The NEGATIVE CONTROL: the very same hook WITHOUT the relocation DOES run with the
-    /// fixture tree as its working directory — which is precisely the condition the fix exists to
-    /// eliminate, and which makes the positive assertion non-vacuous (a hook that never ran, or a
-    /// hook that ran somewhere else by accident, would not reproduce it).
+    /// fixture tree as its working directory — which is the condition the relocation removes from the
+    /// POSIX-visible CWD, and which makes the positive assertion non-vacuous (a hook that never ran,
+    /// or a hook that ran somewhere else by accident, would not reproduce it).
     /// </para>
     /// <para>
     /// WHY THE OBSERVATION IS A WORD, NOT A PATH. The hook reports MEMBERSHIP ("inside" / "outside")
@@ -1004,7 +1051,18 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
 
         // (1) THE RELOCATION TOOK EFFECT: the hook's working directory is NOT inside the fixture
         // tree. A hook that ran with the clone as its working directory would report "inside" here,
-        // and that is exactly the hold the fix removes.
+        // which is the POSIX-visible CWD the relocation removes.
+        // WHAT THE WINDOWS EVIDENCE DOES AND DOES NOT SHOW. The OBSERVED fact is that this
+        // relocation did NOT prevent the observed Windows hold: surviving sleep.exe / sh.exe /
+        // git.exe processes after the merge tree-kill, and the directory becoming deletable only
+        // after roughly 30-60 seconds. Tasklist output and that delayed-delete correlation establish
+        // A SURVIVING HOLD — they do NOT identify which process holds which handle. An inherited
+        // Windows-visible current directory remains the LEADING BUT UNVERIFIED explanation for the
+        // hold, not confirmed fact.
+        // The EXPECTED cleanup remedy is the bounded `sleep 2` blocker in the neighboring
+        // cancellation test's hook: a sleeper that short dies inside Dispose's delete budget even if
+        // it survives the kill. That is an expectation pending the user's Windows re-run #4, NOT an
+        // already-verified Windows outcome.
         Assert.True(File.Exists(cwdPath), "The hook must have recorded its membership observation.");
         var hookCwd = File.ReadAllText(cwdPath).Trim();
         Assert.True(
