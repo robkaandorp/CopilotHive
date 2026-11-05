@@ -57,6 +57,11 @@ public static class DatabaseMigration
             // '{}' are not misinterpreted as format placeholders.
             var statements = createScript.Split(';', StringSplitOptions.RemoveEmptyEntries);
 
+            // Additive backfills for the columns whose model definition intentionally carries no store
+            // default. Runs BEFORE the generated statements so a table that already exists receives
+            // the column (and its default for every existing row) exactly once.
+            ApplyAdditiveDefaults(connection, existingTables, logger);
+
             foreach (var rawStatement in statements)
             {
                 var statement = rawStatement.Trim();
@@ -112,6 +117,65 @@ public static class DatabaseMigration
         using var cmd = connection.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Additive backfills for columns whose EF model definition deliberately declares NO store
+    /// default (see <c>CopilotHiveDbContext.ConfigureUser</c> for why the model must not declare one).
+    /// <see cref="ReconcileColumns"/> can only add a <c>NOT NULL</c> column when its generated DDL
+    /// carries a <c>DEFAULT</c>, so these columns are added here with an explicit
+    /// <c>NOT NULL DEFAULT</c> instead — the ONLY kind of schema change this class performs beyond
+    /// adding whatever the model generates: nothing is dropped, renamed or rebuilt.
+    /// <para>
+    /// Each entry is <c>(table, column, type, default-literal)</c>. The default is the value every
+    /// PRE-EXISTING row receives, which is what makes the upgrade purely additive:
+    /// <c>users.enabled</c> backfills to <c>1</c>, so every legacy account reads back as an ENABLED
+    /// Admin (the legacy <c>role</c> text is already <c>'admin'</c>).
+    /// </para>
+    /// </summary>
+    private static readonly (string Table, string Column, string Type, string DefaultLiteral)[] AdditiveDefaults =
+    [
+        ("users", "enabled", "INTEGER", "1"),
+    ];
+
+    /// <summary>
+    /// Applies the <see cref="AdditiveDefaults"/> backfills to existing tables. A missing table is
+    /// skipped (it will be created with the full model DDL) and a present column is left untouched, so
+    /// the method is idempotent and cannot modify an existing value.
+    /// </summary>
+    /// <param name="connection">Open database connection.</param>
+    /// <param name="existingTables">Tables that already exist in the database.</param>
+    /// <param name="logger">Logger for reporting added columns.</param>
+    private static void ApplyAdditiveDefaults(
+        System.Data.Common.DbConnection connection,
+        IReadOnlySet<string> existingTables,
+        ILogger logger)
+    {
+        foreach (var (table, column, type, defaultLiteral) in AdditiveDefaults)
+        {
+            if (!existingTables.Contains(table))
+                continue;
+
+            var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = $"PRAGMA table_info(\"{table}\")";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                    existingColumns.Add(reader.GetString(1));
+            }
+
+            if (existingColumns.Contains(column))
+                continue;
+
+            logger.LogInformation(
+                "Adding missing column {ColumnName} to table {TableName} with additive default {DefaultLiteral}",
+                column, table, defaultLiteral);
+
+            ExecuteRaw(
+                connection,
+                $"ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {type} NOT NULL DEFAULT {defaultLiteral}");
+        }
     }
 
     /// <summary>

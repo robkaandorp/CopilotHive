@@ -102,9 +102,20 @@ public sealed class Program
     /// This is the OAuth bridge for the very first startup sync of the config repo: on an
     /// OAuth-only deployment the admin token lives in the database, not in the environment, so
     /// without this the startup <c>SyncRepoAsync</c> would authenticate with nothing. It reads the
-    /// admin user exactly as <see cref="UserService.GetAdminUserAsync"/> does (first user by
-    /// <c>Id</c>, no tracking) and constructs its own context on the SAME SQLite options as the
+    /// admin (original/bootstrap) account exactly as <see cref="UserService.GetAdminUserAsync"/> does
+    /// — the lowest <c>id</c> — and constructs its own context on the SAME SQLite options as the
     /// <c>AddDbContextFactory</c> registration.
+    /// </para>
+    /// <para>
+    /// <b>The lookup is deliberately a SCALAR raw-SQL projection of ONE legacy column.</b> It runs
+    /// BEFORE <c>DatabaseMigration.EnsureSchemaUpToDate</c> reconciles an existing database, so it
+    /// must succeed against a users table that does not yet have the columns a newer EF model maps
+    /// (for example <c>enabled</c>). Materializing a <c>UserEntity</c> here would issue
+    /// <c>SELECT ... enabled ...</c> and fail with "no such column" on every upgrade — which would
+    /// silently strip the credential from the first config-repo sync. Selecting only
+    /// <c>access_token</c> from <c>users</c> is inherently safe against a legacy schema, and — because
+    /// pending invitations live in a DIFFERENT table (<c>user_invitations</c>) and hold no tokens at
+    /// all — it can only ever return the activated original account's token, never an invited one.
     /// </para>
     /// <para>
     /// <b>The first-run limitation is DECLARED and accepted.</b> A fresh OAuth-only deployment has
@@ -116,8 +127,8 @@ public sealed class Program
     /// <param name="dbPath">Filesystem path of the SQLite database file.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
-    /// The admin user's non-whitespace access token, or <c>null</c> when no user exists, the token
-    /// is whitespace, or the database could not be read. A CALLER cancellation is RETHROWN — only
+    /// The original account's non-whitespace access token, or <c>null</c> when no account exists, the
+    /// token is whitespace, or the database could not be read. A CALLER cancellation is RETHROWN — only
     /// non-cancellation failures degrade to <c>null</c>.
     /// </returns>
     internal static async Task<string?> PreBuildOAuthTokenLookup(string dbPath, CancellationToken ct)
@@ -129,9 +140,28 @@ public sealed class Program
                 .Options;
 
             await using var db = new CopilotHiveDbContext(options);
-            var admin = await db.Users.AsNoTracking().OrderBy(u => u.Id).FirstOrDefaultAsync(ct);
 
-            return string.IsNullOrWhiteSpace(admin?.AccessToken) ? null : admin.AccessToken;
+            await db.Database.OpenConnectionAsync(ct);
+            try
+            {
+                // ONE legacy column, ordered by the original account's id. No entity materialization
+                // and no reference to any column added after the multi-user foundation, which is what
+                // keeps this working against a users table that has not been reconciled yet.
+                var connection = db.Database.GetDbConnection();
+                await using var command = connection.CreateCommand();
+                command.CommandText = "SELECT access_token FROM users ORDER BY id LIMIT 1";
+
+                var scalar = await command.ExecuteScalarAsync(ct);
+
+                // A SQL NULL (and DBNull) is "no token"; the whitespace rule below is unchanged.
+                var token = scalar as string;
+
+                return string.IsNullOrWhiteSpace(token) ? null : token;
+            }
+            finally
+            {
+                await db.Database.CloseConnectionAsync();
+            }
         }
         catch (Exception ex) when (ex is OperationCanceledException && ct.IsCancellationRequested)
         {

@@ -55,8 +55,17 @@ public sealed class CopilotHiveDbContext : DbContext
     /// <summary>Worker assignment contexts table.</summary>
     public DbSet<WorkerAssignmentContextEntity> WorkerAssignmentContexts { get; set; } = null!;
 
-    /// <summary>Users table (single-user admin model).</summary>
+    /// <summary>
+    /// Activated user accounts. Deliberately does NOT hold pending invitations: those live in
+    /// <see cref="UserInvitations"/> because <c>users.github_id</c> is NOT NULL and uniquely indexed.
+    /// </summary>
     public DbSet<UserEntity> Users { get; set; } = null!;
+
+    /// <summary>
+    /// Pending administrator invitations, keyed by NORMALIZED GitHub username. Never selected by the
+    /// legacy OAuth-admission or global-token account selector, and never counted as activated users.
+    /// </summary>
+    public DbSet<UserInvitationEntity> UserInvitations { get; set; } = null!;
 
     /// <summary>Issues table.</summary>
     public DbSet<Issue> Issues { get; set; } = null!;
@@ -103,9 +112,27 @@ public sealed class CopilotHiveDbContext : DbContext
         ConfigureCompletionReceipt(modelBuilder.Entity<CompletionReceiptEntity>());
         ConfigureWorkerAssignmentContext(modelBuilder.Entity<WorkerAssignmentContextEntity>());
         ConfigureUser(modelBuilder.Entity<UserEntity>());
+        ConfigureUserInvitation(modelBuilder.Entity<UserInvitationEntity>());
         ConfigureIssue(modelBuilder.Entity<Issue>());
     }
 
+    /// <summary>
+    /// Maps <see cref="UserEntity"/> to the <c>users</c> table. Every column that existed before the
+    /// multi-user foundation keeps its exact name, type and constraint — in particular
+    /// <c>github_id</c> stays <c>NOT NULL</c> and uniquely indexed. The only ADDED column is
+    /// <c>enabled</c>, which existing installations gain through
+    /// <see cref="DatabaseMigration"/>'s explicit additive backfill (<c>NOT NULL DEFAULT 1</c>), so
+    /// every legacy row reads back as an ENABLED Admin.
+    /// </summary>
+    /// <remarks>
+    /// Neither <c>role</c> nor <c>enabled</c> declares a STORE default in the model, on purpose. EF
+    /// Core omits a column with a store default from the INSERT whenever its value equals the CLR
+    /// default of its type, and lets the store default win: for a <c>bool</c> that means an explicit
+    /// <c>false</c> (a DISABLED account) would be silently stored as enabled, and for the role enum an
+    /// explicit <see cref="UserRole.Viewer"/> would silently become <see cref="UserRole.Admin"/>. Both
+    /// are real, meaningful states here, so both columns are always written explicitly and the
+    /// legacy-schema <c>DEFAULT</c>s are handled by the schema migration instead.
+    /// </remarks>
     private static void ConfigureUser(EntityTypeBuilder<UserEntity> entity)
     {
         entity.ToTable("users");
@@ -120,11 +147,56 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.AccessToken).HasColumnName("access_token").IsRequired();
         entity.Property(e => e.RefreshToken).HasColumnName("refresh_token");
         entity.Property(e => e.TokenExpiresAt).HasColumnName("token_expires_at");
-        entity.Property(e => e.Role).HasColumnName("role").IsRequired().HasDefaultValue("admin");
+
+        // The role is written through the SHARED validated conversion: lowercase text on the wire,
+        // and an unrecognised persisted value throws instead of becoming a fallback role. The legacy
+        // text value 'admin' is byte-identical to this conversion's Admin output.
+        entity.Property(e => e.Role)
+            .HasColumnName("role")
+            .IsRequired()
+            .HasConversion(UserRoleConverter);
+
+        // ADDITIVE column. DatabaseMigration adds it to an existing users table as
+        // "NOT NULL DEFAULT 1", so every pre-existing row upgrades to an ENABLED account.
+        entity.Property(e => e.Enabled)
+            .HasColumnName("enabled")
+            .IsRequired()
+            .ValueGeneratedNever();
+
         entity.Property(e => e.CreatedAt).HasColumnName("created_at").IsRequired();
         entity.Property(e => e.LastLoginAt).HasColumnName("last_login_at");
 
         entity.HasIndex(e => e.GitHubId).IsUnique();
+    }
+
+    /// <summary>
+    /// Maps <see cref="UserInvitationEntity"/> to its own <c>user_invitations</c> table. The
+    /// normalized username carries a UNIQUE index, so duplicate invitations are rejected by the
+    /// DATABASE rather than by a read-then-insert race. There is deliberately NO foreign key to
+    /// <c>users</c>: an invitation records the activated account id as an additive reference, and it
+    /// must survive independently of the account row (nothing cascades).
+    /// </summary>
+    private static void ConfigureUserInvitation(EntityTypeBuilder<UserInvitationEntity> entity)
+    {
+        entity.ToTable("user_invitations");
+
+        entity.HasKey(e => e.Id);
+        entity.Property(e => e.Id).HasColumnName("id").ValueGeneratedOnAdd();
+        entity.Property(e => e.NormalizedUsername).HasColumnName("normalized_username").IsRequired();
+        entity.Property(e => e.Role)
+            .HasColumnName("role")
+            .IsRequired()
+            .HasConversion(UserRoleConverter);
+        entity.Property(e => e.Enabled).HasColumnName("enabled").IsRequired();
+        entity.Property(e => e.CreatedAt).HasColumnName("created_at").IsRequired();
+        entity.Property(e => e.UpdatedAt).HasColumnName("updated_at").IsRequired();
+        entity.Property(e => e.RevokedAt).HasColumnName("revoked_at");
+        entity.Property(e => e.ActivatedUserId).HasColumnName("activated_user_id");
+        entity.Property(e => e.ActivatedAt).HasColumnName("activated_at");
+
+        entity.HasIndex(e => e.NormalizedUsername)
+            .HasDatabaseName("idx_user_invitations_normalized_username")
+            .IsUnique();
     }
 
     private static void ConfigureIssue(EntityTypeBuilder<Issue> entity)
@@ -371,6 +443,18 @@ public sealed class CopilotHiveDbContext : DbContext
             e => e.ToString().ToLowerInvariant(),
             s => Enum.Parse<TEnum>(s, true));
     }
+
+    /// <summary>
+    /// The SHARED validated persistence conversion for <see cref="UserRole"/>: lowercase role text in
+    /// both directions, through <see cref="UserRoleText"/>. Unlike the generic
+    /// <see cref="LowercaseEnumConverter{TEnum}"/> it is TOTAL on both sides — an undefined enum value
+    /// cannot be written, and an unrecognised persisted value throws instead of silently becoming a
+    /// role (the generic converter would happily parse <c>"2"</c> into <c>(TEnum)2</c>).
+    /// </summary>
+    private static readonly ValueConverter<UserRole, string> UserRoleConverter =
+        new ValueConverter<UserRole, string>(
+            role => UserRoleText.Format(role),
+            text => UserRoleText.Parse(text));
 
     /// <summary>
     /// Normalizes a <see cref="DateTime"/> to UTC regardless of the machine's local timezone,
