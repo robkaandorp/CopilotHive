@@ -376,21 +376,18 @@ public sealed class ComposerUserStateTests : IDisposable
     }
 
     [Fact]
-    public void LegacyComposer_WithLegacyAttachmentService_StaysValid_AndKeepsLegacyRoot()
+    public async Task LegacyComposer_WithLegacyAttachmentService_StaysValid_AndKeepsLegacyRoot()
     {
         var legacy = new ComposerAttachmentService(StateDir, NullLogger<ComposerAttachmentService>.Instance);
         using var db = CopilotHiveDbContext.CreateInMemory();
         var store = new GoalStore(db, NullLogger<GoalStore>.Instance);
 
-        using var _ = new ExitStack();
-        var composer = CreateComposer(store, StateDir, null, legacy);
+        await using var composer = CreateComposer(store, StateDir, null, legacy);
 
         Assert.Equal(Path.GetFullPath(Path.Combine(StateDir, "composer-attachments")), legacy.AttachmentsRootPath);
         Assert.Null(legacy.UserId);
         Assert.NotNull(composer);
     }
-
-    private sealed class ExitStack : IDisposable { public void Dispose() { } }
 
     // ── Legacy byte-identical behaviour ──
 
