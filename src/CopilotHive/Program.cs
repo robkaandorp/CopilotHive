@@ -9,6 +9,7 @@ using CopilotHive.Metrics;
 using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Authentication;
@@ -681,6 +682,26 @@ public sealed class Program
             var authEnabled = !string.IsNullOrEmpty(oauthClientId) && !string.IsNullOrEmpty(oauthClientSecret);
 
             builder.Services.AddSingleton<UserService>();
+
+            // ── Authorization primitives (principal / policy / resolver / circuit accessor) ──
+            // REGISTRATION ONLY: nothing here is enforced at any existing endpoint, facade, route or
+            // Composer tool, and the OAuth admission path and fallback policy above/below are
+            // untouched. The auth mode is an EXPLICIT input computed from the same predicate as
+            // `authEnabled` (both OAuth env vars set), so open mode is never inferred per request.
+            // The resolver and policy are stateless singletons and never capture a user principal;
+            // the circuit accessor is SCOPED per circuit because it holds that circuit's
+            // AuthenticationState identity (it still re-resolves current DB state on every
+            // operation). Later enforcement reads the principal from these primitives explicitly.
+            var authMode = HiveAuthMode.FromValues(oauthClientId, oauthClientSecret);
+            builder.Services.AddSingleton(authMode);
+            builder.Services.AddSingleton<HivePolicy>();
+            builder.Services.AddSingleton(sp => new HivePrincipalResolver(
+                sp.GetRequiredService<UserService>(),
+                sp.GetRequiredService<HiveAuthMode>(),
+                sp.GetRequiredService<ILogger<HivePrincipalResolver>>()));
+            builder.Services.AddScoped(sp => new CircuitUserPrincipalAccessor(
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>()));
 
             if (authEnabled)
             {
