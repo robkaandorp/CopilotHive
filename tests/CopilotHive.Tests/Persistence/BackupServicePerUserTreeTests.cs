@@ -478,21 +478,40 @@ public sealed class BackupServicePerUserTreeTests
             var ct = TestContext.Current.CancellationToken;
             var archive = Path.Combine(service.BackupDirectory, "peruser-traversal.tar.gz");
             Directory.CreateDirectory(service.BackupDirectory);
+
+            // The extraction directory is {BackupDirectory}/restore-tmp-{stamp}; the entry is resolved
+            // against it. Three ".." segments climb composer/users/ AND the extraction directory
+            // itself, so the entry resolves to {BackupDirectory}/{unique} — OUTSIDE the extraction
+            // directory by construction, in a location the restore's temp cleanup never touches (an
+            // unguarded extractor's write therefore survives to be observed).
+            var uniqueName = $"peruser-evil-{Guid.NewGuid():N}.txt";
+            var entryName = $"composer/users/../../../{uniqueName}";
+            var escapedTarget = Path.GetFullPath(Path.Combine(service.BackupDirectory, uniqueName));
+            var extractionDir = Path.GetFullPath(Path.Combine(service.BackupDirectory, "restore-tmp-20250101T000000"));
+            Assert.Equal(
+                escapedTarget,
+                Path.GetFullPath(Path.Combine(extractionDir, entryName.Replace('/', Path.DirectorySeparatorChar))));
+            Assert.False(escapedTarget.StartsWith(extractionDir + Path.DirectorySeparatorChar, StringComparison.Ordinal),
+                "premise: the crafted entry must resolve outside the extraction directory");
+            Assert.False(File.Exists(escapedTarget));
+
             var src = Path.Combine(Path.GetTempPath(), $"peruser-trav-{Guid.NewGuid():N}");
             Directory.CreateDirectory(src);
             try
             {
                 await File.WriteAllTextAsync(Path.Combine(src, "backup-manifest.json"), "{}", ct);
-                var payload = Path.Combine(src, "payload.txt");
-                await File.WriteAllTextAsync(payload, "pwned", ct);
+                await File.WriteAllTextAsync(Path.Combine(src, "payload.txt"), "pwned", ct);
+                await File.WriteAllTextAsync(Path.Combine(src, "control.json"), "control-session", ct);
 
                 await using var fs = File.Create(archive);
                 await using var gz = new GZipStream(fs, CompressionLevel.SmallestSize);
                 await using var tar = new TarWriter(gz, TarEntryFormat.Pax);
                 await tar.WriteEntryAsync(Path.Combine(src, "backup-manifest.json"), "backup-manifest.json", ct);
+                // A VALID per-user entry: it must be restored, proving the restore ran to completion.
+                await tar.WriteEntryAsync(Path.Combine(src, "control.json"), "composer/users/1/session.json", ct);
 
-                var malicious = new PaxTarEntry(TarEntryType.RegularFile, "composer/users/../../peruser-evil.txt");
-                await using (var data = File.OpenRead(payload))
+                var malicious = new PaxTarEntry(TarEntryType.RegularFile, entryName);
+                await using (var data = File.OpenRead(Path.Combine(src, "payload.txt")))
                 {
                     malicious.DataStream = data;
                     await tar.WriteEntryAsync(malicious, ct);
@@ -503,23 +522,13 @@ public sealed class BackupServicePerUserTreeTests
                 Directory.Delete(src, recursive: true);
             }
 
-            // The sentinel an attacker would target: the state directory's parent.
-            var escaped = Path.GetFullPath(Path.Combine(stateDir, "..", "peruser-evil.txt"));
-            if (File.Exists(escaped))
-                File.Delete(escaped);
+            // No blanket catch: any restore failure fails the test loudly.
+            var result = await service.RestoreBackupAsync(archive, ct);
 
-            try
-            {
-                await service.RestoreBackupAsync(archive, ct);
-            }
-            catch
-            {
-                // Either outcome is acceptable (a missing manifest after the skip throws); what
-                // matters is that NOTHING escaped the extraction directory.
-            }
-
-            Assert.False(File.Exists(escaped),
-                $"A per-user archive entry escaped the extraction directory to {escaped}");
+            Assert.False(File.Exists(escapedTarget),
+                $"A per-user archive entry escaped the extraction directory to {escapedTarget}");
+            Assert.Equal(1, result.ComposerUsersCount);
+            Assert.Equal("control-session", await File.ReadAllTextAsync(UserPath(stateDir, Path.Combine("1", "session.json")), ct));
         }
         finally
         {

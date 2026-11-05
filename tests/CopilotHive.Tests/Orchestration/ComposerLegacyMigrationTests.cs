@@ -457,4 +457,186 @@ public sealed class ComposerLegacyMigrationTests : IDisposable
             .ThrowsAsync(new InvalidOperationException("model_max_prompt_tokens_exceeded"));
         return mock.Object;
     }
+
+    // ── Unusable-structure sources (reviewer finding 1) ──
+
+    /// <summary>Payloads that DESERIALIZE but break the session's consumers (or the load itself).</summary>
+    public static TheoryData<string> UnusablePayloads => new()
+    {
+        """{"messages":[null]}""",                                                       // the reviewer's probe
+        """{"messages":[{"role":"user","contents":[null]}]}""",                         // sibling shape: null content entry
+        """{"messages":[{"role":"user","text":"ok"},null]}""",                          // null AFTER a valid message
+        """{"messages":[{"role":""}]}""",                                                // empty role (load throws ArgumentException)
+        """{"messages":[{"role":"user","contents":[{"$type":"functionCall","callId":null,"name":null}]}]}""", // load throws ArgumentNullException
+        """null""",                                                                      // load throws InvalidOperationException
+    };
+
+    private async Task AssertFailedClosedAsync(ComposerUserState original, string payload)
+    {
+        Assert.False(original.PersistenceAllowed);
+        Assert.False(File.Exists(ComposerUserState.SessionFilePath(StateDir, original)), "no destination copy");
+        Assert.False(File.Exists(Evidence(original)), "no evidence");
+        Assert.Equal(payload, await File.ReadAllTextAsync(LegacyFile, Ct)); // legacy source byte-unchanged
+    }
+
+    [Theory]
+    [MemberData(nameof(UnusablePayloads))]
+    public async Task UnusableSource_DirectSeam_FailsClosed_AsMigrationFailure(string payload)
+    {
+        await SeedUsersAsync();
+        await File.WriteAllTextAsync(LegacyFile, payload, Ct);
+        var original = await OriginalAsync();
+
+        await Assert.ThrowsAsync<ComposerMigrationException>(() => ComposerLegacyMigration.EnsureAsync(StateDir, original, Ct));
+
+        await AssertFailedClosedAsync(original, payload);
+    }
+
+    [Theory]
+    [MemberData(nameof(UnusablePayloads))]
+    public async Task UnusableSource_ConnectWithRegistry_FailsClosed_NotNullReference_AndBlocksSaves(string payload)
+    {
+        await SeedUsersAsync();
+        await File.WriteAllTextAsync(LegacyFile, payload, Ct);
+        var original = await OriginalAsync();
+        var registry = new LlmSessionRegistry();
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var composer = CreateComposer(new GoalStore(db, NullLogger<GoalStore>.Instance), StateDir, original, registry: registry);
+
+        var ex = await Record.ExceptionAsync(() => composer.ConnectAsync(Ct));
+
+        Assert.IsType<ComposerMigrationException>(ex);
+        Assert.Empty(registry.GetAll());
+        await Assert.ThrowsAsync<ComposerMigrationException>(() => composer.SaveSessionAsync(Ct));
+        await AssertFailedClosedAsync(original, payload);
+    }
+
+    [Theory]
+    [MemberData(nameof(UnusablePayloads))]
+    public async Task UnusableSource_ConnectWithoutRegistry_FailsClosed_AndBlocksSaves(string payload)
+    {
+        await SeedUsersAsync();
+        await File.WriteAllTextAsync(LegacyFile, payload, Ct);
+        var original = await OriginalAsync();
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var composer = CreateComposer(new GoalStore(db, NullLogger<GoalStore>.Instance), StateDir, original, registry: null);
+
+        var ex = await Record.ExceptionAsync(() => composer.ConnectAsync(Ct));
+
+        Assert.IsType<ComposerMigrationException>(ex);
+        Assert.False(composer.IsConnected);
+        await Assert.ThrowsAsync<ComposerMigrationException>(() => composer.SaveSessionAsync(Ct));
+        await AssertFailedClosedAsync(original, payload);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task UnusableSource_AgentConnect_FailsClosed(bool withRegistry)
+    {
+        await SeedUsersAsync();
+        const string payload = """{"messages":[null]}""";
+        await File.WriteAllTextAsync(LegacyFile, payload, Ct);
+        var original = await OriginalAsync();
+        var agent = CreateAgent(StateDir, original, withRegistry ? new LlmSessionRegistry() : null);
+
+        await Assert.ThrowsAsync<ComposerMigrationException>(() => agent.ConnectAsync(Ct));
+
+        Assert.False(agent.IsConnected);
+        await AssertFailedClosedAsync(original, payload);
+    }
+
+    [Fact]
+    public async Task ValidEmptySession_StillMigrates_ShapeNotVolume()
+    {
+        await SeedUsersAsync();
+        await File.WriteAllTextAsync(LegacyFile, "{}", Ct);
+        var original = await OriginalAsync();
+
+        Assert.Equal(ComposerMigrationOutcome.Migrated, await ComposerLegacyMigration.EnsureAsync(StateDir, original, Ct));
+
+        Assert.True(File.Exists(Evidence(original)));
+        Assert.True(original.PersistenceAllowed);
+    }
+
+    // ── Source-path type (reviewer finding 2) ──
+
+    [Fact]
+    public async Task DirectoryAtLegacySourcePath_DirectSeam_FailsClosed_NotNoLegacySource()
+    {
+        await SeedUsersAsync();
+        Directory.CreateDirectory(LegacyFile);
+        var original = await OriginalAsync();
+
+        var ex = await Assert.ThrowsAsync<ComposerMigrationException>(() => ComposerLegacyMigration.EnsureAsync(StateDir, original, Ct));
+
+        Assert.Contains("directory", ex.Message);
+        Assert.False(original.PersistenceAllowed);
+        Assert.False(File.Exists(Evidence(original)));
+        Assert.False(File.Exists(ComposerUserState.SessionFilePath(StateDir, original)));
+        Assert.True(Directory.Exists(LegacyFile));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DirectoryAtLegacySourcePath_Connect_Fails_BlocksSaves_AndPersistsNoPerUserSession(bool withRegistry)
+    {
+        await SeedUsersAsync();
+        Directory.CreateDirectory(LegacyFile);
+        var original = await OriginalAsync();
+        var registry = withRegistry ? new LlmSessionRegistry() : null;
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var composer = CreateComposer(new GoalStore(db, NullLogger<GoalStore>.Instance), StateDir, original, registry: registry);
+
+        await Assert.ThrowsAsync<ComposerMigrationException>(() => composer.ConnectAsync(Ct));
+        await Assert.ThrowsAsync<ComposerMigrationException>(() => composer.SaveSessionAsync(Ct));
+
+        Assert.False(composer.IsConnected);
+        Assert.True(registry is null || registry.GetAll().Count == 0);
+        Assert.False(File.Exists(Evidence(original)));
+        Assert.False(File.Exists(ComposerUserState.SessionFilePath(StateDir, original)));
+    }
+
+    [Fact]
+    public async Task GenuinelyAbsentSource_StillConnectsFresh_NoMarker_AndSavesWork_BesideTheDirectoryCase()
+    {
+        await SeedUsersAsync();
+        var original = await OriginalAsync();
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var composer = CreateComposer(new GoalStore(db, NullLogger<GoalStore>.Instance), StateDir, original);
+
+        await composer.ConnectAsync(Ct);
+        await composer.SaveSessionAsync(Ct);
+
+        Assert.False(File.Exists(Evidence(original)));
+        Assert.True(File.Exists(ComposerUserState.SessionFilePath(StateDir, original)));
+    }
+
+    [Fact]
+    public async Task SourceProbeFault_Propagates_InsteadOfSettlingAsNoLegacySource()
+    {
+        await SeedUsersAsync();
+        var original = await OriginalAsync();
+        var fault = new UnauthorizedAccessException("probe denied");
+
+        var ex = await Assert.ThrowsAsync<ComposerMigrationException>(
+            () => ComposerLegacyMigration.EnsureAsync(StateDir, original, Ct, _ => throw fault));
+
+        Assert.Same(fault, ex.InnerException);
+        Assert.False(original.PersistenceAllowed);
+        Assert.False(File.Exists(Evidence(original)));
+        Assert.False(File.Exists(ComposerUserState.SessionFilePath(StateDir, original)));
+    }
+
+    [Fact]
+    public async Task SourceProbeReportingNotFound_IsGenuineAbsence()
+    {
+        await SeedUsersAsync();
+        var original = await OriginalAsync();
+
+        Assert.Equal(ComposerMigrationOutcome.NoLegacySource,
+            await ComposerLegacyMigration.EnsureAsync(StateDir, original, Ct, p => throw new DirectoryNotFoundException(p)));
+        Assert.True(original.PersistenceAllowed);
+    }
 }

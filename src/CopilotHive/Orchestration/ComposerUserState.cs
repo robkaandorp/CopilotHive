@@ -185,7 +185,13 @@ internal static class ComposerLegacyMigration
     /// <param name="stateDir">Runtime state directory.</param>
     /// <param name="user">The validated identity (only an original-admin identity migrates).</param>
     /// <param name="ct">Cancellation token; cancellation is propagated, never recorded as a failure.</param>
-    public static async Task<ComposerMigrationOutcome> EnsureAsync(string stateDir, ComposerUserState user, CancellationToken ct)
+    /// <param name="probeSourceAttributes">
+    /// Test seam for the legacy-source existence/type probe (defaults to <see cref="File.GetAttributes(string)"/>);
+    /// lets tests inject a genuine filesystem fault. Inert when <c>null</c>.
+    /// </param>
+    public static async Task<ComposerMigrationOutcome> EnsureAsync(
+        string stateDir, ComposerUserState user, CancellationToken ct,
+        Func<string, FileAttributes>? probeSourceAttributes = null)
     {
         ArgumentNullException.ThrowIfNull(user);
 
@@ -195,7 +201,7 @@ internal static class ComposerLegacyMigration
         user.MarkLegacyHistorySettled(false);
         try
         {
-            var outcome = await ClaimAsync(stateDir, user, ct);
+            var outcome = await ClaimAsync(stateDir, user, ct, probeSourceAttributes ?? File.GetAttributes);
             user.MarkLegacyHistorySettled(true);
             return outcome;
         }
@@ -214,14 +220,15 @@ internal static class ComposerLegacyMigration
         }
     }
 
-    private static async Task<ComposerMigrationOutcome> ClaimAsync(string stateDir, ComposerUserState user, CancellationToken ct)
+    private static async Task<ComposerMigrationOutcome> ClaimAsync(
+        string stateDir, ComposerUserState user, CancellationToken ct, Func<string, FileAttributes> probeSourceAttributes)
     {
         var evidence = ComposerUserState.LegacyMigrationEvidencePath(stateDir, user);
         if (File.Exists(evidence))
             return ComposerMigrationOutcome.AlreadyClaimed;
 
         var source = ComposerUserState.SessionFilePath(stateDir, null);
-        if (!File.Exists(source))
+        if (!IsLegacySourcePresent(source, probeSourceAttributes))
             return ComposerMigrationOutcome.NoLegacySource;
 
         var sourceBytes = await File.ReadAllBytesAsync(source, ct);
@@ -256,16 +263,83 @@ internal static class ComposerLegacyMigration
         return outcome;
     }
 
-    private static async Task EnsureSourceIsValidSessionAsync(string source, CancellationToken ct)
+    /// <summary>
+    /// Distinguishes the three source states. Only a genuinely ABSENT entry (file or directory not
+    /// found) is "no legacy source". A directory at the source path is an invalid path collision and
+    /// fails closed. Any other probe fault (e.g. access denied) propagates — <see cref="File.Exists"/>
+    /// is deliberately not used because it reports every fault as "absent".
+    /// </summary>
+    private static bool IsLegacySourcePresent(string source, Func<string, FileAttributes> probeSourceAttributes)
     {
+        FileAttributes attributes;
         try
         {
-            await SharpCoder.AgentSession.LoadAsync(source, ct);
+            attributes = probeSourceAttributes(source);
         }
-        catch (Exception ex) when (ex is System.Text.Json.JsonException or FormatException or InvalidDataException)
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return false;
+        }
+
+        if ((attributes & FileAttributes.Directory) != 0)
+        {
+            throw new ComposerMigrationException(
+                $"The legacy Composer session path '{source}' is a directory, not a session file; it cannot be migrated or treated as absent.");
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Rejects a source that is not a USABLE session before anything is copied or recorded. Loading
+    /// alone is not enough: a payload such as <c>{"messages":[null]}</c> deserializes but then fails in
+    /// the consumers (token estimate, chat history, save). So after the load this walks exactly what
+    /// they read — every message and every message content must be non-null, and the estimate and
+    /// usage snapshot must be computable. Shape, not volume: <c>{}</c> (an empty session) stays valid.
+    /// </summary>
+    private static async Task EnsureSourceIsValidSessionAsync(string source, CancellationToken ct)
+    {
+        SharpCoder.AgentSession session;
+        try
+        {
+            session = await SharpCoder.AgentSession.LoadAsync(source, ct);
+        }
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or FormatException or InvalidDataException
+            or ArgumentException or NullReferenceException or InvalidOperationException)
         {
             throw new ComposerMigrationException($"The legacy Composer session '{source}' is corrupt; it was not migrated.", ex);
         }
+
+        try
+        {
+            ValidateSessionStructure(session);
+        }
+        catch (Exception ex) when (ex is not ComposerMigrationException and not OperationCanceledException)
+        {
+            throw new ComposerMigrationException($"The legacy Composer session '{source}' has an unusable structure; it was not migrated.", ex);
+        }
+    }
+
+    private static void ValidateSessionStructure(SharpCoder.AgentSession session)
+    {
+        var history = session.MessageHistory ?? throw new InvalidDataException("The session has no message history.");
+        foreach (var message in history)
+        {
+            if (message is null)
+                throw new InvalidDataException("The session contains a null message.");
+
+            foreach (var content in message.Contents ?? [])
+            {
+                if (content is null)
+                    throw new InvalidDataException("The session contains a message with a null content entry.");
+            }
+
+            _ = message.Role;
+            _ = message.Text;
+        }
+
+        _ = session.EstimatedContextTokens;
+        _ = session.Usage.Snapshot();
     }
 
     private static async Task CopyVerifiedWithoutOverwriteAsync(byte[] content, string destination, CancellationToken ct)
