@@ -2,6 +2,8 @@ using CopilotHive.Persistence;
 using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 
+using CopilotHive.Tests;
+
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -333,6 +335,84 @@ public sealed class UserServiceTests
         Assert.Equal("original", original.Username);
         Assert.Equal("1", original.GitHubId);
     }
+
+    /// <summary>
+    /// THE TOKEN SELECTOR NEVER FALLS BACK TO AN INVITED ACCOUNT — not even when the ORIGINAL
+    /// account holds no usable token. The original account is the only credential source: an invited
+    /// Admin that owns a token of its own must never be substituted, because that would re-route the
+    /// legacy global token to a different identity.
+    /// </summary>
+    [Fact]
+    public async Task GetActiveAccessTokenAsync_OriginalAccountWithoutAToken_DoesNotFallBackToAnInvitedAdmin()
+    {
+        var (service, factory) = CreateService();
+        using var _ = factory;
+
+        // The ORIGINAL account exists but holds no usable token — the case in which a fallback
+        // could be introduced.
+        await BootstrapAsync(service, githubId: "1", username: "original", token: "   ");
+
+        // A HIGHER-id invited Admin that owns a real credential.
+        using (var db = factory.CreateDbContext())
+        {
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = "2",
+                Username = "invitedadmin",
+                AccessToken = "invited-admin-token",
+                Role = UserRole.Admin,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        // The invited Admin's token is NEVER returned.
+        var token = await service.GetActiveAccessTokenAsync(Ct);
+        Assert.NotEqual("invited-admin-token", token);
+    }
+
+    /// <summary>
+    /// THE TOKEN SELECTOR NEVER CONSULTS THE INVITATION DIRECTORY AT ALL. The invitation table is a
+    /// different table with no credentials in it, so a selector that never mentions it cannot
+    /// possibly return an invited account's token. This is the structural form of the same
+    /// invariant, and it fails the moment the selector grows an invitation branch.
+    /// </summary>
+    [Fact]
+    public void GetActiveAccessTokenAsync_SelectorNeverConsultsTheInvitationDirectory()
+    {
+        var body = TestSourceScanner.ExtractMethodBlockPreservingLiterals(
+            ReadUserServiceSource(),
+            "public async Task<string?> GetActiveAccessTokenAsync");
+
+        Assert.NotNull(body);
+        Assert.Contains("GetAdminUserAsync", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("Invitation", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("UserInvitations", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("Role == UserRole.Admin", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE ORIGINAL-ACCOUNT SELECTOR IS THE LOWEST-ID ACCOUNT, regardless of role or enabled state:
+    /// it never consults the invitation directory either.
+    /// </summary>
+    [Fact]
+    public void GetAdminUserAsync_SelectorNeverConsultsTheInvitationDirectory()
+    {
+        var body = TestSourceScanner.ExtractMethodBlockPreservingLiterals(
+            ReadUserServiceSource(),
+            "public async Task<UserEntity?> GetAdminUserAsync");
+
+        Assert.NotNull(body);
+        Assert.Contains("OrderBy(u => u.Id)", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("Invitation", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Reads <c>UserService.cs</c> from the repository's production source tree.</summary>
+    private static string ReadUserServiceSource() =>
+        File.ReadAllText(
+                Path.Combine(TestRepoRoot.Find(), "src", "CopilotHive", "Services", "UserService.cs"))
+            .ReplaceLineEndings("\n");
 
     // ── Secret-free listings ─────────────────────────────────────────────────
 
