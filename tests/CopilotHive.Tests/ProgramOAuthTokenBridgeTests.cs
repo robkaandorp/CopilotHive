@@ -76,6 +76,117 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
         await db.SaveChangesAsync(TestContext.Current.CancellationToken);
     }
 
+    /// <summary>
+    /// Creates the PRE-multi-user <c>users</c> table EXACTLY as the legacy single-admin model left it:
+    /// <c>github_id</c> NOT NULL and uniquely indexed, a <c>role</c> text column defaulting to
+    /// <c>'admin'</c> — and, critically, NO <c>enabled</c> column. It also creates the modern
+    /// <c>user_invitations</c> table, so a legacy-token test can prove the lookup never reads it.
+    /// </summary>
+    private static async Task CreateLegacySchemaAsync(string dbPath)
+    {
+        var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite($"Data Source={dbPath}")
+            .Options;
+
+        await using var db = new CopilotHiveDbContext(options);
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                """
+                CREATE TABLE "users" (
+                    "id" INTEGER NOT NULL CONSTRAINT "PK_users" PRIMARY KEY AUTOINCREMENT,
+                    "github_id" TEXT NOT NULL,
+                    "username" TEXT NOT NULL,
+                    "display_name" TEXT NULL,
+                    "avatar_url" TEXT NULL,
+                    "email" TEXT NULL,
+                    "access_token" TEXT NOT NULL,
+                    "refresh_token" TEXT NULL,
+                    "token_expires_at" TEXT NULL,
+                    "role" TEXT NOT NULL DEFAULT 'admin',
+                    "created_at" TEXT NOT NULL,
+                    "last_login_at" TEXT NULL
+                );
+                CREATE UNIQUE INDEX "IX_users_github_id" ON "users" ("github_id");
+                CREATE TABLE "user_invitations" (
+                    "id" INTEGER NOT NULL CONSTRAINT "PK_user_invitations" PRIMARY KEY AUTOINCREMENT,
+                    "normalized_username" TEXT NOT NULL,
+                    "role" TEXT NOT NULL,
+                    "enabled" INTEGER NOT NULL,
+                    "created_at" TEXT NOT NULL,
+                    "updated_at" TEXT NOT NULL,
+                    "revoked_at" TEXT NULL,
+                    "activated_user_id" INTEGER NULL,
+                    "activated_at" TEXT NULL
+                );
+                CREATE UNIQUE INDEX "idx_user_invitations_normalized_username"
+                    ON "user_invitations" ("normalized_username");
+                """;
+            await command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        }
+
+        _ = db;
+    }
+
+    /// <summary>Inserts a legacy-schema user row directly (no EF model involvement at all).</summary>
+    private static async Task InsertLegacyUserAsync(string dbPath, int id, string githubId, string username, string token)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES ($id, $githubId, $username, $token, 'admin', '2024-01-01T00:00:00.0000000Z')
+            """;
+        command.Parameters.AddWithValue("$id", id);
+        command.Parameters.AddWithValue("$githubId", githubId);
+        command.Parameters.AddWithValue("$username", username);
+        command.Parameters.AddWithValue("$token", token);
+        await command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>Inserts a pending (or activated) invitation directly into the modern table.</summary>
+    private static async Task InsertInvitationAsync(
+        string dbPath, string normalizedUsername, string role, bool enabled, int? activatedUserId)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO "user_invitations"
+                (normalized_username, role, enabled, created_at, updated_at, activated_user_id)
+            VALUES
+                ($username, $role, $enabled, '2024-01-01T00:00:00.0000000Z', '2024-01-01T00:00:00.0000000Z', $activated)
+            """;
+        command.Parameters.AddWithValue("$username", normalizedUsername);
+        command.Parameters.AddWithValue("$role", role);
+        command.Parameters.AddWithValue("$enabled", enabled ? 1 : 0);
+        command.Parameters.AddWithValue("$activated", (object?)activatedUserId ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>Whether a column exists on a table in the SQLite file at <paramref name="dbPath"/>.</summary>
+    private static async Task<bool> ColumnExistsAsync(string dbPath, string table, string column)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info(\"{table}\")";
+        await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        while (await reader.ReadAsync(TestContext.Current.CancellationToken))
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
     private static UserEntity User(string username, string token, string githubId) => new()
     {
         GitHubId = githubId,
@@ -115,6 +226,113 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
             "The live UserService resolver must be attached only after the host is built.");
     }
 
+    // ── OAuth admission source structure ─────────────────────────────────────
+
+    /// <summary>
+    /// THE OAUTH ADMISSION CONTRACT, IN SOURCE. The multi-user foundation must NOT widen OAuth
+    /// admission: only the ORIGINAL/bootstrap identity is admitted, and every other identity is
+    /// refused. The <c>OnCreatingTicket</c> handler is a lambda that cannot be invoked without
+    /// booting the host, so its SOURCE is the contract's proof here — this file is the vehicle the
+    /// OAuth bridge already owns.
+    /// <para>
+    /// The handler is extracted with the repository's string-aware scanner, so a brace inside a
+    /// string literal cannot end the block early and the assertions are made about CODE, not prose.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void ProgramCs_OnCreatingTicket_AdmitsOnlyTheOriginalIdentity()
+    {
+        var handler = ExtractOnCreatingTicketHandler();
+
+        Assert.NotNull(handler);
+
+        // The admission decision is made from the ACTIVATED-account count and the ORIGINAL
+        // account's GitHub id — the two reads the multi-user foundation left untouched.
+        Assert.Contains("GetUserCountAsync", handler, StringComparison.Ordinal);
+        Assert.Contains("GetAdminUserAsync", handler, StringComparison.Ordinal);
+        Assert.Contains("admin.GitHubId == githubId", handler, StringComparison.Ordinal);
+
+        // Every other identity is REFUSED through the OAuth failure path.
+        Assert.Contains("context.Fail(", handler, StringComparison.Ordinal);
+        Assert.Contains("Only one user (admin) is allowed in this version.", handler, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE OAUTH ADMISSION PATH NEVER CONSULTS THE INVITATION DIRECTORY: an invitation is not an
+    /// account, so no invitation can influence who is admitted and no invitation can become the
+    /// token account through the sign-in path.
+    /// </summary>
+    [Fact]
+    public void ProgramCs_OnCreatingTicket_NeverConsultsTheInvitationDirectory()
+    {
+        var handler = ExtractOnCreatingTicketHandler();
+
+        Assert.NotNull(handler);
+        Assert.DoesNotContain("Invitation", handler, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ActivateInvitationAsync", handler, StringComparison.Ordinal);
+        Assert.DoesNotContain("ListInvitationsAsync", handler, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetInvitationByUsernameAsync", handler, StringComparison.Ordinal);
+        Assert.DoesNotContain("UserRole", handler, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The admission path calls the ATOMIC bootstrap seam
+    /// (<c>CreateOrUpdateUserAsync</c>) on BOTH branches — the first-sign-in branch and the
+    /// returning-original branch — so the atomic bootstrap semantics apply to the real admission
+    /// path rather than to a read-then-write of the handler's own.
+    /// </summary>
+    [Fact]
+    public void ProgramCs_OnCreatingTicket_DelegatesToTheAtomicBootstrapSeam()
+    {
+        var handler = ExtractOnCreatingTicketHandler();
+
+        Assert.NotNull(handler);
+        Assert.Equal(2, CountOccurrences(handler, "CreateOrUpdateUserAsync"));
+    }
+
+    /// <summary>
+    /// The pre-Build token lookup is a SCALAR projection of ONE legacy column. It must not
+    /// materialize the entity, because materializing it selects every mapped column — including the
+    /// <c>enabled</c> column that a legacy installation does not have yet — and would fail exactly
+    /// when the credential is needed. This is the structural form of the legacy-schema regression.
+    /// </summary>
+    [Fact]
+    public void ProgramCs_PreBuildOAuthTokenLookup_UsesAScalarLegacySafeProjection()
+    {
+        var body = TestSourceScanner.ExtractMethodBlockPreservingLiterals(
+            ReadProgramSource(),
+            "internal static async Task<string?> PreBuildOAuthTokenLookup");
+
+        Assert.NotNull(body);
+
+        // The entity is NOT materialized: no LINQ query over the users set.
+        Assert.DoesNotContain("db.Users", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("AsNoTracking", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("FirstOrDefaultAsync", body, StringComparison.Ordinal);
+
+        // A SCALAR projection of the ONE legacy column, ordered by the original account's id.
+        Assert.Contains("ExecuteScalarAsync", body, StringComparison.Ordinal);
+        Assert.Contains("SELECT access_token FROM users ORDER BY id LIMIT 1", body, StringComparison.Ordinal);
+
+        // No column added after the multi-user foundation is referenced.
+        Assert.DoesNotContain("enabled", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Extracts the body of <c>Program.cs</c>'s <c>OnCreatingTicket</c> handler. The marker is
+    /// unique in the file, and the brace matching is driven by the string-aware mask, so a brace
+    /// inside a literal cannot end the block early.
+    /// </summary>
+    private static string? ExtractOnCreatingTicketHandler() =>
+        TestSourceScanner.ExtractMethodBlockPreservingLiterals(
+            ReadProgramSource(),
+            "options.Events.OnCreatingTicket = async context =>");
+
+    /// <summary>Reads <c>Program.cs</c> from the repository's production source tree.</summary>
+    private static string ReadProgramSource() =>
+        File.ReadAllText(Path.Combine(FindRepoRoot(), "src", "CopilotHive", "Program.cs"))
+            .ReplaceLineEndings("\n");
+
     // ── PreBuildOAuthTokenLookup ──────────────────────────────────────────────
 
     [Fact]
@@ -132,7 +350,7 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
     public async Task PreBuildOAuthTokenLookup_MultipleUsers_ReturnsTheLowestIdUserLikeGetAdminUser()
     {
         // GetAdminUserAsync orders by Id and takes the first — the admin is the FIRST user
-        // to have authenticated, not an arbitrary row.
+        // to have authenticated, not an arbitrary row. An invited Admin (a HIGHER id) never wins.
         var dbPath = NewDbPath();
         await SeedAsync(
             dbPath,
@@ -142,6 +360,84 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
         var token = await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken);
 
         Assert.Equal("first-user-token", token);
+    }
+
+    /// <summary>
+    /// THE PRE-RECONCILIATION REGRESSION. This runs against a REAL legacy <c>users</c> table that has
+    /// NO <c>enabled</c> column — the exact shape every existing installation has BEFORE
+    /// <c>DatabaseMigration.EnsureSchemaUpToDate</c> runs. A materialized-entity lookup would issue
+    /// <c>SELECT ... enabled ...</c> and fail, silently stripping the credential from the first
+    /// config-repo sync; the scalar projection must still return the original account's token.
+    /// </summary>
+    [Fact]
+    public async Task PreBuildOAuthTokenLookup_LegacySchemaWithoutEnabledColumn_ReturnsTheOriginalToken()
+    {
+        var dbPath = NewDbPath();
+        await CreateLegacySchemaAsync(dbPath);
+        await InsertLegacyUserAsync(dbPath, id: 1, githubId: "111", username: "original", token: "gho_legacy_original");
+
+        // The premise of the test: the column a new EF model maps is genuinely ABSENT.
+        Assert.False(await ColumnExistsAsync(dbPath, "users", "enabled"));
+
+        var token = await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken);
+
+        Assert.Equal("gho_legacy_original", token);
+    }
+
+    /// <summary>
+    /// On the same legacy schema, a HIGHER-id account (and an invited Admin occupying the
+    /// <c>user_invitations</c> table) never becomes the token source: the lookup reads ONLY the
+    /// <c>users</c> table, ordered by <c>id</c>, so the original account wins.
+    /// </summary>
+    [Fact]
+    public async Task PreBuildOAuthTokenLookup_LegacySchema_SelectsNoInvitedAccount()
+    {
+        var dbPath = NewDbPath();
+        await CreateLegacySchemaAsync(dbPath);
+        await InsertLegacyUserAsync(dbPath, id: 1, githubId: "111", username: "original", token: "gho_legacy_original");
+        await InsertLegacyUserAsync(dbPath, id: 2, githubId: "222", username: "invitedadmin", token: "gho_invited_admin");
+        await InsertInvitationAsync(dbPath, "pendingadmin", "admin", enabled: true, activatedUserId: null);
+        await InsertInvitationAsync(dbPath, "invitedadmin", "admin", enabled: true, activatedUserId: 2);
+
+        Assert.False(await ColumnExistsAsync(dbPath, "users", "enabled"));
+
+        var token = await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken);
+
+        Assert.Equal("gho_legacy_original", token);
+    }
+
+    /// <summary>
+    /// A legacy schema with NO users row but a PENDING ADMIN invitation still yields no token: an
+    /// invitation is not an account and holds no credential, so the bootstrap gate is untouched.
+    /// </summary>
+    [Fact]
+    public async Task PreBuildOAuthTokenLookup_LegacySchemaWithOnlyInvitations_ReturnsNull()
+    {
+        var dbPath = NewDbPath();
+        await CreateLegacySchemaAsync(dbPath);
+        await InsertInvitationAsync(dbPath, "pendingadmin", "admin", enabled: true, activatedUserId: null);
+
+        var token = await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken);
+
+        Assert.Null(token);
+    }
+
+    /// <summary>
+    /// A caller cancellation is still RETHROWN on the legacy schema: the scalar projection did not
+    /// change any of the degrade-to-null/terminate-the-caller contracts.
+    /// </summary>
+    [Fact]
+    public async Task PreBuildOAuthTokenLookup_LegacySchemaWithCancelledToken_StillRethrows()
+    {
+        var dbPath = NewDbPath();
+        await CreateLegacySchemaAsync(dbPath);
+        await InsertLegacyUserAsync(dbPath, id: 1, githubId: "111", username: "original", token: "gho_legacy_original");
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Program.PreBuildOAuthTokenLookup(dbPath, cts.Token));
     }
 
     [Fact]

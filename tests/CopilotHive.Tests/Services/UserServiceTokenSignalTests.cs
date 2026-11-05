@@ -125,7 +125,7 @@ public sealed class UserServiceTokenSignalTests
         var user = await SignInAsync(service, "token-abc");
 
         Assert.Equal("token-abc", user.AccessToken);
-        Assert.Equal("admin", user.Role);
+        Assert.Equal(UserRole.Admin, user.Role);
     }
 
     /// <summary>

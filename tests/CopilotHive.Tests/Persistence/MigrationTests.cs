@@ -1,5 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
+using CopilotHive.Services;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
@@ -146,5 +147,451 @@ public sealed class MigrationTests
         cmd.CommandText = "SELECT description FROM pipelines WHERE goal_id = 'goal-keep-1'";
         var result = cmd.ExecuteScalar();
         Assert.Equal("preserved description", result);
+    }
+
+    // ── 4. REAL legacy users table: additive upgrade preserves id/token, backfills enabled ─────
+
+    /// <summary>
+    /// The EXACT <c>users</c> DDL a pre-multi-user installation has: <c>github_id</c> NOT NULL and
+    /// uniquely indexed, a <c>role</c> text column defaulting to <c>'admin'</c>, and NO <c>enabled</c>
+    /// column. It is created by raw SQL — never by the current EF model — so the test cannot silently
+    /// "pass" against a schema the new code generated for itself.
+    /// </summary>
+    private const string LegacyUsersTableSql =
+        """
+        CREATE TABLE "users" (
+            "id" INTEGER NOT NULL CONSTRAINT "PK_users" PRIMARY KEY AUTOINCREMENT,
+            "github_id" TEXT NOT NULL,
+            "username" TEXT NOT NULL,
+            "display_name" TEXT NULL,
+            "avatar_url" TEXT NULL,
+            "email" TEXT NULL,
+            "access_token" TEXT NOT NULL,
+            "refresh_token" TEXT NULL,
+            "token_expires_at" TEXT NULL,
+            "role" TEXT NOT NULL DEFAULT 'admin',
+            "created_at" TEXT NOT NULL,
+            "last_login_at" TEXT NULL
+        );
+        """;
+
+    /// <summary>
+    /// The full additive upgrade path over a REAL legacy schema: <see cref="DatabaseMigration.EnsureSchemaUpToDate"/>
+    /// adds the <c>enabled</c> column (and the new invitation table), then EF <c>MigrateAsync</c> runs.
+    /// The original account keeps its integer id, its credential and its Admin role, and reads back as
+    /// ENABLED — the "existing rows upgrade to enabled Admins" contract.
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_AdditiveUpgrade_PreservesIdTokenAndRole_AndReadsAsEnabledAdmin()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, display_name, access_token, refresh_token, role, created_at, last_login_at)
+            VALUES (7, '111', 'octocat', 'The Octocat', 'gho_original_token', 'refresh-xyz', 'admin',
+                    '2024-01-01T00:00:00.0000000Z', '2024-06-01T00:00:00.0000000Z')
+            """);
+
+        // PREMISE: the column the new model maps does not exist yet.
+        Assert.DoesNotContain("enabled", GetColumnNames(conn, "users"), StringComparer.OrdinalIgnoreCase);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        // The additive column now exists, and the new invitation table was created.
+        Assert.Contains("enabled", GetColumnNames(conn, "users"), StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("user_invitations", GetAllTableNames(conn));
+
+        // The ORIGINAL integer id and credential are preserved verbatim.
+        var upgraded = ctx.Users.AsNoTracking().Single();
+        Assert.Equal(7, upgraded.Id);
+        Assert.Equal("111", upgraded.GitHubId);
+        Assert.Equal("octocat", upgraded.Username);
+        Assert.Equal("gho_original_token", upgraded.AccessToken);
+        Assert.Equal("refresh-xyz", upgraded.RefreshToken);
+        Assert.Equal("2024-01-01T00:00:00.0000000Z", upgraded.CreatedAt);
+
+        // The legacy 'admin' TEXT maps onto the validated role enum, and the backfilled enabled
+        // column reads as ENABLED.
+        Assert.Equal(UserRole.Admin, upgraded.Role);
+        Assert.True(upgraded.Enabled);
+
+        // The stored role text is byte-identical to what the legacy column already held.
+        using var roleCmd = conn.CreateCommand();
+        roleCmd.CommandText = "SELECT role FROM users WHERE id = 7";
+        Assert.Equal("admin", roleCmd.ExecuteScalar());
+    }
+
+    /// <summary>
+    /// The upgrade is IDEMPOTENT: running the additive path twice changes nothing and never rewrites a
+    /// value. A SECOND account that is explicitly disabled and non-Admin keeps those values.
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_RepeatedReconciliation_IsIdempotentAndKeepsExplicitValues()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES (3, '111', 'octocat', 'gho_original_token', 'admin', '2024-01-01T00:00:00.0000000Z')
+            """);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        // A later write through the model: an explicitly DISABLED, non-Admin account.
+        ctx.Users.Add(new CopilotHive.Persistence.Entities.UserEntity
+        {
+            GitHubId = "222",
+            Username = "second",
+            AccessToken = "gho_second_token",
+            Role = UserRole.Viewer,
+            Enabled = false,
+            CreatedAt = "2024-02-01T00:00:00.0000000Z",
+        });
+        await ctx.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        // Re-run the additive reconciliation a second time.
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        var accounts = ctx.Users.AsNoTracking().OrderBy(u => u.Id).ToList();
+        Assert.Equal([3, 4], accounts.Select(u => u.Id));
+        Assert.Equal(UserRole.Admin, accounts[0].Role);
+        Assert.True(accounts[0].Enabled);
+        Assert.Equal("gho_original_token", accounts[0].AccessToken);
+
+        // The explicit false survived: the store default never overrode a real write.
+        Assert.Equal(UserRole.Viewer, accounts[1].Role);
+        Assert.False(accounts[1].Enabled);
+        Assert.Equal("gho_second_token", accounts[1].AccessToken);
+    }
+
+    /// <summary>
+    /// An unknown persisted role FAILS CLEARLY instead of silently becoming a role. This is the
+    /// validated-conversion contract: no catch-all fallback exists.
+    /// </summary>
+    [Theory]
+    [InlineData("owner")]
+    [InlineData("SuperAdmin")]
+    [InlineData("2")]
+    [InlineData("")]
+    public async Task PersistedRole_UnknownValue_ThrowsInsteadOfBecomingARole(string persistedRole)
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES (1, '111', 'octocat', 'gho_original_token', {0}, '2024-01-01T00:00:00.0000000Z')
+            """,
+            persistedRole);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        var failure = await Assert.ThrowsAnyAsync<Exception>(
+            () => ctx.Users.AsNoTracking().ToListAsync(TestContext.Current.CancellationToken));
+
+        // The innermost cause names the offending value: a clear failure, not a silent fallback.
+        var innermost = failure;
+        while (innermost.InnerException is not null)
+            innermost = innermost.InnerException;
+
+        Assert.Contains("is not a supported CopilotHive user role", innermost.Message);
+        _ = conn;
+    }
+
+    /// <summary>
+    /// A legacy database whose <c>users.role</c> holds the legacy <c>'admin'</c> text still reads
+    /// through the validated conversion: case-insensitive, so an oddly-cased legacy value is not a
+    /// failure but is also not silently mapped to something else.
+    /// </summary>
+    [Theory]
+    [InlineData("admin")]
+    [InlineData("ADMIN")]
+    [InlineData("Admin")]
+    public async Task PersistedRole_LegacyAdminText_MapsToAdmin(string persistedRole)
+    {
+        using var ctx = CreateEmptyDbContext();
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES (1, '111', 'octocat', 'gho_original_token', {0}, '2024-01-01T00:00:00.0000000Z')
+            """,
+            persistedRole);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        var user = await ctx.Users.AsNoTracking().SingleAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(UserRole.Admin, user.Role);
+        Assert.True(user.Enabled);
+    }
+
+    /// <summary>
+    /// The invitations table is created on an existing installation WITHOUT touching the users rows,
+    /// and it carries NO token columns at all — the storage invariant that keeps invitations out of
+    /// the users table.
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_UpgradeCreatesInvitationTableWithNoTokenColumns()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES (1, '111', 'octocat', 'gho_original_token', 'admin', '2024-01-01T00:00:00.0000000Z')
+            """);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        var invitationColumns = GetColumnNames(conn, "user_invitations");
+        Assert.Contains("normalized_username", invitationColumns);
+        Assert.Contains("role", invitationColumns);
+        Assert.Contains("enabled", invitationColumns);
+        Assert.Contains("activated_user_id", invitationColumns);
+        Assert.Contains("activated_at", invitationColumns);
+        Assert.Contains("revoked_at", invitationColumns);
+
+        // NO OAuth material may live in the invitation table.
+        Assert.DoesNotContain(invitationColumns, c => c.Contains("token", StringComparison.OrdinalIgnoreCase));
+
+        // The unique index on the normalized username is what arbitrates duplicates.
+        using var indexCmd = conn.CreateCommand();
+        indexCmd.CommandText =
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'user_invitations' AND name = 'idx_user_invitations_normalized_username'";
+        Assert.Equal("idx_user_invitations_normalized_username", indexCmd.ExecuteScalar());
+
+        // The users row was not modified beyond the additive column.
+        Assert.Single(ctx.Users.AsNoTracking().ToList());
+    }
+
+    /// <summary>
+    /// THE UPGRADED DATABASE STILL SUPPLIES THE ORIGINAL ACCOUNT'S TOKEN. After the real additive
+    /// upgrade, the global-token selector and the pre-Build scalar lookup both return the ORIGINAL
+    /// (lowest-id) account's credential — an invited Admin is never the fallback, and the original
+    /// account's integer id and token survived the upgrade verbatim.
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_AfterUpgrade_TheOriginalAccountStillSuppliesTheGlobalToken()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES (7, '111', 'octocat', 'gho_original_token', 'admin', '2024-01-01T00:00:00.0000000Z')
+            """);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        // The lowest-id account is the original — the token selector's contract.
+        var original = await ctx.Users.AsNoTracking().OrderBy(u => u.Id).FirstAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(7, original.Id);
+        Assert.Equal("gho_original_token", original.AccessToken);
+
+        // A PENDING Admin invitation and a HIGHER-id Admin invitation both exist now.
+        ctx.UserInvitations.Add(new CopilotHive.Persistence.Entities.UserInvitationEntity
+        {
+            NormalizedUsername = "pendingadmin",
+            Role = UserRole.Admin,
+            Enabled = true,
+            CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            UpdatedAt = "2024-01-01T00:00:00.0000000Z",
+        });
+        await ctx.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        // The selector still names the original account, and an invited Admin is not it.
+        var selected = await ctx.Users.AsNoTracking().OrderBy(u => u.Id).FirstAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(original.Id, selected.Id);
+        Assert.Equal("gho_original_token", selected.AccessToken);
+        Assert.Equal(UserRole.Admin, selected.Role);
+        Assert.True(selected.Enabled);
+
+        // The pending Admin invitation is NOT an activated Admin and never enters the selector.
+        var pending = await ctx.UserInvitations.AsNoTracking()
+            .SingleAsync(i => i.NormalizedUsername == "pendingadmin", TestContext.Current.CancellationToken);
+        Assert.Null(pending.ActivatedUserId);
+        Assert.NotEqual(pending.Id, selected.Id);
+    }
+
+    /// <summary>
+    /// THE END-TO-END UPGRADE PATH ON A FILE-BACKED DATABASE: a REAL legacy <c>users</c> table
+    /// (populated, no <c>enabled</c> column) is upgraded with <see cref="DatabaseMigration.EnsureSchemaUpToDate"/>
+    /// followed by EF <c>MigrateAsync</c>, and the REAL
+    /// <see cref="Program.PreBuildOAuthTokenLookup"/> is then run against the SAME FILE.
+    /// <para>
+    /// This is the whole AC4/AC5 path in one test: the original account's id and credential survive
+    /// the additive upgrade, the lookup still returns the ORIGINAL account's token, and an invited
+    /// Admin (a higher id) never becomes the fallback — before OR after the reconciliation.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_OnAFileDatabase_AfterTheRealUpgrade_TheOriginalTokenStillSuppliesTheLookup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"copilothive-legacy-upgrade-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var dbPath = Path.Combine(dir, "legacy.db");
+
+        try
+        {
+            // ── BEFORE the upgrade: a REAL legacy schema on a FILE, with the original account. ──
+            await using (var legacyConnection = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await legacyConnection.OpenAsync(TestContext.Current.CancellationToken);
+                await using var cmd = legacyConnection.CreateCommand();
+                cmd.CommandText =
+                    """
+                    CREATE TABLE "users" (
+                        "id" INTEGER NOT NULL CONSTRAINT "PK_users" PRIMARY KEY AUTOINCREMENT,
+                        "github_id" TEXT NOT NULL,
+                        "username" TEXT NOT NULL,
+                        "display_name" TEXT NULL,
+                        "avatar_url" TEXT NULL,
+                        "email" TEXT NULL,
+                        "access_token" TEXT NOT NULL,
+                        "refresh_token" TEXT NULL,
+                        "token_expires_at" TEXT NULL,
+                        "role" TEXT NOT NULL DEFAULT 'admin',
+                        "created_at" TEXT NOT NULL,
+                        "last_login_at" TEXT NULL
+                    );
+                    CREATE UNIQUE INDEX "IX_users_github_id" ON "users" ("github_id");
+                    INSERT INTO "users" (id, github_id, username, access_token, refresh_token, role, created_at, last_login_at)
+                    VALUES (7, '111', 'octocat', 'gho_original_token', 'gho_refresh_token', 'admin',
+                            '2024-01-01T00:00:00.0000000Z', '2024-06-01T00:00:00.0000000Z');
+                    """;
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+            }
+
+            // PREMISE: the column a new EF model maps is genuinely ABSENT before the upgrade.
+            Assert.False(await ColumnExistsInFileAsync(dbPath, "users", "enabled"));
+
+            // BEFORE the upgrade: the lookup still returns the original token (legacy-safe).
+            Assert.Equal(
+                "gho_original_token",
+                await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken));
+
+            // ── THE REAL UPGRADE, on the same file. ──
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite($"Data Source={dbPath}")
+                .Options;
+
+            await using (var ctx = new CopilotHiveDbContext(options))
+            {
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+                await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+                // The ORIGINAL account's integer id, credential and history survived verbatim.
+                var upgraded = await ctx.Users.AsNoTracking().SingleAsync(TestContext.Current.CancellationToken);
+                Assert.Equal(7, upgraded.Id);
+                Assert.Equal("111", upgraded.GitHubId);
+                Assert.Equal("octocat", upgraded.Username);
+                Assert.Equal("gho_original_token", upgraded.AccessToken);
+                Assert.Equal("gho_refresh_token", upgraded.RefreshToken);
+                Assert.Equal("2024-01-01T00:00:00.0000000Z", upgraded.CreatedAt);
+                Assert.Equal("2024-06-01T00:00:00.0000000Z", upgraded.LastLoginAt);
+
+                // The legacy row upgraded to an ENABLED Admin.
+                Assert.Equal(UserRole.Admin, upgraded.Role);
+                Assert.True(upgraded.Enabled);
+
+                // A HIGHER-id invited Admin exists now, with a credential of its own, and a PENDING
+                // Admin invitation exists besides it.
+                ctx.Users.Add(new CopilotHive.Persistence.Entities.UserEntity
+                {
+                    GitHubId = "222",
+                    Username = "invitedadmin",
+                    AccessToken = "gho_invited_admin_token",
+                    Role = UserRole.Admin,
+                    Enabled = true,
+                    CreatedAt = "2024-02-01T00:00:00.0000000Z",
+                });
+                ctx.UserInvitations.Add(new CopilotHive.Persistence.Entities.UserInvitationEntity
+                {
+                    NormalizedUsername = "pendingadmin",
+                    Role = UserRole.Admin,
+                    Enabled = true,
+                    CreatedAt = "2024-02-01T00:00:00.0000000Z",
+                    UpdatedAt = "2024-02-01T00:00:00.0000000Z",
+                });
+                await ctx.SaveChangesAsync(TestContext.Current.CancellationToken);
+            }
+
+            // AFTER the upgrade: the ORIGINAL account's token is still what the lookup returns —
+            // the invited Admin (higher id) and the pending invitation never take it over.
+            Assert.Equal(
+                "gho_original_token",
+                await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken));
+
+            // ...and the upgraded schema really does have the new columns now.
+            Assert.True(await ColumnExistsInFileAsync(dbPath, "users", "enabled"));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            try
+            {
+                if (Directory.Exists(dir))
+                    Directory.Delete(dir, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best-effort cleanup only.
+            }
+        }
+    }
+
+    /// <summary>Whether a column exists on a table in the SQLite FILE at <paramref name="dbPath"/>.</summary>
+    private static async Task<bool> ColumnExistsInFileAsync(string dbPath, string table, string column)
+    {
+        await using var connection = new SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info(\"{table}\")";
+        await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        while (await reader.ReadAsync(TestContext.Current.CancellationToken))
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Returns the column names of a table via PRAGMA.</summary>
+    private static List<string> GetColumnNames(SqliteConnection conn, string table)
+    {
+        var columns = new List<string>();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info(\"{table}\")";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            columns.Add(reader.GetString(1));
+        return columns;
     }
 }
