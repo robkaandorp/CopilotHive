@@ -1233,4 +1233,210 @@ public sealed class BackupServiceTests
             Cleanup(stateDir);
         }
     }
+
+    // ── Per-user Composer tree (composer/users) ─────────────────────────────
+
+    private static async Task WriteUserFileAsync(string stateDir, string relative, string content, CancellationToken ct)
+    {
+        var path = Path.Combine(stateDir, "composer", "users", relative);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, content, ct);
+    }
+
+    private static string UserPath(string stateDir, string relative) =>
+        Path.Combine(stateDir, "composer", "users", relative);
+
+    /// <summary>Builds an OLD-format archive: a manifest and (optionally) a single composer-session.json, no per-user tree.</summary>
+    private static async Task<string> BuildArchiveAsync(string dir, IReadOnlyDictionary<string, string> files, CancellationToken ct)
+    {
+        var archive = Path.Combine(dir, $"crafted-{Guid.NewGuid():N}.tar.gz");
+        var src = Path.Combine(Path.GetTempPath(), $"crafted-src-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(src);
+        try
+        {
+            await using var fs = File.Create(archive);
+            await using var gz = new GZipStream(fs, CompressionLevel.SmallestSize);
+            await using var tar = new TarWriter(gz, TarEntryFormat.Pax);
+            foreach (var (name, content) in files.Append(KeyValuePair.Create("backup-manifest.json", "{}")))
+            {
+                var file = Path.Combine(src, Guid.NewGuid().ToString("N"));
+                await File.WriteAllTextAsync(file, content, ct);
+                await tar.WriteEntryAsync(file, name, ct);
+            }
+        }
+        finally
+        {
+            Directory.Delete(src, recursive: true);
+        }
+
+        return archive;
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_IncludesTheCompletePerUserComposerTree_AndManifestCount()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "session.json"), "s1", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "legacy-migration.json"), "ev", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "attachments", "a.png"), "img", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("2", "session.json"), "s2", ct);
+
+            var path = await service.CreateBackupAsync(ct);
+
+            var entries = await GetArchiveEntries(path);
+            Assert.Contains("composer/users/1/session.json", entries);
+            Assert.Contains("composer/users/1/legacy-migration.json", entries);
+            Assert.Contains("composer/users/1/attachments/a.png", entries);
+            Assert.Contains("composer/users/2/session.json", entries);
+            using var manifest = JsonDocument.Parse((await ReadArchiveEntry(path, "backup-manifest.json"))!);
+            Assert.Equal(4, manifest.RootElement.GetProperty("composerUsersCount").GetInt32());
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_RoundTripsThePerUserTree_ReplacingStaleCurrentFiles()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "session.json"), "backed-up", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "legacy-migration.json"), "evidence", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "attachments", "a.png"), "img", ct);
+            var backup = await service.CreateBackupAsync(ct);
+            _clock.Advance(DistinctNameAdvance);
+
+            // Drift after the backup: edit, delete, and add stale files.
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "session.json"), "edited", ct);
+            File.Delete(UserPath(stateDir, Path.Combine("1", "legacy-migration.json")));
+            await WriteUserFileAsync(stateDir, Path.Combine("9", "session.json"), "stale-user", ct);
+
+            var result = await service.RestoreBackupAsync(backup, ct);
+
+            Assert.Equal(3, result.ComposerUsersCount);
+            Assert.Equal("backed-up", await File.ReadAllTextAsync(UserPath(stateDir, Path.Combine("1", "session.json")), ct));
+            Assert.Equal("evidence", await File.ReadAllTextAsync(UserPath(stateDir, Path.Combine("1", "legacy-migration.json")), ct));
+            Assert.Equal("img", await File.ReadAllTextAsync(UserPath(stateDir, Path.Combine("1", "attachments", "a.png")), ct));
+            Assert.False(Directory.Exists(UserPath(stateDir, "9")));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_OldArchiveWithNoPerUserTree_ClearsCurrentPerUserStateAndEvidence_AndRestoresLegacyFileAsBefore()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "session.json"), "current", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "legacy-migration.json"), "current-evidence", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "attachments", "a.png"), "img", ct);
+            await File.WriteAllTextAsync(Path.Combine(stateDir, "composer-session.json"), "current-legacy", ct);
+            var oldArchive = await BuildArchiveAsync(stateDir,
+                new Dictionary<string, string> { ["composer-session.json"] = "old-legacy" }, ct);
+
+            var result = await service.RestoreBackupAsync(oldArchive, ct);
+
+            Assert.Equal(0, result.ComposerUsersCount);
+            Assert.True(result.ComposerSession);
+            Assert.False(Directory.Exists(UserPath(stateDir, "")) && Directory.GetFileSystemEntries(UserPath(stateDir, "")).Length > 0,
+                "Stale per-user sessions, attachments and migration evidence must be cleared.");
+            Assert.False(File.Exists(UserPath(stateDir, Path.Combine("1", "legacy-migration.json"))));
+            Assert.Equal("old-legacy", await File.ReadAllTextAsync(Path.Combine(stateDir, "composer-session.json"), ct));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_EmptyPerUserTreeArchive_ClearsCurrentPerUserState()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            Directory.CreateDirectory(UserPath(stateDir, ""));
+            var emptyTreeBackup = await service.CreateBackupAsync(ct);
+            _clock.Advance(DistinctNameAdvance);
+            Assert.DoesNotContain(await GetArchiveEntries(emptyTreeBackup), e => e.StartsWith("composer/users", StringComparison.Ordinal));
+
+            await WriteUserFileAsync(stateDir, Path.Combine("3", "session.json"), "stale", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("3", "legacy-migration.json"), "stale-evidence", ct);
+
+            var result = await service.RestoreBackupAsync(emptyTreeBackup, ct);
+
+            Assert.Equal(0, result.ComposerUsersCount);
+            Assert.False(Directory.Exists(UserPath(stateDir, "3")));
+            Assert.False(File.Exists(UserPath(stateDir, Path.Combine("3", "legacy-migration.json"))));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_SafetyBackupCapturesThePerUserTreeBeforeItIsReplaced()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            var backup = await service.CreateBackupAsync(ct);
+            _clock.Advance(DistinctNameAdvance);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "session.json"), "about-to-be-replaced", ct);
+
+            var result = await service.RestoreBackupAsync(backup, ct);
+
+            Assert.False(File.Exists(UserPath(stateDir, Path.Combine("1", "session.json"))));
+            Assert.Contains("composer/users/1/session.json", await GetArchiveEntries(result.SafetyBackupPath));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_PerUserTree_DoesNotDisturbBrainMetricsOrKeys()
+    {
+        var (stateDir, service) = CreateService();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            Directory.CreateDirectory(Path.Combine(stateDir, "metrics"));
+            Directory.CreateDirectory(Path.Combine(stateDir, "keys"));
+            await File.WriteAllTextAsync(Path.Combine(stateDir, "metrics", "m.json"), "m", ct);
+            await File.WriteAllTextAsync(Path.Combine(stateDir, "keys", "k.xml"), "k", ct);
+            await File.WriteAllTextAsync(Path.Combine(stateDir, "brain-master.json"), "bm", ct);
+            await WriteUserFileAsync(stateDir, Path.Combine("1", "session.json"), "s", ct);
+            var backup = await service.CreateBackupAsync(ct);
+            _clock.Advance(DistinctNameAdvance);
+
+            var result = await service.RestoreBackupAsync(backup, ct);
+
+            Assert.Equal(1, result.MetricsCount);
+            Assert.Equal(1, result.KeysCount);
+            Assert.True(result.BrainMasterSession);
+            Assert.Equal(1, result.ComposerUsersCount);
+            Assert.Equal("k", await File.ReadAllTextAsync(Path.Combine(stateDir, "keys", "k.xml"), ct));
+        }
+        finally
+        {
+            Cleanup(stateDir);
+        }
+    }
 }

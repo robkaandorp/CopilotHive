@@ -523,6 +523,13 @@ internal sealed class ComposerAgentService(
             if (!string.IsNullOrEmpty(_compactionModel))
                 _compactionChatClient = CreateClient(_compactionModel);
 
+            // Original-admin legacy claim (no-op for legacy construction and for every identity that
+            // cannot claim). A failure propagates OUT of ConnectAsync via the rollback below — it is
+            // deliberately outside the session-load recovery, so a failed migration can never turn
+            // into "start fresh".
+            if (_userState is not null)
+                await ComposerLegacyMigration.EnsureAsync(_stateDir, _userState, ct);
+
             var sessionFile = GetSessionFilePath();
 
             // Tracked locally and committed to the field only after EVERY step of ConnectAsync

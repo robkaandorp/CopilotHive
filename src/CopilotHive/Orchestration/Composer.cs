@@ -591,9 +591,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             {
                 IsCompacting = false;
                 WasCompacted = false;
-                var sessionFile = GetSessionFilePath();
-                if (File.Exists(sessionFile))
-                    File.Delete(sessionFile);
+                DeleteSessionFileIfAllowed();
             });
 
         _actor = new ComposerActor(
@@ -630,8 +628,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 IsCompacting = false;
                 WasCompacted = false;
                 _sessionLoadedFromDisk = false;
-                var f = GetSessionFilePath();
-                if (File.Exists(f)) File.Delete(f);
+                DeleteSessionFileIfAllowed();
             },
             () =>
             {
@@ -1009,12 +1006,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         IsCompacting = false;
         WasCompacted = false;
 
-        var sessionFile = GetSessionFilePath();
-        if (File.Exists(sessionFile))
-        {
-            File.Delete(sessionFile);
+        if (DeleteSessionFileIfAllowed())
             _logger.LogInformation("Deleted previous Composer session file");
-        }
 
         _logger.LogInformation("Composer session reset");
 
@@ -1023,6 +1016,25 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>Returns the file path for persisting the Composer session.</summary>
     private string GetSessionFilePath() => ComposerUserState.SessionFilePath(_stateDir, _userState);
+
+    /// <summary>
+    /// Deletes the session file (reset / overflow recovery). An identity whose legacy-history claim has
+    /// not settled never deletes: the per-user file may be the only copy of history after a failed
+    /// migration. A settled claim leaves durable evidence, so deleting can never resurrect legacy history.
+    /// </summary>
+    /// <returns><c>true</c> when a file was deleted.</returns>
+    private bool DeleteSessionFileIfAllowed()
+    {
+        if (_userState is { PersistenceAllowed: false })
+            return false;
+
+        var sessionFile = GetSessionFilePath();
+        if (!File.Exists(sessionFile))
+            return false;
+
+        File.Delete(sessionFile);
+        return true;
+    }
 
     /// <summary>
     /// An identity-bound Composer only accepts an attachment service bound to the SAME user and the
@@ -1068,6 +1080,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Persists the current Composer session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)
     {
+        if (_userState is { PersistenceAllowed: false })
+        {
+            throw new ComposerMigrationException(
+                $"Refusing to save the Composer session for user {_userState.UserId}: the legacy-session claim has not completed, " +
+                "so saving could replace history.");
+        }
+
         var path = GetSessionFilePath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await _agentService.Session.SaveAsync(path, ct);
