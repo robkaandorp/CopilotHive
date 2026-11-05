@@ -53,14 +53,19 @@ public sealed class UserServiceConcurrencyTests : IDisposable
     {
         // Pooled connections must be released or Windows keeps the file locked.
         SqliteConnection.ClearAllPools();
+
+        // FILE-ONLY best-effort. The narrow catch is deliberate: deleting the temp database can
+        // legitimately fail on a lock (IOException) or a permissions quirk (UnauthorizedAccessException),
+        // and neither should fail a test that already made its assertions. Anything else — a
+        // programming error, a malformed path — must still surface instead of being swallowed.
         try
         {
             if (Directory.Exists(_dir))
                 Directory.Delete(_dir, recursive: true);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Best-effort: a failure to delete the temp dir must never fail a test.
+            // Best-effort cleanup only.
         }
     }
 
@@ -606,13 +611,19 @@ public sealed class UserServiceConcurrencyTests : IDisposable
     /// <summary>
     /// TWO CONCURRENT OPERATIONS THAT WOULD EACH REMOVE AN ENABLED ADMIN CANNOT BOTH SUCCEED when only
     /// two enabled Admins exist: the database serializer makes the second one observe the first's
-    /// committed change, so at least one enabled Admin always survives.
+    /// committed change, so EXACTLY ONE enabled Admin always survives.
+    /// <para>
+    /// The refusal is asserted to be the LAST-ADMIN GUARD specifically (not "some directory
+    /// refusal"), and the survivor is asserted to be the account whose operation was refused — so a
+    /// guard that refused for an unrelated reason, or a lost update where both writes landed, both
+    /// fail here.
+    /// </para>
     /// <para>
     /// A PENDING Admin invitation exists throughout, proving it does not satisfy the protection.
     /// </para>
     /// </summary>
     [Fact]
-    public async Task LastAdminProtection_ConcurrentRemovalsOfTwoAdmins_NeverLeavesZeroEnabledAdmins()
+    public async Task LastAdminProtection_ConcurrentRemovalsOfTwoAdmins_LeavesExactlyTheRefusedAdminsEnabled()
     {
         var seeding = NewService();
         var original = await seeding.CreateOrUpdateUserAsync(
@@ -634,23 +645,40 @@ public sealed class UserServiceConcurrencyTests : IDisposable
 
         await using var verification = NewContext();
         var enabledAdmins = await verification.Users.AsNoTracking()
-            .CountAsync(u => u.Role == UserRole.Admin && u.Enabled, Ct);
+            .Where(u => u.Role == UserRole.Admin && u.Enabled)
+            .ToListAsync(Ct);
 
-        // THE INVARIANT: at least one ENABLED Admin always survives, and the pending Admin
-        // invitation is not it.
-        Assert.True(
-            enabledAdmins >= 1,
-            $"Expected at least one enabled Admin to survive; demote failure='{demote.Refusal?.Message}' " +
-            $"disable failure='{disable.Refusal?.Message}'");
+        // EXACTLY ONE enabled Admin survives: not zero (the guard held), not two (a write was lost).
+        var survivor = Assert.Single(enabledAdmins);
+
+        // EXACTLY ONE operation applied and the other was REFUSED BY THE LAST-ADMIN GUARD — a refusal
+        // for any other reason would mean the guard itself was never exercised.
+        var applied = new[] { demote, disable }.Where(o => o.Succeeded).ToList();
+        var refused = new[] { demote, disable }.Where(o => o.Refusal is not null).ToList();
+        Assert.Single(applied);
+        Assert.Single(refused);
+
+        var refusal = refused[0].Refusal!;
+        Assert.IsType<UserDirectoryException>(refusal);
+        Assert.Contains("last enabled Admin", refusal.Message);
+        Assert.Contains(
+            "pending Admin invitation does not count as an enabled Admin",
+            refusal.Message);
+
+        // The survivor is the account whose operation was REFUSED — the other one really did change,
+        // so this is not a pair of no-ops that happened to leave the state alone.
+        Assert.Equal(refused[0] == demote ? original.Id : second.Id, survivor.Id);
+
+        // The applied side's change is really persisted (the complement of the survivor).
+        var changed = await verification.Users.AsNoTracking()
+            .SingleAsync(u => u.Id != survivor.Id, Ct);
+        Assert.True(changed.Role != UserRole.Admin || !changed.Enabled);
 
         // The pending invitation was never touched by either path.
         var pending = await verification.UserInvitations.AsNoTracking()
             .SingleAsync(i => i.NormalizedUsername == "pending-admin", Ct);
         Assert.Null(pending.ActivatedUserId);
         Assert.True(pending.Enabled);
-
-        _ = demote;
-        _ = disable;
     }
 
     /// <summary>
@@ -676,15 +704,21 @@ public sealed class UserServiceConcurrencyTests : IDisposable
 
         await using var verification = NewContext();
         var enabledAdmins = await verification.Users.AsNoTracking()
-            .CountAsync(u => u.Role == UserRole.Admin && u.Enabled, Ct);
+            .Where(u => u.Role == UserRole.Admin && u.Enabled)
+            .ToListAsync(Ct);
 
-        Assert.Equal(1, enabledAdmins);
+        // EXACTLY ONE enabled Admin survives, and it is the account whose disable was REFUSED — so a
+        // refusal for an unrelated reason, or both disables landing, cannot pass.
+        var survivor = Assert.Single(enabledAdmins);
+        var refused = new[] { first, secondResult }.Single(o => o.Refusal is not null);
+        Assert.Single(new[] { first, secondResult }, o => o.Succeeded);
 
-        // Exactly one operation succeeded and the other was refused by the last-admin guard.
-        var successes = new[] { first, secondResult }.Count(o => o.Succeeded);
-        var refusals = new[] { first, secondResult }.Count(o => o.Refusal is UserDirectoryException);
-        Assert.Equal(1, successes);
-        Assert.Equal(1, refusals);
+        Assert.Contains("last enabled Admin", refused.Refusal!.Message);
+        Assert.Equal(refused == first ? original.Id : second.Id, survivor.Id);
+
+        // The other account really is disabled — the guard refused a genuine change.
+        var disabled = await verification.Users.AsNoTracking().SingleAsync(u => u.Id != survivor.Id, Ct);
+        Assert.False(disabled.Enabled);
     }
 
     // ── Outcome capture helpers ─────────────────────────────────────────────

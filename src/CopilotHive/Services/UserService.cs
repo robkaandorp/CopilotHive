@@ -843,12 +843,22 @@ public sealed class UserService
 
     /// <summary>
     /// Opens the write transaction every mutating directory operation runs inside.
-    /// <see cref="IsolationLevel.Serializable"/> makes Microsoft.Data.Sqlite issue
-    /// <c>BEGIN IMMEDIATE</c>: the write lock is taken BEFORE the guard reads, so two service
-    /// instances on separate connections to one database file SERIALIZE instead of both observing the
-    /// pre-write state. That is what makes bootstrap, invitation consumption, activation, duplicate
-    /// detection and the last-admin check atomic at the database boundary rather than read-check-write
-    /// races.
+    /// <para>
+    /// <see cref="IsolationLevel.Serializable"/> makes Microsoft.Data.Sqlite issue a
+    /// <c>BEGIN IMMEDIATE</c>: the write lock is taken BEFORE the guard reads, so two service instances
+    /// on separate connections to one database file SERIALIZE instead of both observing the pre-write
+    /// state. That is what makes bootstrap, invitation consumption, activation, duplicate detection and
+    /// the last-admin check atomic at the database boundary rather than read-check-write races.
+    /// </para>
+    /// <para>
+    /// The level is declared EXPLICITLY rather than left to a provider default, and must stay a level
+    /// that maps to an immediate begin. Measured behaviour of Microsoft.Data.Sqlite: Serializable,
+    /// ReadCommitted and RepeatableRead all begin IMMEDIATE; only
+    /// <see cref="IsolationLevel.ReadUncommitted"/> begins DEFERRED, which would silently turn every
+    /// guard below into a read-check-write race. That weakening is caught by the concurrency suite —
+    /// switching this transaction to a deferred begin makes the bootstrap, invitation-consumption,
+    /// activation and last-admin protection tests fail — so a regression here is loud, not quiet.
+    /// </para>
     /// </summary>
     private static Task<Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction> BeginImmediateTransactionAsync(
         CopilotHiveDbContext db,
