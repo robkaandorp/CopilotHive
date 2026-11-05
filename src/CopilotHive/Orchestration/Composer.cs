@@ -69,6 +69,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly IBrainRepoManager? _repoManager;
     private readonly IServiceProvider? _serviceProvider;
     private readonly string _stateDir;
+    private readonly ComposerUserState? _userState;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly string? _ollamaApiKey;
     private readonly ComposerAgentService _agentService;
@@ -481,7 +482,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         ReasoningEffort? reasoningEffort = null,
         IIssueStore? issueStore = null,
         ComposerEventSubscriber? eventSubscriber = null,
-        IEventBus? eventBus = null)
+        IEventBus? eventBus = null,
+        ComposerUserState? userState = null)
     {
         // Constructor normalization: null/whitespace model ⇒ null (no model configured).
         // The Composer then registers as a disconnected shell — no client, IsConnected false.
@@ -493,6 +495,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _repoManager = repoManager;
         _serviceProvider = serviceProvider;
         _stateDir = stateDir ?? "/app/state";
+        _userState = userState;
+        ValidateAttachmentServiceMatchesIdentity(attachmentService);
         _httpClientFactory = httpClientFactory;
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
         _hiveConfig = hiveConfig;
@@ -571,7 +575,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             },
             subAgentsEnabled,
             subAgentModels,
-            attachmentService?.AttachmentsRootPath);
+            attachmentService?.AttachmentsRootPath,
+            _userState);
 
         _handleSubAgentChanged = info => OnSubAgentChanged?.Invoke(info);
         _agentService.OnSubAgentChanged += _handleSubAgentChanged;
@@ -1017,7 +1022,27 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     }
 
     /// <summary>Returns the file path for persisting the Composer session.</summary>
-    private string GetSessionFilePath() => Path.Combine(_stateDir, "composer-session.json");
+    private string GetSessionFilePath() => ComposerUserState.SessionFilePath(_stateDir, _userState);
+
+    /// <summary>
+    /// An identity-bound Composer only accepts an attachment service bound to the SAME user and the
+    /// canonical root for that user. Legacy Composers accept any attachment service, as before.
+    /// </summary>
+    private void ValidateAttachmentServiceMatchesIdentity(ComposerAttachmentService? attachmentService)
+    {
+        if (_userState is null || attachmentService is null)
+            return;
+
+        var expectedRoot = ComposerUserState.AttachmentsRootPath(_stateDir, _userState);
+        if (attachmentService.UserId != _userState.UserId
+            || !string.Equals(attachmentService.AttachmentsRootPath, expectedRoot, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"The attachment service (user {attachmentService.UserId?.ToString() ?? "legacy"}, root '{attachmentService.AttachmentsRootPath}') " +
+                $"does not match the Composer's user {_userState.UserId} (root '{expectedRoot}').",
+                nameof(attachmentService));
+        }
+    }
 
     /// <summary>Refreshes the <c>composer</c> registry entry with the current session tokens and status.</summary>
     private void RefreshComposerRegistry(string status = "idle", long? currentTokens = null)
@@ -1030,7 +1055,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
-            SessionId = "composer",
+            SessionId = ComposerUserState.RegistryId(_userState),
             SessionType = LlmSessionType.Composer,
             Model = model,
             Status = status,

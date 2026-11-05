@@ -52,7 +52,8 @@ internal sealed class ComposerAgentService(
     Action<CompactionResult>? onCompacted,
     bool subAgentsEnabled,
     IReadOnlyList<ModelEntry> subAgentModels,
-    string? additionalImagesRoot = null) : IAsyncDisposable
+    string? additionalImagesRoot = null,
+    ComposerUserState? userState = null) : IAsyncDisposable
 {
     private string? _model = string.IsNullOrWhiteSpace(model) ? null : model;
     private int _maxContextTokens = maxContextTokens;
@@ -78,6 +79,7 @@ internal sealed class ComposerAgentService(
     private readonly Action<CompactionResult>? _onCompacted = onCompacted;
     private readonly bool _subAgentsEnabled = subAgentsEnabled;
     private readonly string? _additionalImagesRoot = additionalImagesRoot;
+    private readonly ComposerUserState? _userState = userState;
 
     /// <summary>
     /// Immutable construction-time snapshot of the sub-agent model catalog. Deliberately NOT read
@@ -332,7 +334,9 @@ internal sealed class ComposerAgentService(
 
     private IChatClient CreateClient(string modelId) => (_chatClientFactory ?? ChatClientFactory.Create)(modelId);
 
-    private string GetSessionFilePath() => Path.Combine(_stateDir, "composer-session.json");
+    private string GetSessionFilePath() => ComposerUserState.SessionFilePath(_stateDir, _userState);
+
+    private string RegistryId => ComposerUserState.RegistryId(_userState);
 
     /// <summary>
     /// Disposes the old agent asynchronously, invoking <see cref="OnAgentDisposing"/> first.
@@ -561,7 +565,7 @@ internal sealed class ComposerAgentService(
 
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
-                SessionId = "composer",
+                SessionId = RegistryId,
                 SessionType = LlmSessionType.Composer,
                 Model = model,
                 Status = "idle",
@@ -581,7 +585,7 @@ internal sealed class ComposerAgentService(
             // failure happened after it). Roll back the stale composer entry BEFORE any
             // fallible cleanup logging — a throwing logger must not skip the rollback, and
             // the original connection exception must not be masked.
-            _sessionRegistry?.Unregister("composer");
+            _sessionRegistry?.Unregister(RegistryId);
 
             try
             {
@@ -715,7 +719,7 @@ internal sealed class ComposerAgentService(
         {
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
-                SessionId = "composer",
+                SessionId = RegistryId,
                 SessionType = LlmSessionType.Composer,
                 Model = selection.Model,
                 Status = "idle",

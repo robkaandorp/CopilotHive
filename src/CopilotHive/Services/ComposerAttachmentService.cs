@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using CopilotHive.Orchestration;
 
 namespace CopilotHive.Services;
 
@@ -210,6 +211,18 @@ public sealed class ComposerAttachmentService
     }
 
     /// <summary>
+    /// Initialises an identity-bound service over the canonical per-user root
+    /// <c>{stateDir}/composer/users/N/attachments</c>, creating it.
+    /// </summary>
+    /// <param name="stateDir">Runtime state directory.</param>
+    /// <param name="userState">The validated per-user Composer identity that owns this root.</param>
+    /// <param name="logger">Logger used for stray-file and cleanup-failure diagnostics.</param>
+    internal ComposerAttachmentService(string stateDir, ComposerUserState userState, ILogger<ComposerAttachmentService> logger)
+        : this(stateDir, logger, new AttachmentFileSystem(), seed: null, userState ?? throw new ArgumentNullException(nameof(userState)))
+    {
+    }
+
+    /// <summary>
     /// Test-only constructor: a narrow internal seam for portable IO-failure, oversize,
     /// cancellation and fault simulation plus an optional seed of retained records
     /// (used by the malicious-stored-path containment tests).
@@ -218,11 +231,13 @@ public sealed class ComposerAttachmentService
     /// <param name="logger">Logger used for stray-file and cleanup-failure diagnostics.</param>
     /// <param name="fs">File-system seam implementation.</param>
     /// <param name="seed">Optional pre-existing records to retain.</param>
+    /// <param name="userState">Optional validated per-user identity selecting the canonical per-user root.</param>
     internal ComposerAttachmentService(
         string stateDir,
         ILogger<ComposerAttachmentService> logger,
         IAttachmentFileSystem fs,
-        IReadOnlyDictionary<string, ComposerAttachment>? seed = null)
+        IReadOnlyDictionary<string, ComposerAttachment>? seed = null,
+        ComposerUserState? userState = null)
     {
         ArgumentNullException.ThrowIfNull(stateDir);
         ArgumentNullException.ThrowIfNull(logger);
@@ -230,7 +245,8 @@ public sealed class ComposerAttachmentService
 
         _logger = logger;
         _fs = fs;
-        AttachmentsRootPath = Path.GetFullPath(Path.Combine(stateDir, "composer-attachments"));
+        UserId = userState?.UserId;
+        AttachmentsRootPath = ComposerUserState.AttachmentsRootPath(stateDir, userState);
         _fs.CreateDirectory(AttachmentsRootPath);
 
         if (seed is null)
@@ -246,6 +262,9 @@ public sealed class ComposerAttachmentService
     /// <see cref="ComposerAttachment.SavedRelativePath"/>.
     /// </summary>
     public string AttachmentsRootPath { get; }
+
+    /// <summary>The validated internal user id this service is bound to; <c>null</c> for the legacy/default root.</summary>
+    internal int? UserId { get; }
 
     /// <summary>
     /// Validates and streams <paramref name="content"/> into a newly generated file under
