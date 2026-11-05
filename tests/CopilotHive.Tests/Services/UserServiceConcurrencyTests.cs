@@ -21,6 +21,21 @@ namespace CopilotHive.Tests.Services;
 /// </summary>
 public sealed class UserServiceConcurrencyTests : IDisposable
 {
+    /// <summary>
+    /// The BOUNDED HANG-GUARD for every concurrent operation. A task that never completes — a
+    /// deadlocked write transaction, a lock that is never released — fails the test as a NAMED
+    /// failure instead of hanging the whole run forever. The bound is generous (the operations under
+    /// test are milliseconds of SQLite work) so it can only trip on a genuine hang.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The FIXED clock every service in this file runs on. A controlled clock keeps the timestamps
+    /// deterministic — no assertion in this file depends on elapsed wall-clock time — and proves
+    /// the services do not reach for the system clock.
+    /// </summary>
+    private static readonly DateTimeOffset FixedNow = new(2033, 3, 3, 3, 3, 3, TimeSpan.Zero);
+
     private readonly string _dir;
     private readonly string _dbPath;
 
@@ -59,10 +74,11 @@ public sealed class UserServiceConcurrencyTests : IDisposable
 
     /// <summary>
     /// A service instance with its OWN connection settings, so two instances never share an
-    /// in-process connection object. SQLite's write lock is what arbitrates between them.
+    /// in-process connection object. SQLite's write lock is what arbitrates between them. Every
+    /// service runs on the SAME controlled clock, so the timestamps they write are deterministic.
     /// </summary>
     private UserService NewService() =>
-        new(new IndependentDbContextFactory(_dbPath), NullLogger<UserService>.Instance);
+        new(new IndependentDbContextFactory(_dbPath), NullLogger<UserService>.Instance, new FixedTimeProvider(FixedNow));
 
     private static CancellationToken Ct => CancellationToken.None;
 
@@ -71,6 +87,12 @@ public sealed class UserServiceConcurrencyTests : IDisposable
     /// side's outcome. A rendezvous (not a sleep) establishes that both were in flight. The two sides
     /// may have different result types — the outcomes are deliberately compared as outcomes, never by
     /// which task happened to finish first.
+    /// <para>
+    /// Both tasks are awaited under the BOUNDED hang-guard, and the guard applies to the WHOLE
+    /// rendezvous: a side that never completes fails the test with a named timeout rather than
+    /// hanging the run. Both tasks are always observed, so a failure on one side never leaves the
+    /// other side unobserved.
+    /// </para>
     /// </summary>
     private static async Task<(TFirst First, TSecond Second)> RunConcurrentlyAsync<TFirst, TSecond>(
         Func<Task<TFirst>> first,
@@ -90,6 +112,8 @@ public sealed class UserServiceConcurrencyTests : IDisposable
             return await second();
         });
 
+        // Await BOTH sides under the guard: a refusal on one side must not hide a hang on the other.
+        await Task.WhenAll(firstTask, secondTask).WaitAsync(HangGuard);
         return (await firstTask, await secondTask);
     }
 
@@ -246,6 +270,141 @@ public sealed class UserServiceConcurrencyTests : IDisposable
         Assert.Equal(UserRole.Admin, account.Role);
     }
 
+    /// <summary>
+    /// A MATCHING VIEWER INVITATION UNDER CONTENTION ALSO KEEPS THE BOOTSTRAP ACCOUNT ADMIN. The
+    /// invitation's role is consumed but NEVER applied to the account, so the least-privileged
+    /// matching invitation cannot demote the original admin.
+    /// </summary>
+    [Theory]
+    [InlineData(UserRole.Viewer)]
+    [InlineData(UserRole.Member)]
+    public async Task BootstrapWithMatchingInvitationConcurrently_KeepsTheBootstrapAccountAdmin(UserRole invitationRole)
+    {
+        var seeding = NewService();
+        var invitation = await seeding.InviteUserAsync("octocat", invitationRole, Ct);
+
+        var serviceA = NewService();
+        var serviceB = NewService();
+
+        var (first, second) = await RunConcurrentlyAsync(
+            () => serviceA.CreateOrUpdateUserAsync("100", "octocat", null, null, null, "token-a", null, null, Ct),
+            () => serviceB.CreateOrUpdateUserAsync("100", "octocat", null, null, null, "token-b", null, null, Ct));
+
+        Assert.Equal(first.Id, second.Id);
+
+        await using var verification = NewContext();
+        var account = Assert.Single(await verification.Users.AsNoTracking().ToListAsync(Ct));
+
+        // The account is an ENABLED ADMIN regardless of the invitation's role.
+        Assert.Equal(UserRole.Admin, account.Role);
+        Assert.True(account.Enabled);
+
+        // The invitation was consumed exactly once, into THAT account.
+        var consumed = Assert.Single(await verification.UserInvitations.AsNoTracking().ToListAsync(Ct));
+        Assert.Equal(invitation.Id, consumed.Id);
+        Assert.Equal(account.Id, consumed.ActivatedUserId);
+    }
+
+    /// <summary>
+    /// THE MATCHING-INVITATION CONSUMPTION AND THE ACCOUNT INSERT ARE ONE ATOMIC STEP: under
+    /// contention, the invitation is NEVER left consumed without an account, and never activated
+    /// into an account that does not exist. The database is read back for the FULL state, so a
+    /// partial write would be visible.
+    /// </summary>
+    [Fact]
+    public async Task BootstrapWithMatchingInvitationConcurrently_NeverConsumesTheInvitationWithoutAnAccount()
+    {
+        var seeding = NewService();
+        var invitation = await seeding.InviteUserAsync("octocat", UserRole.Member, Ct);
+
+        var serviceA = NewService();
+        var serviceB = NewService();
+
+        var (first, second) = await RunConcurrentlyAsync(
+            () => serviceA.CreateOrUpdateUserAsync("100", "octocat", null, null, null, "token-a", null, null, Ct),
+            () => serviceB.CreateOrUpdateUserAsync("100", "octocat", null, null, null, "token-b", null, null, Ct));
+
+        Assert.Equal(first.Id, second.Id);
+
+        await using var verification = NewContext();
+        var accounts = await verification.Users.AsNoTracking().ToListAsync(Ct);
+        var invitations = await verification.UserInvitations.AsNoTracking().ToListAsync(Ct);
+
+        var stored = Assert.Single(invitations);
+        Assert.Equal(invitation.Id, stored.Id);
+
+        if (stored.ActivatedUserId is null)
+        {
+            // Not consumed: the invitation is still pending — but then no account may claim it.
+            Assert.True(stored.Enabled);
+            Assert.Null(stored.ActivatedAt);
+        }
+        else
+        {
+            // Consumed: the referenced account MUST exist and carry the original id.
+            Assert.NotNull(stored.ActivatedAt);
+            Assert.Contains(accounts, u => u.Id == stored.ActivatedUserId);
+            Assert.Equal(first.Id, stored.ActivatedUserId);
+        }
+
+        // Whatever happened, at most ONE account exists for the identity.
+        Assert.True(accounts.Count <= 1);
+    }
+
+    /// <summary>
+    /// ACTIVATION DUPLICATE DETECTION IS ATOMIC WHEN BOTH SIDES USE THE SAME GITHUB ID: two
+    /// separate service instances activate TWO DIFFERENT invitations that carry the SAME GitHub
+    /// numeric id. At most ONE account can exist for that id, so one side must be refused and the
+    /// refused side must leave NO row behind.
+    /// </summary>
+    [Fact]
+    public async Task Activation_SameGitHubIdAcrossDifferentInvitationsConcurrently_ProducesOneAccount()
+    {
+        var seeding = NewService();
+        await seeding.CreateOrUpdateUserAsync("1", "original", null, null, null, "original-token", null, null, Ct);
+        await seeding.InviteUserAsync("first-invitee", UserRole.Member, Ct);
+        await seeding.InviteUserAsync("second-invitee", UserRole.Viewer, Ct);
+
+        var serviceA = NewService();
+        var serviceB = NewService();
+
+        var (first, second) = await RunConcurrentlyAsync(
+            () => CaptureActivation("200", () => serviceA.ActivateInvitationAsync("first-invitee", "200", null, null, null, Ct)),
+            () => CaptureActivation("200", () => serviceB.ActivateInvitationAsync("second-invitee", "200", null, null, null, Ct)));
+
+        var winners = new[] { first, second }.Where(o => o.Summary is not null).ToList();
+        var losers = new[] { first, second }.Where(o => o.Refusal is not null).ToList();
+        Assert.Single(winners);
+        Assert.Single(losers);
+        Assert.IsType<UserDirectoryException>(losers[0].Refusal);
+
+        // The winner is the side whose account was actually created.
+        var winnerSummary = winners[0].Summary!;
+        var loserSummary = losers[0].Summary;
+        Assert.Null(loserSummary);
+
+        await using var verification = NewContext();
+        var accounts = await verification.Users.AsNoTracking().ToListAsync(Ct);
+
+        // EXACTLY ONE account carries the shared GitHub id — the UNIQUE index arbitrated.
+        var bound = Assert.Single(accounts, u => u.GitHubId == "200");
+        Assert.Equal(winnerSummary.Id, bound.Id);
+        Assert.Equal(2, accounts.Count);
+
+        // The loser's invitation was NOT consumed — the refusal commits nothing.
+        var invitations = await verification.UserInvitations.AsNoTracking().ToListAsync(Ct);
+        var consumed = invitations.Where(i => i.ActivatedUserId is not null).ToList();
+        Assert.Single(consumed);
+        Assert.Equal(bound.Id, consumed[0].ActivatedUserId);
+
+        // Every invitation that WAS consumed points at a real, existing account.
+        foreach (var invitation in invitations)
+        {
+            if (invitation.ActivatedUserId is not null)
+                Assert.Contains(accounts, u => u.Id == invitation.ActivatedUserId);
+        }
+    }
+
     // ── Activation ───────────────────────────────────────────────────────────
 
     /// <summary>
@@ -295,8 +454,7 @@ public sealed class UserServiceConcurrencyTests : IDisposable
     /// the "one identity to one activated user" invariant holds under contention.
     /// </summary>
     [Fact]
-    public async Task Activation_DifferentInvitationsConcurrently_BindsOneIdentityEach()
-    {
+    public async Task Activation_DifferentInvitationsConcurrently_BindsOneIdentityEach()    {
         var seeding = NewService();
         await seeding.CreateOrUpdateUserAsync("1", "original", null, null, null, "original-token", null, null, Ct);
         await seeding.InviteUserAsync("member-user", UserRole.Member, Ct);
@@ -398,6 +556,51 @@ public sealed class UserServiceConcurrencyTests : IDisposable
     }
 
     // ── Last enabled Admin protection ───────────────────────────────────────
+
+    /// <summary>
+    /// THE BOOTSTRAP RACE, DETERMINISTICALLY STAGED: the second identity is released only AFTER the
+    /// first has COMMITTED, so the "both in flight" ordering is not left to scheduling luck. The
+    /// invariant is the same — exactly ONE original account, and the late loser is REJECTED and never
+    /// inserted — but it is now proven for a precisely known interleaving as well.
+    /// <para>
+    /// The gate is a task completion, not a sleep: the test thread awaits the first operation's
+    /// completion and only then releases the second.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Bootstrap_LateDistinctIdentity_IsRejectedAndNeverInserted()
+    {
+        var serviceA = NewService();
+        var serviceB = NewService();
+
+        // The first identity commits on its own.
+        var winner = await serviceA.CreateOrUpdateUserAsync(
+            "100", "alpha", null, null, null, "token-alpha", null, null, Ct);
+
+        // The second, DISTINCT identity arrives afterwards and is refused.
+        var refusal = await Assert.ThrowsAsync<UserDirectoryException>(
+            () => serviceB.CreateOrUpdateUserAsync(
+                "200", "beta", null, null, null, "token-beta", null, null, Ct));
+
+        Assert.Contains("Only the original activated account may sign in", refusal.Message);
+
+        await using var verification = NewContext();
+        var accounts = await verification.Users.AsNoTracking().ToListAsync(Ct);
+
+        // EXACTLY ONE account: the loser's row was never inserted.
+        var account = Assert.Single(accounts);
+        Assert.Equal(winner.Id, account.Id);
+        Assert.Equal("100", account.GitHubId);
+        Assert.Equal("token-alpha", account.AccessToken);
+        Assert.Equal(UserRole.Admin, account.Role);
+
+        // The loser's identity has no row and no credential.
+        Assert.DoesNotContain(accounts, u => u.GitHubId == "200");
+        Assert.Null(await serviceB.GetByGitHubIdAsync("200", Ct));
+
+        // The global token is still the original account's.
+        Assert.Equal("token-alpha", await serviceA.GetActiveAccessTokenAsync(Ct));
+    }
 
     /// <summary>
     /// TWO CONCURRENT OPERATIONS THAT WOULD EACH REMOVE AN ENABLED ADMIN CANNOT BOTH SUCCEED when only
@@ -584,5 +787,15 @@ public sealed class UserServiceConcurrencyTests : IDisposable
                 .Options;
             return new CopilotHiveDbContext(options);
         }
+    }
+
+    /// <summary>
+    /// A fully manual clock pinned to one instant, so every timestamp written under contention is
+    /// deterministic. No assertion in this file depends on elapsed time — the guard is there to keep
+    /// the written values reproducible, not to measure anything.
+    /// </summary>
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
     }
 }

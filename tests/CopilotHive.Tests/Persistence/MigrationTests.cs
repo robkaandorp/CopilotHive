@@ -386,6 +386,59 @@ public sealed class MigrationTests
         Assert.Single(ctx.Users.AsNoTracking().ToList());
     }
 
+    /// <summary>
+    /// THE UPGRADED DATABASE STILL SUPPLIES THE ORIGINAL ACCOUNT'S TOKEN. After the real additive
+    /// upgrade, the global-token selector and the pre-Build scalar lookup both return the ORIGINAL
+    /// (lowest-id) account's credential — an invited Admin is never the fallback, and the original
+    /// account's integer id and token survived the upgrade verbatim.
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_AfterUpgrade_TheOriginalAccountStillSuppliesTheGlobalToken()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.Database.ExecuteSqlRaw(LegacyUsersTableSql);
+        ctx.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX \"IX_users_github_id\" ON \"users\" (\"github_id\")");
+        ctx.Database.ExecuteSqlRaw(
+            """
+            INSERT INTO "users" (id, github_id, username, access_token, role, created_at)
+            VALUES (7, '111', 'octocat', 'gho_original_token', 'admin', '2024-01-01T00:00:00.0000000Z')
+            """);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+        // The lowest-id account is the original — the token selector's contract.
+        var original = await ctx.Users.AsNoTracking().OrderBy(u => u.Id).FirstAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(7, original.Id);
+        Assert.Equal("gho_original_token", original.AccessToken);
+
+        // A PENDING Admin invitation and a HIGHER-id Admin invitation both exist now.
+        ctx.UserInvitations.Add(new CopilotHive.Persistence.Entities.UserInvitationEntity
+        {
+            NormalizedUsername = "pendingadmin",
+            Role = UserRole.Admin,
+            Enabled = true,
+            CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            UpdatedAt = "2024-01-01T00:00:00.0000000Z",
+        });
+        await ctx.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        // The selector still names the original account, and an invited Admin is not it.
+        var selected = await ctx.Users.AsNoTracking().OrderBy(u => u.Id).FirstAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(original.Id, selected.Id);
+        Assert.Equal("gho_original_token", selected.AccessToken);
+        Assert.Equal(UserRole.Admin, selected.Role);
+        Assert.True(selected.Enabled);
+
+        // The pending Admin invitation is NOT an activated Admin and never enters the selector.
+        var pending = await ctx.UserInvitations.AsNoTracking()
+            .SingleAsync(i => i.NormalizedUsername == "pendingadmin", TestContext.Current.CancellationToken);
+        Assert.Null(pending.ActivatedUserId);
+        Assert.NotEqual(pending.Id, selected.Id);
+    }
+
     /// <summary>Returns the column names of a table via PRAGMA.</summary>
     private static List<string> GetColumnNames(SqliteConnection conn, string table)
     {

@@ -294,6 +294,46 @@ public sealed class UserServiceTests
         Assert.Null((await service.GetActivatedUserByIdAsync(second.Id, Ct))!.LastLoginAt);
     }
 
+    /// <summary>
+    /// AN INVITED ADMIN NEVER BECOMES THE GLOBAL-TOKEN FALLBACK. The seeded row models an
+    /// invited administrator that was activated and later received a credential of its own: a
+    /// HIGHER internal id, the Admin role, enabled, and a DIFFERENT access token. The legacy
+    /// selector is the LOWEST-id activated account, so the ORIGINAL account's token is returned —
+    /// an invited Admin can never take over the global token, no matter how many Admins exist.
+    /// </summary>
+    [Fact]
+    public async Task GetActiveAccessTokenAsync_InvitedAdminWithHigherIdAndOwnToken_IsNeverTheFallback()
+    {
+        var (service, factory) = CreateService();
+        using var _ = factory;
+
+        var bootstrap = await BootstrapAsync(service, githubId: "1", username: "original", token: "original-token");
+
+        using (var db = factory.CreateDbContext())
+        {
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = "2",
+                Username = "invitedadmin",
+                AccessToken = "invited-admin-token",
+                Role = UserRole.Admin,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        // The ORIGINAL account's token is the global token — never the invited Admin's.
+        Assert.Equal("original-token", await service.GetActiveAccessTokenAsync(Ct));
+
+        // ...and the original-account selector still names the original account.
+        var original = await service.GetAdminUserAsync(Ct);
+        Assert.NotNull(original);
+        Assert.Equal(bootstrap.Id, original!.Id);
+        Assert.Equal("original", original.Username);
+        Assert.Equal("1", original.GitHubId);
+    }
+
     // ── Secret-free listings ─────────────────────────────────────────────────
 
     [Fact]
