@@ -341,6 +341,11 @@ public sealed class UserServiceTests
     /// account holds no usable token. The original account is the only credential source: an invited
     /// Admin that owns a token of its own must never be substituted, because that would re-route the
     /// legacy global token to a different identity.
+    /// <para>
+    /// The ORIGINAL account's token is EMPTY here, so the selector has nothing to return from it. A
+    /// selector that grew a fallback branch would return the invited Admin's token here — which is
+    /// exactly what this assertion forbids.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task GetActiveAccessTokenAsync_OriginalAccountWithoutAToken_DoesNotFallBackToAnInvitedAdmin()
@@ -348,9 +353,9 @@ public sealed class UserServiceTests
         var (service, factory) = CreateService();
         using var _ = factory;
 
-        // The ORIGINAL account exists but holds no usable token — the case in which a fallback
-        // could be introduced.
-        await BootstrapAsync(service, githubId: "1", username: "original", token: "   ");
+        // The ORIGINAL account exists but holds NO token — the case in which a fallback could be
+        // introduced.
+        await BootstrapAsync(service, githubId: "1", username: "original", token: string.Empty);
 
         // A HIGHER-id invited Admin that owns a real credential.
         using (var db = factory.CreateDbContext())
@@ -370,6 +375,41 @@ public sealed class UserServiceTests
         // The invited Admin's token is NEVER returned.
         var token = await service.GetActiveAccessTokenAsync(Ct);
         Assert.NotEqual("invited-admin-token", token);
+
+        // The selector returned the ORIGINAL account's own (empty) credential — nothing else.
+        Assert.Equal(string.Empty, token);
+    }
+
+    /// <summary>
+    /// A WHITESPACE-ONLY original token is likewise never replaced by an invited account's
+    /// credential: the selector returns the original account's own value, not somebody else's.
+    /// </summary>
+    [Fact]
+    public async Task GetActiveAccessTokenAsync_OriginalAccountWithWhitespaceToken_IsNotReplacedByAnInvitedAdmin()
+    {
+        var (service, factory) = CreateService();
+        using var _ = factory;
+
+        await BootstrapAsync(service, githubId: "1", username: "original", token: "   ");
+
+        using (var db = factory.CreateDbContext())
+        {
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = "2",
+                Username = "invitedadmin",
+                AccessToken = "invited-admin-token",
+                Role = UserRole.Admin,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        var token = await service.GetActiveAccessTokenAsync(Ct);
+
+        Assert.NotEqual("invited-admin-token", token);
+        Assert.Equal("   ", token);
     }
 
     /// <summary>
