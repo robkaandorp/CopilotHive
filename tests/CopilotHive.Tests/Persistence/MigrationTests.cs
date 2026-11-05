@@ -439,6 +439,150 @@ public sealed class MigrationTests
         Assert.NotEqual(pending.Id, selected.Id);
     }
 
+    /// <summary>
+    /// THE END-TO-END UPGRADE PATH ON A FILE-BACKED DATABASE: a REAL legacy <c>users</c> table
+    /// (populated, no <c>enabled</c> column) is upgraded with <see cref="DatabaseMigration.EnsureSchemaUpToDate"/>
+    /// followed by EF <c>MigrateAsync</c>, and the REAL
+    /// <see cref="Program.PreBuildOAuthTokenLookup"/> is then run against the SAME FILE.
+    /// <para>
+    /// This is the whole AC4/AC5 path in one test: the original account's id and credential survive
+    /// the additive upgrade, the lookup still returns the ORIGINAL account's token, and an invited
+    /// Admin (a higher id) never becomes the fallback — before OR after the reconciliation.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task LegacyUsersTable_OnAFileDatabase_AfterTheRealUpgrade_TheOriginalTokenStillSuppliesTheLookup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"copilothive-legacy-upgrade-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var dbPath = Path.Combine(dir, "legacy.db");
+
+        try
+        {
+            // ── BEFORE the upgrade: a REAL legacy schema on a FILE, with the original account. ──
+            await using (var legacyConnection = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await legacyConnection.OpenAsync(TestContext.Current.CancellationToken);
+                await using var cmd = legacyConnection.CreateCommand();
+                cmd.CommandText =
+                    """
+                    CREATE TABLE "users" (
+                        "id" INTEGER NOT NULL CONSTRAINT "PK_users" PRIMARY KEY AUTOINCREMENT,
+                        "github_id" TEXT NOT NULL,
+                        "username" TEXT NOT NULL,
+                        "display_name" TEXT NULL,
+                        "avatar_url" TEXT NULL,
+                        "email" TEXT NULL,
+                        "access_token" TEXT NOT NULL,
+                        "refresh_token" TEXT NULL,
+                        "token_expires_at" TEXT NULL,
+                        "role" TEXT NOT NULL DEFAULT 'admin',
+                        "created_at" TEXT NOT NULL,
+                        "last_login_at" TEXT NULL
+                    );
+                    CREATE UNIQUE INDEX "IX_users_github_id" ON "users" ("github_id");
+                    INSERT INTO "users" (id, github_id, username, access_token, refresh_token, role, created_at, last_login_at)
+                    VALUES (7, '111', 'octocat', 'gho_original_token', 'gho_refresh_token', 'admin',
+                            '2024-01-01T00:00:00.0000000Z', '2024-06-01T00:00:00.0000000Z');
+                    """;
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+            }
+
+            // PREMISE: the column a new EF model maps is genuinely ABSENT before the upgrade.
+            Assert.False(await ColumnExistsInFileAsync(dbPath, "users", "enabled"));
+
+            // BEFORE the upgrade: the lookup still returns the original token (legacy-safe).
+            Assert.Equal(
+                "gho_original_token",
+                await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken));
+
+            // ── THE REAL UPGRADE, on the same file. ──
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite($"Data Source={dbPath}")
+                .Options;
+
+            await using (var ctx = new CopilotHiveDbContext(options))
+            {
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+                await ctx.Database.MigrateAsync(TestContext.Current.CancellationToken);
+
+                // The ORIGINAL account's integer id, credential and history survived verbatim.
+                var upgraded = await ctx.Users.AsNoTracking().SingleAsync(TestContext.Current.CancellationToken);
+                Assert.Equal(7, upgraded.Id);
+                Assert.Equal("111", upgraded.GitHubId);
+                Assert.Equal("octocat", upgraded.Username);
+                Assert.Equal("gho_original_token", upgraded.AccessToken);
+                Assert.Equal("gho_refresh_token", upgraded.RefreshToken);
+                Assert.Equal("2024-01-01T00:00:00.0000000Z", upgraded.CreatedAt);
+                Assert.Equal("2024-06-01T00:00:00.0000000Z", upgraded.LastLoginAt);
+
+                // The legacy row upgraded to an ENABLED Admin.
+                Assert.Equal(UserRole.Admin, upgraded.Role);
+                Assert.True(upgraded.Enabled);
+
+                // A HIGHER-id invited Admin exists now, with a credential of its own, and a PENDING
+                // Admin invitation exists besides it.
+                ctx.Users.Add(new CopilotHive.Persistence.Entities.UserEntity
+                {
+                    GitHubId = "222",
+                    Username = "invitedadmin",
+                    AccessToken = "gho_invited_admin_token",
+                    Role = UserRole.Admin,
+                    Enabled = true,
+                    CreatedAt = "2024-02-01T00:00:00.0000000Z",
+                });
+                ctx.UserInvitations.Add(new CopilotHive.Persistence.Entities.UserInvitationEntity
+                {
+                    NormalizedUsername = "pendingadmin",
+                    Role = UserRole.Admin,
+                    Enabled = true,
+                    CreatedAt = "2024-02-01T00:00:00.0000000Z",
+                    UpdatedAt = "2024-02-01T00:00:00.0000000Z",
+                });
+                await ctx.SaveChangesAsync(TestContext.Current.CancellationToken);
+            }
+
+            // AFTER the upgrade: the ORIGINAL account's token is still what the lookup returns —
+            // the invited Admin (higher id) and the pending invitation never take it over.
+            Assert.Equal(
+                "gho_original_token",
+                await Program.PreBuildOAuthTokenLookup(dbPath, TestContext.Current.CancellationToken));
+
+            // ...and the upgraded schema really does have the new columns now.
+            Assert.True(await ColumnExistsInFileAsync(dbPath, "users", "enabled"));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            try
+            {
+                if (Directory.Exists(dir))
+                    Directory.Delete(dir, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best-effort cleanup only.
+            }
+        }
+    }
+
+    /// <summary>Whether a column exists on a table in the SQLite FILE at <paramref name="dbPath"/>.</summary>
+    private static async Task<bool> ColumnExistsInFileAsync(string dbPath, string table, string column)
+    {
+        await using var connection = new SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info(\"{table}\")";
+        await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        while (await reader.ReadAsync(TestContext.Current.CancellationToken))
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
     /// <summary>Returns the column names of a table via PRAGMA.</summary>
     private static List<string> GetColumnNames(SqliteConnection conn, string table)
     {

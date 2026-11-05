@@ -274,6 +274,116 @@ public sealed class UserServiceInvitationDirectoryTests
         Assert.False(listed.Enabled);
     }
 
+    /// <summary>
+    /// AN INVITATION ACTIVATION MINTS NO CREDENTIAL. The activated account is created by a
+    /// DIRECTORY operation, not by an OAuth sign-in, so it holds no access token, no refresh token
+    /// and no expiry — it must never be a credential source. This is read back from the DATABASE
+    /// (not from a summary projection), so a credential written behind the projection would be
+    /// visible here.
+    /// </summary>
+    [Fact]
+    public async Task ActivateInvitationAsync_MintsNoCredentialOnTheActivatedAccount()
+    {
+        var (service, factory) = CreateService();
+        using var _ = factory;
+
+        await service.CreateOrUpdateUserAsync(
+            "1", "original", null, null, null, "original-token", null, null, Ct);
+        await service.InviteUserAsync("newcomer", UserRole.Member, Ct);
+
+        var activated = await service.ActivateInvitationAsync(
+            "newcomer", "55555", "New Comer", null, "newcomer@example.com", Ct);
+
+        // Read the RAW ROW back out of the database.
+        using (var db = factory.CreateDbContext())
+        {
+            var stored = await db.Users.AsNoTracking().SingleAsync(u => u.Id == activated.Id, Ct);
+
+            Assert.Equal(string.Empty, stored.AccessToken);
+            Assert.Null(stored.RefreshToken);
+            Assert.Null(stored.TokenExpiresAt);
+
+            // The account has never signed in: no last-login timestamp either.
+            Assert.Null(stored.LastLoginAt);
+        }
+
+        // ...and it is therefore never a credential source for the global token.
+        Assert.Equal("original-token", await service.GetActiveAccessTokenAsync(Ct));
+    }
+
+    /// <summary>
+    /// THE STORAGE INVARIANT: A PENDING INVITATION NEVER BECOMES A USERS ROW. The users table
+    /// keeps its <c>github_id NOT NULL</c> unique constraint and holds only ACTIVATED accounts, so
+    /// the activated-account count is unchanged by an invitation and no users row can exist for an
+    /// invitation that has not been activated.
+    /// </summary>
+    [Fact]
+    public async Task InviteUserAsync_APendingInvitationNeverCreatesAUsersRow()
+    {
+        var (service, factory) = CreateService();
+        using var _ = factory;
+
+        var invitation = await service.InviteUserAsync("pending-user", UserRole.Admin, Ct);
+
+        // No users row exists for the invited login.
+        Assert.Equal(0, await service.GetUserCountAsync(Ct));
+        Assert.Null(await service.GetAdminUserAsync(Ct));
+        Assert.Null(await service.GetByGitHubIdAsync("pending-user", Ct));
+        Assert.Null(await service.GetActivatedUserByUsernameAsync("pending-user", Ct));
+
+        using (var db = factory.CreateDbContext())
+        {
+            Assert.Empty(await db.Users.AsNoTracking().ToListAsync(Ct));
+
+            // The invitation itself lives in the SEPARATE table, keyed by the normalized login.
+            var stored = await db.UserInvitations.AsNoTracking().SingleAsync(Ct);
+            Assert.Equal(invitation.Id, stored.Id);
+            Assert.Equal("pending-user", stored.NormalizedUsername);
+            Assert.Null(stored.ActivatedUserId);
+        }
+    }
+
+    /// <summary>
+    /// THE USERS TABLE KEEPS ITS <c>github_id NOT NULL</c> UNIQUE CONSTRAINT after the invitation
+    /// table was added — the storage invariant that makes "a pending invitation can never be
+    /// represented as a users row" true at the SCHEMA level, not only by convention.
+    /// </summary>
+    [Fact]
+    public void UsersTable_KeepsGithubIdNotNullAndUnique_AlongsideTheInvitationTable()
+    {
+        var (service, factory) = CreateService();
+        using var _ = factory;
+
+        using var db = factory.CreateDbContext();
+        using var conn = db.Database.GetDbConnection();
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(\"users\")";
+        using var reader = cmd.ExecuteReader();
+        var githubIdNotNull = false;
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), "github_id", StringComparison.OrdinalIgnoreCase))
+                githubIdNotNull = reader.GetInt32(3) == 1;
+        }
+
+        Assert.True(githubIdNotNull, "users.github_id must stay NOT NULL");
+
+        using var indexCmd = conn.CreateCommand();
+        indexCmd.CommandText =
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'users' " +
+            "AND name = 'IX_users_github_id' AND sql LIKE '%UNIQUE%'";
+        Assert.Equal(1L, Convert.ToInt64(indexCmd.ExecuteScalar()));
+
+        // The invitations table is a SEPARATE table with its own unique index.
+        using var invitationIndexCmd = conn.CreateCommand();
+        invitationIndexCmd.CommandText =
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'user_invitations' " +
+            "AND name = 'idx_user_invitations_normalized_username' AND sql LIKE '%UNIQUE%'";
+        Assert.Equal(1L, Convert.ToInt64(invitationIndexCmd.ExecuteScalar()));
+    }
+
     // ── A pending Admin invitation is never an activated Admin ───────────────
 
     /// <summary>

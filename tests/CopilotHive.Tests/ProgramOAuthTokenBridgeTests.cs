@@ -226,6 +226,113 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
             "The live UserService resolver must be attached only after the host is built.");
     }
 
+    // ── OAuth admission source structure ─────────────────────────────────────
+
+    /// <summary>
+    /// THE OAUTH ADMISSION CONTRACT, IN SOURCE. The multi-user foundation must NOT widen OAuth
+    /// admission: only the ORIGINAL/bootstrap identity is admitted, and every other identity is
+    /// refused. The <c>OnCreatingTicket</c> handler is a lambda that cannot be invoked without
+    /// booting the host, so its SOURCE is the contract's proof here — this file is the vehicle the
+    /// OAuth bridge already owns.
+    /// <para>
+    /// The handler is extracted with the repository's string-aware scanner, so a brace inside a
+    /// string literal cannot end the block early and the assertions are made about CODE, not prose.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void ProgramCs_OnCreatingTicket_AdmitsOnlyTheOriginalIdentity()
+    {
+        var handler = ExtractOnCreatingTicketHandler();
+
+        Assert.NotNull(handler);
+
+        // The admission decision is made from the ACTIVATED-account count and the ORIGINAL
+        // account's GitHub id — the two reads the multi-user foundation left untouched.
+        Assert.Contains("GetUserCountAsync", handler, StringComparison.Ordinal);
+        Assert.Contains("GetAdminUserAsync", handler, StringComparison.Ordinal);
+        Assert.Contains("admin.GitHubId == githubId", handler, StringComparison.Ordinal);
+
+        // Every other identity is REFUSED through the OAuth failure path.
+        Assert.Contains("context.Fail(", handler, StringComparison.Ordinal);
+        Assert.Contains("Only one user (admin) is allowed in this version.", handler, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE OAUTH ADMISSION PATH NEVER CONSULTS THE INVITATION DIRECTORY: an invitation is not an
+    /// account, so no invitation can influence who is admitted and no invitation can become the
+    /// token account through the sign-in path.
+    /// </summary>
+    [Fact]
+    public void ProgramCs_OnCreatingTicket_NeverConsultsTheInvitationDirectory()
+    {
+        var handler = ExtractOnCreatingTicketHandler();
+
+        Assert.NotNull(handler);
+        Assert.DoesNotContain("Invitation", handler, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ActivateInvitationAsync", handler, StringComparison.Ordinal);
+        Assert.DoesNotContain("ListInvitationsAsync", handler, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetInvitationByUsernameAsync", handler, StringComparison.Ordinal);
+        Assert.DoesNotContain("UserRole", handler, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The admission path calls the ATOMIC bootstrap seam
+    /// (<c>CreateOrUpdateUserAsync</c>) on BOTH branches — the first-sign-in branch and the
+    /// returning-original branch — so the atomic bootstrap semantics apply to the real admission
+    /// path rather than to a read-then-write of the handler's own.
+    /// </summary>
+    [Fact]
+    public void ProgramCs_OnCreatingTicket_DelegatesToTheAtomicBootstrapSeam()
+    {
+        var handler = ExtractOnCreatingTicketHandler();
+
+        Assert.NotNull(handler);
+        Assert.Equal(2, CountOccurrences(handler, "CreateOrUpdateUserAsync"));
+    }
+
+    /// <summary>
+    /// The pre-Build token lookup is a SCALAR projection of ONE legacy column. It must not
+    /// materialize the entity, because materializing it selects every mapped column — including the
+    /// <c>enabled</c> column that a legacy installation does not have yet — and would fail exactly
+    /// when the credential is needed. This is the structural form of the legacy-schema regression.
+    /// </summary>
+    [Fact]
+    public void ProgramCs_PreBuildOAuthTokenLookup_UsesAScalarLegacySafeProjection()
+    {
+        var body = TestSourceScanner.ExtractMethodBlockPreservingLiterals(
+            ReadProgramSource(),
+            "internal static async Task<string?> PreBuildOAuthTokenLookup");
+
+        Assert.NotNull(body);
+
+        // The entity is NOT materialized: no LINQ query over the users set.
+        Assert.DoesNotContain("db.Users", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("AsNoTracking", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("FirstOrDefaultAsync", body, StringComparison.Ordinal);
+
+        // A SCALAR projection of the ONE legacy column, ordered by the original account's id.
+        Assert.Contains("ExecuteScalarAsync", body, StringComparison.Ordinal);
+        Assert.Contains("SELECT access_token FROM users ORDER BY id LIMIT 1", body, StringComparison.Ordinal);
+
+        // No column added after the multi-user foundation is referenced.
+        Assert.DoesNotContain("enabled", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Extracts the body of <c>Program.cs</c>'s <c>OnCreatingTicket</c> handler. The marker is
+    /// unique in the file, and the brace matching is driven by the string-aware mask, so a brace
+    /// inside a literal cannot end the block early.
+    /// </summary>
+    private static string? ExtractOnCreatingTicketHandler() =>
+        TestSourceScanner.ExtractMethodBlockPreservingLiterals(
+            ReadProgramSource(),
+            "options.Events.OnCreatingTicket = async context =>");
+
+    /// <summary>Reads <c>Program.cs</c> from the repository's production source tree.</summary>
+    private static string ReadProgramSource() =>
+        File.ReadAllText(Path.Combine(FindRepoRoot(), "src", "CopilotHive", "Program.cs"))
+            .ReplaceLineEndings("\n");
+
     // ── PreBuildOAuthTokenLookup ──────────────────────────────────────────────
 
     [Fact]
