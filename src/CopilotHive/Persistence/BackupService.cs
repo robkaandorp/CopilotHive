@@ -12,7 +12,7 @@ namespace CopilotHive.Persistence;
 
 /// <summary>
 /// Creates compressed (tar.gz) backups of the CopilotHive runtime state, including the
-/// SQLite database, Brain session files, the Composer session file, metrics, and data
+/// SQLite database, Brain session files, the Composer session file, the per-user Composer tree, metrics, and data
 /// protection keys. Backups are stored under <c>{stateDir}/backups</c> and the most recent
 /// ten archives are retained.
 /// </summary>
@@ -111,6 +111,11 @@ public sealed class BackupService
                 Path.Combine(_stateDir, "keys"),
                 Path.Combine(tempDir, "keys"));
 
+            // 6b. Per-user Composer tree: sessions, attachments and migration evidence.
+            var composerUsersCount = CopyDirectory(
+                Path.Combine(_stateDir, "composer", "users"),
+                Path.Combine(tempDir, "composer", "users"));
+
             // 7. Manifest
             var manifest = new
             {
@@ -125,6 +130,7 @@ public sealed class BackupService
                 composerSession,
                 metricsCount,
                 keysCount,
+                composerUsersCount,
             };
             await File.WriteAllTextAsync(
                 Path.Combine(tempDir, "backup-manifest.json"),
@@ -167,6 +173,10 @@ public sealed class BackupService
     /// <param name="MetricsCount">Number of metrics files restored.</param>
     /// <param name="KeysCount">Number of data protection key files restored.</param>
     /// <param name="SafetyBackupPath">Full path to the safety backup created before restoring.</param>
+    /// <param name="ComposerUsersCount">
+    /// Number of files restored under <c>composer/users</c> (per-user sessions, attachments and migration
+    /// evidence); 0 when the archive carried none, in which case current per-user state was cleared.
+    /// </param>
     public sealed record RestoreResult(
         bool DatabaseRestored,
         bool BrainMasterSession,
@@ -174,7 +184,8 @@ public sealed class BackupService
         bool ComposerSession,
         int MetricsCount,
         int KeysCount,
-        string SafetyBackupPath);
+        string SafetyBackupPath,
+        int ComposerUsersCount = 0);
 
     /// <summary>
     /// Restores a previously created tar.gz backup archive, extracting and replacing the
@@ -247,12 +258,19 @@ public sealed class BackupService
                 Path.Combine(tempDir, "keys"),
                 Path.Combine(_stateDir, "keys"));
 
+            // 9b. Restore the per-user Composer tree. ReplaceDirectory deletes the destination FIRST,
+            // so an archive without (or with an empty) composer/users tree clears current per-user
+            // sessions, attachments and migration evidence instead of merging stale files.
+            var composerUsersCount = ReplaceDirectory(
+                Path.Combine(tempDir, "composer", "users"),
+                Path.Combine(_stateDir, "composer", "users"));
+
             _logger.LogInformation(
                 "Restore complete from {ArchivePath}: database={DatabaseRestored}, brainMaster={BrainMasterSession}, "
-                + "brainGoals={BrainGoalSessionCount}, composer={ComposerSession}, metrics={MetricsCount}, keys={KeysCount}. "
+                + "brainGoals={BrainGoalSessionCount}, composer={ComposerSession}, metrics={MetricsCount}, keys={KeysCount}, composerUsers={ComposerUsersCount}. "
                 + "Safety backup at {SafetyBackupPath}",
                 archivePath, databaseRestored, brainMasterSession, brainGoalSessionCount,
-                composerSession, metricsCount, keysCount, safetyBackupPath);
+                composerSession, metricsCount, keysCount, composerUsersCount, safetyBackupPath);
 
             return new RestoreResult(
                 databaseRestored,
@@ -261,7 +279,8 @@ public sealed class BackupService
                 composerSession,
                 metricsCount,
                 keysCount,
-                safetyBackupPath);
+                safetyBackupPath,
+                composerUsersCount);
         }
         finally
         {
