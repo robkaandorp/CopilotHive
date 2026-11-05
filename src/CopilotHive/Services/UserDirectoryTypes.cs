@@ -195,8 +195,27 @@ public sealed class UserDirectoryException : InvalidOperationException
 /// The matching invitation that was NOT consumed because it is revoked or already activated, or
 /// null. A conflict is reported, never applied silently.
 /// </param>
+/// <param name="UsernameConflict">
+/// Set when the ORIGINAL account signed in under a new login whose normalized form already belongs to
+/// another activated account or invitation. The sign-in still succeeded (it is anchored to the
+/// immutable GitHub id): the original's existing username was preserved and every other field was
+/// refreshed. Null when there was no collision.
+/// </param>
 internal sealed record UserBootstrapOutcome(
     UserEntity User,
     bool CreatedNewAccount,
     UserInvitationEntity? ConsumedInvitation,
-    UserInvitationEntity? ConflictingInvitation);
+    UserInvitationEntity? ConflictingInvitation,
+    UsernameConflict? UsernameConflict = null);
+
+/// <summary>
+/// A reported (never thrown) collision between the login an original account tried to rename to and an
+/// identity that already owns that normalized login.
+/// </summary>
+/// <param name="RequestedUsername">The (trimmed) login the sign-in carried and that was NOT applied.</param>
+/// <param name="ConflictingUserId">The activated account holding that login, or null.</param>
+/// <param name="ConflictingInvitationId">The invitation reserving that login, or null.</param>
+internal sealed record UsernameConflict(
+    string RequestedUsername,
+    int? ConflictingUserId,
+    int? ConflictingInvitationId);

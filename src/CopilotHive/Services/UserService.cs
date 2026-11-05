@@ -195,6 +195,7 @@ public sealed class UserService
     {
         var nowIso = NowIso();
         var normalizedUsername = UserNormalization.TryNormalize(username);
+        var storedUsername = username.Trim();
 
         await using var db = await _dbContextFactory.CreateDbContextAsync(ct);
         await using var tx = await BeginImmediateTransactionAsync(db, ct);
@@ -212,6 +213,7 @@ public sealed class UserService
         bool created;
         UserInvitationEntity? consumedInvitation = null;
         UserInvitationEntity? conflictingInvitation = null;
+        UsernameConflict? usernameConflict = null;
 
         if (originalId is null)
         {
@@ -219,7 +221,9 @@ public sealed class UserService
             user = new UserEntity
             {
                 GitHubId = githubId,
-                Username = username,
+                // Trimmed BEFORE persistence (see UserNormalization): a stored " OctoCat " would
+                // otherwise bypass every normalized lookup/conflict check.
+                Username = storedUsername,
                 DisplayName = displayName,
                 AvatarUrl = avatarUrl,
                 Email = email,
@@ -279,7 +283,24 @@ public sealed class UserService
                     $"(id {original.Id}). Invited users are activated through the invitation directory, not through sign-in.");
             }
 
-            original.Username = username;
+            // THE ORIGINAL ACCOUNT'S SIGN-IN IS ANCHORED TO ITS IMMUTABLE GITHUB ID, never to its
+            // mutable login. A rename whose normalized login already belongs to ANOTHER activated
+            // account (or is reserved by another invitation) must not block the sign-in or the token
+            // refresh, and must not create a second account for one normalized login: the original's
+            // EXISTING unique username is preserved, everything else is refreshed, and the conflict
+            // is reported on the outcome and in the log. Nothing throws and nothing is consumed.
+            if (normalizedUsername is not null
+                && !UserNormalization.NormalizedEquals(original.Username, storedUsername))
+            {
+                usernameConflict = await FindUsernameConflictAsync(
+                    db, original.Id, storedUsername, normalizedUsername, ct);
+            }
+
+            if (usernameConflict is null)
+            {
+                original.Username = storedUsername;
+            }
+
             original.DisplayName = displayName;
             original.AvatarUrl = avatarUrl;
             original.Email = email;
@@ -324,9 +345,22 @@ public sealed class UserService
                     : "revoked");
         }
 
+        if (usernameConflict is not null)
+        {
+            _logger.LogWarning(
+                "Original account {UserId} signed in with login '{RequestedUsername}', which is already taken by {Holder}. " +
+                "The account keeps its existing username '{ExistingUsername}'; the profile and token were refreshed.",
+                user.Id,
+                usernameConflict.RequestedUsername,
+                usernameConflict.ConflictingUserId is not null
+                    ? $"activated account {usernameConflict.ConflictingUserId}"
+                    : $"invitation {usernameConflict.ConflictingInvitationId}",
+                user.Username);
+        }
+
         RaiseTokenAvailable(accessToken);
 
-        return new UserBootstrapOutcome(user, created, consumedInvitation, conflictingInvitation);
+        return new UserBootstrapOutcome(user, created, consumedInvitation, conflictingInvitation, usernameConflict);
     }
 
     /// <summary>
@@ -415,14 +449,11 @@ public sealed class UserService
 
         await using var db = await _dbContextFactory.CreateDbContextAsync(ct);
 
-        // lower(username) is SQLite's ASCII case fold, which is exactly what GitHub logins allow. The
-        // comparison is performed in SQL so casing can never make two identities out of one.
-        var id = await db.Users
-            .AsNoTracking()
-            .Where(u => u.Username.ToLower() == normalized)
-            .OrderBy(u => u.Id)
-            .Select(u => (int?)u.Id)
-            .FirstOrDefaultAsync(ct);
+        // Compared with the SAME trim + case-fold the invitation directory uses, applied to the STORED
+        // value too, so a legacy row stored verbatim (" OctoCat ") still resolves as "octocat". The
+        // users table is tiny, and comparing in C# keeps the rule identical to UserNormalization.
+        var ids = await FindAccountIdsByNormalizedUsernameAsync(db, normalized, ct);
+        int? id = ids.Count == 0 ? null : ids[0];
 
         return id is null ? null : await GetActivatedUserByIdAsync(id.Value, ct);
     }
@@ -886,14 +917,72 @@ public sealed class UserService
             .ToListAsync(ct);
 
     /// <summary>
-    /// Whether an ACTIVATED account already holds this normalized GitHub login. Casing cannot create
-    /// two identities out of one login, so the comparison is done on the lower-cased login in SQL.
+    /// The ids (ascending, so the lowest id is first) of the ACTIVATED accounts whose stored login
+    /// normalizes to <paramref name="normalizedUsername"/>. The normalization is applied to the STORED
+    /// value as well as the probe, so a legacy row stored with surrounding whitespace or different
+    /// casing cannot hide behind its verbatim spelling.
     /// </summary>
-    private static Task<bool> NormalizedAccountExistsAsync(
+    private static async Task<List<int>> FindAccountIdsByNormalizedUsernameAsync(
         CopilotHiveDbContext db,
         string normalizedUsername,
         CancellationToken ct)
-        => db.Users.AsNoTracking().AnyAsync(u => u.Username.ToLower() == normalizedUsername, ct);
+    {
+        var rows = await db.Users
+            .AsNoTracking()
+            .OrderBy(u => u.Id)
+            .Select(u => new { u.Id, u.Username })
+            .ToListAsync(ct);
+
+        return rows
+            .Where(r => UserNormalization.NormalizedEquals(r.Username, normalizedUsername))
+            .Select(r => r.Id)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Whether an ACTIVATED account already holds this normalized GitHub login (see
+    /// <see cref="FindAccountIdsByNormalizedUsernameAsync"/>).
+    /// </summary>
+    private static async Task<bool> NormalizedAccountExistsAsync(
+        CopilotHiveDbContext db,
+        string normalizedUsername,
+        CancellationToken ct)
+        => (await FindAccountIdsByNormalizedUsernameAsync(db, normalizedUsername, ct)).Count > 0;
+
+    /// <summary>
+    /// Finds who else already owns the normalized login the original account is renaming to: another
+    /// ACTIVATED account, or an invitation that is not the original's own consumed one. An invitation
+    /// in ANY state counts (a revoked invitation can be re-enabled, and activating it would then collide
+    /// with the renamed account). Runs inside the caller's write transaction.
+    /// </summary>
+    private static async Task<UsernameConflict?> FindUsernameConflictAsync(
+        CopilotHiveDbContext db,
+        int originalUserId,
+        string requestedUsername,
+        string normalizedUsername,
+        CancellationToken ct)
+    {
+        var otherAccountIds = (await FindAccountIdsByNormalizedUsernameAsync(db, normalizedUsername, ct))
+            .Where(id => id != originalUserId)
+            .ToList();
+
+        if (otherAccountIds.Count > 0)
+        {
+            return new UsernameConflict(requestedUsername, otherAccountIds[0], null);
+        }
+
+        var invitation = await db.UserInvitations
+            .AsNoTracking()
+            .FirstOrDefaultAsync(i => i.NormalizedUsername == normalizedUsername, ct);
+
+        // The original's OWN consumed invitation is its history, not a competing claim.
+        if (invitation is not null && invitation.ActivatedUserId != originalUserId)
+        {
+            return new UsernameConflict(requestedUsername, null, invitation.Id);
+        }
+
+        return null;
+    }
 
     private static async Task<UserInvitationEntity> RequireInvitationAsync(
         CopilotHiveDbContext db,
