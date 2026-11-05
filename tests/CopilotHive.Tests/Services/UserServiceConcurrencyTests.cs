@@ -721,6 +721,157 @@ public sealed class UserServiceConcurrencyTests : IDisposable
         Assert.False(disabled.Enabled);
     }
 
+    // ── Normalized-login uniqueness under contention ─────────────────────────
+
+    /// <summary>
+    /// A RENAME RACING AN INVITATION FOR THE SAME NORMALIZED LOGIN NEVER PRODUCES TWO CLAIMS ON
+    /// THAT LOGIN. The normalized-login uniqueness rule is a SHARED invariant across activated
+    /// accounts and invitations, and both sides write, so the database serialises them. Whichever
+    /// side commits first, the other must observe it: either the invitation is refused because the
+    /// account now owns the login, or the rename is refused because the invitation reserves it.
+    /// <para>
+    /// The assertion is on the INVARIANT, never on which side won: at most one activated account and
+    /// at most one invitation may hold the normalized login "bob", and the two must never BOTH hold
+    /// it.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RenameAndInviteConcurrently_ForTheSameNormalizedLogin_NeverProduceTwoClaimsOnIt()
+    {
+        var seeding = NewService();
+        var original = await seeding.CreateOrUpdateUserAsync(
+            "1", "alice", null, null, null, "original-token", null, null, Ct);
+
+        var renameService = NewService();
+        var inviteService = NewService();
+
+        var (rename, invite) = await RunConcurrentlyAsync(
+            () => CaptureBootstrap(() => renameService.BootstrapOrRefreshAsync(
+                "1", "bob", null, null, null, "rotated-token", null, null, Ct)),
+            () => CaptureInvitation(() => inviteService.InviteUserAsync("bob", UserRole.Member, Ct)));
+
+        await using var verification = NewContext();
+
+        var accounts = await verification.Users.AsNoTracking().OrderBy(u => u.Id).ToListAsync(Ct);
+        var invitations = await verification.UserInvitations.AsNoTracking().ToListAsync(Ct);
+
+        // THE INVARIANT: the normalized login "bob" is claimed by AT MOST ONE activated account...
+        var accountsHoldingBob = accounts
+            .Where(u => UserNormalization.NormalizedEquals(u.Username, "bob"))
+            .ToList();
+        Assert.True(accountsHoldingBob.Count <= 1);
+
+        // ...and by AT MOST ONE invitation, and NEVER by both at once.
+        var invitationsHoldingBob = invitations
+            .Where(i => i.NormalizedUsername == "bob")
+            .ToList();
+        Assert.True(invitationsHoldingBob.Count <= 1);
+        Assert.False(accountsHoldingBob.Count == 1 && invitationsHoldingBob.Count == 1);
+
+        // The ORIGINAL account is never lost, and it always keeps its GitHub id.
+        var stored = await verification.Users.AsNoTracking().SingleAsync(u => u.Id == original.Id, Ct);
+        Assert.Equal("1", stored.GitHubId);
+
+        // The sign-in was NEVER rejected — the original's sign-in is anchored to its GitHub id.
+        Assert.NotNull(rename.Outcome);
+        Assert.Equal(original.Id, rename.Outcome!.User.Id);
+
+        // Exactly one of the two sides applied and the other was refused — never both, never neither.
+        var renameApplied = rename.Outcome!.UsernameConflict is null
+            && string.Equals(rename.Outcome.User.Username, "bob", StringComparison.Ordinal);
+        var inviteApplied = invite.Invitation is not null;
+        Assert.True(
+            renameApplied ^ inviteApplied,
+            $"Expected exactly one side to claim 'bob'; renameApplied={renameApplied} " +
+            $"inviteApplied={inviteApplied} conflict={rename.Outcome.UsernameConflict}");
+
+        // If the rename applied, the invitation must have been refused with a clear message.
+        if (renameApplied)
+        {
+            Assert.NotNull(invite.Refusal);
+            Assert.IsType<UserDirectoryException>(invite.Refusal);
+        }
+        else
+        {
+            // The rename was refused: the invitation holds the login and the original kept its name.
+            Assert.NotNull(rename.Outcome.UsernameConflict);
+            Assert.NotNull(rename.Outcome.UsernameConflict!.ConflictingInvitationId);
+            Assert.Equal("alice", stored.Username);
+
+            // The invitation that holds the login is the one the conflict names, and it is still
+            // pending — nothing was consumed.
+            var holding = await verification.UserInvitations.AsNoTracking()
+                .SingleAsync(i => i.Id == rename.Outcome.UsernameConflict!.ConflictingInvitationId, Ct);
+            Assert.Equal("bob", holding.NormalizedUsername);
+            Assert.Null(holding.ActivatedUserId);
+        }
+    }
+
+    /// <summary>
+    /// A RENAME RACING AN ACTIVATION NEVER HIDES THE ACTIVATED ACCOUNT. The activated account must
+    /// stay resolvable by its own login, and the original must keep a login that resolves to it —
+    /// whichever order the database commits them in.
+    /// </summary>
+    [Fact]
+    public async Task RenameAndActivationConcurrently_NeverHideTheActivatedAccount()
+    {
+        var seeding = NewService();
+        var original = await seeding.CreateOrUpdateUserAsync(
+            "1", "alice", null, null, null, "original-token", null, null, Ct);
+        await seeding.InviteUserAsync("bob", UserRole.Member, Ct);
+
+        var renameService = NewService();
+        var activationService = NewService();
+
+        var (rename, activation) = await RunConcurrentlyAsync(
+            () => CaptureBootstrap(() => renameService.BootstrapOrRefreshAsync(
+                "1", "bob", null, null, null, "rotated-token", null, null, Ct)),
+            () => CaptureActivation("200", () => activationService.ActivateInvitationAsync(
+                "bob", "200", null, null, null, Ct)));
+
+        await using var verification = NewContext();
+        var accounts = await verification.Users.AsNoTracking().OrderBy(u => u.Id).ToListAsync(Ct);
+
+        // THE INVARIANT: the normalized login "bob" is held by AT MOST ONE activated account.
+        var holders = accounts
+            .Where(u => UserNormalization.NormalizedEquals(u.Username, "bob"))
+            .ToList();
+        Assert.True(holders.Count <= 1);
+
+        // The original account always survives with its GitHub id.
+        var storedOriginal = Assert.Single(accounts, u => u.Id == original.Id);
+        Assert.Equal("1", storedOriginal.GitHubId);
+
+        // The sign-in was never rejected.
+        Assert.NotNull(rename.Outcome);
+        Assert.Equal(original.Id, rename.Outcome!.User.Id);
+
+        // If the activation bound the login, the original must have kept its own login and the
+        // activated account must be resolvable by "bob".
+        if (activation.Summary is not null)
+        {
+            var activated = Assert.Single(holders);
+            Assert.Equal(activation.Summary.Id, activated.Id);
+            Assert.NotEqual(original.Id, activated.Id);
+            Assert.Equal("alice", storedOriginal.Username);
+
+            // ...and it really is resolvable through the directory resolver.
+            var service = NewService();
+            Assert.Equal(activated.Id, (await service.GetActivatedUserByUsernameAsync("bob", Ct))!.Id);
+        }
+        else
+        {
+            // The activation was refused (the rename took the login first): the invitation stays
+            // pending and the original holds the login.
+            Assert.NotNull(activation.Refusal);
+            Assert.Single(holders);
+            Assert.Equal(original.Id, holders[0].Id);
+            var invitation = await verification.UserInvitations.AsNoTracking()
+                .SingleAsync(i => i.NormalizedUsername == "bob", Ct);
+            Assert.Null(invitation.ActivatedUserId);
+        }
+    }
+
     // ── Outcome capture helpers ─────────────────────────────────────────────
 
     /// <summary>
@@ -785,6 +936,31 @@ public sealed class UserServiceConcurrencyTests : IDisposable
             return new InvitationOutcome(null, ex);
         }
     }
+
+    /// <summary>
+    /// Captures the outcome of one BOOTSTRAP/REFRESH attempt, keeping the full outcome so the
+    /// reported username conflict is observable. A refresh of the ORIGINAL account must never be
+    /// rejected, so this helper records a refusal only if one actually happened.
+    /// </summary>
+    private static async Task<BootstrapOutcome> CaptureBootstrap(Func<Task<UserBootstrapOutcome>> operation)
+    {
+        try
+        {
+            return new BootstrapOutcome(await operation(), null);
+        }
+        catch (UserDirectoryException ex)
+        {
+            return new BootstrapOutcome(null, ex);
+        }
+    }
+
+    /// <summary>
+    /// The captured outcome of one bootstrap/refresh attempt: the full outcome (when it succeeded) or
+    /// the directory refusal (when it did not).
+    /// </summary>
+    private sealed record BootstrapOutcome(
+        UserBootstrapOutcome? Outcome,
+        UserDirectoryException? Refusal);
 
     /// <summary>
     /// The captured outcome of one account-writing attempt. Exactly one of <see cref="User"/>,

@@ -337,4 +337,215 @@ public sealed class UserServiceUsernameNormalizationTests
         Assert.Null(outcome.UsernameConflict);
         Assert.Equal("OctoCat", outcome.User.Username);
     }
+
+    // ── The public seam reports the conflict too ────────────────────────────
+
+    /// <summary>
+    /// THE CONFLICT IS REPORTED THROUGH THE PUBLIC SEAM AS WELL. <c>CreateOrUpdateUserAsync</c>
+    /// returns only the account, so the outcome cannot carry the conflict — the LOG is the public
+    /// channel, and it must name the requested login, the preserved login and the holder. This
+    /// proves the "report the conflict explicitly (log + service result/outcome)" requirement holds
+    /// for BOTH seams, not only for the internal one.
+    /// </summary>
+    [Fact]
+    public async Task OriginalAccountRename_Collision_IsAlsoReportedThroughThePublicSeamsLog()
+    {
+        var (service, factory, log, _) = Create();
+        using var _f = factory;
+
+        await SignIn(service, "1", "alice", "token-1");
+        await service.InviteUserAsync("bob", UserRole.Member, Ct);
+        var bob = await service.ActivateInvitationAsync("bob", "2", null, null, null, Ct);
+        log.Entries.Clear();
+
+        // The PUBLIC seam: it must not throw, must keep the username and must refresh the token.
+        var viaPublic = await service.CreateOrUpdateUserAsync(
+            "1", "bob", null, null, null, "token-2", null, null, Ct);
+
+        Assert.Equal("alice", viaPublic.Username);
+        Assert.Equal("token-2", viaPublic.AccessToken);
+
+        // The log names the requested login, the preserved login and the holder.
+        var warning = Assert.Single(log.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains("bob", warning.Message);
+        Assert.Contains("alice", warning.Message);
+        Assert.Contains(bob.Id.ToString(), warning.Message);
+    }
+
+    // ── Legacy stored values ────────────────────────────────────────────────
+
+    /// <summary>
+    /// A LEGACY VERBATIM ORIGINAL IS REFRESHED TO ITS NORMALIZED FORM without any conflict: the
+    /// account's own stored spelling (" OctoCat ") normalizes to the login it signed in with, so
+    /// this is a refresh of the SAME identity, not a rename onto somebody else's login. The legacy
+    /// admission/token behaviour is untouched: the original keeps its id and its role.
+    /// </summary>
+    [Fact]
+    public async Task LegacyVerbatimStoredOriginal_RefreshesToItsNormalizedForm_WithoutAConflict()
+    {
+        var (service, factory, log, _) = Create();
+        using var _f = factory;
+
+        using (var db = factory.CreateDbContext())
+        {
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = "1",
+                Username = " OctoCat ",
+                AccessToken = "legacy-token",
+                Role = UserRole.Admin,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        var outcome = await service.BootstrapOrRefreshAsync(
+            "1", "octocat", null, null, null, "rotated-token", null, null, Ct);
+
+        // No conflict: the account's own legacy spelling IS this identity.
+        Assert.Null(outcome.UsernameConflict);
+        Assert.Equal("octocat", outcome.User.Username);
+        Assert.Equal("rotated-token", outcome.User.AccessToken);
+
+        // The legacy admission/token behaviour is unchanged: same id, still the original account,
+        // still the global-token source.
+        Assert.Equal(1, await service.GetUserCountAsync(Ct));
+        Assert.Equal("rotated-token", await service.GetActiveAccessTokenAsync(Ct));
+        Assert.Equal(outcome.User.Id, (await service.GetAdminUserAsync(Ct))!.Id);
+        Assert.DoesNotContain(log.Entries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A LEGACY VERBATIM ACCOUNT BLOCKS A RENAME ONTO ITS NORMALIZED LOGIN, exactly as a
+    /// normalized account does: the comparison is applied to the STORED value, so " BoB " and "bob"
+    /// are one identity and the original's rename to "bob" is refused with the conflict reported.
+    /// </summary>
+    [Fact]
+    public async Task LegacyVerbatimStoredAccount_BlocksARenameOntoItsNormalizedLogin()
+    {
+        var (service, factory, log, _) = Create();
+        using var _f = factory;
+
+        await SignIn(service, "1", "alice", "token-1");
+
+        using (var db = factory.CreateDbContext())
+        {
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = "2",
+                Username = " BoB ",
+                AccessToken = "other-token",
+                Role = UserRole.Member,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        var outcome = await service.BootstrapOrRefreshAsync(
+            "1", "bob", null, null, null, "token-2", null, null, Ct);
+
+        // The original keeps its username; the token was still refreshed; the sign-in was not rejected.
+        Assert.Equal("alice", outcome.User.Username);
+        Assert.Equal("token-2", outcome.User.AccessToken);
+
+        // TWO accounts exist: the original plus the legacy verbatim one — the rename created none.
+        Assert.Equal(2, await service.GetUserCountAsync(Ct));
+
+        // The conflict names the holder of the normalized login.
+        var conflict = Assert.IsType<UsernameConflict>(outcome.UsernameConflict);
+        Assert.Equal("bob", conflict.RequestedUsername);
+        Assert.Equal(2, conflict.ConflictingUserId);
+        Assert.Null(conflict.ConflictingInvitationId);
+
+        // And it is reported in the log.
+        Assert.Single(log.Entries, e => e.Level == LogLevel.Warning);
+    }
+
+    // ── The normalized-login invariant across accounts and invitations ──────
+
+    /// <summary>
+    /// ONE NORMALIZED LOGIN IS NEVER HELD BY TWO ACTIVATED ACCOUNTS. The invitation directory
+    /// refuses a login an account already holds, and the activation path refuses a login another
+    /// account already holds — so an account and an invitation can never end up owning the same
+    /// normalized login, and two accounts can never be created for one.
+    /// </summary>
+    [Fact]
+    public async Task OneNormalizedLogin_IsNeverHeldByTwoActivatedAccounts()
+    {
+        var (service, factory, _, _) = Create();
+        using var _f = factory;
+
+        await SignIn(service, "1", "alice");
+
+        // Inviting the same normalized login is refused.
+        await Assert.ThrowsAsync<UserDirectoryException>(
+            () => service.InviteUserAsync("alice", UserRole.Member, Ct));
+
+        // Activating an invitation whose normalized login an account holds is refused.
+        await service.InviteUserAsync("bob", UserRole.Member, Ct);
+        using (var db = factory.CreateDbContext())
+        {
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = "3", Username = "BOB", AccessToken = "t", Role = UserRole.Member,
+                Enabled = true, CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        await Assert.ThrowsAsync<UserDirectoryException>(
+            () => service.ActivateInvitationAsync("bob", "2", null, null, null, Ct));
+
+        // Exactly the two pre-existing accounts, and no account was created for "bob".
+        Assert.Equal(2, await service.GetUserCountAsync(Ct));
+        Assert.Null(await service.GetByGitHubIdAsync("2", Ct));
+    }
+
+    /// <summary>
+    /// A RENAME ONTO A LOGIN THAT AN INVITATION RESERVES LEAVES THE INVITATION PENDING AND
+    /// UNCONSUMED, AND THE LOGIN STAYS AVAILABLE FOR THE INVITATION.
+    /// <para>
+    /// The original keeps its own username while the invitation holds "bob", so the two never share
+    /// a normalized login. The invitation was NOT silently consumed, and — because the original
+    /// never took the login — activating the invitation afterwards still succeeds and binds "bob"
+    /// to exactly one activated account.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OriginalAccountRename_CollidingWithAnInvitation_LeavesTheInvitationPendingAndActivatable()
+    {
+        var (service, factory, _, _) = Create();
+        using var _f = factory;
+
+        await SignIn(service, "1", "alice");
+        var invitation = await service.InviteUserAsync("bob", UserRole.Member, Ct);
+
+        var outcome = await service.BootstrapOrRefreshAsync(
+            "1", "bob", null, null, null, "token-2", null, null, Ct);
+
+        // The rename did NOT take the login and did NOT consume the invitation.
+        Assert.Equal("alice", outcome.User.Username);
+        Assert.Null(outcome.ConsumedInvitation);
+        var after = (await service.GetInvitationByUsernameAsync("bob", Ct))!;
+        Assert.Equal(invitation.Id, after.Id);
+        Assert.Null(after.ActivatedUserId);
+        Assert.True(after.IsPending);
+
+        // The login was never taken by the original, so the invitation can still be activated into
+        // exactly one account — and the original stays resolvable under its own login.
+        var activated = await service.ActivateInvitationAsync("bob", "2", null, null, null, Ct);
+
+        Assert.True(activated.Id > outcome.User.Id);
+        Assert.Equal("bob", activated.Username);
+        Assert.Equal(2, await service.GetUserCountAsync(Ct));
+
+        var consumed = (await service.GetInvitationByUsernameAsync("bob", Ct))!;
+        Assert.Equal(activated.Id, consumed.ActivatedUserId);
+
+        // Both identities resolve to their own account — one normalized login, one account.
+        Assert.Equal(activated.Id, (await service.GetActivatedUserByUsernameAsync("bob", Ct))!.Id);
+        Assert.Equal(outcome.User.Id, (await service.GetActivatedUserByUsernameAsync("alice", Ct))!.Id);
+    }
 }
