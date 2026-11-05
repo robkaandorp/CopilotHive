@@ -454,7 +454,8 @@ public sealed class UserServiceConcurrencyTests : IDisposable
     /// the "one identity to one activated user" invariant holds under contention.
     /// </summary>
     [Fact]
-    public async Task Activation_DifferentInvitationsConcurrently_BindsOneIdentityEach()    {
+    public async Task Activation_DifferentInvitationsConcurrently_BindsOneIdentityEach()
+    {
         var seeding = NewService();
         await seeding.CreateOrUpdateUserAsync("1", "original", null, null, null, "original-token", null, null, Ct);
         await seeding.InviteUserAsync("member-user", UserRole.Member, Ct);
