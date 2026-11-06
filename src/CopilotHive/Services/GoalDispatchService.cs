@@ -370,10 +370,12 @@ internal sealed class GoalDispatchService
         await _taskDispatchService.DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
 
         // Only publish if a task was actually dispatched (ActiveTaskId is set).
+        // The message is a single-line identity summary only: the full description is
+        // available through get_goal and must not be pushed into Composer context.
         if (!string.IsNullOrEmpty(pipeline.ActiveTaskId))
             _eventBus?.Publish(new SystemEvent(
                 Type: EventType.GoalDispatched,
-                Message: pipeline.Description,
+                Message: $"Goal '{pipeline.GoalId}' dispatched",
                 GoalId: pipeline.GoalId));
 
         _pipelineManager.PersistFull(pipeline);
