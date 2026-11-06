@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
@@ -13,6 +14,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
+using SharpCoder;
 
 namespace CopilotHive.Tests.Orchestration;
 
@@ -20,16 +22,17 @@ namespace CopilotHive.Tests.Orchestration;
 /// Creation / cache / re-check semantics of <see cref="ComposerRuntimeManager"/> and equivalence of
 /// the legacy Composer built through the shared <see cref="ComposerFactory"/> seam.
 /// </summary>
-public sealed class ComposerRuntimeManagerTests : IDisposable
+public sealed class ComposerRuntimeManagerTests : IAsyncLifetime
 {
     private const string Model = "test-model";
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), $"composer-runtime-mgr-{Guid.NewGuid():N}");
-    private readonly FileDbFactory _factory;
+    private readonly MemoryDbFactory _factory;
     private readonly UserService _users;
     private readonly CountingEventBus _bus = new();
     private readonly CopilotHiveDbContext _goalDb = CopilotHiveDbContext.CreateInMemory();
-    private readonly List<ComposerRuntimeManager> _managers = [];
+    private readonly List<ServiceProvider> _providers = [];
+    private readonly List<Task<ComposerRuntimeResult>> _requests = [];
 
     // Gate hooks for the chat-client factory used by every Composer built in these tests.
     private int _clientCreations;
@@ -38,32 +41,70 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public ComposerRuntimeManagerTests()
     {
         Directory.CreateDirectory(StateDir);
-        _factory = new FileDbFactory(Path.Combine(_dir, "users.db"));
+        _factory = new MemoryDbFactory();
         _users = new UserService(_factory, NullLogger<UserService>.Instance);
         _clientFactory = _ => new Mock<IChatClient>().Object;
     }
 
-    public void Dispose()
+    public ValueTask InitializeAsync() => ValueTask.CompletedTask;
+
+    public async ValueTask DisposeAsync()
     {
-        _goalDb.Dispose();
-        SqliteConnection.ClearAllPools();
-        TestHelpers.ForceDeleteDirectory(_dir);
+        var runtimes = new HashSet<ComposerUserRuntime>();
+        // Enumerate lazily: all request-join steps run before we enumerate the runtime set they
+        // populate. Every independent cleanup runs even if a previous join/disposal failed.
+        IEnumerable<Func<Task>> CleanupSteps()
+        {
+            foreach (var request in _requests)
+                yield return async () =>
+                {
+                    // A fault can be the expected rejection asserted in the test. Still join EVERY
+                    // request before disposing resources; timeout is never ignored as a fault.
+                    await JoinRequestAsync(request);
+                    if (request.IsCompletedSuccessfully && request.Result.Runtime is { } runtime)
+                        runtimes.Add(runtime);
+                };
+            foreach (var runtime in runtimes)
+                yield return () => GuardAsync(runtime.DisposeAsync().AsTask(), "runtime fixture disposal");
+            foreach (var provider in _providers)
+                yield return () => provider.DisposeAsync().AsTask();
+            yield return () => { _goalDb.Dispose(); return Task.CompletedTask; };
+            yield return () => { _factory.Dispose(); return Task.CompletedTask; };
+            yield return () => { TestHelpers.ForceDeleteDirectory(_dir); return Task.CompletedTask; };
+        }
+        await CompleteCleanupAsync(CleanupSteps());
     }
 
-    private sealed class FileDbFactory : IDbContextFactory<CopilotHiveDbContext>
+    private static async Task CompleteCleanupAsync(IEnumerable<Func<Task>> steps)
     {
+        var failures = new List<Exception>();
+        foreach (var step in steps)
+        {
+            try { await step(); }
+            catch (Exception ex) { failures.Add(ex); }
+        }
+        if (failures.Count > 0) throw new AggregateException("Runtime test cleanup failed", failures);
+    }
+
+    // Separate connections share a uniquely named in-memory database. Keeping one open retains
+    // it, without concurrently using a single SqliteConnection from several manager callers.
+    private sealed class MemoryDbFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly SqliteConnection _keeper;
         private readonly DbContextOptions<CopilotHiveDbContext> _options;
 
-        public FileDbFactory(string path)
+        public MemoryDbFactory()
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            _options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-                .UseSqlite($"Data Source={path};Pooling=False").Options;
+            var connectionString = $"Data Source=runtime-{Guid.NewGuid():N};Mode=Memory;Cache=Shared;Pooling=False";
+            _keeper = new SqliteConnection(connectionString);
+            _keeper.Open();
+            _options = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connectionString).Options;
             using var ctx = CreateDbContext();
             ctx.Database.EnsureCreated();
         }
 
         public CopilotHiveDbContext CreateDbContext() => new(_options);
+        public void Dispose() => _keeper.Dispose();
     }
 
     private sealed class CountingEventBus : IEventBus
@@ -84,9 +125,9 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
 
     private string StateDir => Path.Combine(_dir, "state");
 
-    private ServiceProvider BuildProvider()
+    private ServiceProvider BuildProvider(bool authEnabled = true, HiveConfigFile? config = null)
     {
-        var config = new HiveConfigFile
+        config ??= new HiveConfigFile
         {
             Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = Model }] },
             Composer = new ComposerConfig { Model = Model },
@@ -97,8 +138,12 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         services.AddSingleton<IGoalStore>(new GoalStore(_goalDb, NullLogger<GoalStore>.Instance));
         services.AddSingleton<IEventBus>(_bus);
+        services.AddSingleton<ComposerEventSubscriber>();
+        services.AddSingleton(authEnabled ? HiveAuthMode.AuthenticationEnabled : HiveAuthMode.Open);
         services.AddSingleton<LlmSessionRegistry>();
-        return services.BuildServiceProvider();
+        var provider = services.BuildServiceProvider();
+        _providers.Add(provider);
+        return provider;
     }
 
     private ComposerFactory NewFactory(IServiceProvider sp) =>
@@ -111,26 +156,109 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     private ComposerRuntimeManager NewManager(IServiceProvider sp)
     {
         var m = new ComposerRuntimeManager(NewFactory(sp), _users, NullLogger<ComposerRuntimeManager>.Instance);
-        _managers.Add(m);
         return m;
     }
 
     /// <summary>Bootstraps the original admin (id 1) and one activated invited Member (id 2).</summary>
-    private async Task<(ActingUserPrincipal First, ActingUserPrincipal Second)> TwoUsersAsync()
+    private async Task<(ActingUserPrincipal First, ActingUserPrincipal Second)> TwoUsersAsync(UserRole secondRole = UserRole.Member)
     {
         var original = await _users.CreateOrUpdateUserAsync(
             "100", "first", null, null, null, "tok", "ref", "2030-01-01T00:00:00.0000000Z", Ct);
-        await _users.InviteUserAsync("second", UserRole.Member, Ct);
+        await _users.InviteUserAsync("second", secondRole, Ct);
         var invited = await _users.ActivateInvitationAsync("second", "200", null, null, null, Ct);
         return (ActingUserPrincipal.ForActivatedAccount(original.Id, "100", UserRole.Admin, true, isOriginal: true),
-                ActingUserPrincipal.ForActivatedAccount(invited.Id, "200", UserRole.Member, true, isOriginal: false));
+                ActingUserPrincipal.ForActivatedAccount(invited.Id, "200", secondRole, true, isOriginal: false));
     }
 
-    private static async Task<Composer> GrantedComposerAsync(ComposerRuntimeManager manager, ActingUserPrincipal p)
+    private Task<ComposerRuntimeResult> Request(ComposerRuntimeManager manager, ActingUserPrincipal principal, CancellationToken? cancellationToken = null)
     {
-        var result = await manager.GetOrCreateAsync(p, Ct);
-        Assert.True(result.IsGranted, $"expected a runtime, refused with {result.Refusal}");
-        return result.Runtime!.Composer;
+        var task = manager.GetOrCreateAsync(principal, cancellationToken ?? Ct);
+        _requests.Add(task); // Own it BEFORE any assertion can throw.
+        return task;
+    }
+
+    private static async Task GuardAsync(Task task, string milestone)
+    {
+        try { await task.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None); }
+        catch (TimeoutException ex) { throw new TimeoutException($"Timed out: {milestone}", ex); }
+    }
+
+    private static async Task JoinRequestAsync(Task<ComposerRuntimeResult> task)
+    {
+        // Observe faults only AFTER establishing completion with the named hang guard.
+        await GuardAsync(task.ContinueWith(_ => { }, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default), "manager request completion");
+        if (task.IsFaulted) _ = task.Exception;
+    }
+
+    private async Task SetStoredRoleAsync(ActingUserPrincipal principal, string role)
+    {
+        await using var db = _factory.CreateDbContext();
+        Assert.Equal(1, await db.Database.ExecuteSqlInterpolatedAsync(
+            $"UPDATE users SET role={role} WHERE id={principal.UserId}", CancellationToken.None));
+    }
+
+    private static string InvalidRoleMessage =>
+        "The persisted user role 'retired-role' is not a supported CopilotHive user role " +
+        "(expected exactly one of: viewer, member, operator, admin).";
+
+    private static async Task AssertInvalidRoleAsync(Task<ComposerRuntimeResult> request)
+    {
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await GuardAsync(request, "invalid-role request rejection");
+            Assert.Null(request.Result.Runtime); // a successful handle must NEVER escape this vector
+        });
+        Assert.Equal(InvalidRoleMessage, error.Message);
+        Assert.True(request.IsFaulted);
+    }
+
+    private async Task WithParkedCreationAsync(ComposerRuntimeManager manager, ActingUserPrincipal principal,
+        Func<Task<ComposerRuntimeResult>, Action, Task> body)
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim(false);
+        _clientFactory = _ =>
+        {
+            // Only the first creation is parked; a different user must be free to create.
+            if (Volatile.Read(ref _clientCreations) > 1) return new Mock<IChatClient>().Object;
+            entered.TrySetResult(); // production-caused: Composer reached the real client factory
+            Assert.True(release.Wait(TimeSpan.FromSeconds(30)), "Timed out: release parked Composer client factory");
+            return new Mock<IChatClient>().Object;
+        };
+        ExceptionDispatchInfo? primary = null;
+        Exception? cleanupFailure = null;
+        try
+        {
+            var creator = Request(manager, principal);
+            await GuardAsync(entered.Task, "Composer entered client factory");
+            await body(creator, release.Set);
+        }
+        catch (Exception ex) { primary = ExceptionDispatchInfo.Capture(ex); }
+        finally
+        {
+            release.Set(); // unblock production BEFORE observing any owned task
+            try
+            {
+                foreach (var task in _requests.ToArray()) await JoinRequestAsync(task);
+                // Refused creator/waiter calls do not expose the created runtime. Restore the
+                // directory and retrieve it for cleanup even when a test assertion failed.
+                await SetStoredRoleAsync(principal, UserRoleText.Format(principal.Role));
+                var account = await _users.GetActivatedUserByIdAsync(principal.UserId, CancellationToken.None);
+                if (account is { Enabled: false })
+                    await _users.SetUserEnabledAsync(principal.UserId, true, CancellationToken.None);
+                var recovered = Request(manager, principal, CancellationToken.None);
+                await GuardAsync(recovered, "retrieve parked runtime for cleanup");
+                Assert.True(recovered.Result.IsGranted);
+            }
+            catch (Exception ex) { cleanupFailure = ex; }
+        }
+        if (primary is not null)
+        {
+            if (cleanupFailure is not null) primary.SourceException.Data["CleanupFailure"] = cleanupFailure;
+            primary.Throw();
+        }
+        if (cleanupFailure is not null) ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
     }
 
     private static T Field<T>(object target, string name) =>
@@ -142,17 +270,36 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public async Task SameUser_SequentialAndConcurrentCalls_ShareExactlyOneRuntimeAndConnection()
     {
         var (first, _) = await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider();
         var manager = NewManager(sp);
 
-        var results = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => manager.GetOrCreateAsync(first, Ct)));
-        var later = await manager.GetOrCreateAsync(first, Ct);
+        await WithParkedCreationAsync(manager, first, async (creator, release) =>
+        {
+            var concurrent = Enumerable.Range(0, 8).Select(_ => Request(manager, first)).ToArray();
+            Assert.False(creator.IsCompleted);
+            Assert.All(concurrent, task => Assert.False(task.IsCompleted));
+            release();
+            var all = Task.WhenAll(concurrent.Prepend(creator));
+            await GuardAsync(all, "all same-user callers receive shared runtime");
+            var results = await all;
+            var later = await Request(manager, first);
 
-        Assert.All(results, r => Assert.Same(results[0].Runtime, r.Runtime));
-        Assert.Same(results[0].Runtime, later.Runtime);
-        Assert.Equal(1, _clientCreations);
-        Assert.Equal(1, _bus.SubscriberCount);
-        Assert.True(later.Runtime!.Composer.IsConnected);
+            Assert.All(results, r =>
+            {
+                Assert.True(r.IsGranted);
+                Assert.Equal(ComposerRuntimeRefusal.None, r.Refusal);
+                Assert.Same(results[0].Runtime, r.Runtime);
+                Assert.Same(later.Runtime!.Composer, r.Runtime!.Composer);
+                Assert.Same(later.Runtime.Attachments, r.Runtime.Attachments);
+                Assert.Same(later.Runtime.Subscriber, r.Runtime.Subscriber);
+                Assert.Same(Field<object>(later.Runtime.Composer, "_actor"), Field<object>(r.Runtime.Composer, "_actor"));
+            });
+            Assert.Same(results[0].Runtime, later.Runtime);
+            Assert.Equal(1, _clientCreations);
+            Assert.Equal(1, _bus.SubscriberCount);
+            Assert.True(later.Runtime!.Composer.IsConnected);
+            Assert.Equal(["composer:1"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId).ToArray());
+        });
     }
 
     // ── Different users → isolation ──
@@ -161,14 +308,20 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public async Task DifferentUsers_GetDistinctStateAttachmentsSubscribersAndRegistryIds()
     {
         var (first, second) = await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider();
         var manager = NewManager(sp);
 
-        var r1 = (await manager.GetOrCreateAsync(first, Ct)).Runtime!;
-        var r2 = (await manager.GetOrCreateAsync(second, Ct)).Runtime!;
+        var firstPath = Path.Combine(StateDir, "composer", "users", "1", "session.json");
+        var secondPath = Path.Combine(StateDir, "composer", "users", "2", "session.json");
+        await WriteSessionAsync(firstPath, "first-user-session-marker");
+        await WriteSessionAsync(secondPath, "second-user-session-marker");
+        var r1 = (await Request(manager, first)).Runtime!;
+        var r2 = (await Request(manager, second)).Runtime!;
 
         Assert.NotSame(r1, r2);
         Assert.NotSame(r1.Composer, r2.Composer);
+        Assert.NotSame(r1.State, r2.State);
+        Assert.NotSame(Field<object>(r1.Composer, "_actor"), Field<object>(r2.Composer, "_actor"));
         Assert.Equal(1, r1.State.UserId);
         Assert.Equal(2, r2.State.UserId);
         Assert.True(r1.State.LegacyClaimEligible);
@@ -193,55 +346,110 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
         Assert.Contains("composer:1", registry.GetAll().Select(s => s.SessionId));
         Assert.Contains("composer:2", registry.GetAll().Select(s => s.SessionId));
 
-        // One user's event delivery never lands in the other's buffer is NOT asserted (shared bus
-        // broadcasts); ownership is per instance, which the distinct-subscriber checks above prove.
+        Assert.Equal(["composer:1", "composer:2"], registry.GetAll().Select(s => s.SessionId).Order().ToArray());
+        Assert.Equal(firstPath, ComposerUserState.SessionFilePath(StateDir, r1.State));
+        Assert.Equal(secondPath, ComposerUserState.SessionFilePath(StateDir, r2.State));
+        Assert.Equal(Path.GetFullPath(Path.Combine(StateDir, "composer", "users", "1", "attachments")), r1.Attachments.AttachmentsRootPath);
+        Assert.Equal(Path.GetFullPath(Path.Combine(StateDir, "composer", "users", "2", "attachments")), r2.Attachments.AttachmentsRootPath);
+        Assert.Equal(["first-user-session-marker"], r1.Composer.GetChatHistory().Select(m => m.Content));
+        Assert.Equal(["second-user-session-marker"], r2.Composer.GetChatHistory().Select(m => m.Content));
+        await r1.Composer.SaveSessionAsync(Ct);
+        await r2.Composer.SaveSessionAsync(Ct);
+        var firstSaved = await File.ReadAllTextAsync(firstPath, Ct);
+        var secondSaved = await File.ReadAllTextAsync(secondPath, Ct);
+        Assert.Contains("first-user-session-marker", firstSaved);
+        Assert.DoesNotContain("second-user-session-marker", firstSaved);
+        Assert.Contains("second-user-session-marker", secondSaved);
+        Assert.DoesNotContain("first-user-session-marker", secondSaved);
+        Assert.False(File.Exists(Path.Combine(StateDir, "composer-session.json")));
+
+        using var firstContent = new MemoryStream([1, 3, 5, 7]);
+        using var secondContent = new MemoryStream([2, 4, 6, 8]);
+        var firstAttachment = await r1.Attachments.SaveAsync("first.png", firstContent, Ct);
+        var secondAttachment = await r2.Attachments.SaveAsync("second.png", secondContent, Ct);
+        Assert.True(firstAttachment.Success, firstAttachment.Error);
+        Assert.True(secondAttachment.Success, secondAttachment.Error);
+        Assert.Equal(new byte[] { 1, 3, 5, 7 }, await File.ReadAllBytesAsync(Path.Combine(r1.Attachments.AttachmentsRootPath, firstAttachment.Attachment!.SavedRelativePath), Ct));
+        Assert.Equal(new byte[] { 2, 4, 6, 8 }, await File.ReadAllBytesAsync(Path.Combine(r2.Attachments.AttachmentsRootPath, secondAttachment.Attachment!.SavedRelativePath), Ct));
+        Assert.False(r2.Attachments.Remove(firstAttachment.Attachment).Success);
+        Assert.True(File.Exists(Path.Combine(r1.Attachments.AttachmentsRootPath, firstAttachment.Attachment.SavedRelativePath)));
+
+        // The global bus broadcasts to all buffers. Draining one managed buffer must NOT drain
+        // another (or the legacy subscriber), and managed construction must never borrow DI's one.
+        var legacySubscriber = sp.GetRequiredService<ComposerEventSubscriber>();
+        Assert.NotSame(legacySubscriber, r1.Subscriber);
+        Assert.NotSame(legacySubscriber, r2.Subscriber);
+        var evt = new SystemEvent(EventType.GoalCompleted, "independent-buffer-marker", GoalId: "isolated-goal");
+        _bus.Publish(evt);
+        Assert.Same(evt, Assert.Single(r1.Subscriber.DrainPendingEvents()));
+        Assert.Empty(r1.Subscriber.PeekPendingEvents());
+        Assert.Same(evt, Assert.Single(r2.Subscriber.PeekPendingEvents()));
+        Assert.Same(evt, Assert.Single(r2.Subscriber.DrainPendingEvents()));
+        Assert.Same(evt, Assert.Single(legacySubscriber.DrainPendingEvents()));
     }
 
     // ── Rejection matrix ──
 
-    [Fact]
-    public async Task DisabledPrincipal_IsRefusedWithoutCreatingAnything()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DisabledPrincipal_IsRefusedWithoutCreatingAnything(bool authEnabled)
     {
         await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider(authEnabled);
+        Assert.Equal(authEnabled, sp.GetRequiredService<HiveAuthMode>().AuthEnabled);
         var manager = NewManager(sp);
         var disabled = ActingUserPrincipal.ForActivatedAccount(2, "200", UserRole.Member, enabled: false, isOriginal: false);
 
-        var result = await manager.GetOrCreateAsync(disabled, Ct);
+        var result = await Request(manager, disabled);
 
         Assert.False(result.IsGranted);
+        Assert.Null(result.Runtime);
         Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, result.Refusal);
         Assert.Equal(0, _clientCreations);
+        Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll());
         Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
     }
 
-    [Fact]
-    public async Task UndefinedRolePrincipal_IsRefusedWithoutCreatingAnything()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UndefinedRolePrincipal_IsRefusedWithoutCreatingAnything(bool authEnabled)
     {
         var (first, _) = await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider(authEnabled);
+        Assert.Equal(authEnabled, sp.GetRequiredService<HiveAuthMode>().AuthEnabled);
         var manager = NewManager(sp);
-        // Factories refuse undefined roles, so force the (unreachable-in-production) value in.
-        var forged = first with { };
-        typeof(ActingUserPrincipal).GetField("<Role>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(forged, (UserRole)999);
+        // Sanctioned factories reject undefined roles. Only this defensive-input cell uses
+        // the private constructor; directory-state vectors below use real persisted SQL data.
+        var forged = (ActingUserPrincipal)typeof(ActingUserPrincipal)
+            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)
+            .Single(c => c.GetParameters().Length == 6)
+            .Invoke([first.UserId, first.GitHubId, (UserRole)999, true, true, false]);
 
-        var result = await manager.GetOrCreateAsync(forged, Ct);
+        var result = await Request(manager, forged);
 
+        Assert.False(result.IsGranted);
+        Assert.Null(result.Runtime);
         Assert.Equal(ComposerRuntimeRefusal.UndefinedRole, result.Refusal);
         Assert.Equal(0, _clientCreations);
+        Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll());
+        Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
     }
 
-    [Fact]
-    public async Task SyntheticLocalOperator_IsRefusedRegardlessOfAuthMode_AndNeverCreatesARuntime()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SyntheticLocalOperator_IsRefusedRegardlessOfAuthMode_AndNeverCreatesARuntime(bool authEnabled)
     {
         await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider(authEnabled);
+        Assert.Equal(authEnabled, sp.GetRequiredService<HiveAuthMode>().AuthEnabled);
         var manager = NewManager(sp);
 
         // The manager takes no auth-mode input: the refusal is unconditional, so open mode
         // (where the resolver yields this principal) and auth mode behave identically.
-        var result = await manager.GetOrCreateAsync(ActingUserPrincipal.LocalOperator(), Ct);
+        var result = await Request(manager, ActingUserPrincipal.LocalOperator());
 
         Assert.False(result.IsGranted);
         Assert.Equal(ComposerRuntimeRefusal.LocalOperator, result.Refusal);
@@ -254,11 +462,11 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public async Task PrincipalWithoutActivatedAccount_IsRefused()
     {
         await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider();
         var manager = NewManager(sp);
         var ghost = ActingUserPrincipal.ForActivatedAccount(77, "777", UserRole.Admin, true, isOriginal: false);
 
-        var result = await manager.GetOrCreateAsync(ghost, Ct);
+        var result = await Request(manager, ghost);
 
         Assert.Equal(ComposerRuntimeRefusal.UnknownAccount, result.Refusal);
         Assert.Equal(0, _clientCreations);
@@ -270,18 +478,20 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public async Task CacheHit_WithStalePrincipalAfterDisable_IsRefused_AndRecoversAfterReEnable()
     {
         var (_, second) = await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider();
         var manager = NewManager(sp);
-        var runtime = (await manager.GetOrCreateAsync(second, Ct)).Runtime!;
+        var runtime = (await Request(manager, second)).Runtime!;
 
         await _users.SetUserEnabledAsync(second.UserId, false, Ct);
-        var stale = await manager.GetOrCreateAsync(second, Ct); // principal still says Enabled=true
+        var stale = await Request(manager, second); // principal still says Enabled=true
 
         Assert.False(stale.IsGranted);
         Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, stale.Refusal);
+        Assert.Null(stale.Runtime);
+        Assert.True(second.Enabled);
 
         await _users.SetUserEnabledAsync(second.UserId, true, Ct);
-        var back = await manager.GetOrCreateAsync(second, Ct);
+        var back = await Request(manager, second);
         Assert.Same(runtime, back.Runtime);
         Assert.Equal(1, _clientCreations);
     }
@@ -290,32 +500,279 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public async Task WaiterJoinedToInFlightCreation_IsRefusedWhenAccountDisabledMeanwhile()
     {
         var (_, second) = await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider();
         var manager = NewManager(sp);
 
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new ManualResetEventSlim(false);
-        _clientFactory = _ =>
+        await WithParkedCreationAsync(manager, second, async (creator, release) =>
         {
-            entered.TrySetResult();
-            Assert.True(release.Wait(TimeSpan.FromSeconds(30)), "creation gate was never released");
-            return new Mock<IChatClient>().Object;
-        };
+            // With an entry already parked, GetOrCreate reaches Creation.WaitAsync synchronously
+            // (no earlier await is executed on this path). Returning an incomplete task therefore
+            // proves this caller has joined the in-flight entry, not a hoped-for scheduler turn.
+            var waiter = Request(manager, second);
+            Assert.False(waiter.IsCompleted);
+            Assert.False(creator.IsCompleted);
+            await _users.SetUserEnabledAsync(second.UserId, false, Ct);
+            Assert.True(second.Enabled); // caller still holds the pre-disable principal
+            release();
+            await GuardAsync(Task.WhenAll(creator, waiter), "disabled creator and waiter rechecks");
+            foreach (var result in new[] { await creator, await waiter })
+            {
+                Assert.False(result.IsGranted);
+                Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, result.Refusal);
+                Assert.Null(result.Runtime);
+            }
+            await _users.SetUserEnabledAsync(second.UserId, true, Ct);
+            var recovered = await Request(manager, second);
+            Assert.True(recovered.IsGranted);
+            Assert.Same(recovered.Runtime, (await Request(manager, second)).Runtime);
+            Assert.Equal(1, _clientCreations);
+        });
+    }
 
-        var creator = manager.GetOrCreateAsync(second, Ct);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct); // creation is parked inside connect
-        // The entry exists, so this call joins the in-flight creation synchronously before returning.
-        var waiter = manager.GetOrCreateAsync(second, Ct);
-        Assert.False(waiter.IsCompleted);
+    [Fact]
+    public async Task CacheHit_WithStalePrincipalAfterRoleInvalidation_IsRejectedAndKeepsCachedRuntime()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var manager = NewManager(sp);
+        var before = (await Request(manager, second)).Runtime!;
+        await SetStoredRoleAsync(second, "retired-role");
 
-        await _users.SetUserEnabledAsync(second.UserId, false, Ct);
-        release.Set();
+        Assert.Equal(UserRole.Member, second.Role);
+        await AssertInvalidRoleAsync(Request(manager, second));
 
-        var waiterResult = await waiter.WaitAsync(TimeSpan.FromSeconds(30), Ct);
-        var creatorResult = await creator.WaitAsync(TimeSpan.FromSeconds(30), Ct);
-        Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, waiterResult.Refusal);
-        Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, creatorResult.Refusal);
-        Assert.Null(waiterResult.Runtime);
+        await SetStoredRoleAsync(second, "member");
+        var after = await Request(manager, second);
+        Assert.True(after.IsGranted);
+        Assert.Same(before, after.Runtime);
+        Assert.Same(before.Composer, after.Runtime!.Composer);
+        Assert.Same(before.Attachments, after.Runtime.Attachments);
+        Assert.Equal(1, _clientCreations);
+        Assert.Equal(1, _bus.SubscriberCount);
+        Assert.Equal(["composer:2"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId));
+    }
+
+    [Fact]
+    public async Task WaiterJoinedToInFlightCreation_IsRejectedWhenRoleInvalidatedMeanwhile_AndCacheRecovers()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var manager = NewManager(sp);
+        await WithParkedCreationAsync(manager, second, async (creator, release) =>
+        {
+            var waiter = Request(manager, second);
+            Assert.False(waiter.IsCompleted);
+            Assert.False(creator.IsCompleted);
+            await SetStoredRoleAsync(second, "retired-role");
+            Assert.Equal(UserRole.Member, second.Role);
+            release();
+
+            await AssertInvalidRoleAsync(waiter);
+            await AssertInvalidRoleAsync(creator);
+            await SetStoredRoleAsync(second, "member");
+            var recovered = await Request(manager, second);
+            var again = await Request(manager, second);
+            Assert.True(recovered.IsGranted);
+            Assert.Same(recovered.Runtime, again.Runtime);
+            Assert.Same(recovered.Runtime!.Composer, again.Runtime!.Composer);
+            Assert.Same(recovered.Runtime.Attachments, again.Runtime.Attachments);
+            Assert.Equal(1, _clientCreations); // failed rechecks did not evict/recreate the entry
+            Assert.Equal(1, _bus.SubscriberCount);
+            Assert.Equal(["composer:2"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId));
+        });
+    }
+
+    [Fact]
+    public async Task CacheHit_DemotionToDefinedViewerRole_StillGrantsTheSameRuntime()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider());
+        var before = (await Request(manager, second)).Runtime!;
+        await SetStoredRoleAsync(second, "viewer");
+
+        var after = await Request(manager, second);
+
+        Assert.True(after.IsGranted); // capability enforcement is deliberately NOT this slice
+        Assert.Equal(ComposerRuntimeRefusal.None, after.Refusal);
+        Assert.Same(before, after.Runtime);
+        Assert.Equal(1, _clientCreations);
+    }
+
+    [Fact]
+    public async Task WaiterJoinedToInFlightCreation_DemotionToDefinedViewerRole_StillSharesRuntime()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider());
+        await WithParkedCreationAsync(manager, second, async (creator, release) =>
+        {
+            var waiter = Request(manager, second);
+            Assert.False(waiter.IsCompleted);
+            await SetStoredRoleAsync(second, "viewer");
+            release();
+            await GuardAsync(Task.WhenAll(creator, waiter), "defined-role creator and waiter complete");
+            Assert.True((await creator).IsGranted);
+            Assert.True((await waiter).IsGranted);
+            Assert.Same((await creator).Runtime, (await waiter).Runtime);
+            Assert.Equal(1, _clientCreations);
+        });
+    }
+
+    [Fact]
+    public async Task FirstCall_WithStalePrincipalAfterDisable_DoesNotCreateOrMigrate()
+    {
+        var (first, _) = await TwoUsersAsync(UserRole.Admin);
+        var manager = NewManager(BuildProvider());
+        var legacyPath = Path.Combine(StateDir, "composer-session.json");
+        await WriteSessionAsync(legacyPath, "disabled-original-history-marker");
+        var before = await File.ReadAllBytesAsync(legacyPath, Ct);
+        await _users.SetUserEnabledAsync(first.UserId, false, Ct);
+
+        var result = await Request(manager, first);
+
+        Assert.True(first.Enabled);
+        Assert.False(result.IsGranted);
+        Assert.Null(result.Runtime);
+        Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, result.Refusal);
+        Assert.Equal(0, _clientCreations);
+        Assert.Equal(0, _bus.SubscriberCount);
+        Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
+        Assert.Equal(before, await File.ReadAllBytesAsync(legacyPath, Ct));
+    }
+
+    [Fact]
+    public async Task FirstCall_WithStalePrincipalAfterRoleInvalidation_DoesNotCreateOrMigrate()
+    {
+        var (first, _) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider());
+        var legacyPath = Path.Combine(StateDir, "composer-session.json");
+        await WriteSessionAsync(legacyPath, "invalid-role-original-history-marker");
+        var before = await File.ReadAllBytesAsync(legacyPath, Ct);
+        await SetStoredRoleAsync(first, "retired-role");
+
+        await AssertInvalidRoleAsync(Request(manager, first));
+
+        Assert.Equal(UserRole.Admin, first.Role);
+        Assert.Equal(0, _clientCreations);
+        Assert.Equal(0, _bus.SubscriberCount);
+        Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
+        Assert.Equal(before, await File.ReadAllBytesAsync(legacyPath, Ct));
+    }
+
+    [Fact]
+    public async Task DifferentUsers_OneCreationInFlight_DoesNotBlockTheOtherUser()
+    {
+        var (first, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider());
+        await WithParkedCreationAsync(manager, first, async (creator, release) =>
+        {
+            var other = Request(manager, second);
+            await GuardAsync(other, "second user's independent creation while first is parked");
+            Assert.True((await other).IsGranted);
+            Assert.False(creator.IsCompleted);
+            release();
+            await GuardAsync(creator, "first user's creation resumes");
+            Assert.NotSame((await creator).Runtime, (await other).Runtime);
+            Assert.Equal(2, _clientCreations);
+        });
+    }
+
+    [Fact]
+    public async Task ParkedCreationHelper_WhenBodyThrows_JoinsRequestsAndRetainsPrimaryFailure()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider());
+        var sentinel = new InvalidOperationException("deliberate test-body failure while creator is parked");
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            WithParkedCreationAsync(manager, second, (_, _) => throw sentinel));
+
+        Assert.Same(sentinel, error);
+        Assert.False(error.Data.Contains("CleanupFailure"));
+        Assert.All(_requests, task => Assert.True(task.IsCompletedSuccessfully));
+        var runtime = Assert.Single(_requests.Select(task => task.Result.Runtime).Distinct());
+        Assert.NotNull(runtime);
+        Assert.Equal(1, _clientCreations);
+        Assert.Same(runtime, (await Request(manager, second)).Runtime);
+    }
+
+    [Fact]
+    public async Task FixtureCleanup_WhenAStepFails_CompletesRemainingStepsAndRetainsAllFailures()
+    {
+        var firstFailure = new InvalidOperationException("deliberate first cleanup failure");
+        var lastFailure = new IOException("deliberate last cleanup failure");
+        var completed = new List<int>();
+        var error = await Assert.ThrowsAsync<AggregateException>(() => CompleteCleanupAsync(
+        [
+            () => { completed.Add(1); throw firstFailure; },
+            () => { completed.Add(2); return Task.CompletedTask; },
+            () => { completed.Add(3); throw lastFailure; },
+            () => { completed.Add(4); return Task.CompletedTask; },
+        ]));
+
+        Assert.Equal([1, 2, 3, 4], completed);
+        Assert.Collection(error.InnerExceptions,
+            failure => Assert.Same(firstFailure, failure),
+            failure => Assert.Same(lastFailure, failure));
+    }
+
+    private async Task WriteSessionAsync(string path, string marker)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var session = AgentSession.Create("composer");
+        session.MessageHistory.Add(new ChatMessage(ChatRole.User, marker));
+        await session.SaveAsync(path, Ct);
+    }
+
+    [Fact]
+    public async Task OriginalAccount_ManagerRequest_MigratesLegacyBytesAndLoadsHistory()
+    {
+        var (first, _) = await TwoUsersAsync();
+        var legacyPath = Path.Combine(StateDir, "composer-session.json");
+        await WriteSessionAsync(legacyPath, "original-only-legacy-history-marker");
+        var before = await File.ReadAllBytesAsync(legacyPath, Ct);
+        var manager = NewManager(BuildProvider());
+
+        var result = await Request(manager, first);
+
+        Assert.True(result.IsGranted);
+        var runtime = result.Runtime!;
+        Assert.True(runtime.State.LegacyClaimEligible);
+        Assert.True(runtime.State.PersistenceAllowed);
+        Assert.Equal(before, await File.ReadAllBytesAsync(Path.Combine(StateDir, "composer", "users", "1", "session.json"), Ct));
+        Assert.Equal(before, await File.ReadAllBytesAsync(legacyPath, Ct));
+        Assert.Equal(["original-only-legacy-history-marker"], runtime.Composer.GetChatHistory().Select(m => m.Content));
+        using var evidence = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(
+            Path.Combine(StateDir, "composer", "users", "1", "legacy-migration.json"), Ct));
+        Assert.Equal(first.UserId, evidence.RootElement.GetProperty("userId").GetInt32());
+        Assert.Equal(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(before)), evidence.RootElement.GetProperty("sha256").GetString());
+        Assert.False(Directory.Exists(Path.Combine(StateDir, "composer", "users", "2")));
+    }
+
+    [Fact]
+    public async Task SecondAdmin_ManagerRequestBeforeOriginal_NeverClaimsOrLoadsLegacyHistory()
+    {
+        var (first, second) = await TwoUsersAsync(UserRole.Admin);
+        var legacyPath = Path.Combine(StateDir, "composer-session.json");
+        await WriteSessionAsync(legacyPath, "unclaimed-original-history-marker");
+        var before = await File.ReadAllBytesAsync(legacyPath, Ct);
+        var manager = NewManager(BuildProvider());
+
+        var result = await Request(manager, second);
+
+        Assert.True(result.IsGranted);
+        Assert.False(result.Runtime!.State.LegacyClaimEligible);
+        Assert.True(result.Runtime.State.PersistenceAllowed);
+        Assert.Empty(result.Runtime.Composer.GetChatHistory());
+        Assert.False(File.Exists(Path.Combine(StateDir, "composer", "users", "2", "session.json")));
+        Assert.False(File.Exists(Path.Combine(StateDir, "composer", "users", "2", "legacy-migration.json")));
+        Assert.False(Directory.Exists(Path.Combine(StateDir, "composer", "users", "1")));
+        Assert.Equal(before, await File.ReadAllBytesAsync(legacyPath, Ct));
+
+        // Positive control in the same fresh directory: legacy history really IS claimable.
+        var original = await Request(manager, first);
+        Assert.True(original.IsGranted);
+        Assert.Equal(["unclaimed-original-history-marker"], original.Runtime!.Composer.GetChatHistory().Select(m => m.Content));
+        Assert.Equal(before, await File.ReadAllBytesAsync(Path.Combine(StateDir, "composer", "users", "1", "session.json"), Ct));
+        Assert.Empty(result.Runtime.Composer.GetChatHistory());
     }
 
     // ── Failed creation ──
@@ -324,23 +781,69 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
     public async Task FailedConnect_DisposesPartialRuntime_ClearsCacheEntry_AndRetrySucceeds()
     {
         var (_, second) = await TwoUsersAsync();
-        using var sp = BuildProvider();
+        var sp = BuildProvider();
         var manager = NewManager(sp);
         var userRoot = ComposerUserState.AttachmentsRootPath(StateDir, await ComposerUserState.ResolveAsync(_users, second.UserId, Ct));
-        _clientFactory = _ => throw new InvalidOperationException("boom");
+        var sentinel = new InvalidOperationException("deliberate client construction failure");
+        _clientFactory = _ => throw sentinel;
 
-        await Assert.ThrowsAnyAsync<Exception>(() => manager.GetOrCreateAsync(second, Ct));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => Request(manager, second));
+        Assert.Same(sentinel, error);
 
         Assert.Equal(0, _bus.SubscriberCount); // the partial runtime's subscriber was detached
         Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId + "/" + s.Status));
 
         _clientFactory = _ => new Mock<IChatClient>().Object;
-        var retry = await manager.GetOrCreateAsync(second, Ct);
+        var retry = await Request(manager, second);
 
         Assert.True(retry.IsGranted);
         Assert.True(retry.Runtime!.Composer.IsConnected);
         Assert.Equal(userRoot, retry.Runtime.Attachments.AttachmentsRootPath);
         Assert.Equal(1, _bus.SubscriberCount);
+    }
+
+    [Theory]
+    [InlineData(true, "high", "low", ReasoningEffort.High, 45001, 17)]
+    [InlineData(true, "   ", "low", ReasoningEffort.Low, null, 0)]
+    [InlineData(true, null, null, null, null, 19)]
+    [InlineData(true, "unsupported-effort", "low", null, 45003, 23)]
+    [InlineData(false, null, "medium", ReasoningEffort.Medium, 45005, 29)]
+    public async Task SharedFactory_LegacyAndManagedConstruction_PreserveConfigurationPrecedence(
+        bool composerSection, string? composerEffort, string? brainEffort, ReasoningEffort? expectedEffort,
+        int? contextWindow, int maxSteps)
+    {
+        var (_, second) = await TwoUsersAsync();
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = Model, ContextWindow = contextWindow },
+                    new ModelEntry { Name = "brain-only-model", ContextWindow = 81000 }],
+            },
+            Orchestrator = new OrchestratorConfig
+            {
+                Model = "brain-only-model", BrainMaxSteps = 73, ReasoningEffort = brainEffort,
+            },
+            Composer = composerSection
+                ? new ComposerConfig { Model = $"  {Model.ToUpperInvariant()}  ", MaxSteps = maxSteps, ReasoningEffort = composerEffort }
+                : null,
+        };
+        var sp = BuildProvider(config: config);
+        await using var legacy = NewFactory(sp).CreateLegacy();
+        var managed = (await Request(NewManager(sp), second)).Runtime!;
+
+        foreach (var composer in new[] { legacy, managed.Composer })
+        {
+            var service = Field<ComposerAgentService>(composer, "_agentService");
+            Assert.Equal(composerSection ? Model : null, composer.StartupDefaultModel);
+            Assert.Equal(composerSection ? maxSteps : 73, service.MaxSteps);
+            Assert.Equal(composerSection ? contextWindow ?? 150000 : 150000, service.MaxContextTokens);
+            Assert.Equal(expectedEffort, composer.ReasoningEffort);
+            Assert.Equal([Model, "brain-only-model"], composer.AvailableModels);
+        }
+        // Missing Composer model never falls back to the orchestrator's distinct model, nor
+        // to its context window. Both entry points consume the SAME moved construction logic.
+        Assert.Equal(composerSection ? 1 : 0, _clientCreations);
     }
 
     // ── Legacy equivalence through the shared seam ──
@@ -364,14 +867,19 @@ public sealed class ComposerRuntimeManagerTests : IDisposable
         services.AddSingleton<ComposerEventSubscriber>();
         using var sp = services.BuildServiceProvider();
 
+        await WriteSessionAsync(Path.Combine(StateDir, "composer-session.json"), "legacy-factory-history-marker");
         await using var composer = NewFactory(sp).CreateLegacy();
         await composer.ConnectAsync(Ct);
+        Assert.Equal(["legacy-factory-history-marker"], composer.GetChatHistory().Select(m => m.Content));
         await composer.SaveSessionAsync(Ct);
 
         Assert.Equal(Model, composer.StartupDefaultModel);
         Assert.Null(Field<ComposerUserState?>(composer, "_userState"));
         Assert.Same(legacyAttachments, Field<ComposerAttachmentService>(composer, "_attachmentService"));
         Assert.Same(sp.GetRequiredService<ComposerEventSubscriber>(), Field<ComposerEventSubscriber>(composer, "_eventSubscriber"));
+        var evt = new SystemEvent(EventType.IssueRaised, "legacy-shared-subscriber-marker", IssueId: "legacy-issue");
+        _bus.Publish(evt);
+        Assert.Same(evt, Assert.Single(sp.GetRequiredService<ComposerEventSubscriber>().DrainPendingEvents()));
         Assert.Equal(Path.Combine(StateDir, "composer-attachments"), legacyAttachments.AttachmentsRootPath);
         Assert.True(File.Exists(Path.Combine(StateDir, "composer-session.json")));
         Assert.False(Directory.Exists(Path.Combine(StateDir, "composer", "users")));
