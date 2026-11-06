@@ -1,12 +1,33 @@
+using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
 using CopilotHive.Dashboard;
 using CopilotHive.Orchestration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Tests.Orchestration;
 
 public sealed partial class ComposerRuntimeManagerTests
 {
+    private sealed record LifecycleLogEntry(LogLevel Level, string Message, Exception? Exception,
+        KeyValuePair<string, object?>[] Properties);
+
+    // Records the actual manager ILogger sink, including exception identity and structured user id.
+    // No hooks throw or alter scheduling; snapshots are read after the lifecycle producer is joined.
+    private sealed class LifecycleWarningLogger : ILogger<ComposerRuntimeManager>
+    {
+        private readonly ConcurrentQueue<LifecycleLogEntry> _entries = new();
+        public LifecycleLogEntry[] Entries => _entries.ToArray();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var properties = state is IEnumerable<KeyValuePair<string, object?>> fields ? fields.ToArray() : [];
+            _entries.Enqueue(new(logLevel, formatter(state, exception), exception, properties));
+        }
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]
@@ -63,7 +84,8 @@ public sealed partial class ComposerRuntimeManagerTests
     public async Task Lifecycle_WhenCancellationCallbackThrows_StillJoinsLiveOperationBeforeCompleting(bool shutdown)
     {
         var (_, second) = await TwoUsersAsync();
-        var manager = NewManager(BuildProvider());
+        var warningLog = new LifecycleWarningLogger();
+        var manager = NewManager(BuildProvider(), warningLog);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -115,12 +137,36 @@ public sealed partial class ComposerRuntimeManagerTests
             var operation = await Bounded(joiningOperation.Task, "lifecycle retained ownership after cancellation callback fault");
             Assert.False(operation.IsCompleted);
             Assert.False(connectExited.Task.IsCompleted);
+            // Removed closes this entry's admission but retains ownership. NoRuntime here would
+            // mean early eviction. Shutdown's established ShuttingDown admission is expected.
+            Assert.Equal(shutdown ? ComposerRuntimeStatus.Refused : ComposerRuntimeStatus.Removed, entryProbe.Status);
+            Assert.Equal(shutdown ? ComposerRuntimeRefusal.ShuttingDown : ComposerRuntimeRefusal.None, entryProbe.Refusal);
+            Assert.Null(entryProbe.Runtime);
+            Assert.Null(entryProbe.Failure);
             release.TrySetResult();
             await GuardAsync(lifecycle, "lifecycle completes only after owned operation and runtime cleanup");
             Assert.True(operation.IsCompleted);
             Assert.True(connectExited.Task.IsCompleted);
             Assert.True(composer!.TeardownCompletion.IsCompletedSuccessfully);
             Assert.True(ActorCompleted(composer));
+            var creatorResult = await Bounded(creator, "callback-fault lifecycle creator result");
+            Assert.Equal(ComposerRuntimeStatus.Removed, creatorResult.Status);
+            Assert.Null(creatorResult.Runtime);
+            Assert.Null(creatorResult.Failure);
+            Assert.Equal(ComposerRuntimeRefusal.None, creatorResult.Refusal);
+
+            // The public lifecycle task succeeds: its Exception property in the original failure
+            // diagnostic is NOT the surfaced channel. The actual Warning must carry this fault.
+            var warning = Assert.Single(warningLog.Entries, entry => entry.Level == LogLevel.Warning);
+            Assert.Equal($"A cancellation callback of the shared operation of user {second.UserId} threw; teardown continues", warning.Message);
+            var aggregate = Assert.IsType<AggregateException>(warning.Exception);
+            Assert.Same(callbackFault, Assert.Single(aggregate.InnerExceptions));
+            var userId = Assert.Single(warning.Properties, property => property.Key == "UserId");
+            Assert.Equal(second.UserId, Assert.IsType<int>(userId.Value));
+            Assert.DoesNotContain(warningLog.Entries, entry => entry.Level >= LogLevel.Error);
+            var afterTeardown = await Bounded(Retry(manager, second), "entry admission after actual callback-fault teardown");
+            Assert.Equal(ComposerRuntimeStatus.Refused, afterTeardown.Status);
+            Assert.Equal(shutdown ? ComposerRuntimeRefusal.ShuttingDown : ComposerRuntimeRefusal.NoRuntime, afterTeardown.Refusal);
         }
         catch (Exception ex) { primary = ExceptionDispatchInfo.Capture(ex); }
         finally
@@ -135,6 +181,17 @@ public sealed partial class ComposerRuntimeManagerTests
             {
                 if (lifecycle is not null) yield return () => GuardAsync(lifecycle, "callback-fault lifecycle cleanup");
                 yield return () => JoinRequestAsync(creator);
+                // A regressed lifecycle can claim success and abandon the now-settled runtime.
+                // Only after that lifecycle and the request have been joined may this fallback
+                // take ownership; it never races a manager that is still performing teardown.
+                if (composer is not null && lifecycle?.IsCompletedSuccessfully == true && !composer.TeardownCompletion.IsCompleted)
+                    yield return async () =>
+                    {
+                        await GuardAsync(composer.DisposeAsync().AsTask(), "dispose runtime abandoned by completed lifecycle");
+                        Field<ComposerEventSubscriber?>(composer, "_eventSubscriber")?.Dispose();
+                        Field<LlmSessionRegistry?>(composer, "_sessionRegistry")?.Unregister(
+                            ComposerUserState.RegistryId(Field<ComposerUserState>(composer, "_userState")));
+                    };
                 if (composer is not null)
                     yield return () => GuardAsync(composer.TeardownCompletion, "orphan-operation actual teardown cleanup");
                 yield return () => GuardAsync(manager.ShutdownAsync(), "callback-fault manager cleanup");

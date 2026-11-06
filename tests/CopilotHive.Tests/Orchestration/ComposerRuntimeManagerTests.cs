@@ -180,9 +180,9 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
             return _clientFactory(m);
         }, isTokenAvailable: () => _tokenAvailable, providerOf: model => _providerResolver?.Invoke(model) ?? _provider);
 
-    private ComposerRuntimeManager NewManager(IServiceProvider sp)
+    private ComposerRuntimeManager NewManager(IServiceProvider sp, ILogger<ComposerRuntimeManager>? logger = null)
     {
-        var m = new ComposerRuntimeManager(NewFactory(sp), _users, NullLogger<ComposerRuntimeManager>.Instance,
+        var m = new ComposerRuntimeManager(NewFactory(sp), _users, logger ?? NullLogger<ComposerRuntimeManager>.Instance,
             (composer, ct) => (_connectHook ?? ((c, t) => c.ConnectAsync(t)))(composer, ct));
         _managerUsers.Add(m, []);
         return m;
