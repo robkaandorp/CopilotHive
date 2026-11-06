@@ -15,12 +15,17 @@ namespace CopilotHive.Security;
 /// (<see cref="UserService.GetByGitHubIdAsync"/> for an OAuth identity,
 /// <see cref="UserService.GetActivatedUserByIdAsync"/> for a known account id) via
 /// <see cref="HivePrincipalResolver"/>, and only then (b) ask <see cref="IsAllowed"/> — never the
-/// reverse, and never from cookie claims.
+/// reverse, and never from cookie claims. <see cref="ActingUserPrincipal"/> is deliberately NOT
+/// publicly constructible, so this evaluation can only ever be handed a resolver-produced principal
+/// (or one built by trusted assembly code such as this type's own tests).
 /// </para>
 /// <para>
 /// The evaluation NEVER trusts the principal's own <see cref="ActingUserPrincipal.IsOriginal"/> flag:
 /// original identity confers no authority, so a demoted original account is evaluated exactly like
-/// any other account of that role, and a DISABLED principal holds no capability at all.
+/// any other account of that role, and a DISABLED principal holds no capability at all. That
+/// enabled/defined-role validation is INDEPENDENT of the resolver: the evaluator re-checks the
+/// principal's own <see cref="ActingUserPrincipal.Enabled"/> flag and role instead of assuming how
+/// the principal was produced.
 /// </para>
 /// </summary>
 public sealed class HivePolicy
@@ -73,8 +78,8 @@ public sealed class HivePolicy
         UserRoleText.EnsureDefined(principal.Role, nameof(principal));
 
         // A disabled account holds NOTHING, whatever its role says. This is the evaluator's own second
-        // line of defence: the resolver already refuses disabled accounts, so a disabled principal can
-        // only appear if a caller hand-built one.
+        // line of defence: the resolver already refuses disabled accounts, so a principal can only
+        // carry enabled=false when trusted assembly code (a test, for example) built it directly.
         if (!principal.Enabled)
         {
             return false;

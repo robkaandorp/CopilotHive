@@ -14,6 +14,14 @@ namespace CopilotHive.Security;
 /// and never from cookie claims.
 /// </para>
 /// <para>
+/// PROVENANCE: this type is public so later boundaries can CONSUME a principal, but it is not
+/// publicly constructible — the constructor is private and both factories are <c>internal</c>, so
+/// only trusted code inside this assembly may create one. In practice that is
+/// <see cref="HivePrincipalResolver"/> alone: a DB-backed ACTIVATED-ACCOUNT principal, or the
+/// explicit open-mode local operator. A caller outside this assembly therefore cannot fabricate an
+/// enabled <see cref="UserRole.Admin"/> identity that has no resolver/directory provenance.
+/// </para>
+/// <para>
 /// This is the ACTING user only. It is deliberately not a "goal owner" and carries no ownership,
 /// attribution or sharing semantics; those are separate, unimplemented slices.
 /// </para>
@@ -66,8 +74,9 @@ public sealed record ActingUserPrincipal
     /// <summary>
     /// Whether the account was enabled when this principal was resolved. A DISABLED account never
     /// becomes a principal — the resolver refuses it — so this is always <c>true</c> for a principal
-    /// produced by <see cref="HivePrincipalResolver"/>; the policy evaluator still requires it, so a
-    /// hand-built principal for a disabled account can never be granted a capability.
+    /// produced by <see cref="HivePrincipalResolver"/>; <see cref="HivePolicy"/> still requires it
+    /// independently, so even a principal constructed inside this assembly for a disabled account
+    /// can never be granted a capability.
     /// </summary>
     public bool Enabled { get; }
 
@@ -93,6 +102,14 @@ public sealed record ActingUserPrincipal
 
     /// <summary>
     /// Builds the principal of one persisted ACTIVATED account.
+    /// <para>
+    /// This factory is <c>internal</c> ON PURPOSE: it is the only path that can mint an activated
+    /// account identity, so it must stay reachable from trusted assembly code only — in production
+    /// that is <see cref="HivePrincipalResolver.ResolveAsync"/>, projecting an account it just read
+    /// through the trusted directory. Exposing it publicly would let any future caller fabricate an
+    /// enabled <see cref="UserRole.Admin"/> principal with no directory provenance. Tests reach it
+    /// through <c>InternalsVisibleTo</c>, never through a public surface.
+    /// </para>
     /// </summary>
     /// <param name="userId">The stable internal account id (must be positive).</param>
     /// <param name="gitHubId">The persisted GitHub numeric user id (must be non-blank).</param>
@@ -102,7 +119,7 @@ public sealed record ActingUserPrincipal
     /// <returns>The immutable acting principal.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="userId"/> is not positive, or <paramref name="role"/> is not a defined role.</exception>
     /// <exception cref="ArgumentException"><paramref name="gitHubId"/> is null, empty or whitespace.</exception>
-    public static ActingUserPrincipal ForActivatedAccount(
+    internal static ActingUserPrincipal ForActivatedAccount(
         int userId,
         string gitHubId,
         UserRole role,
@@ -130,15 +147,17 @@ public sealed record ActingUserPrincipal
     /// Builds the open/no-auth LOCAL OPERATOR principal: a full <see cref="UserRole.Admin"/> that is
     /// enabled, original and NOT backed by any persisted account.
     /// <para>
-    /// Callers must pass the explicit authentication mode to the resolver rather than calling this
-    /// directly; it exists (and is public) only so the resolver's open-mode branch and its tests
-    /// share one definition. Producing it while authentication is ENABLED would be an open-mode
-    /// escalation, which is why the resolver makes that decision from its supplied
-    /// <see cref="HiveAuthMode"/> alone.
+    /// This factory is <c>internal</c> ON PURPOSE: the open-mode identity is the one principal that
+    /// exists without any persisted account, so it must not be reachable from outside this assembly.
+    /// Its only production caller is <see cref="HivePrincipalResolver.ResolveAsync"/>, which takes
+    /// the explicit <see cref="HiveAuthMode"/> as host input and never infers open mode from a
+    /// failure; producing this principal while authentication is ENABLED would be an open-mode
+    /// escalation, so that decision stays in the resolver's single open-mode branch. Tests reach it
+    /// through <c>InternalsVisibleTo</c>.
     /// </para>
     /// </summary>
     /// <returns>The immutable local-operator principal.</returns>
-    public static ActingUserPrincipal LocalOperator() =>
+    internal static ActingUserPrincipal LocalOperator() =>
         new(
             LocalOperatorUserId,
             string.Empty,
