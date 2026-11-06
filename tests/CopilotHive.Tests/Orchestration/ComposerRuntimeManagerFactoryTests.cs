@@ -236,6 +236,144 @@ public sealed partial class ComposerRuntimeManagerTests
     }
 
     /// <summary>
+    /// AC1, PRIMARY-MODEL AXIS: a runtime captured with a Copilot-backed PRIMARY model keeps its
+    /// construction-captured deferral decision when the live <see cref="HiveConfigFile"/> replaces that
+    /// primary model with a non-Copilot one — exactly the flip a LIVE lookup would have produced.
+    /// </summary>
+    /// <remarks>
+    /// The compaction-model axis is covered by <see cref="RuntimeDeferral_AfterLiveConfigReload_StillUsesTheConstructionCapturedModels"/>;
+    /// this pins the OTHER captured value the snapshot carries. The positive control at the end re-creates the
+    /// runtime AFTER the reload, proving the reload really is observable — so the runtime above kept its capture
+    /// for a substantive reason and not because the reload never happened.
+    /// </remarks>
+    [Fact]
+    public async Task RuntimeDeferral_AfterLivePrimaryModelReload_StillUsesTheConstructionCapturedPrimary()
+    {
+        var (_, second) = await TwoUsersAsync();
+        _providerResolver = model => model.StartsWith("copilot/", StringComparison.Ordinal) ? "copilot" : "ollama-local";
+        _tokenAvailable = false;
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "copilot/main" },
+                    new ModelEntry { Name = "ollama-local/main" },
+                    new ModelEntry { Name = "ollama-local/compact" },
+                ],
+                CompactionModel = "ollama-local/compact",
+            },
+            Composer = new ComposerConfig { Model = "copilot/main" },
+        };
+        var sp = BuildProvider(authEnabled: true, config: config);
+        var factory = NewFactory(sp);
+        await using var gate = Park();
+
+        var context = await CreateRuntimeAsync(sp, factory, second, "ollama-local/compact");
+        Assert.Equal(ComposerRuntimeStatus.Deferred, context.Created.Status);
+        Assert.Equal("copilot/main", context.Runtime.Configuration.PrimaryModel);
+        Assert.True(factory.ShouldDeferConnect(context.Runtime.Configuration));
+
+        // ── LIVE reload: the primary model is replaced by a non-Copilot one ──
+        config.Composer = new ComposerConfig { Model = "ollama-local/main" };
+        Assert.Equal("ollama-local/main", sp.GetRequiredService<HiveConfigFile>().ResolveComposerDefaultModel());
+
+        // The LIVE-shaped capture would NOT defer any more: the decision really flips ...
+        Assert.False(factory.ShouldDeferConnect(
+            new ComposerConstructionSnapshot("ollama-local/main", "ollama-local/compact")));
+        // ... but the runtime's own capture still defers: the runtime and the factory agree.
+        Assert.True(factory.ShouldDeferConnect(context.Runtime.Configuration));
+        // The Composer's own construction input was never rewritten either.
+        Assert.Equal("copilot/main", context.Runtime.Composer.StartupDefaultModel);
+
+        // Production assertion: the manager keeps the runtime Deferred and starts NO connect.
+        var afterReload = await Retry(context.Manager, second);
+        Assert.Equal(ComposerRuntimeStatus.Deferred, afterReload.Status);
+        Assert.Same(context.Runtime, afterReload.Runtime);
+        Assert.Null(afterReload.Failure);
+        Assert.Equal(0, gate.Calls);
+        Assert.Equal(0, _clientCreations);
+
+        // Positive control: a FRESH runtime built after the reload captures the new primary and connects —
+        // the reload is genuinely observable, so the runtime above kept its capture for a real reason.
+        gate.Release();
+        Assert.True(await Remove(context.Manager, second.UserId));
+        var freshFactory = NewFactory(sp);
+        var fresh = await CreateRuntimeAsync(sp, freshFactory, second, "ollama-local/compact");
+        Assert.Equal("ollama-local/main", fresh.Runtime.Configuration.PrimaryModel);
+        Assert.Equal(ComposerRuntimeStatus.Connected, fresh.Created.Status);
+        Assert.Equal(1, gate.Calls);
+    }
+
+    /// <summary>
+    /// AC1, PRIMARY-MODEL AXIS, DEFER-FALSE SHAPE: a runtime captured with a NON-Copilot primary model (and
+    /// no compaction model) is NOT deferred, and a live reload that installs a Copilot-backed primary model —
+    /// which WOULD defer a live lookup — never turns that runtime's decision into a deferral.
+    /// </summary>
+    /// <remarks>
+    /// The positive control at the end re-creates the runtime AFTER the reload: the fresh runtime DOES defer on
+    /// the reloaded primary, so the reload is genuinely observable — the already-constructed runtime kept its
+    /// capture for a substantive reason and not because the reload never happened.
+    /// </remarks>
+    [Fact]
+    public async Task RuntimeDeferral_AfterLivePrimaryModelReload_ForANonDeferredCapture_StaysNonDeferred()
+    {
+        var (_, second) = await TwoUsersAsync();
+        _providerResolver = model => model.StartsWith("copilot/", StringComparison.Ordinal) ? "copilot" : "ollama-local";
+        _tokenAvailable = false;
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "ollama-local/main" },
+                    new ModelEntry { Name = "copilot/other" },
+                ],
+            },
+            Composer = new ComposerConfig { Model = "ollama-local/main" },
+        };
+        var sp = BuildProvider(authEnabled: true, config: config);
+        var factory = NewFactory(sp);
+
+        // No compaction model and a non-Copilot primary: nothing defers, the runtime connects.
+        var context = await CreateRuntimeAsync(sp, factory, second, expectedCompaction: null);
+        Assert.Equal(ComposerRuntimeStatus.Connected, context.Created.Status);
+        Assert.Equal("ollama-local/main", context.Runtime.Configuration.PrimaryModel);
+        Assert.Null(context.Runtime.Configuration.CompactionModel);
+        Assert.False(factory.ShouldDeferConnect(context.Runtime.Configuration));
+        Assert.True(context.Runtime.Composer.IsConnected);
+
+        await using var gate = Park();
+
+        // ── LIVE reload: a Copilot-backed primary replaces the captured one ──
+        config.Composer = new ComposerConfig { Model = "copilot/other" };
+        Assert.Equal("copilot/other", sp.GetRequiredService<HiveConfigFile>().ResolveComposerDefaultModel());
+
+        // The LIVE-shaped capture WOULD defer (Copilot primary, still no usable token): the decision really flips ...
+        Assert.True(factory.ShouldDeferConnect(new ComposerConstructionSnapshot("copilot/other", null)));
+        // ... but the runtime's own capture does not: the runtime and the factory still agree.
+        Assert.False(factory.ShouldDeferConnect(context.Runtime.Configuration));
+
+        // Production assertion: the connected runtime stays connected and starts NO new connect.
+        var afterReload = await Retry(context.Manager, second);
+        Assert.Equal(ComposerRuntimeStatus.Connected, afterReload.Status);
+        Assert.Same(context.Runtime, afterReload.Runtime);
+        Assert.Null(afterReload.Failure);
+        Assert.Equal(0, gate.Calls);
+
+        // Positive control: a FRESH runtime built after the reload captures the Copilot primary and DEFERS —
+        // the reload is genuinely observable, so the runtime above kept its capture for a real reason.
+        Assert.True(await Remove(context.Manager, second.UserId));
+        var freshFactory = NewFactory(sp);
+        var fresh = await CreateRuntimeAsync(sp, freshFactory, second, expectedCompaction: null);
+        Assert.Equal("copilot/other", fresh.Runtime.Configuration.PrimaryModel);
+        Assert.Equal(ComposerRuntimeStatus.Deferred, fresh.Created.Status);
+        Assert.Equal(0, gate.Calls);
+    }
+
+    /// <summary>
     /// STRUCTURAL PIN: the factory reads the compaction model exactly ONCE — in <c>Build</c> — and resolves
     /// <see cref="HiveConfigFile"/> exactly once there too, so no code path can reach a live compaction value for
     /// an already-constructed runtime. <c>Composer.cs</c> does not grow a snapshot accessor: the capture is

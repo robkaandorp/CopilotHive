@@ -185,6 +185,66 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Equal(1, gate.Calls);
     }
 
+    /// <summary>
+    /// AC2, SECOND-USER <c>ConnectAsync</c> CELL: while one user's token probe is genuinely parked, a DIFFERENT
+    /// user's <see cref="ComposerRuntimeManager.ConnectAsync"/> completes — proving the parked probe holds no
+    /// manager lock at all (not merely that creation is unaffected).
+    /// </summary>
+    /// <remarks>
+    /// The parked probe belongs to the SECOND user's connect; the FIRST user's connect is the unrelated caller.
+    /// The probe seam parks only the FIRST armed evaluation, so the unrelated user's own probe evaluation passes
+    /// straight through and its caller settles on the same Deferred verdict the owner settles on.
+    /// </remarks>
+    [Fact]
+    public async Task ParkedTokenProbe_DoesNotBlockAnotherUsersConnectAsync()
+    {
+        var (first, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider(authEnabled: true));
+        _provider = "copilot";
+        _tokenAvailable = false;
+        // Both users own a Deferred runtime, so BOTH have a cached entry to connect.
+        var owner = (await Request(manager, second)).Runtime!;
+        var other = (await Request(manager, first)).Runtime!;
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, first)).Status);
+
+        using var probe = new TokenProbeGate();
+        using var restore = ParkTokenProbe(probe);
+        await using var gate = Park();
+        probe.Arm();
+
+        // The owner's connect evaluates the synchronous probe and BLOCKS there.
+        var parked = RetryOnBackgroundThread(manager, second);
+        await GuardAsync(probe.Completion, "owner's connect evaluated the token probe");
+        Assert.False(parked.IsCompleted);
+
+        // The unrelated user's ConnectAsync must complete while the owner's probe is still parked.
+        var otherConnect = RetryOnBackgroundThread(manager, first);
+        var otherResult = await Bounded(otherConnect, "unrelated user's ConnectAsync completes while the probe is parked");
+        Assert.Equal(ComposerRuntimeStatus.Deferred, otherResult.Status);
+        Assert.Same(other, otherResult.Runtime);
+        Assert.Null(otherResult.Failure);
+        Assert.False(parked.IsCompleted); // production is genuinely still inside the parked probe
+        Assert.Equal(0, gate.Calls);    // no connect was attempted by either caller
+
+        // The owner's stale probe result settles Deferred as well: no runtime was handed out from it.
+        probe.Release();
+        var ownerResult = await Bounded(parked, "parked owner's deferred connect settles");
+        Assert.Equal(ComposerRuntimeStatus.Deferred, ownerResult.Status);
+        Assert.Same(owner, ownerResult.Runtime);
+        Assert.Null(ownerResult.Failure);
+        Assert.Equal(0, gate.Calls);
+        Assert.Equal(0, _clientCreations);
+        probe.AssertHealthy();
+
+        // Control: with a token both users connect normally.
+        _tokenAvailable = true;
+        gate.Release();
+        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, second)).Status);
+        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, first)).Status);
+        Assert.Equal(2, gate.Calls);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
