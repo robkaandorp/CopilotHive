@@ -1614,6 +1614,19 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         CancellationToken ct) =>
         AnswerClarificationAsync(goalId, question, context, clarificationQueue, request, ct);
 
+    /// <summary>
+    /// Completes only when the actor AND the agent service have ACTUALLY finished tearing down after
+    /// <see cref="DisposeAsync"/> — including the deferred path where <see cref="DisposeAsync"/> returns while
+    /// the actor is still running (its 5-second dispose timeout elapsed) and the agent disposal is chained
+    /// onto <c>_actor.Completion</c>. It stays incomplete until <see cref="DisposeAsync"/> is called. A
+    /// failure to dispose the agent is surfaced by <see cref="DisposeAsync"/> itself (or logged on the deferred
+    /// path) and never faults this task; the task only reports "teardown is over". Used by the per-user runtime
+    /// manager to block same-user recreation until no old actor/agent can still be running.
+    /// </summary>
+    internal Task TeardownCompletion => _teardownCompletion.Task;
+
+    private readonly TaskCompletionSource _teardownCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
@@ -1624,7 +1637,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         // Actor first: it owns the streaming task, so nothing it depends on may be torn down
         // while it can still run. DisposeAsync applies its own 5-second timeout.
-        await _actor.DisposeAsync();
+        try
+        {
+            await _actor.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            // The agent is not disposed on this path (unchanged behaviour), so teardown is over only in
+            // the sense that nothing further will run; report that as a faulted completion.
+            _teardownCompletion.TrySetException(ex);
+            throw;
+        }
 
         // Retained-but-unused service: its failures must never mask or block the rest.
         try { await _streamingService.DisposeAsync(); }
@@ -1640,7 +1663,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             }
             finally
             {
-                _issueUpdateLock.Dispose();
+                try { _issueUpdateLock.Dispose(); }
+                finally { _teardownCompletion.TrySetResult(); }
             }
         }
         else
@@ -1657,6 +1681,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                     {
                         try { _issueUpdateLock.Dispose(); }
                         catch (Exception ex) { _logger.LogWarning(ex, "Deferred issue-lock disposal failed"); }
+                        finally { _teardownCompletion.TrySetResult(); }
                     }
                 },
                 CancellationToken.None,

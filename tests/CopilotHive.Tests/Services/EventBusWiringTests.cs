@@ -96,7 +96,12 @@ public sealed class EventBusWiringTests
         // call is unique to that line — the startup resolution cannot satisfy it.
         // (eventBus: is now the true last argument; the eventSubscriber: argument still
         // must be present.)
-        Assert.Contains("eventSubscriber: sp.GetService<ComposerEventSubscriber>(),", source);
+        // The Composer construction now lives in the shared ComposerFactory seam; the legacy
+        // registration hands it the process-wide subscriber from DI.
+        var factorySource = File.ReadAllText(Path.Combine(
+            repoRoot, "src", "CopilotHive", "Orchestration", "ComposerFactory.cs")).ReplaceLineEndings("\n");
+        Assert.Contains("_sp.GetService<ComposerEventSubscriber>()", factorySource);
+        Assert.Contains("eventSubscriber: eventSubscriber,\n            eventBus: _sp.GetService<IEventBus>(),", factorySource);
     }
 
     /// <summary>
@@ -122,11 +127,9 @@ public sealed class EventBusWiringTests
             "builder.Services.AddSingleton<IEventBus, EventBus>();",
             "builder.Services.AddSingleton<ComposerEventSubscriber>();",
             "app.Services.GetService<ComposerEventSubscriber>();",
-            "eventSubscriber: sp.GetService<ComposerEventSubscriber>(),",
-            // Two adjacent lines: unique to the Composer factory (the DistributedBrain
-            // factory's eventBus line is indented differently and has no preceding
-            // eventSubscriber argument).
-            "eventSubscriber: sp.GetService<ComposerEventSubscriber>(),\n                    eventBus: sp.GetService<IEventBus>());",
+            // The Composer construction moved to the shared ComposerFactory seam, which the
+            // legacy registration invokes exactly once.
+            "sp.GetRequiredService<ComposerFactory>().CreateLegacy()",
         ];
 
         foreach (var fragment in fragments)
@@ -136,6 +139,11 @@ public sealed class EventBusWiringTests
                 $"Expected exactly 1 occurrence of '{fragment}' in Program.cs but found {occurrences}. " +
                 "An ambiguous or missing fragment breaks the removal-proof guarantee of the wiring tests.");
         }
+
+        // The seam's own legacy entry hands the shared subscriber over exactly once.
+        var factorySource = File.ReadAllText(Path.Combine(
+            repoRoot, "src", "CopilotHive", "Orchestration", "ComposerFactory.cs")).ReplaceLineEndings("\n");
+        Assert.Equal(1, CountOccurrences(factorySource, "_sp.GetService<ComposerEventSubscriber>()"));
     }
 
     /// <summary>Counts non-overlapping occurrences of <paramref name="needle"/> in <paramref name="haystack"/>.</summary>

@@ -432,6 +432,8 @@ public sealed class ComposerLegacyMigrationContractTests : IDisposable
                 continue; // the seam's own definition
             if (relative.StartsWith("Orchestration/ComposerAgentService.cs", StringComparison.Ordinal))
                 continue; // the connect path that calls the seam for an identity-bound service
+            if (relative.Equals("Orchestration/ComposerRuntimeManager.cs", StringComparison.Ordinal))
+                continue; // the per-user runtime manager: DI-registered but not wired to any live path
 
             var text = File.ReadAllText(file);
             if (text.Contains("ResolveOriginalAdminAsync", StringComparison.Ordinal)
@@ -460,12 +462,16 @@ public sealed class ComposerLegacyMigrationContractTests : IDisposable
 
         var source = File.ReadAllText(programPath).ReplaceLineEndings("\n");
 
-        // The production Composer construction names no per-user identity parameter.
-        var composerCtor = TestSourceScanner.ExtractMethodBlockPreservingLiterals(
-            source, "return new Composer(resolvedDefault,");
-        Assert.NotNull(composerCtor);
-        Assert.DoesNotContain("userState", composerCtor, StringComparison.Ordinal);
-        Assert.DoesNotContain("ResolveOriginalAdminAsync", composerCtor, StringComparison.Ordinal);
+        // The production registration builds the legacy Composer through the shared seam's
+        // legacy entry point, and that entry point passes NO per-user identity.
+        Assert.Contains("sp.GetRequiredService<ComposerFactory>().CreateLegacy()", source, StringComparison.Ordinal);
+        var factorySource = File.ReadAllText(Path.Combine(
+            TestRepoRoot.Find(), "src", "CopilotHive", "Orchestration", "ComposerFactory.cs")).ReplaceLineEndings("\n");
+        Assert.Contains(
+            "Build(userState: null, _sp.GetService<ComposerAttachmentService>(), _sp.GetService<ComposerEventSubscriber>())",
+            factorySource,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("ResolveOriginalAdminAsync", source, StringComparison.Ordinal);
 
         // The production attachment service is the legacy (state-dir only) construction.
         Assert.Contains(
