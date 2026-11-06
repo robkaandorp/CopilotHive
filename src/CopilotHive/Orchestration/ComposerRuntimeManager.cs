@@ -103,15 +103,25 @@ public sealed record ComposerRuntimeResult
 /// The per-user pieces of one managed Composer: validated identity, the Composer (and through it the
 /// actor / agent service), the per-user attachment service and the per-runtime event subscriber.
 /// </summary>
-public sealed class ComposerUserRuntime : IAsyncDisposable
+/// <remarks>
+/// READ-ONLY HANDLE — deliberately NOT <see cref="IAsyncDisposable"/> and with no <c>DisposeAsync</c>: the
+/// <see cref="ComposerRuntimeManager"/> alone disposes this runtime's Composer and subscriber (on removal,
+/// failure or shutdown). A public disposal entry point on the handle would let any holder tear the runtime down
+/// while the manager still owns it — racing removal and completing teardown before the manager joined the actual
+/// actor/agent completion. There is exactly ONE disposal path (the manager's), so no extra completion signal is
+/// needed to disambiguate it.
+/// </remarks>
+public sealed class ComposerUserRuntime
 {
     internal ComposerUserRuntime(
-        ComposerUserState state, Composer composer, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber)
+        ComposerUserState state, Composer composer, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber,
+        ComposerConstructionSnapshot configuration)
     {
         State = state;
         Composer = composer;
         Attachments = attachments;
         Subscriber = subscriber;
+        Configuration = configuration;
     }
 
     /// <summary>The validated per-user identity (session / attachment paths, <c>composer:N</c> registry id).</summary>
@@ -126,12 +136,13 @@ public sealed class ComposerUserRuntime : IAsyncDisposable
     /// <summary>The user's own event subscriber, or <c>null</c> when no event bus is registered.</summary>
     public ComposerEventSubscriber? Subscriber { get; }
 
-    /// <summary>Disposes the Composer, then detaches the subscriber. Session history on disk is never touched.</summary>
-    public async ValueTask DisposeAsync()
-    {
-        try { await Composer.DisposeAsync(); }
-        finally { Subscriber?.Dispose(); }
-    }
+    /// <summary>
+    /// The IMMUTABLE construction inputs this runtime's <see cref="Composer"/> was built from (primary and
+    /// compaction model), captured once by <see cref="ComposerFactory"/>. Every deferral decision for this
+    /// runtime is evaluated against THIS capture, so a later configuration reload can never make the decision
+    /// diverge from what the Composer was actually constructed with.
+    /// </summary>
+    internal ComposerConstructionSnapshot Configuration { get; }
 }
 
 /// <summary>
@@ -151,7 +162,9 @@ public sealed class ComposerUserRuntime : IAsyncDisposable
 /// <para>
 /// NO GLOBAL COORDINATOR: this class never touches <see cref="LlmConnectionCoordinator"/> instances nor
 /// <see cref="UserService.TokenAvailable"/>; it only evaluates the coordinator's pure deferral predicate
-/// through <see cref="ComposerFactory.ShouldDeferConnect"/>. A deferred runtime is connected by an
+/// through <see cref="ComposerFactory.ShouldDeferConnect"/> over each runtime's CONSTRUCTION-CAPTURED
+/// configuration (<see cref="ComposerUserRuntime.Configuration"/>), so a configuration reload can never
+/// change the deferral decision of an already-constructed runtime. A deferred runtime is connected by an
 /// explicit, awaitable <see cref="ConnectAsync"/>.
 /// </para>
 /// <para>
@@ -306,6 +319,13 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     /// stays <see cref="ComposerRuntimeStatus.Deferred"/> with no connect attempt. It never reaches the
     /// legacy <see cref="LlmConnectionCoordinator"/> or <see cref="UserService.TokenAvailable"/>.
     /// </summary>
+    /// <remarks>
+    /// LOCK SCOPE: <see cref="ComposerFactory.ShouldDeferConnect"/> can synchronously block (its token probe may hit
+    /// SQLite), so it is evaluated OUTSIDE <see cref="_gate"/>: the entry and its settled Deferred runtime are
+    /// snapshotted under the lock, the probe runs without it, and the decision is then REVALIDATED against the same
+    /// entry before a shared connect starts. A slow probe therefore never blocks unrelated users, while a removal or
+    /// shutdown that started meanwhile keeps ownership — its stale probe result can only yield Removed/refusal.
+    /// </remarks>
     /// <param name="principal">The acting principal (re-checked exactly like <see cref="GetOrCreateAsync"/>).</param>
     /// <param name="ct">Cancels THIS caller's wait only.</param>
     /// <returns>A typed outcome; <see cref="ComposerRuntimeRefusal.NoRuntime"/> when the user has no cached runtime.</returns>
@@ -315,7 +335,10 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             return ComposerRuntimeResult.Refused(refusal);
 
         var userId = principal.UserId;
+
+        // ── 1. Snapshot under the lock (no probe, no I/O) ──
         Entry entry;
+        ComposerUserRuntime? deferred;
         lock (_gate)
         {
             if (_shutdown is not null)
@@ -325,13 +348,40 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             if (entry.Removing)
                 return ComposerRuntimeResult.RemovedResult();
 
-            // Only a SETTLED Deferred runtime starts a connect; an in-flight operation (initial create or
-            // an earlier connect) is joined, never duplicated.
-            if (entry.Operation.IsCompletedSuccessfully
-                && entry.Operation.Result is { Status: ComposerRuntimeStatus.Deferred, Runtime: { } runtime }
-                && !_factory.ShouldDeferConnect(runtime.Composer))
+            // Only a SETTLED Deferred runtime is a connect candidate; an in-flight operation (initial create
+            // or an earlier connect) is joined, never duplicated.
+            deferred = entry.Operation.IsCompletedSuccessfully
+                && entry.Operation.Result is { Status: ComposerRuntimeStatus.Deferred, Runtime: { } settled }
+                ? settled
+                : null;
+        }
+
+        // ── 2. Token probe OUTSIDE the lock: a blocking probe must not stall unrelated users ──
+        if (deferred is not null && !_factory.ShouldDeferConnect(deferred.Configuration))
+        {
+            // ── 3. Revalidate under the lock: only the SAME entry, still cached, not Removing, not shut
+            //      down, and still settled on the SAME Deferred runtime may start the shared connect. ──
+            lock (_gate)
             {
-                entry.Operation = Task.Run(() => ConnectDeferredAsync(entry, runtime), CancellationToken.None);
+                if (_shutdown is not null)
+                    return ComposerRuntimeResult.Refused(ComposerRuntimeRefusal.ShuttingDown);
+
+                // A removal (or a failed operation) that finished during the probe dropped this entry from the
+                // cache — possibly followed by a fresh one. The snapshot then owns nothing: no runtime is handed
+                // out and no connect is started on a runtime whose lifecycle somebody else now owns.
+                if (!_entries.TryGetValue(userId, out var current) || !ReferenceEquals(current, entry))
+                    return ComposerRuntimeResult.RemovedResult();
+                if (entry.Removing)
+                    return ComposerRuntimeResult.RemovedResult();
+
+                if (entry.Operation.IsCompletedSuccessfully
+                    && entry.Operation.Result is { Status: ComposerRuntimeStatus.Deferred, Runtime: { } settled }
+                    && ReferenceEquals(settled, deferred))
+                {
+                    entry.Operation = Task.Run(() => ConnectDeferredAsync(entry, settled), CancellationToken.None);
+                }
+                // Otherwise a concurrent caller already started the SAME connect (or the operation settled
+                // differently): fall through and JOIN whatever the entry now owns — never a second connect.
             }
         }
 
@@ -411,7 +461,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             catch (ObjectDisposedException) { }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "A cancellation callback of the shared operation of user {UserId} threw; teardown continues", userId);
+                LogCleanupWarning(ex, "A cancellation callback of the shared operation of user {UserId} threw; teardown continues", userId);
             }
 
             // The operation never throws; a connect aborted by the cancellation disposed its own partial
@@ -424,7 +474,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Tearing down the runtime of user {UserId} failed", userId);
+            LogCleanupWarning(ex, "Tearing down the runtime of user {UserId} failed", userId);
         }
         finally
         {
@@ -500,7 +550,10 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         ComposerUserState? state = null;
         ComposerAttachmentService? attachments = null;
         ComposerEventSubscriber? subscriber = null;
-        Composer? composer = null;
+        // ONE result carrying BOTH the Composer and the construction-captured configuration it was built
+        // from, so the two can never drift apart: every later deferral decision for this runtime reads
+        // these captured values, never a live configuration lookup.
+        ComposerBuildResult? build = null;
         try
         {
             state = principal.IsOriginal
@@ -508,8 +561,9 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
                 : await ComposerUserState.ResolveAsync(_users, principal.UserId, CancellationToken.None);
             attachments = _factory.CreateUserAttachments(state);
             subscriber = _factory.CreateUserSubscriber();
-            composer = _factory.CreateForUser(state, attachments, subscriber);
-            var runtime = new ComposerUserRuntime(state, composer, attachments, subscriber);
+            build = _factory.CreateForUser(state, attachments, subscriber);
+            var composer = build.Composer;
+            var runtime = new ComposerUserRuntime(state, composer, attachments, subscriber, build.Configuration);
 
             // A Composer without a resolved model is an explicit disconnected shell: nothing to connect.
             if (composer.StartupDefaultModel is null)
@@ -517,7 +571,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
 
             // Deferred: the gate says no usable token yet. An explicit state — not a failure and not a
             // started connect; the manager's awaitable ConnectAsync completes it later.
-            if (_factory.ShouldDeferConnect(composer))
+            if (_factory.ShouldDeferConnect(build.Configuration))
                 return new Settled(ComposerRuntimeStatus.Deferred, runtime, null);
 
             // Migration / session load run inside ConnectAsync and fail closed (never delete history).
@@ -528,11 +582,11 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         catch (Exception ex)
         {
             // Lifecycle cancellation of a constructed runtime: route through the lifecycle teardown (no clearing).
-            if (entry.Cts.IsCancellationRequested && composer is not null)
+            if (entry.Cts.IsCancellationRequested && build is not null)
                 return new Settled(ComposerRuntimeStatus.Removed,
-                    new ComposerUserRuntime(state!, composer, attachments!, subscriber), null);
+                    new ComposerUserRuntime(state!, build.Composer, attachments!, subscriber, build.Configuration), null);
 
-            return await FailAsync(entry, principal.UserId, state, composer, subscriber, attachments, ex);
+            return await FailAsync(entry, principal.UserId, state, build?.Composer, subscriber, attachments, ex);
         }
     }
 
@@ -570,7 +624,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         if (composer is not null)
         {
             try { await composer.DisposeAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Disposing the partial Composer of user {UserId} failed", userId); }
+            catch (Exception ex) { LogCleanupWarning(ex, "Disposing the partial Composer of user {UserId} failed", userId); }
 
             // DisposeAsync may return while a stuck actor still runs: the entry may only leave the cache (and
             // a recreation may only start) after the ACTUAL actor/agent teardown.
@@ -578,12 +632,12 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         }
 
         try { subscriber?.Dispose(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Disposing the partial subscriber of user {UserId} failed", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Disposing the partial subscriber of user {UserId} failed", userId); }
 
         if (attachments is not null)
         {
             try { await attachments.ClearAllAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Clearing the partial attachments of user {UserId} failed", userId); }
+            catch (Exception ex) { LogCleanupWarning(ex, "Clearing the partial attachments of user {UserId} failed", userId); }
         }
 
         // Disposal re-publishes an idle registry entry for the partial Composer: drop it.
@@ -612,15 +666,15 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     {
         var userId = runtime.State.UserId;
         try { await runtime.Composer.DisposeAsync(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Disposing the Composer of user {UserId} failed", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Disposing the Composer of user {UserId} failed", userId); }
 
         try { runtime.Subscriber?.Dispose(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Disposing the subscriber of user {UserId} failed", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Disposing the subscriber of user {UserId} failed", userId); }
 
         if (clearAttachments)
         {
             try { await runtime.Attachments.ClearAllAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Clearing the attachments of user {UserId} failed", userId); }
+            catch (Exception ex) { LogCleanupWarning(ex, "Clearing the attachments of user {UserId} failed", userId); }
         }
 
         await JoinTeardownAsync(runtime.Composer, userId);
@@ -633,7 +687,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     private async Task JoinTeardownAsync(Composer composer, int userId)
     {
         try { await WaitForTeardownAsync(userId, composer.TeardownCompletion, CancellationToken.None); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Teardown of the Composer of user {UserId} faulted", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Teardown of the Composer of user {UserId} faulted", userId); }
     }
 
     /// <summary>The single place the manager blocks on a teardown task; reports it to the observation seam first.</summary>
@@ -641,5 +695,26 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     {
         OnJoiningTeardown?.Invoke(userId, teardown);
         return teardown.WaitAsync(ct);
+    }
+
+    /// <summary>
+    /// BEST-EFFORT cleanup warning: the ONE place the manager writes a cleanup/teardown warning, and it can never
+    /// throw. Cleanup runs inside catch blocks; a throwing logger (a synchronous sink that faults, a disposed
+    /// logger factory, a test double that asserts) would otherwise ESCAPE that catch, mask the original
+    /// connect/migration failure, and skip every remaining cleanup step — composer disposal, the actual teardown
+    /// join, subscriber cleanup, attachment policy, unregister and cache eviction. Any logger fault is swallowed and
+    /// the remaining steps always run; the settled outcome (including the ORIGINAL failure) is never altered.
+    /// </summary>
+    /// <param name="exception">The cleanup failure being reported (payload unchanged from the direct call it replaces).</param>
+    /// <param name="message">The warning template — identical to the text that appears when the logger works.</param>
+    /// <param name="userId">The user whose runtime is being cleaned up (the <c>{UserId}</c> property).</param>
+    private void LogCleanupWarning(Exception exception, string message, int userId)
+    {
+        try { _logger.LogWarning(exception, message, userId); }
+        catch
+        {
+            // Deliberately swallowed: reporting a cleanup failure must never become a second, louder failure.
+            // Diagnostics must not throw, and this one runs on the failure path where a throw is most damaging.
+        }
     }
 }

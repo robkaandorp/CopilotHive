@@ -48,6 +48,14 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     private Func<string, string>? _providerResolver;
     private Func<Composer, CancellationToken, Task>? _connectHook;
 
+    /// <summary>
+    /// Test observation seam for the factory's token probe; <c>null</c> (inert) by default. Production evaluates
+    /// this probe SYNCHRONOUSLY inside its deferral gate, so a test can park it deterministically and prove the
+    /// manager never holds its gate across it. A hook must never assert: the production gate contains probe
+    /// failures, so a hook records outcomes in counters that the test asserts on afterwards.
+    /// </summary>
+    private Action? _tokenProbeHook;
+
     public ComposerRuntimeManagerTests()
     {
         Directory.CreateDirectory(StateDir);
@@ -178,11 +186,16 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
         {
             Interlocked.Increment(ref _clientCreations);
             return _clientFactory(m);
-        }, isTokenAvailable: () => _tokenAvailable, providerOf: model => _providerResolver?.Invoke(model) ?? _provider);
+        }, isTokenAvailable: () =>
+        {
+            _tokenProbeHook?.Invoke();
+            return _tokenAvailable;
+        }, providerOf: model => _providerResolver?.Invoke(model) ?? _provider);
 
-    private ComposerRuntimeManager NewManager(IServiceProvider sp, ILogger<ComposerRuntimeManager>? logger = null)
+    private ComposerRuntimeManager NewManager(IServiceProvider sp, ILogger<ComposerRuntimeManager>? logger = null,
+        ComposerFactory? factory = null)
     {
-        var m = new ComposerRuntimeManager(NewFactory(sp), _users, logger ?? NullLogger<ComposerRuntimeManager>.Instance,
+        var m = new ComposerRuntimeManager(factory ?? NewFactory(sp), _users, logger ?? NullLogger<ComposerRuntimeManager>.Instance,
             (composer, ct) => (_connectHook ?? ((c, t) => c.ConnectAsync(t)))(composer, ct));
         _managerUsers.Add(m, []);
         return m;
@@ -309,6 +322,13 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 
     private static T Field<T>(object target, string name) =>
         (T)typeof(Composer).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
+
+    /// <summary>
+    /// Reads a private instance field declared on <paramref name="target"/>'s OWN type (e.g. a
+    /// <see cref="ComposerAgentService"/> field), unlike <see cref="Field{T}"/> which is anchored on <see cref="Composer"/>.
+    /// </summary>
+    private static T InstanceField<T>(object target, string name) =>
+        (T)target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
 
     // ── Same user → one shared runtime ──
 
