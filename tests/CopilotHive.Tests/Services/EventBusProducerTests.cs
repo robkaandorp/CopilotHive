@@ -608,7 +608,13 @@ public sealed class EventBusProducerTests
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.GoalDispatched, evt.Type);
         Assert.Equal(goal.Id, evt.GoalId);
-        Assert.Equal(goal.Description, evt.Message);
+
+        // The message is a single-line identity summary: the goal ID is present and the
+        // goal description is NOT copied into the event that feeds Composer context.
+        Assert.Contains(goal.Id, evt.Message);
+        Assert.DoesNotContain(goal.Description, evt.Message);
+        Assert.DoesNotContain('\n', evt.Message);
+        Assert.DoesNotContain('\r', evt.Message);
     }
 
     /// <summary>
@@ -690,8 +696,14 @@ public sealed class EventBusProducerTests
         Assert.DoesNotContain(eventBus.Published, e => e.Type == EventType.GoalDispatched);
     }
 
+    /// <summary>
+    /// <c>GoalDispatched</c> must carry a single-line identity summary, never the goal text.
+    /// The goal here has a LONG, MULTILINE description: the message must stay one line,
+    /// must contain the goal ID, and must contain no fragment of the description — proving
+    /// the full text is not embedded and therefore cannot leak into Composer context.
+    /// </summary>
     [Fact]
-    public async Task DispatchNextGoal_GoalDispatched_MessageMatchesPipelineDescription()
+    public async Task DispatchNextGoal_GoalDispatched_MessageIsSingleLineIdOnlySummary()
     {
         var ct = TestContext.Current.CancellationToken;
         var config = new HiveConfigFile
@@ -708,8 +720,22 @@ public sealed class EventBusProducerTests
             // All broadcastable roles need configured models to pass the readiness gate.
             Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
-        // Use a distinctive description so we can verify it propagates verbatim.
-        var description = "Distinctive goal description for message matching " + Guid.NewGuid().ToString("N")[..8];
+
+        // A long, multiline description with a distinctive marker fragment. If any of this
+        // text reached the event message, the newline and fragment assertions below fail.
+        var marker = "distinctive-marker-" + Guid.NewGuid().ToString("N")[..8];
+        var description = string.Join('\n',
+        [
+            "## Objective " + marker,
+            "",
+            "1. Refactor the dispatch path so events carry identity only.",
+            "2. Keep the existing pipeline behaviour unchanged across all phases.",
+            "3. Document the change in the knowledge graph progress page.",
+            "",
+            "Notes: this description is deliberately long and spans several lines so that a",
+            "verbatim copy into the event message is detectable by the assertions below.",
+        ]);
+
         var goal = new Goal
         {
             Id = "goal-dispatch-msg-" + Guid.NewGuid().ToString("N")[..8],
@@ -721,14 +747,31 @@ public sealed class EventBusProducerTests
 
         await service.DispatchNextGoalAsync(ct);
 
-        // Retrieve the pipeline so we can assert against the actual Description field.
+        // The pipeline really did carry the full multiline description — so the assertions
+        // below are proving the producer dropped it, not that the description was absent.
         var pipeline = pipelineManager.GetByGoalId(goal.Id);
         Assert.NotNull(pipeline);
+        Assert.Equal(description, pipeline.Description);
+        Assert.Contains('\n', pipeline.Description);
 
         var evt = Assert.Single(eventBus.Published, e => e.Type == EventType.GoalDispatched);
-        Assert.Equal(pipeline.Description, evt.Message);
-        Assert.Equal(description, evt.Message);
         Assert.Equal(goal.Id, evt.GoalId);
+
+        // Single line: no line breaks of any kind.
+        Assert.DoesNotContain('\n', evt.Message);
+        Assert.DoesNotContain('\r', evt.Message);
+        Assert.Equal(evt.Message.Trim(), evt.Message);
+        Assert.Single(evt.Message.Split('\n'));
+
+        // Identity only: the goal ID is present, no description text is.
+        Assert.Contains(goal.Id, evt.Message);
+        Assert.DoesNotContain(marker, evt.Message);
+        Assert.DoesNotContain("Objective", evt.Message);
+        Assert.DoesNotContain("Refactor the dispatch path", evt.Message);
+        Assert.DoesNotContain(description, evt.Message);
+
+        // The documented contract for the message form.
+        Assert.Equal($"Goal '{goal.Id}' dispatched", evt.Message);
     }
 
     // ── HiveOrchestratorService producer: raise_issue ──────────────────────
