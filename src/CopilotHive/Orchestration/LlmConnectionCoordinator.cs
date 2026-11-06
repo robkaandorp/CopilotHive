@@ -132,7 +132,7 @@ public sealed class LlmConnectionCoordinator : IAsyncDisposable
     /// requires a GitHub Copilot token (primary or compaction model) AND none is available.
     /// </summary>
     internal bool ShouldDefer()
-        => _oauthEnabled && RequiresCopilotToken() && !SafeIsTokenAvailable();
+        => ShouldDefer(_oauthEnabled, _primaryModel, _compactionModel, _isTokenAvailable, _providerOf, _logger);
 
     /// <summary>
     /// Whether the Composer's primary or compaction model resolves to the GitHub Copilot
@@ -140,42 +140,63 @@ public sealed class LlmConnectionCoordinator : IAsyncDisposable
     /// gates on its own.
     /// </summary>
     internal bool RequiresCopilotToken()
+        => RequiresCopilotToken(_primaryModel, _compactionModel, _providerOf, _logger);
+
+    /// <summary>
+    /// The deferral predicate as a PURE function of its inputs — the single definition shared by this
+    /// coordinator and by the per-user runtime manager (which has no coordinator, token signal or
+    /// retry loop of its own). It holds no state and never touches a coordinator instance.
+    /// </summary>
+    internal static bool ShouldDefer(
+        bool oauthEnabled,
+        string? primaryModel,
+        string? compactionModel,
+        Func<bool> isTokenAvailable,
+        Func<string, string> providerOf,
+        ILogger? logger)
+        => oauthEnabled
+            && RequiresCopilotToken(primaryModel, compactionModel, providerOf, logger)
+            && !SafeIsTokenAvailable(isTokenAvailable, logger);
+
+    /// <summary>Static form of <see cref="RequiresCopilotToken()"/>.</summary>
+    internal static bool RequiresCopilotToken(
+        string? primaryModel, string? compactionModel, Func<string, string> providerOf, ILogger? logger)
     {
-        if (string.IsNullOrWhiteSpace(_primaryModel))
+        if (string.IsNullOrWhiteSpace(primaryModel))
             return false;
 
-        if (IsCopilot(_primaryModel))
+        if (IsCopilot(primaryModel, providerOf, logger))
             return true;
 
-        return !string.IsNullOrWhiteSpace(_compactionModel) && IsCopilot(_compactionModel);
+        return !string.IsNullOrWhiteSpace(compactionModel) && IsCopilot(compactionModel, providerOf, logger);
     }
 
-    private bool IsCopilot(string model)
+    private static bool IsCopilot(string model, Func<string, string> providerOf, ILogger? logger)
     {
         try
         {
-            return string.Equals(_providerOf(model), CopilotProvider, StringComparison.OrdinalIgnoreCase);
+            return string.Equals(providerOf(model), CopilotProvider, StringComparison.OrdinalIgnoreCase);
         }
         catch (Exception ex)
         {
             // An unparseable model must never crash startup; treat it as non-Copilot so the
             // eager connect path runs and surfaces the real error as Faulted.
-            _logger?.LogWarning(ex, "Could not resolve provider for model '{Model}'", model);
+            logger?.LogWarning(ex, "Could not resolve provider for model '{Model}'", model);
             return false;
         }
     }
 
-    private bool SafeIsTokenAvailable()
+    private static bool SafeIsTokenAvailable(Func<bool> isTokenAvailable, ILogger? logger)
     {
         try
         {
-            return _isTokenAvailable();
+            return isTokenAvailable();
         }
         catch (Exception ex)
         {
             // A failing availability probe must not gate startup: assume no token, which is the
             // safe (deferring) answer only when a Copilot model is configured anyway.
-            _logger?.LogWarning(ex, "Token availability probe threw; treating token as unavailable");
+            logger?.LogWarning(ex, "Token availability probe threw; treating token as unavailable");
             return false;
         }
     }

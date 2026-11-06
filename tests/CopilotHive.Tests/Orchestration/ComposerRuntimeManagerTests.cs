@@ -22,7 +22,7 @@ namespace CopilotHive.Tests.Orchestration;
 /// Creation / cache / re-check semantics of <see cref="ComposerRuntimeManager"/> and equivalence of
 /// the legacy Composer built through the shared <see cref="ComposerFactory"/> seam.
 /// </summary>
-public sealed class ComposerRuntimeManagerTests : IAsyncLifetime
+public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 {
     private const string Model = "test-model";
 
@@ -37,6 +37,12 @@ public sealed class ComposerRuntimeManagerTests : IAsyncLifetime
     // Gate hooks for the chat-client factory used by every Composer built in these tests.
     private int _clientCreations;
     private Func<string, IChatClient> _clientFactory;
+
+    // Connect-outcome hooks: the token probe / provider resolver the shared factory evaluates its deferral
+    // gate with, and an optional replacement for the manager's single connect call.
+    private volatile bool _tokenAvailable = true;
+    private volatile string _provider = "test";
+    private Func<Composer, CancellationToken, Task>? _connectHook;
 
     public ComposerRuntimeManagerTests()
     {
@@ -112,10 +118,17 @@ public sealed class ComposerRuntimeManagerTests : IAsyncLifetime
         private event Action<SystemEvent>? Handlers;
         public int SubscriberCount => Handlers?.GetInvocationList().Length ?? 0;
 
+        /// <summary>Production-caused milestone: invoked inside a subscriber's unsubscribe, before the handler is removed.</summary>
+        public Action? OnUnsubscribe { get; set; }
+
         public event Action<SystemEvent>? OnEvent
         {
             add => Handlers += value;
-            remove => Handlers -= value;
+            remove
+            {
+                OnUnsubscribe?.Invoke();
+                Handlers -= value;
+            }
         }
 
         public void Publish(SystemEvent evt) => Handlers?.Invoke(evt);
@@ -151,11 +164,12 @@ public sealed class ComposerRuntimeManagerTests : IAsyncLifetime
         {
             Interlocked.Increment(ref _clientCreations);
             return _clientFactory(m);
-        });
+        }, isTokenAvailable: () => _tokenAvailable, providerOf: _ => _provider);
 
     private ComposerRuntimeManager NewManager(IServiceProvider sp)
     {
-        var m = new ComposerRuntimeManager(NewFactory(sp), _users, NullLogger<ComposerRuntimeManager>.Instance);
+        var m = new ComposerRuntimeManager(NewFactory(sp), _users, NullLogger<ComposerRuntimeManager>.Instance,
+            (composer, ct) => (_connectHook ?? ((c, t) => c.ConnectAsync(t)))(composer, ct));
         return m;
     }
 
@@ -787,8 +801,12 @@ public sealed class ComposerRuntimeManagerTests : IAsyncLifetime
         var sentinel = new InvalidOperationException("deliberate client construction failure");
         _clientFactory = _ => throw sentinel;
 
-        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => Request(manager, second));
-        Assert.Same(sentinel, error);
+        // A failed connect is a TYPED outcome carrying the original fault, reported only after cleanup.
+        var failed = await Request(manager, second);
+        Assert.Equal(ComposerRuntimeStatus.Failed, failed.Status);
+        Assert.Same(sentinel, failed.Failure);
+        Assert.Null(failed.Runtime);
+        Assert.False(failed.IsGranted);
 
         Assert.Equal(0, _bus.SubscriberCount); // the partial runtime's subscriber was detached
         Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId + "/" + s.Status));
