@@ -876,6 +876,7 @@ public sealed partial class ComposerRuntimeManagerTests
 
         ExceptionDispatchInfo? primary = null;
         Exception? cleanupFailure = null;
+        var cleanupOrder = new List<string>();
         try
         {
             Assert.True(await Bounded(Remove(manager, second.UserId), "removal whose teardown faults"));
@@ -904,7 +905,11 @@ public sealed partial class ComposerRuntimeManagerTests
             {
                 // Retain the cleanup's own failures, then let the verification steps below report what they observe:
                 // a removed cleanup must FAIL this test (load-bearing), not vanish behind an aggregate.
-                try { await CompleteCleanupAsync(OrphanOwnershipCleanupSteps(runtime, registry, registryId)); }
+                try
+                {
+                    await CompleteCleanupAsync(
+                        OrphanOwnershipCleanupSteps(runtime, registry, registryId, cleanupOrder));
+                }
                 catch (Exception ex) { cleanupFailure = ex; }
                 // Independent post-conditions: observable whether or not the cleanup above ran.
                 Assert.True(ActorCompleted(runtime.Composer),
@@ -913,6 +918,11 @@ public sealed partial class ComposerRuntimeManagerTests
                     "The orphaned runtime's ACTUAL teardown was never joined — its ownership cleanup did not run.");
                 Assert.Equal(0, _bus.SubscriberCount);
                 Assert.DoesNotContain(registryId, registry.GetAll().Select(row => row.SessionId));
+                // The ORDER of the cleanup steps is load-bearing: the registry row must be unregistered AFTER the
+                // actual teardown join, because a still-running actor re-publishes its row from its shutdown path.
+                // Unregistering earlier leaves a stale row behind — see
+                // OrphanOwnershipCleanup_UnregistersTheRegistryRowOnlyAfterTheActualTeardown.
+                Assert.Equal(["composer-disposal", "teardown-join", "subscriber", "unregister"], cleanupOrder);
             }
             catch (Exception ex) { cleanupFailure ??= ex; }
         }
@@ -930,14 +940,84 @@ public sealed partial class ComposerRuntimeManagerTests
     /// dispose the subscriber and unregister the registry row. Every step is attempted in production's own order —
     /// <see cref="CompleteCleanupAsync"/> runs them all and aggregates failures, so one fault never skips the rest.
     /// </summary>
+    /// <remarks>
+    /// The ORDER is load-bearing and is pinned by <see cref="OrphanOwnershipCleanup_UnregistersTheRegistryRowOnlyAfterTheActualTeardown"/>.
+    /// Unregistering EARLY is a real leak: a still-running actor re-publishes its <c>composer:N</c> row from its
+    /// shutdown path, so an unregister issued before the teardown join is undone by the very actor the join waits
+    /// for.
+    /// </remarks>
     private IEnumerable<Func<Task>> OrphanOwnershipCleanupSteps(
-        ComposerUserRuntime runtime, LlmSessionRegistry registry, string registryId)
+        ComposerUserRuntime runtime, LlmSessionRegistry registry, string registryId) =>
+        OrphanOwnershipCleanupSteps(runtime, registry, registryId, null);
+
+    /// <summary>
+    /// The failure-safe cleanup of a runtime this test deliberately orphaned (it replaced the manager's only
+    /// ownership record): dispose the Composer, boundedly join its EXACT <see cref="Composer.TeardownCompletion"/>,
+    /// dispose the subscriber and unregister the registry row. Every step is attempted in production's own order —
+    /// <see cref="CompleteCleanupAsync"/> runs them all and aggregates failures, so one fault never skips the rest.
+    /// </summary>
+    /// <param name="runtime">The orphaned runtime.</param>
+    /// <param name="registry">The session registry that still holds the runtime's row.</param>
+    /// <param name="registryId">The runtime's registry id.</param>
+    /// <param name="order">
+    /// When supplied, the executed step names are recorded here so the ORDER of the cleanup is OBSERVABLE and can
+    /// be asserted — a reordering that would reintroduce the registry-row leak must not pass silently.
+    /// </param>
+    private IEnumerable<Func<Task>> OrphanOwnershipCleanupSteps(
+        ComposerUserRuntime runtime, LlmSessionRegistry registry, string registryId, List<string>? order)
     {
-        yield return () => runtime.Composer.DisposeAsync().AsTask();
-        yield return () => GuardAsync(runtime.Composer.TeardownCompletion,
-            "orphaned runtime's ACTUAL teardown completion");
-        yield return () => { runtime.Subscriber?.Dispose(); return Task.CompletedTask; };
-        yield return () => { registry.Unregister(registryId); return Task.CompletedTask; };
+        yield return () => { order?.Add("composer-disposal"); return runtime.Composer.DisposeAsync().AsTask(); };
+        yield return () =>
+        {
+            order?.Add("teardown-join");
+            return GuardAsync(runtime.Composer.TeardownCompletion, "orphaned runtime's ACTUAL teardown completion");
+        };
+        yield return () => { order?.Add("subscriber"); runtime.Subscriber?.Dispose(); return Task.CompletedTask; };
+        yield return () => { order?.Add("unregister"); registry.Unregister(registryId); return Task.CompletedTask; };
+    }
+
+    /// <summary>
+    /// ORDERING PIN for the orphan cleanup: the registry row must be unregistered AFTER the actual teardown join,
+    /// never before. Unregistering early is a genuine leak — the still-running actor re-publishes its
+    /// <c>composer:N</c> row from its shutdown path, so the unregister is undone by the very actor the join waits
+    /// for, and a stale registry row survives the cleanup.
+    /// </summary>
+    /// <remarks>
+    /// This vector reproduces the hazard on the REAL production path (a runtime whose actor is genuinely torn down
+    /// by the cleanup) and proves that unregistering before the teardown leaves the row behind, while unregistering
+    /// after it removes the row. Without this, the ordering of the cleanup's steps is unpinned and a reordering
+    /// would pass the suite silently.
+    /// </remarks>
+    [Fact]
+    public async Task OrphanOwnershipCleanup_UnregistersTheRegistryRowOnlyAfterTheActualTeardown()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var registry = sp.GetRequiredService<LlmSessionRegistry>();
+        var manager = NewManager(sp);
+        var runtime = (await Request(manager, second)).Runtime!;
+        var registryId = ComposerUserState.RegistryId(runtime.State);
+        Assert.Contains(registryId, registry.GetAll().Select(row => row.SessionId));
+
+        // ── The EARLY-unregister variant: unregister BEFORE the teardown, then let the actor really go. ──
+        // The actor is torn down for real, and its shutdown path RE-PUBLISHES its row.
+        registry.Unregister(registryId);
+        Assert.DoesNotContain(registryId, registry.GetAll().Select(row => row.SessionId));
+        await runtime.Composer.DisposeAsync().AsTask();
+        await GuardAsync(runtime.Composer.TeardownCompletion, "orphaned runtime's ACTUAL teardown completion");
+
+        // The row SURVIVED: the actor re-published it while the teardown the unregister preceded was running. This
+        // is the leak the ordering rule exists to prevent — and it is exactly what moving the cleanup's unregister
+        // step to the front would cause.
+        Assert.Contains(registryId, registry.GetAll().Select(row => row.SessionId));
+
+        // ── The CORRECT order: unregister AFTER the teardown join removes the row for good. ──
+        registry.Unregister(registryId);
+        Assert.DoesNotContain(registryId, registry.GetAll().Select(row => row.SessionId));
+
+        // The cleanup's own final assertions therefore hold: the row is gone and the actor is really down.
+        Assert.True(ActorCompleted(runtime.Composer));
+        Assert.True(runtime.Composer.TeardownCompletion.IsCompleted);
     }
 
     /// <summary>
