@@ -106,12 +106,14 @@ public sealed record ComposerRuntimeResult
 public sealed class ComposerUserRuntime : IAsyncDisposable
 {
     internal ComposerUserRuntime(
-        ComposerUserState state, Composer composer, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber)
+        ComposerUserState state, Composer composer, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber,
+        ComposerConstructionSnapshot configuration)
     {
         State = state;
         Composer = composer;
         Attachments = attachments;
         Subscriber = subscriber;
+        Configuration = configuration;
     }
 
     /// <summary>The validated per-user identity (session / attachment paths, <c>composer:N</c> registry id).</summary>
@@ -125,6 +127,14 @@ public sealed class ComposerUserRuntime : IAsyncDisposable
 
     /// <summary>The user's own event subscriber, or <c>null</c> when no event bus is registered.</summary>
     public ComposerEventSubscriber? Subscriber { get; }
+
+    /// <summary>
+    /// The IMMUTABLE construction inputs this runtime's <see cref="Composer"/> was built from (primary and
+    /// compaction model), captured once by <see cref="ComposerFactory"/>. Every deferral decision for this
+    /// runtime is evaluated against THIS capture, so a later configuration reload can never make the decision
+    /// diverge from what the Composer was actually constructed with.
+    /// </summary>
+    internal ComposerConstructionSnapshot Configuration { get; }
 
     /// <summary>Disposes the Composer, then detaches the subscriber. Session history on disk is never touched.</summary>
     public async ValueTask DisposeAsync()
@@ -151,7 +161,9 @@ public sealed class ComposerUserRuntime : IAsyncDisposable
 /// <para>
 /// NO GLOBAL COORDINATOR: this class never touches <see cref="LlmConnectionCoordinator"/> instances nor
 /// <see cref="UserService.TokenAvailable"/>; it only evaluates the coordinator's pure deferral predicate
-/// through <see cref="ComposerFactory.ShouldDeferConnect"/>. A deferred runtime is connected by an
+/// through <see cref="ComposerFactory.ShouldDeferConnect"/> over each runtime's CONSTRUCTION-CAPTURED
+/// configuration (<see cref="ComposerUserRuntime.Configuration"/>), so a configuration reload can never
+/// change the deferral decision of an already-constructed runtime. A deferred runtime is connected by an
 /// explicit, awaitable <see cref="ConnectAsync"/>.
 /// </para>
 /// <para>
@@ -306,6 +318,13 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     /// stays <see cref="ComposerRuntimeStatus.Deferred"/> with no connect attempt. It never reaches the
     /// legacy <see cref="LlmConnectionCoordinator"/> or <see cref="UserService.TokenAvailable"/>.
     /// </summary>
+    /// <remarks>
+    /// LOCK SCOPE: <see cref="ComposerFactory.ShouldDeferConnect"/> can synchronously block (its token probe may hit
+    /// SQLite), so it is evaluated OUTSIDE <see cref="_gate"/>: the entry and its settled Deferred runtime are
+    /// snapshotted under the lock, the probe runs without it, and the decision is then REVALIDATED against the same
+    /// entry before a shared connect starts. A slow probe therefore never blocks unrelated users, while a removal or
+    /// shutdown that started meanwhile keeps ownership — its stale probe result can only yield Removed/refusal.
+    /// </remarks>
     /// <param name="principal">The acting principal (re-checked exactly like <see cref="GetOrCreateAsync"/>).</param>
     /// <param name="ct">Cancels THIS caller's wait only.</param>
     /// <returns>A typed outcome; <see cref="ComposerRuntimeRefusal.NoRuntime"/> when the user has no cached runtime.</returns>
@@ -315,7 +334,10 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             return ComposerRuntimeResult.Refused(refusal);
 
         var userId = principal.UserId;
+
+        // ── 1. Snapshot under the lock (no probe, no I/O) ──
         Entry entry;
+        ComposerUserRuntime? deferred;
         lock (_gate)
         {
             if (_shutdown is not null)
@@ -325,13 +347,40 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             if (entry.Removing)
                 return ComposerRuntimeResult.RemovedResult();
 
-            // Only a SETTLED Deferred runtime starts a connect; an in-flight operation (initial create or
-            // an earlier connect) is joined, never duplicated.
-            if (entry.Operation.IsCompletedSuccessfully
-                && entry.Operation.Result is { Status: ComposerRuntimeStatus.Deferred, Runtime: { } runtime }
-                && !_factory.ShouldDeferConnect(runtime.Composer))
+            // Only a SETTLED Deferred runtime is a connect candidate; an in-flight operation (initial create
+            // or an earlier connect) is joined, never duplicated.
+            deferred = entry.Operation.IsCompletedSuccessfully
+                && entry.Operation.Result is { Status: ComposerRuntimeStatus.Deferred, Runtime: { } settled }
+                ? settled
+                : null;
+        }
+
+        // ── 2. Token probe OUTSIDE the lock: a blocking probe must not stall unrelated users ──
+        if (deferred is not null && !_factory.ShouldDeferConnect(deferred.Configuration))
+        {
+            // ── 3. Revalidate under the lock: only the SAME entry, still cached, not Removing, not shut
+            //      down, and still settled on the SAME Deferred runtime may start the shared connect. ──
+            lock (_gate)
             {
-                entry.Operation = Task.Run(() => ConnectDeferredAsync(entry, runtime), CancellationToken.None);
+                if (_shutdown is not null)
+                    return ComposerRuntimeResult.Refused(ComposerRuntimeRefusal.ShuttingDown);
+
+                // A removal (or a failed operation) that finished during the probe dropped this entry from the
+                // cache — possibly followed by a fresh one. The snapshot then owns nothing: no runtime is handed
+                // out and no connect is started on a runtime whose lifecycle somebody else now owns.
+                if (!_entries.TryGetValue(userId, out var current) || !ReferenceEquals(current, entry))
+                    return ComposerRuntimeResult.RemovedResult();
+                if (entry.Removing)
+                    return ComposerRuntimeResult.RemovedResult();
+
+                if (entry.Operation.IsCompletedSuccessfully
+                    && entry.Operation.Result is { Status: ComposerRuntimeStatus.Deferred, Runtime: { } settled }
+                    && ReferenceEquals(settled, deferred))
+                {
+                    entry.Operation = Task.Run(() => ConnectDeferredAsync(entry, settled), CancellationToken.None);
+                }
+                // Otherwise a concurrent caller already started the SAME connect (or the operation settled
+                // differently): fall through and JOIN whatever the entry now owns — never a second connect.
             }
         }
 
@@ -500,7 +549,10 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         ComposerUserState? state = null;
         ComposerAttachmentService? attachments = null;
         ComposerEventSubscriber? subscriber = null;
-        Composer? composer = null;
+        // ONE result carrying BOTH the Composer and the construction-captured configuration it was built
+        // from, so the two can never drift apart: every later deferral decision for this runtime reads
+        // these captured values, never a live configuration lookup.
+        ComposerBuildResult? build = null;
         try
         {
             state = principal.IsOriginal
@@ -508,8 +560,9 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
                 : await ComposerUserState.ResolveAsync(_users, principal.UserId, CancellationToken.None);
             attachments = _factory.CreateUserAttachments(state);
             subscriber = _factory.CreateUserSubscriber();
-            composer = _factory.CreateForUser(state, attachments, subscriber);
-            var runtime = new ComposerUserRuntime(state, composer, attachments, subscriber);
+            build = _factory.CreateForUser(state, attachments, subscriber);
+            var composer = build.Composer;
+            var runtime = new ComposerUserRuntime(state, composer, attachments, subscriber, build.Configuration);
 
             // A Composer without a resolved model is an explicit disconnected shell: nothing to connect.
             if (composer.StartupDefaultModel is null)
@@ -517,7 +570,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
 
             // Deferred: the gate says no usable token yet. An explicit state — not a failure and not a
             // started connect; the manager's awaitable ConnectAsync completes it later.
-            if (_factory.ShouldDeferConnect(composer))
+            if (_factory.ShouldDeferConnect(build.Configuration))
                 return new Settled(ComposerRuntimeStatus.Deferred, runtime, null);
 
             // Migration / session load run inside ConnectAsync and fail closed (never delete history).
@@ -528,11 +581,11 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         catch (Exception ex)
         {
             // Lifecycle cancellation of a constructed runtime: route through the lifecycle teardown (no clearing).
-            if (entry.Cts.IsCancellationRequested && composer is not null)
+            if (entry.Cts.IsCancellationRequested && build is not null)
                 return new Settled(ComposerRuntimeStatus.Removed,
-                    new ComposerUserRuntime(state!, composer, attachments!, subscriber), null);
+                    new ComposerUserRuntime(state!, build.Composer, attachments!, subscriber, build.Configuration), null);
 
-            return await FailAsync(entry, principal.UserId, state, composer, subscriber, attachments, ex);
+            return await FailAsync(entry, principal.UserId, state, build?.Composer, subscriber, attachments, ex);
         }
     }
 

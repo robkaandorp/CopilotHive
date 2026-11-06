@@ -2,6 +2,7 @@ using CopilotHive.Actors;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Orchestration;
+using CopilotHive.Security;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -70,6 +71,350 @@ public sealed partial class ComposerRuntimeManagerTests
         _connectHook = gate.RunAsync;
         return gate;
     }
+
+    /// <summary>
+    /// Parks the factory's token probe — which production evaluates SYNCHRONOUSLY inside its deferral gate — so a
+    /// test can prove the manager never holds its gate across it. The hook must never assert: production CONTAINS
+    /// probe failures, so every outcome is recorded in counters the test asserts on afterwards, and a hang-guard
+    /// timeout is recorded rather than thrown into production.
+    /// </summary>
+    private sealed class TokenProbeGate : IDisposable
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _allEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly int _expectedParked;
+        private int _armed;
+        private int _calls;
+        private int _timedOut;
+
+        /// <param name="expectedParked">How many parked probes complete <see cref="AllEntered"/> (1 = just the first).</param>
+        public TokenProbeGate(int expectedParked = 1) => _expectedParked = expectedParked;
+
+        /// <summary>Production-caused: the FIRST armed probe is genuinely parked.</summary>
+        public Task Completion => _entered.Task;
+
+        /// <summary>Production-caused: <see cref="_expectedParked"/> probes are parked simultaneously.</summary>
+        public Task AllEntered => _allEntered.Task;
+
+        /// <summary>How many armed probes have been evaluated (each of them parks until <see cref="Release"/>).</summary>
+        public int Calls => Volatile.Read(ref _calls);
+
+        /// <summary>Arms the gate: probes evaluated from now on park. Nothing parks before this call.</summary>
+        public void Arm() => Volatile.Write(ref _armed, 1);
+
+        /// <summary>Disarms the gate: later probes pass straight through (used while the test drives other production paths).</summary>
+        public void Disarm() => Volatile.Write(ref _armed, 0);
+
+        public void Release() => _release.TrySetResult();
+
+        /// <summary>Invoked from the factory's <c>isTokenAvailable</c> probe — the production call path.</summary>
+        public void Observe()
+        {
+            if (Volatile.Read(ref _armed) == 0) return;
+            var call = Interlocked.Increment(ref _calls);
+            // Only the FIRST <see cref="_expectedParked"/> armed probes park; later ones pass through with the
+            // fixture's current token value, so unrelated production paths keep working while the test asserts.
+            if (call > _expectedParked) return;
+            if (call >= _expectedParked) _allEntered.TrySetResult();
+            _entered.TrySetResult();
+            // A genuinely BLOCKING probe, exactly like a synchronous SQLite hit.
+            if (!_release.Task.Wait(TimeSpan.FromSeconds(30))) Interlocked.Exchange(ref _timedOut, 1);
+        }
+
+        public void AssertHealthy() => Assert.True(Volatile.Read(ref _timedOut) == 0,
+            "Timed out: release parked token probe (production must not swallow a test timeout)");
+
+        public void Dispose() => Release();
+    }
+
+    private IDisposable ParkTokenProbe(TokenProbeGate gate)
+    {
+        _tokenProbeHook = gate.Observe;
+        return new RestoreTokenProbeHook(this);
+    }
+
+    private sealed class RestoreTokenProbeHook(ComposerRuntimeManagerTests owner) : IDisposable
+    {
+        public void Dispose() => owner._tokenProbeHook = null;
+    }
+
+    // ── Lock scope: the synchronous token probe never runs under the manager gate ──
+
+    [Fact]
+    public async Task ParkedTokenProbe_DoesNotHoldTheManagerGate_WhileAnotherUserCreatesAndTheOwnerStaysDeferred()
+    {
+        var (first, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider(authEnabled: true));
+        _provider = "copilot";
+        _tokenAvailable = false;
+        var deferred = (await Request(manager, second)).Runtime!;
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+        using var probe = new TokenProbeGate();
+        using var restore = ParkTokenProbe(probe);
+        await using var gate = Park();
+        probe.Arm();
+
+        // The probe is synchronous, so the owner's ConnectAsync must run on its own thread: it BLOCKS there.
+        var parked = RetryOnBackgroundThread(manager, second);
+        await GuardAsync(probe.Completion, "owner's connect evaluated the token probe");
+        Assert.False(parked.IsCompleted);
+
+        // Unrelated user: the manager gate is free, so creation completes while the probe is still parked.
+        // (Bounded, so a regression that held the gate fails loudly instead of hanging the test.)
+        var other = RequestOnBackgroundThread(manager, first);
+        var otherResult = await Bounded(other, "unrelated user's GetOrCreateAsync completes while the probe is parked");
+        Assert.True(otherResult.IsGranted);
+        Assert.Equal(ComposerRuntimeStatus.Deferred, otherResult.Status); // same copilot/no-token gate
+        Assert.NotSame(deferred, otherResult.Runtime);
+        Assert.False(parked.IsCompleted); // production is genuinely still inside the parked probe
+
+        probe.Release();
+        var stillDeferred = await Bounded(parked, "parked owner's deferred connect settles");
+        Assert.Equal(ComposerRuntimeStatus.Deferred, stillDeferred.Status);
+        Assert.Same(deferred, stillDeferred.Runtime);
+        Assert.Null(stillDeferred.Failure);
+        Assert.Equal(0, gate.Calls); // the probe said "no usable token": no connect was attempted
+        Assert.Equal(0, _clientCreations);
+        probe.AssertHealthy();
+        probe.Disarm();
+        gate.Release(); // the control below really connects: let it through the connect gate
+
+        _tokenAvailable = true;
+        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, second)).Status);
+        Assert.Equal(1, gate.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RemovalStartedDuringTheParkedTokenProbe_KeepsOwnership_RemovedAndNoRuntimeHandedOut(bool shutdown)
+    {
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider(authEnabled: true));
+        _provider = "copilot";
+        _tokenAvailable = false;
+        var deferred = (await Request(manager, second)).Runtime!;
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+        using var probe = new TokenProbeGate();
+        using var restore = ParkTokenProbe(probe);
+        await using var gate = Park();
+        probe.Arm();
+
+        var parked = RetryOnBackgroundThread(manager, second);
+        await GuardAsync(probe.Completion, "owner's connect evaluated the token probe");
+
+        // The lifecycle takes ownership WHILE the probe is parked: this can only complete if the probe is not
+        // holding the manager gate.
+        Task<bool>? removal = null;
+        Task lifecycle;
+        if (shutdown) lifecycle = ShutdownOnBackgroundThread(manager);
+        else { removal = RemoveOnBackgroundThread(manager, second.UserId); lifecycle = removal; }
+        await GuardAsync(lifecycle, "removal/shutdown completes while the token probe is parked");
+        if (removal is not null) Assert.True(await removal, "the parked owner's runtime was removed");
+        Assert.False(parked.IsCompleted);
+
+        // The stale probe result would start a connect: release it with a usable token.
+        _tokenAvailable = true;
+        probe.Release();
+        var result = await Bounded(parked, "stale probe result settles after removal/shutdown");
+
+        Assert.Equal(shutdown ? ComposerRuntimeStatus.Refused : ComposerRuntimeStatus.Removed, result.Status);
+        if (shutdown) Assert.Equal(ComposerRuntimeRefusal.ShuttingDown, result.Refusal);
+        Assert.Null(result.Runtime); // no runtime is handed out from a stale probe
+        Assert.Null(result.Failure);
+        Assert.Equal(0, gate.Calls); // and no connect is started on a runtime the lifecycle owns
+        Assert.Equal(0, _clientCreations);
+        probe.AssertHealthy();
+        await GuardAsync(deferred.Composer.TeardownCompletion, "removed runtime's actual teardown");
+        Assert.True(ActorCompleted(deferred.Composer));
+    }
+
+    [Fact]
+    public async Task StaleTokenProbe_AfterRemoveAndRecreate_StartsNoConnectAndHandsOutNoRuntime()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider(authEnabled: true));
+        _provider = "copilot";
+        _tokenAvailable = false;
+        var old = (await Request(manager, second)).Runtime!;
+        using var probe = new TokenProbeGate();
+        using var restore = ParkTokenProbe(probe);
+        await using var gate = Park();
+        probe.Arm();
+
+        var parked = RetryOnBackgroundThread(manager, second);
+        await GuardAsync(probe.Completion, "owner's connect evaluated the token probe");
+        Assert.True(await RemoveOnBackgroundThread(manager, second.UserId));
+
+        // Recreation happens while the stale probe is still parked: the cache entry (and runtime) is NEW.
+        probe.Disarm();
+        var recreated = (await Request(manager, second)).Runtime!;
+        Assert.NotSame(old, recreated);
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+
+        _tokenAvailable = true;
+        probe.Release();
+        var result = await Bounded(parked, "stale probe result settles after removal + recreation");
+
+        Assert.Equal(ComposerRuntimeStatus.Removed, result.Status);
+        Assert.Null(result.Runtime); // neither the old nor the new runtime is handed out
+        Assert.Equal(0, gate.Calls); // the stale probe started no connect at all
+        Assert.False(recreated.Composer.IsConnected); // the recreated runtime is untouched
+
+        // Control: the recreated runtime is the one the manager serves now.
+        gate.Release();
+        Assert.Same(recreated, (await Request(manager, second)).Runtime);
+        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, second)).Status);
+        Assert.Same(recreated, (await Request(manager, second)).Runtime);
+        Assert.Equal(1, gate.Calls);
+        Assert.True(recreated.Composer.IsConnected);
+        probe.AssertHealthy();
+    }
+
+    [Fact]
+    public async Task RemovalInProgressDuringTheParkedTokenProbe_RevalidationStartsNoConnectOnTheOwnedRuntime()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider(authEnabled: true));
+        _provider = "copilot";
+        _tokenAvailable = false;
+        var deferred = (await Request(manager, second)).Runtime!;
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+        using var probe = new TokenProbeGate();
+        using var restore = ParkTokenProbe(probe);
+        await using var gate = Park();
+
+        // Park the REMOVAL's own teardown at a production-caused milestone (the manager's join of the runtime's
+        // teardown), so the entry is genuinely mid-removal — Removing set, its CTS cancelled but NOT yet disposed,
+        // and still the cached entry — while the stale probe result is released.
+        using var releaseTeardown = new ManualResetEventSlim(false);
+        var teardownReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var teardownJoins = 0;
+        var teardownTimedOut = 0;
+        manager.OnJoiningTeardown = (userId, _) =>
+        {
+            Assert.Equal(second.UserId, userId);
+            if (Interlocked.Increment(ref teardownJoins) != 1) return;
+            teardownReached.TrySetResult();
+            // Production contains hook failures; record the hang-guard failure in a counter instead.
+            if (!releaseTeardown.Wait(TimeSpan.FromSeconds(30))) Interlocked.Exchange(ref teardownTimedOut, 1);
+        };
+
+        probe.Arm();
+        var parked = RetryOnBackgroundThread(manager, second);
+        await GuardAsync(probe.Completion, "owner's connect evaluated the token probe");
+        Task<bool>? removal = null;
+        try
+        {
+            removal = RemoveOnBackgroundThread(manager, second.UserId);
+            await GuardAsync(teardownReached.Task, "removal reached the runtime's actual teardown join");
+            Assert.False(removal.IsCompleted); // the entry is still cached, in the Removing state
+
+            // Release the STALE probe result with a usable token: it must NOT start a connect on a runtime whose
+            // lifecycle removal now owns. (A connect would enter the parked connect gate and be counted.)
+            _tokenAvailable = true;
+            probe.Release();
+            var result = await Bounded(parked, "stale probe result settles while removal is in progress");
+
+            Assert.Equal(ComposerRuntimeStatus.Removed, result.Status);
+            Assert.Null(result.Runtime);
+            Assert.Equal(0, gate.Calls); // revalidated: !Removing failed ⇒ no shared connect was started
+        }
+        finally
+        {
+            releaseTeardown.Set();
+            if (removal is not null) await GuardAsync(removal, "removal completes after its teardown join is released");
+            Assert.True(Volatile.Read(ref teardownTimedOut) == 0, "Timed out: release parked removal teardown");
+        }
+
+        Assert.True(await removal!);
+        await GuardAsync(deferred.Composer.TeardownCompletion, "removed runtime's actual teardown");
+        Assert.True(ActorCompleted(deferred.Composer));
+        Assert.Equal(0, _clientCreations);
+        probe.AssertHealthy();
+    }
+
+    [Fact]
+    public async Task ConcurrentSameUserConnects_ProbedSimultaneouslyOutsideTheGate_StartExactlyOneConnect()
+    {
+        const int callers = 6;
+        var (_, second) = await TwoUsersAsync();
+        var manager = NewManager(BuildProvider(authEnabled: true));
+        _provider = "copilot";
+        _tokenAvailable = false;
+        var deferred = (await Request(manager, second)).Runtime!;
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+        using var probe = new TokenProbeGate(expectedParked: callers);
+        using var restore = ParkTokenProbe(probe);
+        await using var gate = Park();
+        probe.Arm();
+
+        var connets = Enumerable.Range(0, callers).Select(_ => RetryOnBackgroundThread(manager, second)).ToArray();
+        // Every caller evaluates the probe OUTSIDE the gate, so all of them park simultaneously.
+        await GuardAsync(probe.AllEntered, "all concurrent connect callers evaluated the token probe");
+        Assert.All(connets, task => Assert.False(task.IsCompleted));
+
+        _tokenAvailable = true;
+        probe.Release();
+        // Exactly ONE of them may start the shared connect: it parks in the connect gate, and none can finish.
+        await GuardAsync(gate.Entered.Task, "exactly one shared connect started");
+        Assert.All(connets, task => Assert.False(task.IsCompleted));
+        Assert.Equal(1, gate.Calls); // no duplicate same-user connect
+        Assert.Equal(callers, probe.Calls); // every caller really did probe (outside the lock)
+
+        gate.Release();
+        var results = await Bounded(Task.WhenAll(connets), "all concurrent connect callers settle");
+        Assert.All(results, result =>
+        {
+            Assert.Equal(ComposerRuntimeStatus.Connected, result.Status);
+            Assert.Same(deferred, result.Runtime);
+        });
+        Assert.Equal(1, gate.Calls);
+        Assert.Equal(1, _clientCreations);
+        Assert.True(deferred.Composer.IsConnected);
+        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, second)).Status);
+        Assert.Equal(1, gate.Calls); // settled: no reconnect
+        probe.AssertHealthy();
+    }
+
+    /// <summary>
+    /// Starts <see cref="ComposerRuntimeManager.ConnectAsync"/> on a dedicated thread. The factory's token probe is
+    /// SYNCHRONOUS, so a parked probe blocks whichever thread runs the call: only a genuine background caller can
+    /// prove the manager does not hold its gate across it (and lets a bounded guard fail loudly instead of hanging).
+    /// </summary>
+    private Task<ComposerRuntimeResult> RetryOnBackgroundThread(ComposerRuntimeManager manager, ActingUserPrincipal principal)
+    {
+        _managerUsers[manager].Add(principal.UserId);
+        var task = Task.Factory.StartNew(() => manager.ConnectAsync(principal, Ct), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _requests.Add(task); // registered from THIS thread, before any assertion can throw
+        return task;
+    }
+
+    /// <summary>Starts <see cref="ComposerRuntimeManager.GetOrCreateAsync"/> on a dedicated thread (see above).</summary>
+    private Task<ComposerRuntimeResult> RequestOnBackgroundThread(ComposerRuntimeManager manager, ActingUserPrincipal principal)
+    {
+        _managerUsers[manager].Add(principal.UserId);
+        var task = Task.Factory.StartNew(() => manager.GetOrCreateAsync(principal, Ct), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _requests.Add(task);
+        return task;
+    }
+
+    /// <summary>Starts <see cref="ComposerRuntimeManager.RemoveAsync"/> on a dedicated thread (see above).</summary>
+    private Task<bool> RemoveOnBackgroundThread(ComposerRuntimeManager manager, int userId)
+    {
+        var task = Task.Factory.StartNew(() => manager.RemoveAsync(userId), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _removals.Add(task);
+        return task;
+    }
+
+    /// <summary>Starts <see cref="ComposerRuntimeManager.ShutdownAsync"/> on a dedicated thread (see above).</summary>
+    private Task ShutdownOnBackgroundThread(ComposerRuntimeManager manager) =>
+        Task.Factory.StartNew(manager.ShutdownAsync, CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
 
     private static bool ActorCompleted(Composer composer) => Field<ComposerActor>(composer, "_actor").IsCompleted;
 
