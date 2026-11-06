@@ -23,6 +23,9 @@ public enum ComposerRuntimeRefusal
 
     /// <summary><see cref="ComposerRuntimeManager.ConnectAsync"/> found no cached runtime for the user.</summary>
     NoRuntime = 5,
+
+    /// <summary>The manager is shutting down (or has shut down): no runtime is created and none is handed out.</summary>
+    ShuttingDown = 6,
 }
 
 /// <summary>
@@ -151,9 +154,16 @@ public sealed class ComposerUserRuntime : IAsyncDisposable
 /// through <see cref="ComposerFactory.ShouldDeferConnect"/>. A deferred runtime is connected by an
 /// explicit, awaitable <see cref="ConnectAsync"/>.
 /// </para>
-/// Removing-state blocking until actual actor/agent completion and shutdown ordering are later slices.
+/// <para>
+/// TEARDOWN: a removed (or failed) runtime is torn down until <see cref="Composer.TeardownCompletion"/> says
+/// the actor AND agent are genuinely finished — <see cref="Composer.DisposeAsync"/> returning is NOT enough,
+/// because it can return while a stuck actor is still running. The entry stays in the cache in the Removing
+/// state for that whole time, so a same-user recreation waits for the old teardown instead of overlapping a
+/// second <c>composer:N</c> actor. <see cref="ShutdownAsync"/> refuses new creation and waits for EVERY entry's
+/// teardown. Persisted sessions and attachments are never deleted by removal or shutdown.
+/// </para>
 /// </remarks>
-public sealed class ComposerRuntimeManager
+public sealed class ComposerRuntimeManager : IAsyncDisposable
 {
     private readonly ComposerFactory _factory;
     private readonly UserService _users;
@@ -161,6 +171,15 @@ public sealed class ComposerRuntimeManager
     private readonly object _gate = new();
     private readonly Dictionary<int, Entry> _entries = [];
     private readonly Func<Composer, CancellationToken, Task> _connect;
+    private Task? _shutdown;
+
+    /// <summary>
+    /// Test observation seam, <c>null</c> (inert) in production: invoked with the user id and the EXACT task the
+    /// manager is about to block on — <see cref="Composer.TeardownCompletion"/> while a runtime is being torn down, or
+    /// the entry's teardown while a same-user recreation waits for it. It lets a test prove the manager joins the
+    /// actual teardown task rather than a surrogate, and fire a milestone when the manager is genuinely blocked.
+    /// </summary>
+    internal Action<int, Task>? OnJoiningTeardown { get; set; }
 
     /// <summary>Creates the manager.</summary>
     /// <param name="factory">The shared Composer construction seam.</param>
@@ -197,8 +216,15 @@ public sealed class ComposerRuntimeManager
         /// <summary>The latest shared operation; every joiner awaits this task. Assigned under the manager gate.</summary>
         public Task<Settled> Operation { get; set; } = null!;
 
-        /// <summary>Set by <see cref="RemoveAsync"/> under the gate: no new waiter may join and no runtime is handed out.</summary>
+        /// <summary>Set under the gate when removal/shutdown owns the entry: no new waiter may join and no runtime is handed out.</summary>
         public bool Removing { get; set; }
+
+        /// <summary>
+        /// The ONE teardown of this entry (cancel the operation, dispose the runtime, join its actual
+        /// actor/agent completion, then drop the entry). Assigned under the gate together with <see cref="Removing"/>;
+        /// it never throws. Same-user recreation and shutdown await it.
+        /// </summary>
+        public Task Teardown { get; set; } = Task.CompletedTask;
     }
 
     /// <summary>
@@ -218,30 +244,55 @@ public sealed class ComposerRuntimeManager
 
         var userId = principal.UserId;
 
-        // A stale principal must not trigger creation (and legacy migration) for a since-disabled
-        // account; callers joining an existing entry are re-checked after the await below instead.
-        bool exists;
-        lock (_gate) exists = _entries.ContainsKey(userId);
-        if (!exists && await RecheckAsync(userId, ct) is { } early)
-            return ComposerRuntimeResult.Refused(early);
-
-        Entry entry;
-        lock (_gate)
+        while (true)
         {
-            if (!_entries.TryGetValue(userId, out entry!))
+            // A stale principal must not trigger creation (and legacy migration) for a since-disabled
+            // account; callers joining an existing entry are re-checked after the await below instead.
+            bool exists;
+            lock (_gate)
             {
-                entry = new Entry();
-                _entries[userId] = entry;
-                entry.Operation = Task.Run(() => CreateAsync(principal, entry), CancellationToken.None);
+                if (_shutdown is not null)
+                    return ComposerRuntimeResult.Refused(ComposerRuntimeRefusal.ShuttingDown);
+                exists = _entries.ContainsKey(userId);
             }
-            else if (entry.Removing)
-            {
-                // A removing entry admits no new waiter.
-                return ComposerRuntimeResult.RemovedResult();
-            }
-        }
+            if (!exists && await RecheckAsync(userId, ct) is { } early)
+                return ComposerRuntimeResult.Refused(early);
 
-        return await JoinAsync(entry, userId, ct);
+            Entry entry;
+            Task? teardown = null;
+            lock (_gate)
+            {
+                // Re-checked INSIDE the lock that creates the entry: shutdown cannot begin between the
+                // check and the creation, so no runtime is ever created after shutdown started.
+                if (_shutdown is not null)
+                    return ComposerRuntimeResult.Refused(ComposerRuntimeRefusal.ShuttingDown);
+
+                if (!_entries.TryGetValue(userId, out entry!))
+                {
+                    entry = new Entry();
+                    _entries[userId] = entry;
+                    entry.Operation = Task.Run(() => CreateAsync(principal, entry), CancellationToken.None);
+                }
+                else if (entry.Removing)
+                {
+                    // While removal is still cancelling the in-flight operation this caller would only join a
+                    // doomed operation: it is told Removed. Once the operation has settled and only the old
+                    // runtime's teardown remains, a same-user recreation WAITS for that actual teardown below.
+                    if (!entry.Operation.IsCompleted)
+                        return ComposerRuntimeResult.RemovedResult();
+                    teardown = entry.Teardown;
+                }
+            }
+
+            if (teardown is not null)
+            {
+                // Joins the ACTUAL teardown task (never a surrogate); the caller's token ends only this wait.
+                await WaitForTeardownAsync(userId, teardown, ct);
+                continue; // the entry is gone: re-run admission and create a fresh runtime
+            }
+
+            return await JoinAsync(entry, userId, ct);
+        }
     }
 
     /// <summary>
@@ -264,6 +315,8 @@ public sealed class ComposerRuntimeManager
         Entry entry;
         lock (_gate)
         {
+            if (_shutdown is not null)
+                return ComposerRuntimeResult.Refused(ComposerRuntimeRefusal.ShuttingDown);
             if (!_entries.TryGetValue(userId, out entry!))
                 return ComposerRuntimeResult.Refused(ComposerRuntimeRefusal.NoRuntime);
             if (entry.Removing)
@@ -285,39 +338,92 @@ public sealed class ComposerRuntimeManager
     /// <summary>
     /// Removes the user's runtime: marks the entry Removing (no new waiter joins; waiters already joined
     /// receive <see cref="ComposerRuntimeStatus.Removed"/>), cancels the shared operation, waits for it to
-    /// settle, then disposes the runtime and drops the entry. Returns <c>false</c> when there was nothing
-    /// to remove. Blocking until actual actor/agent completion is a later slice.
+    /// settle, disposes the runtime and its per-instance subscriber, then waits for the old actor/agent to
+    /// ACTUALLY finish (<see cref="Composer.TeardownCompletion"/>) before dropping the entry. The entry stays
+    /// Removing the whole time, so a same-user recreation waits for this teardown. Persisted sessions and
+    /// attachments are never deleted. Returns <c>false</c> when there was nothing to remove (or the entry is
+    /// already being removed by someone else).
     /// </summary>
     /// <param name="userId">The internal account id.</param>
-    /// <returns>Whether a cache entry was removed.</returns>
+    /// <returns>Whether this call removed a cache entry.</returns>
     public async Task<bool> RemoveAsync(int userId)
     {
-        Entry entry;
+        Task teardown;
         lock (_gate)
         {
-            if (!_entries.TryGetValue(userId, out entry!) || entry.Removing)
+            if (!_entries.TryGetValue(userId, out var entry) || entry.Removing)
                 return false;
-            entry.Removing = true;
+            teardown = BeginTeardownLocked(userId, entry);
         }
 
-        try { await entry.Cts.CancelAsync(); }
-        catch (ObjectDisposedException) { }
+        await teardown;
+        return true;
+    }
 
-        // The operation never throws; a connect aborted by the cancellation disposed its own partial
-        // runtime and removed the entry itself.
-        var settled = await entry.Operation;
-
+    /// <summary>
+    /// Shuts the manager down: from the moment it is called no runtime is created or handed out
+    /// (<see cref="ComposerRuntimeRefusal.ShuttingDown"/>), and the returned task completes only after EVERY
+    /// entry — including ones already being removed — has finished its actual actor/agent teardown. Safe to
+    /// call repeatedly and concurrently: every caller joins the same shutdown. Persisted data is never deleted.
+    /// </summary>
+    /// <returns>A task that completes once all teardown is genuinely over; it never throws.</returns>
+    public Task ShutdownAsync()
+    {
         lock (_gate)
         {
-            if (_entries.TryGetValue(userId, out var current) && ReferenceEquals(current, entry))
-                _entries.Remove(userId);
+            if (_shutdown is not null)
+                return _shutdown;
+
+            // The flag and the snapshot are taken under the SAME lock that admits creation, so an entry is
+            // either in the snapshot or was never created.
+            var teardowns = new List<Task>();
+            foreach (var (userId, entry) in _entries.ToArray())
+                teardowns.Add(entry.Removing ? entry.Teardown : BeginTeardownLocked(userId, entry));
+
+            _shutdown = Task.WhenAll(teardowns);
+            return _shutdown;
         }
+    }
 
-        if (settled.Runtime is { } runtime)
-            await DisposeRuntimeAsync(runtime, clearAttachments: false);
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync() => await ShutdownAsync();
 
-        entry.Cts.Dispose();
-        return true;
+    /// <summary>Marks the entry Removing and starts its single teardown. Must be called under the gate.</summary>
+    private Task BeginTeardownLocked(int userId, Entry entry)
+    {
+        entry.Removing = true;
+        entry.Teardown = Task.Run(() => TearDownAsync(userId, entry), CancellationToken.None);
+        return entry.Teardown;
+    }
+
+    /// <summary>The one teardown of an entry; never throws. The entry leaves the cache only at the very end.</summary>
+    private async Task TearDownAsync(int userId, Entry entry)
+    {
+        try
+        {
+            try { await entry.Cts.CancelAsync(); }
+            catch (ObjectDisposedException) { }
+
+            // The operation never throws; a connect aborted by the cancellation disposed its own partial
+            // runtime (and joined its actual teardown) itself.
+            var settled = await entry.Operation;
+            if (settled.Runtime is { } runtime)
+                await DisposeRuntimeAsync(runtime, clearAttachments: false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tearing down the runtime of user {UserId} failed", userId);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_entries.TryGetValue(userId, out var current) && ReferenceEquals(current, entry))
+                    _entries.Remove(userId);
+            }
+
+            entry.Cts.Dispose();
+        }
     }
 
     private static ComposerRuntimeRefusal? Admit(ActingUserPrincipal principal)
@@ -442,6 +548,10 @@ public sealed class ComposerRuntimeManager
         {
             try { await composer.DisposeAsync(); }
             catch (Exception ex) { _logger.LogWarning(ex, "Disposing the partial Composer of user {UserId} failed", userId); }
+
+            // DisposeAsync may return while a stuck actor still runs: the entry may only leave the cache (and
+            // a recreation may only start) after the ACTUAL actor/agent teardown.
+            await JoinTeardownAsync(composer, userId);
         }
 
         try { subscriber?.Dispose(); }
@@ -470,7 +580,11 @@ public sealed class ComposerRuntimeManager
             : new Settled(ComposerRuntimeStatus.Failed, null, failure);
     }
 
-    /// <summary>Disposes a runtime's pieces and registry row; every step runs and no failure escapes.</summary>
+    /// <summary>
+    /// Disposes a runtime's pieces and registry row; every step runs and no failure escapes. The registry row is
+    /// dropped only AFTER the actor/agent teardown truly finished, because a still-running actor can
+    /// re-publish its idle <c>composer:N</c> entry until then.
+    /// </summary>
     private async Task DisposeRuntimeAsync(ComposerUserRuntime runtime, bool clearAttachments)
     {
         var userId = runtime.State.UserId;
@@ -486,7 +600,23 @@ public sealed class ComposerRuntimeManager
             catch (Exception ex) { _logger.LogWarning(ex, "Clearing the attachments of user {UserId} failed", userId); }
         }
 
+        await JoinTeardownAsync(runtime.Composer, userId);
+
         // Disposal re-publishes an idle registry entry: drop it so no stale composer:N row remains.
         _factory.UnregisterUser(runtime.State);
+    }
+
+    /// <summary>Waits for <see cref="Composer.TeardownCompletion"/>; a faulted completion is logged, never thrown.</summary>
+    private async Task JoinTeardownAsync(Composer composer, int userId)
+    {
+        try { await WaitForTeardownAsync(userId, composer.TeardownCompletion, CancellationToken.None); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Teardown of the Composer of user {UserId} faulted", userId); }
+    }
+
+    /// <summary>The single place the manager blocks on a teardown task; reports it to the observation seam first.</summary>
+    private Task WaitForTeardownAsync(int userId, Task teardown, CancellationToken ct)
+    {
+        OnJoiningTeardown?.Invoke(userId, teardown);
+        return teardown.WaitAsync(ct);
     }
 }
