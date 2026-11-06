@@ -404,8 +404,15 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     {
         try
         {
+            // A throwing registered cancellation callback surfaces from CancelAsync, but the token IS cancelled and
+            // every other callback still ran. That fault must neither skip the join below nor evict the entry
+            // early: contain it HERE, surface it as a warning, and carry on with the teardown.
             try { await entry.Cts.CancelAsync(); }
             catch (ObjectDisposedException) { }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "A cancellation callback of the shared operation of user {UserId} threw; teardown continues", userId);
+            }
 
             // The operation never throws; a connect aborted by the cancellation disposed its own partial
             // runtime (and joined its actual teardown) itself.
@@ -520,6 +527,11 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            // Lifecycle cancellation of a constructed runtime: route through the lifecycle teardown (no clearing).
+            if (entry.Cts.IsCancellationRequested && composer is not null)
+                return new Settled(ComposerRuntimeStatus.Removed,
+                    new ComposerUserRuntime(state!, composer, attachments!, subscriber), null);
+
             return await FailAsync(entry, principal.UserId, state, composer, subscriber, attachments, ex);
         }
     }
@@ -534,6 +546,12 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            // A fault caused by removal's/shutdown's own cancellation is NOT a connect failure: the EXISTING
+            // runtime (with its uploaded attachments and session) is handed to the lifecycle teardown, which
+            // disposes it WITHOUT clearing attachments. Only a genuine connect failure reaches FailAsync.
+            if (entry.Cts.IsCancellationRequested)
+                return new Settled(ComposerRuntimeStatus.Removed, runtime, null);
+
             return await FailAsync(entry, runtime.State.UserId, runtime.State, runtime.Composer,
                 runtime.Subscriber, runtime.Attachments, ex);
         }
