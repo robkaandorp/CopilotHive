@@ -665,6 +665,489 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Equal(0, _bus.SubscriberCount);
     }
 
+    // ── AC3: the contained sites the phase-2 suite left UNPROBED ──────────────
+
+    /// <summary>
+    /// THE <c>DisposeRuntimeAsync</c> SITES (removal/shutdown path), as opposed to the <c>FailAsync</c> sites the
+    /// phase-2 suite already covered: the runtime's COMPOSER disposal and its SUBSCRIBER disposal each get their OWN
+    /// vector with a REAL secondary fault, while the manager logger also throws.
+    /// </summary>
+    /// <remarks>
+    /// Every row proves the SAME three things at ITS OWN site: (1) the LIFECYCLE's own outcome stays authoritative
+    /// and the logger/cleanup fault never becomes it; (2) the step AFTER the contained log site still ran; and
+    /// (3) the entry was still evicted and the registry row still dropped, so no partially-cleaned runtime
+    /// survived. The row also asserts the warning was genuinely attempted with the exact text of ITS OWN site, so
+    /// a vector that never reached the site cannot pass silently.
+    /// <para>
+    /// The THIRD <c>DisposeRuntimeAsync</c> site (attachment clearing) is deliberately NOT covered here: its
+    /// <c>clearAttachments</c> branch is UNREACHABLE — the only call site passes <c>false</c> — so no runtime
+    /// behaviour can reach it. Its dead-branch nature is pinned by
+    /// <see cref="DisposeRuntimeAsync_AttachmentClearingBranch_IsUnreachableAndThereforeUntestable"/> instead.
+    /// </para>
+    /// </remarks>
+    /// <param name="site">Which contained cleanup site this row arms.</param>
+    [Theory]
+    [InlineData(CleanupSite.ComposerDisposal)]
+    [InlineData(CleanupSite.SubscriberDisposal)]
+    public async Task ThrowingLogger_AtEachDisposeRuntimeCleanupSite_KeepsTheLifecycleOutcomeAndStillEvicts(CleanupSite site)
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var logger = new ThrowingLogger<ComposerRuntimeManager>();
+        var manager = NewManager(sp, logger);
+        var teardownJoins = new ConcurrentQueue<Task>();
+        var steps = new List<string>();
+        var stepLock = new object();
+        manager.OnJoiningTeardown = (_, task) =>
+        {
+            lock (stepLock) steps.Add("teardown-join");
+            teardownJoins.Enqueue(task);
+        };
+
+        // The runtime is CONNECTED first, so it owns a real subscriber, a real attachment service and a real
+        // chat client — every disposal step below is genuinely reachable (a never-connected runtime has none).
+        var runtime = (await Request(manager, second)).Runtime!;
+        var composer = runtime.Composer;
+        var attachments = runtime.Attachments;
+
+        // An attachment the user actually uploaded: the clearing policy is observable on real bytes.
+        using var content = new MemoryStream([7, 7, 7, 7]);
+        var saved = await attachments.SaveAsync("dispose-site-pending.png", content, Ct);
+        Assert.True(saved.Success, saved.Error);
+        var pendingPath = Path.Combine(attachments.AttachmentsRootPath, saved.Attachment!.SavedRelativePath);
+        Assert.True(File.Exists(pendingPath));
+
+        var unsubscribes = 0;
+
+        // Arm a REAL secondary fault at THIS row's site, so the contained log site is genuinely reached.
+        Exception armed;
+        switch (site)
+        {
+            case CleanupSite.ComposerDisposal:
+                // The agent-disposal hook throws INSIDE Composer.DisposeAsync ⇒ the composer's disposal fails.
+                armed = new IOException("deliberate composer-disposal fault");
+                Field<ComposerAgentService>(composer, "_agentService").OnAgentDisposing = _ =>
+                {
+                    lock (stepLock) steps.Add("composer-disposal");
+                    throw armed;
+                };
+                _bus.OnUnsubscribe = () =>
+                {
+                    lock (stepLock) steps.Add("subscriber");
+                    Interlocked.Increment(ref unsubscribes);
+                };
+                break;
+            case CleanupSite.SubscriberDisposal:
+                // The bus unsubscribe throws ⇒ the subscriber's disposal fails.
+                armed = new InvalidOperationException("deliberate subscriber-disposal fault");
+                // The composer disposal is RECORDED (but does not fail) so the order is fully observable.
+                Field<ComposerAgentService>(composer, "_agentService").OnAgentDisposing = _ =>
+                {
+                    lock (stepLock) steps.Add("composer-disposal");
+                };
+                _bus.OnUnsubscribe = () =>
+                {
+                    lock (stepLock) steps.Add("subscriber");
+                    Interlocked.Increment(ref unsubscribes);
+                    throw armed;
+                };
+                break;
+            default: throw new ArgumentOutOfRangeException(nameof(site));
+        }
+
+        try
+        {
+            Assert.True(await Bounded(Remove(manager, second.UserId), "throwing-logger removal with a real cleanup fault"));
+        }
+        finally
+        {
+            _bus.OnUnsubscribe = null;
+        }
+
+        // ── The contained site was genuinely reached, with ITS OWN text, and swallowed. ──
+        Assert.True(logger.LoggedCalls > 0,
+            "The throwing logger was never reached — the containment vector is inert and proves nothing.");
+        var expectedMessage = site switch
+        {
+            CleanupSite.ComposerDisposal => $"Disposing the Composer of user {second.UserId} failed",
+            CleanupSite.SubscriberDisposal => $"Disposing the subscriber of user {second.UserId} failed",
+            _ => throw new ArgumentOutOfRangeException(nameof(site)),
+        };
+        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Equal(expectedMessage, warning.Message);
+        Assert.Same(armed, warning.Exception);
+
+        // ── The steps AFTER the contained site still ran. ──
+        Assert.True(ActorCompleted(composer));                        // the actor really was torn down
+        Assert.True(composer.TeardownCompletion.IsCompleted);         // the ACTUAL teardown completion was reached
+        Assert.Contains(teardownJoins, task => ReferenceEquals(task, composer.TeardownCompletion));
+        Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId)); // row dropped
+        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);            // entry evicted
+
+        // ── The ORDER of the removal-path cleanup steps, as production performed them: the composer disposal
+        // FIRST, then the subscriber cleanup, and only THEN the ACTUAL teardown join. (The removal path —
+        // DisposeRuntimeAsync — deliberately disposes the subscriber before joining the teardown, unlike the
+        // failure path.) A reordering (or a step that skipped ahead) is observable here, not hidden behind an
+        // end state that merely looks right. ──
+        lock (stepLock)
+        {
+            Assert.Equal(["composer-disposal", "subscriber", "teardown-join"], steps);
+        }
+
+        if (site == CleanupSite.SubscriberDisposal)
+        {
+            // The subscriber disposal itself failed, so the bus unsubscribe WAS attempted (and failed).
+            Assert.True(Volatile.Read(ref unsubscribes) > 0, "The subscriber-cleanup step never ran.");
+        }
+        else
+        {
+            // The subscriber WAS detached on the path where its own disposal did not fail.
+            Assert.Equal(0, _bus.SubscriberCount);
+            Assert.True(Volatile.Read(ref unsubscribes) > 0);
+        }
+
+        // The LIFECYCLE never clears attachments (clearAttachments is false on this path), so the user's bytes
+        // survive: the attachment policy is unchanged by the containment.
+        Assert.True(File.Exists(pendingPath));
+    }
+
+    /// <summary>
+    /// The third <c>DisposeRuntimeAsync</c> catch site — attachment clearing — sits behind a
+    /// <c>clearAttachments</c> flag whose ONLY call site passes <c>false</c>. The branch is therefore DEAD CODE: no
+    /// runtime behaviour can reach it, so no behaviour test could ever cover it.
+    /// </summary>
+    /// <remarks>
+    /// This pins that fact explicitly instead of leaving a silently-uncovered catch site. It is a STRUCTURAL
+    /// assertion about the CURRENT source, not a behavioural one; if a future change ever passes
+    /// <c>clearAttachments: true</c>, the pin fails and the site must then be given a real vector.
+    /// </remarks>
+    [Fact]
+    public void DisposeRuntimeAsync_AttachmentClearingBranch_IsUnreachableAndThereforeUntestable()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            TestRepoRoot.Find(), "src", "CopilotHive", "Orchestration", "ComposerRuntimeManager.cs"))
+            .ReplaceLineEndings("\n");
+
+        // The ONLY call site passes clearAttachments: false ⇒ the `if (clearAttachments)` branch is dead.
+        Assert.Equal(1, CountOccurrences(source, "DisposeRuntimeAsync(runtime, clearAttachments: false)"));
+        Assert.DoesNotContain("clearAttachments: true", source);
+        Assert.Contains("if (clearAttachments)", source);
+        // The site is nonetheless CONTAINED (it goes through the safe-log helper like every other one).
+        Assert.Contains("LogCleanupWarning(ex, \"Clearing the attachments of user {UserId} failed\", userId)", source);
+    }
+
+    /// <summary>
+    /// The <c>TearDownAsync</c> OUTER catch site: when the entry teardown itself throws, the warning is contained
+    /// and the entry is STILL evicted (the <c>finally</c> block that drops it must run).
+    /// </summary>
+    /// <remarks>
+    /// The teardown's own body cannot throw in normal production (every step is contained), so this vector drives
+    /// the failure through the ONE seam the teardown awaits: the shared operation. Its settlement is awaited
+    /// directly, so a fault there escapes the teardown body into its outer catch.
+    /// </remarks>
+    [Fact]
+    public async Task ThrowingLogger_WhenTheEntryTeardownItselfFaults_StillEvictsTheEntryAndContainsTheWarning()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var logger = new ThrowingLogger<ComposerRuntimeManager>();
+        var manager = NewManager(sp, logger);
+        var teardownFault = new InvalidOperationException("deliberate entry-teardown fault");
+        var runtime = (await Request(manager, second)).Runtime!;
+
+        // Fault the shared operation the teardown awaits: TearDownAsync's `await entry.Operation` throws, which
+        // is exactly what its OUTER catch is for.
+        FaultEntryOperation(manager, second.UserId, teardownFault);
+
+        Assert.True(await Bounded(Remove(manager, second.UserId), "removal whose teardown faults"));
+
+        // The outer catch was reached and contained.
+        Assert.True(logger.LoggedCalls > 0,
+            "The throwing logger was never reached — the containment vector is inert and proves nothing.");
+        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Equal($"Tearing down the runtime of user {second.UserId} failed", warning.Message);
+        Assert.Same(teardownFault, warning.Exception);
+
+        // The teardown's finally block still ran: the entry left the cache.
+        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);
+    }
+
+    /// <summary>
+    /// The REMAINING cleanup steps run IN ORDER even when the logger throws at the FIRST one: composer disposal,
+    /// then the actual teardown join, then the subscriber cleanup, then the attachment policy, and only THEN the
+    /// registry unregister and the cache eviction.
+    /// </summary>
+    /// <remarks>
+    /// The phase-2 vectors each proved that the steps AFTER a contained site still ran, but none pinned their
+    /// ORDER. This vector records the exact production order from a single run, so a reordering (or a step that
+    /// silently skipped ahead) is observable rather than invisible behind "the end state looked right".
+    /// </remarks>
+    [Fact]
+    public async Task ThrowingLogger_AllRemainingCleanupSteps_RunInOrder_EvenWhenTheFirstOneThrows()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var logger = new ThrowingLogger<ComposerRuntimeManager>();
+        var manager = NewManager(sp, logger);
+        var sentinel = new InvalidOperationException("deliberate connect fault for the ordered-cleanup vector");
+        var steps = new List<string>();
+        var stepLock = new object();
+
+        var teardownJoins = new ConcurrentQueue<Task>();
+        manager.OnJoiningTeardown = (_, task) =>
+        {
+            lock (stepLock) steps.Add("teardown-join");
+            teardownJoins.Enqueue(task);
+        };
+        var unsubscribes = 0;
+        _bus.OnUnsubscribe = () => { lock (stepLock) steps.Add("subscriber"); Interlocked.Increment(ref unsubscribes); };
+        Composer? failedComposer = null;
+
+        _connectHook = async (composer, token) =>
+        {
+            failedComposer = composer;
+            var attachments = Field<ComposerAttachmentService>(composer, "_attachmentService");
+            using var content = new MemoryStream([4, 2, 4, 2]);
+            var saved = await attachments.SaveAsync("ordered-pending.png", content, token);
+            Assert.True(saved.Success, saved.Error);
+            // Connect for real FIRST, so an agent EXISTS and its disposal hook can genuinely fault — otherwise
+            // the armed secondary cleanup failure below would be unreachable and this vector inert.
+            await composer.ConnectAsync(token);
+            Assert.True(composer.IsConnected);
+            // Record the composer-disposal attempt from INSIDE it, so the order is observed at the real call site.
+            Field<ComposerAgentService>(composer, "_agentService").OnAgentDisposing = _ =>
+            {
+                lock (stepLock) steps.Add("composer-disposal");
+                throw new IOException("deliberate composer-disposal fault inside the ordered vector");
+            };
+            throw sentinel;
+        };
+
+        var failed = await Bounded(Request(manager, second), "ordered-cleanup failure settles");
+
+        // The ORIGINAL failure is authoritative.
+        Assert.Equal(ComposerRuntimeStatus.Failed, failed.Status);
+        Assert.Same(sentinel, failed.Failure);
+        Assert.Null(failed.Runtime);
+
+        // The contained site was reached (the composer disposal failed inside the manager's cleanup).
+        Assert.True(logger.LoggedCalls > 0, "The throwing logger was never reached.");
+        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Equal($"Disposing the partial Composer of user {second.UserId} failed", warning.Message);
+
+        // The ORDER of the steps that ran, as production performed them: the composer disposal, then the ACTUAL
+        // teardown join, then the subscriber cleanup.
+        lock (stepLock)
+        {
+            Assert.Equal(["composer-disposal", "teardown-join", "subscriber"], steps);
+        }
+
+        // The teardown join came after the composer disposal and before the subscriber cleanup: the manager joined
+        // the EXACT teardown task, and the registry row was dropped only afterwards.
+        Assert.NotNull(failedComposer);
+        Assert.Contains(teardownJoins, task => ReferenceEquals(task, failedComposer.TeardownCompletion));
+        Assert.True(failedComposer.TeardownCompletion.IsCompleted);
+        Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
+        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);
+    }
+
+    /// <summary>
+    /// AC4: disposal is driven ONLY by the manager's three lifecycle paths — removal, failure and shutdown — and
+    /// NOTHING else disposes the Composer or its subscriber. A plain <c>GetOrCreateAsync</c> never disposes, and
+    /// the handle itself cannot.
+    /// </summary>
+    /// <remarks>
+    /// The disposal counters are observed on the runtime's OWN chat client (the agent's client is disposed with
+    /// the agent) and on the bus subscriber count. A second disposal path — anywhere — would show up as a client
+    /// disposed twice or a subscriber detached twice.
+    /// </remarks>
+    [Fact]
+    public async Task ManagerOwnedDisposal_OnlyTheLifecyclePathsDispose_TheHandleItselfNeverDoes()
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var manager = NewManager(sp);
+        var client = new CountingClient();
+        _clientFactory = _ => client;
+
+        // ── A plain create/connect disposes NOTHING. ──
+        var runtime = (await Request(manager, second)).Runtime!;
+        Assert.True(runtime.Composer.IsConnected);
+        Assert.Equal(0, client.DisposeCount);
+        Assert.Equal(1, _bus.SubscriberCount);
+
+        // Repeated cache hits change nothing either.
+        Assert.Same(runtime, (await Request(manager, second)).Runtime);
+        Assert.Same(runtime, (await Retry(manager, second)).Runtime);
+        Assert.Equal(0, client.DisposeCount);
+        Assert.Equal(1, _bus.SubscriberCount);
+
+        // The handle exposes no disposal entry point at all, so a holder cannot drive teardown.
+        var handle = runtime;
+        var disposeMembers = handle.GetType().GetMethods(System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.Instance)
+            .Where(m => !m.IsSpecialName)
+            .Select(m => m.Name)
+            .ToArray();
+        Assert.DoesNotContain("DisposeAsync", disposeMembers);
+        Assert.DoesNotContain("Dispose", disposeMembers);
+        // The handle's RUNTIME type implements neither interface (the compile-time check is vacuous here: the
+        // static type no longer implements them at all, which is why the runtime check is the meaningful one).
+        Assert.False(typeof(IAsyncDisposable).IsAssignableFrom(handle.GetType()));
+        Assert.False(typeof(IDisposable).IsAssignableFrom(handle.GetType()));
+
+        // ── REMOVAL disposes: exactly once. ──
+        Assert.True(await Bounded(Remove(manager, second.UserId), "removal disposes the runtime"));
+        Assert.Equal(1, client.DisposeCount);
+        Assert.Equal(0, _bus.SubscriberCount);
+
+        // ── A RECREATED runtime is disposed by SHUTDOWN: exactly once, on its own client. ──
+        var secondClient = new CountingClient();
+        _clientFactory = _ => secondClient;
+        var recreated = (await Request(manager, second)).Runtime!;
+        Assert.NotSame(runtime, recreated);
+        Assert.Equal(0, secondClient.DisposeCount);
+        await GuardAsync(manager.ShutdownAsync(), "shutdown disposes the recreated runtime");
+        Assert.Equal(1, secondClient.DisposeCount);
+        Assert.Equal(0, _bus.SubscriberCount);
+        Assert.True(ActorCompleted(recreated.Composer));
+    }
+
+    /// <summary>
+    /// ATTACHMENT-CLEARING POLICY under a throwing logger: a GENUINE failure clears the user's pending
+    /// attachments, while a LIFECYCLE cancellation (removal/shutdown) does NOT — the containment changes the
+    /// robustness of the reporting, never the policy.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ThrowingLogger_AttachmentPolicy_IsUnchanged_GenuineFailureClearsAndLifecyclePreserves(bool shutdown)
+    {
+        var (_, second) = await TwoUsersAsync();
+        var sp = BuildProvider();
+        var logger = new ThrowingLogger<ComposerRuntimeManager>();
+        var manager = NewManager(sp, logger);
+        var sentinel = new InvalidOperationException("deliberate connect fault for the attachment-policy control");
+        ComposerAttachmentService? failedAttachments = null;
+        string? pendingPath = null;
+
+        _connectHook = async (composer, token) =>
+        {
+            failedAttachments = Field<ComposerAttachmentService>(composer, "_attachmentService");
+            using var content = new MemoryStream([8, 8, 8, 8]);
+            var saved = await failedAttachments.SaveAsync("policy-pending.png", content, token);
+            Assert.True(saved.Success, saved.Error);
+            pendingPath = Path.Combine(failedAttachments.AttachmentsRootPath, saved.Attachment!.SavedRelativePath);
+            Assert.True(File.Exists(pendingPath));
+            throw sentinel;
+        };
+
+        var failed = await Bounded(Request(manager, second), "attachment-policy failure settles");
+        Assert.Equal(ComposerRuntimeStatus.Failed, failed.Status);
+        Assert.Same(sentinel, failed.Failure);
+        Assert.NotNull(failedAttachments);
+        Assert.NotNull(pendingPath);
+
+        // GENUINE FAILURE ⇒ the partial attachments ARE cleared (the policy is unchanged by containment).
+        Assert.False(File.Exists(pendingPath));
+
+        // ── The LIFECYCLE half: a deferred runtime's uploaded bytes SURVIVE removal/shutdown. ──
+        _connectHook = null;
+        var lifecycleLogger = new ThrowingLogger<ComposerRuntimeManager>();
+        var lifecycleManager = NewManager(sp, lifecycleLogger);
+        var lifecycleRuntime = (await Request(lifecycleManager, second)).Runtime!;
+        using var lifecycleContent = new MemoryStream([9, 9, 9, 9]);
+        var lifecycleSaved = await lifecycleRuntime.Attachments.SaveAsync("lifecycle-pending.png", lifecycleContent, Ct);
+        Assert.True(lifecycleSaved.Success, lifecycleSaved.Error);
+        var lifecyclePath = Path.Combine(lifecycleRuntime.Attachments.AttachmentsRootPath,
+            lifecycleSaved.Attachment!.SavedRelativePath);
+        Assert.True(File.Exists(lifecyclePath));
+
+        Task lifecycle = shutdown ? lifecycleManager.ShutdownAsync() : Remove(lifecycleManager, second.UserId);
+        await GuardAsync(lifecycle, "lifecycle completes under a throwing logger");
+
+        // LIFECYCLE CANCELLATION ⇒ the user's content is PRESERVED (never cleared).
+        Assert.True(File.Exists(lifecyclePath),
+            "A lifecycle cancellation must never clear the user's attachments.");
+        Assert.True(lifecycleRuntime.Attachments.MarkAsSent(lifecycleSaved.Attachment).Success);
+        Assert.True(ActorCompleted(lifecycleRuntime.Composer));
+    }
+
+    /// <summary>
+    /// STRUCTURAL PIN on the containment itself: EVERY cleanup/teardown warning in the manager goes through the ONE
+    /// contained helper, and the helper itself can never throw.
+    /// </summary>
+    /// <remarks>
+    /// This is the inventory that makes the per-site vectors complete: it proves there is no cleanup log site
+    /// left that bypasses the containment, so no per-site vector can be silently defeated by a tenth, uncovered
+    /// call site appearing in the future.
+    /// </remarks>
+    [Fact]
+    public void EveryCleanupWarningInTheManager_GoesThroughTheContainedSafeLogHelper()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            TestRepoRoot.Find(), "src", "CopilotHive", "Orchestration", "ComposerRuntimeManager.cs"))
+            .ReplaceLineEndings("\n");
+
+        // The manager writes warnings through EXACTLY ONE sink call, and that call is inside the contained helper.
+        Assert.Equal(1, CountOccurrences(source, "_logger.LogWarning("));
+        Assert.Equal(10, CountOccurrences(source, "LogCleanupWarning(")); // 9 call sites + the helper's own declaration
+        // No other logging API is reachable from the manager's cleanup paths.
+        Assert.DoesNotContain("_logger.LogError", source);
+        Assert.DoesNotContain("_logger.LogInformation", source);
+        Assert.DoesNotContain("_logger.LogDebug", source);
+        Assert.DoesNotContain("_logger.LogCritical", source);
+
+        // The helper's own body contains the log call in a try/catch that swallows everything.
+        var helperStart = source.IndexOf("private void LogCleanupWarning(", StringComparison.Ordinal);
+        Assert.True(helperStart > 0, "The contained safe-log helper is missing from the manager.");
+        var helperBody = source[helperStart..];
+        Assert.Contains("try { _logger.LogWarning(exception, message, userId); }", helperBody);
+        Assert.Contains("catch", helperBody);
+        // The catch that swallows the logger fault must come BEFORE the helper's closing brace.
+        var catchIndex = helperBody.IndexOf("catch", StringComparison.Ordinal);
+        var helperEnd = helperBody.IndexOf("\n    }\n", StringComparison.Ordinal);
+        Assert.True(catchIndex > 0 && catchIndex < helperEnd,
+            "The logger fault must be swallowed INSIDE the helper, not by its caller.");
+    }
+
+    /// <summary>Which contained cleanup site a vector arms.</summary>
+    public enum CleanupSite { ComposerDisposal, SubscriberDisposal }
+
+    /// <summary>
+    /// Faults the live shared operation of a user's cache entry, so a test can make the entry teardown's own
+    /// <c>await entry.Operation</c> throw — the ONLY way into <c>TearDownAsync</c>'s outer catch.
+    /// </summary>
+    /// <remarks>
+    /// The operation's element type (<c>Settled</c>) is private to the manager, so the task is handled through its
+    /// non-generic <see cref="Task"/> base: the faulting behaviour is what matters here, not the payload.
+    /// </remarks>
+    private static void FaultEntryOperation(ComposerRuntimeManager manager, int userId, Exception fault)
+    {
+        var entriesField = typeof(ComposerRuntimeManager).GetField("_entries",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var entries = (System.Collections.IDictionary)entriesField.GetValue(manager)!;
+        Assert.True(entries.Contains(userId), "The user has no cache entry to fault.");
+        var entry = entries[userId]!;
+
+        // The entry owns its operation as `Task<Settled>`, and `Settled` is private to the manager. The faulted
+        // task is therefore built through the generic `Task.FromException<T>` whose type argument is read off the
+        // property — the entry is then handed exactly the task its teardown awaits.
+        var operationProperty = entry.GetType().GetProperty("Operation",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)!;
+        var operation = (Task)operationProperty.GetValue(entry)!;
+        Assert.True(operation.IsCompleted, "The shared operation must have settled before it can be replaced.");
+
+        var fromException = typeof(Task).GetMethods()
+            .Single(m => m.Name == nameof(Task.FromException)
+                && m.IsGenericMethodDefinition
+                && m.GetParameters().Length == 1
+                && m.GetParameters()[0].ParameterType == typeof(Exception))
+            .MakeGenericMethod(operationProperty.PropertyType.GetGenericArguments()[0]);
+        var faulted = (Task)fromException.Invoke(null, [fault])!;
+        operationProperty.SetValue(entry, faulted);
+    }
+
     /// <summary>An <see cref="IChatClient"/> that counts its own disposal, so a double disposal is observable.</summary>
     private sealed class CountingClient : IChatClient
     {
@@ -681,4 +1164,6 @@ public sealed partial class ComposerRuntimeManagerTests
 
         public object? GetService(Type serviceType, object? serviceKey = null) => null;
     }
+
 }
+
