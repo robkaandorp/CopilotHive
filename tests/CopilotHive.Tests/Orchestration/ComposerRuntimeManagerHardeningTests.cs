@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
 using CopilotHive.Dashboard;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -844,6 +845,17 @@ public sealed partial class ComposerRuntimeManagerTests
     /// The teardown's own body cannot throw in normal production (every step is contained), so this vector drives
     /// the failure through the ONE seam the teardown awaits: the shared operation. Its settlement is awaited
     /// directly, so a fault there escapes the teardown body into its outer catch.
+    /// <para>
+    /// OWNERSHIP: injecting that fault deliberately hands the manager an invalid state — replacing
+    /// <c>Entry.Operation</c> destroys the manager's ONLY runtime ownership record, so the teardown throws BEFORE
+    /// <see cref="ComposerRuntimeManager"/>'s disposal sequence and its <c>finally</c> then evicts the entry. The
+    /// saved runtime is therefore orphaned: never disposed, never joined, its subscriber still attached and its
+    /// registry row still published. Nothing else owns it (DI does not own these manually constructed pieces, and
+    /// fixture teardown only observes requests and shuts down CACHED entries), so this test must own the cleanup it
+    /// caused: a failure-safe <c>finally</c> disposes the Composer, boundedly joins its EXACT
+    /// <see cref="Composer.TeardownCompletion"/>, disposes the subscriber and unregisters the registry row — every
+    /// step attempted even when an earlier one faults, with the primary failure rethrown only afterwards.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task ThrowingLogger_WhenTheEntryTeardownItselfFaults_StillEvictsTheEntryAndContainsTheWarning()
@@ -854,22 +866,78 @@ public sealed partial class ComposerRuntimeManagerTests
         var manager = NewManager(sp, logger);
         var teardownFault = new InvalidOperationException("deliberate entry-teardown fault");
         var runtime = (await Request(manager, second)).Runtime!;
+        var registry = sp.GetRequiredService<LlmSessionRegistry>();
+        var registryId = ComposerUserState.RegistryId(runtime.State);
+        Assert.Contains(registryId, registry.GetAll().Select(row => row.SessionId));
 
         // Fault the shared operation the teardown awaits: TearDownAsync's `await entry.Operation` throws, which
         // is exactly what its OUTER catch is for.
         FaultEntryOperation(manager, second.UserId, teardownFault);
 
-        Assert.True(await Bounded(Remove(manager, second.UserId), "removal whose teardown faults"));
+        ExceptionDispatchInfo? primary = null;
+        Exception? cleanupFailure = null;
+        try
+        {
+            Assert.True(await Bounded(Remove(manager, second.UserId), "removal whose teardown faults"));
 
-        // The outer catch was reached and contained.
-        Assert.True(logger.LoggedCalls > 0,
-            "The throwing logger was never reached — the containment vector is inert and proves nothing.");
-        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
-        Assert.Equal($"Tearing down the runtime of user {second.UserId} failed", warning.Message);
-        Assert.Same(teardownFault, warning.Exception);
+            // The outer catch was reached and contained.
+            Assert.True(logger.LoggedCalls > 0,
+                "The throwing logger was never reached — the containment vector is inert and proves nothing.");
+            var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+            Assert.Equal($"Tearing down the runtime of user {second.UserId} failed", warning.Message);
+            Assert.Same(teardownFault, warning.Exception);
 
-        // The teardown's finally block still ran: the entry left the cache.
-        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);
+            // The teardown's finally block still ran: the entry left the cache.
+            Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);
+
+            // ... and the injected fault really did orphan the runtime (this is the leak being owned below):
+            // its registry row survived the removal because the disposal sequence never ran, and its actor is
+            // still live. These are the preconditions that make the cleanup below necessary, asserted HERE so a
+            // vanished cleanup cannot silently satisfy them.
+            Assert.Contains(registryId, registry.GetAll().Select(row => row.SessionId));
+            Assert.False(ActorCompleted(runtime.Composer));
+        }
+        catch (Exception ex) { primary = ExceptionDispatchInfo.Capture(ex); }
+        finally
+        {
+            try
+            {
+                // Retain the cleanup's own failures, then let the verification steps below report what they observe:
+                // a removed cleanup must FAIL this test (load-bearing), not vanish behind an aggregate.
+                try { await CompleteCleanupAsync(OrphanOwnershipCleanupSteps(runtime, registry, registryId)); }
+                catch (Exception ex) { cleanupFailure = ex; }
+                // Independent post-conditions: observable whether or not the cleanup above ran.
+                Assert.True(ActorCompleted(runtime.Composer),
+                    "The orphaned runtime's actor was never torn down — its ownership cleanup did not run.");
+                Assert.True(runtime.Composer.TeardownCompletion.IsCompleted,
+                    "The orphaned runtime's ACTUAL teardown was never joined — its ownership cleanup did not run.");
+                Assert.Equal(0, _bus.SubscriberCount);
+                Assert.DoesNotContain(registryId, registry.GetAll().Select(row => row.SessionId));
+            }
+            catch (Exception ex) { cleanupFailure ??= ex; }
+        }
+        if (primary is not null)
+        {
+            if (cleanupFailure is not null) primary.SourceException.Data["CleanupFailure"] = cleanupFailure;
+            primary.Throw();
+        }
+        if (cleanupFailure is not null) ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+    }
+
+    /// <summary>
+    /// The failure-safe cleanup of a runtime this test deliberately orphaned (it replaced the manager's only
+    /// ownership record): dispose the Composer, boundedly join its EXACT <see cref="Composer.TeardownCompletion"/>,
+    /// dispose the subscriber and unregister the registry row. Every step is attempted in production's own order —
+    /// <see cref="CompleteCleanupAsync"/> runs them all and aggregates failures, so one fault never skips the rest.
+    /// </summary>
+    private IEnumerable<Func<Task>> OrphanOwnershipCleanupSteps(
+        ComposerUserRuntime runtime, LlmSessionRegistry registry, string registryId)
+    {
+        yield return () => runtime.Composer.DisposeAsync().AsTask();
+        yield return () => GuardAsync(runtime.Composer.TeardownCompletion,
+            "orphaned runtime's ACTUAL teardown completion");
+        yield return () => { runtime.Subscriber?.Dispose(); return Task.CompletedTask; };
+        yield return () => { registry.Unregister(registryId); return Task.CompletedTask; };
     }
 
     /// <summary>
