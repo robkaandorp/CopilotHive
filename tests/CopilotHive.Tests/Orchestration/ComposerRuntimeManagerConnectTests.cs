@@ -1,4 +1,4 @@
-using System.Reflection;
+using CopilotHive.Actors;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Orchestration;
@@ -20,9 +20,10 @@ namespace CopilotHive.Tests.Orchestration;
 public sealed partial class ComposerRuntimeManagerTests
 {
     /// <summary>Parks the manager's connect call until released; can fail it, or delegate to the real connect.</summary>
-    private sealed class ConnectGate : IDisposable
+    private sealed class ConnectGate : IAsyncDisposable
     {
-        private readonly ManualResetEventSlim _release = new(false);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly List<Task> _terminalRuns = [];
         private int _calls;
         private readonly List<Composer> _composers = [];
 
@@ -33,21 +34,33 @@ public sealed partial class ComposerRuntimeManagerTests
         public Exception? FailWith { get; set; }
         public Composer Composer0 { get { lock (_composers) return _composers[0]; } }
 
-        public void Release() => _release.Set();
-        public void Dispose() => _release.Dispose();
+        public void Release() => _release.TrySetResult();
+
+        public async ValueTask DisposeAsync()
+        {
+            Release(); // assertion-failure fallback: release production BEFORE joining it
+            Task[] terminals;
+            lock (_terminalRuns) terminals = _terminalRuns.ToArray();
+            await GuardAsync(Task.WhenAll(terminals), "all connect-gate invocations exited");
+        }
 
         public async Task RunAsync(Composer composer, CancellationToken ct)
         {
-            Interlocked.Increment(ref _calls);
-            lock (_composers) _composers.Add(composer);
-            ObservedToken = ct;
-            using var registration = ct.Register(() => CancelObserved.TrySetResult());
-            Entered.TrySetResult(); // production-caused: the manager reached its connect call
-            await Task.Run(() => Assert.True(_release.Wait(TimeSpan.FromSeconds(30)), "Timed out: release parked manager connect"),
-                CancellationToken.None);
-            if (FailWith is { } failure) throw failure;
-            ct.ThrowIfCancellationRequested();
-            await composer.ConnectAsync(ct);
+            var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_terminalRuns) _terminalRuns.Add(terminal.Task); // own BEFORE publishing Entered
+            try
+            {
+                Interlocked.Increment(ref _calls);
+                lock (_composers) _composers.Add(composer);
+                ObservedToken = ct;
+                using var registration = ct.Register(() => CancelObserved.TrySetResult());
+                Entered.TrySetResult(); // production-caused: the manager reached its connect call
+                await GuardAsync(_release.Task, "release parked manager connect");
+                if (FailWith is { } failure) throw failure;
+                ct.ThrowIfCancellationRequested();
+                await composer.ConnectAsync(ct);
+            }
+            finally { terminal.TrySetResult(); }
         }
     }
 
@@ -58,18 +71,13 @@ public sealed partial class ComposerRuntimeManagerTests
         return gate;
     }
 
-    private static bool ActorCompleted(Composer composer)
-    {
-        var actor = Field<object>(composer, "_actor");
-        return (bool)actor.GetType()
-            .GetProperty("IsCompleted", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!.GetValue(actor)!;
-    }
+    private static bool ActorCompleted(Composer composer) => Field<ComposerActor>(composer, "_actor").IsCompleted;
 
-    private static Task<T> Bounded<T>(Task<T> task, string milestone) =>
-        task.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None)
-            .ContinueWith(t => t.IsFaulted && t.Exception!.InnerException is TimeoutException te
-                ? throw new TimeoutException($"Timed out: {milestone}", te)
-                : t.GetAwaiter().GetResult(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+    private static async Task<T> Bounded<T>(Task<T> task, string milestone)
+    {
+        await GuardAsync(task, milestone);
+        return await task;
+    }
 
     // ── Typed outcomes: never "the connect was started" ──
 
@@ -78,7 +86,7 @@ public sealed partial class ComposerRuntimeManagerTests
     {
         var (_, second) = await TwoUsersAsync();
         var manager = NewManager(BuildProvider());
-        using var gate = Park();
+        await using var gate = Park();
 
         var creator = Request(manager, second);
         await GuardAsync(gate.Entered.Task, "manager entered connect");
@@ -97,7 +105,7 @@ public sealed partial class ComposerRuntimeManagerTests
     {
         var (_, second) = await TwoUsersAsync();
         var manager = NewManager(BuildProvider(config: new HiveConfigFile()));
-        using var gate = Park();
+        await using var gate = Park();
 
         var result = await Request(manager, second);
 
@@ -108,6 +116,11 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Equal(0, _clientCreations);
         Assert.Same(result.Runtime, (await Request(manager, second)).Runtime); // cached and shared like any runtime
         Assert.Equal(0, gate.Calls);
+        var retry = await Retry(manager, second);
+        Assert.Equal(ComposerRuntimeStatus.DisconnectedShell, retry.Status);
+        Assert.Same(result.Runtime, retry.Runtime);
+        Assert.Null(retry.Failure);
+        Assert.Equal(0, gate.Calls);
     }
 
     [Fact]
@@ -117,7 +130,7 @@ public sealed partial class ComposerRuntimeManagerTests
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
-        using var gate = Park();
+        await using var gate = Park();
 
         var deferred = await Request(manager, second);
 
@@ -128,16 +141,16 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Equal(0, _clientCreations);
 
         // Still no token: the retry stays Deferred and attempts no connect.
-        var stillDeferred = await manager.ConnectAsync(second, Ct);
+        var stillDeferred = await Retry(manager, second);
         Assert.Equal(ComposerRuntimeStatus.Deferred, stillDeferred.Status);
         Assert.Same(deferred.Runtime, stillDeferred.Runtime);
         Assert.Equal(0, gate.Calls);
 
         _tokenAvailable = true;
-        var retry = manager.ConnectAsync(second, Ct);
+        var retry = Retry(manager, second);
         await GuardAsync(gate.Entered.Task, "deferred retry entered connect");
         Assert.False(retry.IsCompleted); // awaitable: completes only once the connect settled
-        var concurrent = manager.ConnectAsync(second, Ct); // joins the ONE in-flight connect
+        var concurrent = Retry(manager, second); // joins the ONE in-flight connect
         Assert.False(concurrent.IsCompleted);
         gate.Release();
         var results = await Bounded(Task.WhenAll(retry, concurrent), "deferred connect callers");
@@ -146,7 +159,7 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.All(results, r => Assert.Same(deferred.Runtime, r.Runtime));
         Assert.True(deferred.Runtime.Composer.IsConnected);
         Assert.Equal(1, gate.Calls);
-        Assert.Equal(ComposerRuntimeStatus.Connected, (await manager.ConnectAsync(second, Ct)).Status);
+        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, second)).Status);
         Assert.Equal(1, gate.Calls); // settled: no reconnect
     }
 
@@ -157,7 +170,7 @@ public sealed partial class ComposerRuntimeManagerTests
         var manager = NewManager(BuildProvider(authEnabled: false));
         _provider = "copilot";
         _tokenAvailable = false;
-        using var gate = Park();
+        await using var gate = Park();
         gate.Release();
 
         var result = await Request(manager, second);
@@ -172,7 +185,7 @@ public sealed partial class ComposerRuntimeManagerTests
         var (_, second) = await TwoUsersAsync();
         var manager = NewManager(BuildProvider());
 
-        var result = await manager.ConnectAsync(second, Ct);
+        var result = await Retry(manager, second);
 
         Assert.Equal(ComposerRuntimeStatus.Refused, result.Status);
         Assert.Equal(ComposerRuntimeRefusal.NoRuntime, result.Refusal);
@@ -188,7 +201,7 @@ public sealed partial class ComposerRuntimeManagerTests
         var sp = BuildProvider();
         var manager = NewManager(sp);
         var sentinel = new InvalidOperationException("deliberate connect fault");
-        using var gate = Park();
+        await using var gate = Park();
         gate.FailWith = sentinel;
 
         var creator = Request(manager, second);
@@ -229,7 +242,7 @@ public sealed partial class ComposerRuntimeManagerTests
 
         var sentinel = new InvalidOperationException("deliberate deferred connect fault");
         _tokenAvailable = true;
-        using var gate = Park();
+        await using var gate = Park();
         gate.FailWith = sentinel;
 
         // Production-caused milestone INSIDE the failure cleanup: the partial subscriber is being detached,
@@ -237,21 +250,24 @@ public sealed partial class ComposerRuntimeManagerTests
         var cleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var cleanupRelease = new ManualResetEventSlim(false);
         var unsubscribeCalls = 0;
+        var cleanupGateTimedOut = 0;
         _bus.OnUnsubscribe = () =>
         {
             if (Interlocked.Increment(ref unsubscribeCalls) != 1) return;
             cleanupReached.TrySetResult();
-            Assert.True(cleanupRelease.Wait(TimeSpan.FromSeconds(30)), "Timed out: release parked failure cleanup");
+            // Production catches subscriber-disposal exceptions. Record the hang-guard failure
+            // independently so that it cannot be swallowed into the expected connect sentinel.
+            if (!cleanupRelease.Wait(TimeSpan.FromSeconds(30)))
+                Interlocked.Exchange(ref cleanupGateTimedOut, 1);
         };
 
-        var retry = manager.ConnectAsync(second, Ct);
-        _requests.Add(retry);
-        await GuardAsync(gate.Entered.Task, "deferred retry entered connect");
-        gate.Release();
-        await GuardAsync(cleanupReached.Task, "failure cleanup reached subscriber disposal");
-
+        Task<ComposerRuntimeResult>? retry = null;
         try
         {
+            retry = Retry(manager, second);
+            await GuardAsync(gate.Entered.Task, "deferred retry entered connect");
+            gate.Release();
+            await GuardAsync(cleanupReached.Task, "failure cleanup reached subscriber disposal");
             // Mid-cleanup: the faulted instance is already disposed ...
             Assert.True(ActorCompleted(deferred.Composer));
             // ... but its cache entry is still present, so a recreation attempt JOINS the failing operation
@@ -275,10 +291,15 @@ public sealed partial class ComposerRuntimeManagerTests
         finally
         {
             cleanupRelease.Set();
+            gate.Release();
+            _bus.OnUnsubscribe = null;
+            if (retry is not null) await JoinRequestAsync(retry);
+            Assert.True(Volatile.Read(ref cleanupGateTimedOut) == 0, "Timed out: release parked failure cleanup");
         }
 
+        Assert.Equal(0, _bus.SubscriberCount);
         Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll());
-        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await manager.ConnectAsync(second, Ct)).Refusal); // removed from cache
+        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal); // removed from cache
 
         _connectHook = null;
         var recreated = await Request(manager, second);
@@ -294,7 +315,7 @@ public sealed partial class ComposerRuntimeManagerTests
     {
         var (_, second) = await TwoUsersAsync();
         var manager = NewManager(BuildProvider());
-        using var gate = Park();
+        await using var gate = Park();
         using var creatorCts = new CancellationTokenSource();
         using var waiterCts = new CancellationTokenSource();
 
@@ -305,10 +326,12 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.False(cancelledWaiter.IsCompleted);
         Assert.False(survivor.IsCompleted);
 
-        creatorCts.Cancel();
-        waiterCts.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(creator, "cancelled creator wait"));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(cancelledWaiter, "cancelled waiter wait"));
+        await creatorCts.CancelAsync();
+        await waiterCts.CancelAsync();
+        var creatorCancellation = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(creator, "cancelled creator wait"));
+        var waiterCancellation = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(cancelledWaiter, "cancelled waiter wait"));
+        Assert.Equal(creatorCts.Token, creatorCancellation.CancellationToken);
+        Assert.Equal(waiterCts.Token, waiterCancellation.CancellationToken);
 
         // Cancelled callers ended only their own WAIT: the shared connect is untouched and still parked.
         Assert.False(gate.ObservedToken.IsCancellationRequested);
@@ -338,52 +361,79 @@ public sealed partial class ComposerRuntimeManagerTests
         _tokenAvailable = false;
         var deferred = (await Request(manager, second)).Runtime!;
         _tokenAvailable = true;
-        using var gate = Park();
+        await using var gate = Park();
         using var cts = new CancellationTokenSource();
 
-        var cancelling = manager.ConnectAsync(second, cts.Token);
-        _requests.Add(cancelling);
+        var cancelling = Retry(manager, second, cts.Token);
         await GuardAsync(gate.Entered.Task, "deferred connect entered");
-        var survivor = manager.ConnectAsync(second, Ct);
-        _requests.Add(survivor);
-        cts.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(cancelling, "cancelled deferred caller"));
+        var survivor = Retry(manager, second);
+        Assert.False(survivor.IsCompleted);
+        await cts.CancelAsync();
+        var cancellation = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(cancelling, "cancelled deferred caller"));
+        Assert.Equal(cts.Token, cancellation.CancellationToken);
 
         Assert.False(gate.ObservedToken.IsCancellationRequested);
+        Assert.False(gate.CancelObserved.Task.IsCompleted);
+        Assert.False(survivor.IsCompleted);
+        var cachedWhileInFlight = Request(manager, second);
+        Assert.False(cachedWhileInFlight.IsCompleted);
         gate.Release();
         var result = await Bounded(survivor, "surviving deferred caller");
 
         Assert.Equal(ComposerRuntimeStatus.Connected, result.Status);
         Assert.Same(deferred, result.Runtime);
+        Assert.Same(deferred, (await Bounded(cachedWhileInFlight, "cached waiter after cancellation")).Runtime);
+        Assert.Same(deferred, (await Request(manager, second)).Runtime);
+        Assert.True(deferred.Composer.IsConnected);
+        await deferred.Composer.SaveSessionAsync(Ct); // usable, not just a retained reference
+        Assert.Equal(1, _clientCreations);
         Assert.Equal(1, gate.Calls);
     }
 
     // ── Removal owns the shared operation ──
 
-    [Fact]
-    public async Task Removal_CancelsTheSharedOperation_AdmitsNoNewWaiters_AndTearsTheRuntimeDown()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Removal_CancelsTheSharedOperation_AdmitsNoNewWaiters_AndTearsTheRuntimeDown(bool deferred)
     {
         var (_, second) = await TwoUsersAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
-        using var gate = Park();
+        if (deferred)
+        {
+            _provider = "copilot";
+            _tokenAvailable = false;
+            Assert.Equal(ComposerRuntimeStatus.Deferred, (await Request(manager, second)).Status);
+            _tokenAvailable = true;
+        }
+        await using var gate = Park();
 
-        var creator = Request(manager, second);
+        var creator = deferred ? Retry(manager, second) : Request(manager, second);
         await GuardAsync(gate.Entered.Task, "manager entered connect");
         var joinedWaiter = Request(manager, second);
+        Assert.False(creator.IsCompleted);
+        Assert.False(joinedWaiter.IsCompleted);
         Assert.False(gate.ObservedToken.IsCancellationRequested);
 
-        var removal = manager.RemoveAsync(second.UserId);
+        var removal = Remove(manager, second.UserId);
         await GuardAsync(gate.CancelObserved.Task, "removal cancelled the shared operation");
         Assert.True(gate.ObservedToken.IsCancellationRequested);
 
         // Removing is set BEFORE the cancellation fired: no new waiter joins, and no connect/create starts.
-        var lateCreate = await Request(manager, second);
-        var lateConnect = await manager.ConnectAsync(second, Ct);
+        var lateCreateCall = Request(manager, second);
+        var lateConnectCall = Retry(manager, second);
+        Assert.True(lateCreateCall.IsCompletedSuccessfully, "Removing entry must refuse create synchronously, not join the doomed operation");
+        Assert.True(lateConnectCall.IsCompletedSuccessfully, "Removing entry must refuse connect synchronously, not join the doomed operation");
+        var lateCreate = await Bounded(lateCreateCall, "late create refused during removal");
+        var lateConnect = await Bounded(lateConnectCall, "late connect refused during removal");
         Assert.Equal(ComposerRuntimeStatus.Removed, lateCreate.Status);
         Assert.Equal(ComposerRuntimeStatus.Removed, lateConnect.Status);
         Assert.Null(lateCreate.Runtime);
-        Assert.False(await manager.RemoveAsync(second.UserId)); // a second removal does not double-own
+        Assert.Null(lateConnect.Runtime);
+        Assert.Null(lateCreate.Failure);
+        Assert.Null(lateConnect.Failure);
+        Assert.False(await Remove(manager, second.UserId)); // a second removal does not double-own
         Assert.Equal(1, gate.Calls); // the late callers started no second operation
         Assert.False(removal.IsCompleted); // removal waits for the shared operation to settle
 
@@ -413,14 +463,14 @@ public sealed partial class ComposerRuntimeManagerTests
         var sp = BuildProvider();
         var manager = NewManager(sp);
         var before = (await Request(manager, second)).Runtime!;
-        Assert.False(await manager.RemoveAsync(12345)); // nothing to remove
+        Assert.False(await Remove(manager, 12345)); // nothing to remove
 
-        Assert.True(await manager.RemoveAsync(second.UserId));
+        Assert.True(await Remove(manager, second.UserId));
 
         Assert.True(ActorCompleted(before.Composer));
         Assert.Equal(0, _bus.SubscriberCount);
         Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll());
-        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await manager.ConnectAsync(second, Ct)).Refusal);
+        Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);
         var after = await Request(manager, second);
         Assert.NotSame(before, after.Runtime);
         Assert.Equal(2, _clientCreations);
@@ -459,13 +509,13 @@ public sealed partial class ComposerRuntimeManagerTests
         var deferred = await Request(manager, second);
         Assert.Equal(ComposerRuntimeStatus.Deferred, deferred.Status);
         _tokenAvailable = true;
-        using var gate = Park();
+        await using var gate = Park();
         gate.FailWith = new InvalidOperationException("deliberate");
         gate.Release();
-        Assert.Equal(ComposerRuntimeStatus.Failed, (await manager.ConnectAsync(second, Ct)).Status);
+        Assert.Equal(ComposerRuntimeStatus.Failed, (await Retry(manager, second)).Status);
         _connectHook = null;
         Assert.Equal(ComposerRuntimeStatus.Connected, (await Request(manager, second)).Status);
-        Assert.True(await manager.RemoveAsync(second.UserId));
+        Assert.True(await Remove(manager, second.UserId));
 
         Assert.Equal(0, Volatile.Read(ref legacyConnects));
         Assert.Equal(probesAfterStart, Volatile.Read(ref legacyProbes));

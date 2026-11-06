@@ -33,6 +33,9 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     private readonly CopilotHiveDbContext _goalDb = CopilotHiveDbContext.CreateInMemory();
     private readonly List<ServiceProvider> _providers = [];
     private readonly List<Task<ComposerRuntimeResult>> _requests = [];
+    private readonly List<Task<bool>> _removals = [];
+    private readonly Dictionary<ComposerRuntimeManager, HashSet<int>> _managerUsers = [];
+    private readonly List<LegacyIsolationSentinel> _legacySentinels = [];
 
     // Gate hooks for the chat-client factory used by every Composer built in these tests.
     private int _clientCreations;
@@ -42,6 +45,7 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     // gate with, and an optional replacement for the manager's single connect call.
     private volatile bool _tokenAvailable = true;
     private volatile string _provider = "test";
+    private Func<string, string>? _providerResolver;
     private Func<Composer, CancellationToken, Task>? _connectHook;
 
     public ComposerRuntimeManagerTests()
@@ -56,9 +60,8 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 
     public async ValueTask DisposeAsync()
     {
-        var runtimes = new HashSet<ComposerUserRuntime>();
-        // Enumerate lazily: all request-join steps run before we enumerate the runtime set they
-        // populate. Every independent cleanup runs even if a previous join/disposal failed.
+        // Observe every owned call, then remove entries even if all callers were cancelled or
+        // refused and therefore never exposed a runtime handle. Each cleanup step still runs.
         IEnumerable<Func<Task>> CleanupSteps()
         {
             foreach (var request in _requests)
@@ -67,11 +70,17 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
                     // A fault can be the expected rejection asserted in the test. Still join EVERY
                     // request before disposing resources; timeout is never ignored as a fault.
                     await JoinRequestAsync(request);
-                    if (request.IsCompletedSuccessfully && request.Result.Runtime is { } runtime)
-                        runtimes.Add(runtime);
                 };
-            foreach (var runtime in runtimes)
-                yield return () => GuardAsync(runtime.DisposeAsync().AsTask(), "runtime fixture disposal");
+            foreach (var removal in _removals)
+                yield return () => GuardAsync(removal, "owned removal completion");
+            foreach (var (manager, userIds) in _managerUsers)
+                foreach (var userId in userIds)
+                    yield return () => GuardAsync(manager.RemoveAsync(userId), "fixture removes managed runtime");
+            foreach (var sentinel in _legacySentinels)
+            {
+                yield return () => { sentinel.AssertUntouched(); return Task.CompletedTask; };
+                yield return () => sentinel.DisposeAsync().AsTask();
+            }
             foreach (var provider in _providers)
                 yield return () => provider.DisposeAsync().AsTask();
             yield return () => { _goalDb.Dispose(); return Task.CompletedTask; };
@@ -147,6 +156,10 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
         };
         var services = new ServiceCollection();
         services.AddSingleton(config);
+        services.AddSingleton(_users);
+        var sentinel = new LegacyIsolationSentinel(_users);
+        _legacySentinels.Add(sentinel);
+        services.AddSingleton(sentinel.Coordinator);
         services.AddSingleton<ILoggerFactory>(NullLoggerFactory.Instance);
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         services.AddSingleton<IGoalStore>(new GoalStore(_goalDb, NullLogger<GoalStore>.Instance));
@@ -164,12 +177,13 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
         {
             Interlocked.Increment(ref _clientCreations);
             return _clientFactory(m);
-        }, isTokenAvailable: () => _tokenAvailable, providerOf: _ => _provider);
+        }, isTokenAvailable: () => _tokenAvailable, providerOf: model => _providerResolver?.Invoke(model) ?? _provider);
 
     private ComposerRuntimeManager NewManager(IServiceProvider sp)
     {
         var m = new ComposerRuntimeManager(NewFactory(sp), _users, NullLogger<ComposerRuntimeManager>.Instance,
             (composer, ct) => (_connectHook ?? ((c, t) => c.ConnectAsync(t)))(composer, ct));
+        _managerUsers.Add(m, []);
         return m;
     }
 
@@ -186,8 +200,25 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 
     private Task<ComposerRuntimeResult> Request(ComposerRuntimeManager manager, ActingUserPrincipal principal, CancellationToken? cancellationToken = null)
     {
+        _managerUsers[manager].Add(principal.UserId);
         var task = manager.GetOrCreateAsync(principal, cancellationToken ?? Ct);
         _requests.Add(task); // Own it BEFORE any assertion can throw.
+        return task;
+    }
+
+    private Task<ComposerRuntimeResult> Retry(ComposerRuntimeManager manager, ActingUserPrincipal principal,
+        CancellationToken? cancellationToken = null)
+    {
+        _managerUsers[manager].Add(principal.UserId);
+        var task = manager.ConnectAsync(principal, cancellationToken ?? Ct);
+        _requests.Add(task);
+        return task;
+    }
+
+    private Task<bool> Remove(ComposerRuntimeManager manager, int userId)
+    {
+        var task = manager.RemoveAsync(userId);
+        _removals.Add(task);
         return task;
     }
 
