@@ -103,7 +103,15 @@ public sealed record ComposerRuntimeResult
 /// The per-user pieces of one managed Composer: validated identity, the Composer (and through it the
 /// actor / agent service), the per-user attachment service and the per-runtime event subscriber.
 /// </summary>
-public sealed class ComposerUserRuntime : IAsyncDisposable
+/// <remarks>
+/// READ-ONLY HANDLE — deliberately NOT <see cref="IAsyncDisposable"/> and with no <c>DisposeAsync</c>: the
+/// <see cref="ComposerRuntimeManager"/> alone disposes this runtime's Composer and subscriber (on removal,
+/// failure or shutdown). A public disposal entry point on the handle would let any holder tear the runtime down
+/// while the manager still owns it — racing removal and completing teardown before the manager joined the actual
+/// actor/agent completion. There is exactly ONE disposal path (the manager's), so no extra completion signal is
+/// needed to disambiguate it.
+/// </remarks>
+public sealed class ComposerUserRuntime
 {
     internal ComposerUserRuntime(
         ComposerUserState state, Composer composer, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber,
@@ -135,13 +143,6 @@ public sealed class ComposerUserRuntime : IAsyncDisposable
     /// diverge from what the Composer was actually constructed with.
     /// </summary>
     internal ComposerConstructionSnapshot Configuration { get; }
-
-    /// <summary>Disposes the Composer, then detaches the subscriber. Session history on disk is never touched.</summary>
-    public async ValueTask DisposeAsync()
-    {
-        try { await Composer.DisposeAsync(); }
-        finally { Subscriber?.Dispose(); }
-    }
 }
 
 /// <summary>
@@ -460,7 +461,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             catch (ObjectDisposedException) { }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "A cancellation callback of the shared operation of user {UserId} threw; teardown continues", userId);
+                LogCleanupWarning(ex, "A cancellation callback of the shared operation of user {UserId} threw; teardown continues", userId);
             }
 
             // The operation never throws; a connect aborted by the cancellation disposed its own partial
@@ -473,7 +474,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Tearing down the runtime of user {UserId} failed", userId);
+            LogCleanupWarning(ex, "Tearing down the runtime of user {UserId} failed", userId);
         }
         finally
         {
@@ -623,7 +624,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         if (composer is not null)
         {
             try { await composer.DisposeAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Disposing the partial Composer of user {UserId} failed", userId); }
+            catch (Exception ex) { LogCleanupWarning(ex, "Disposing the partial Composer of user {UserId} failed", userId); }
 
             // DisposeAsync may return while a stuck actor still runs: the entry may only leave the cache (and
             // a recreation may only start) after the ACTUAL actor/agent teardown.
@@ -631,12 +632,12 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         }
 
         try { subscriber?.Dispose(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Disposing the partial subscriber of user {UserId} failed", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Disposing the partial subscriber of user {UserId} failed", userId); }
 
         if (attachments is not null)
         {
             try { await attachments.ClearAllAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Clearing the partial attachments of user {UserId} failed", userId); }
+            catch (Exception ex) { LogCleanupWarning(ex, "Clearing the partial attachments of user {UserId} failed", userId); }
         }
 
         // Disposal re-publishes an idle registry entry for the partial Composer: drop it.
@@ -665,15 +666,15 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     {
         var userId = runtime.State.UserId;
         try { await runtime.Composer.DisposeAsync(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Disposing the Composer of user {UserId} failed", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Disposing the Composer of user {UserId} failed", userId); }
 
         try { runtime.Subscriber?.Dispose(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Disposing the subscriber of user {UserId} failed", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Disposing the subscriber of user {UserId} failed", userId); }
 
         if (clearAttachments)
         {
             try { await runtime.Attachments.ClearAllAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Clearing the attachments of user {UserId} failed", userId); }
+            catch (Exception ex) { LogCleanupWarning(ex, "Clearing the attachments of user {UserId} failed", userId); }
         }
 
         await JoinTeardownAsync(runtime.Composer, userId);
@@ -686,7 +687,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     private async Task JoinTeardownAsync(Composer composer, int userId)
     {
         try { await WaitForTeardownAsync(userId, composer.TeardownCompletion, CancellationToken.None); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Teardown of the Composer of user {UserId} faulted", userId); }
+        catch (Exception ex) { LogCleanupWarning(ex, "Teardown of the Composer of user {UserId} faulted", userId); }
     }
 
     /// <summary>The single place the manager blocks on a teardown task; reports it to the observation seam first.</summary>
@@ -694,5 +695,26 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     {
         OnJoiningTeardown?.Invoke(userId, teardown);
         return teardown.WaitAsync(ct);
+    }
+
+    /// <summary>
+    /// BEST-EFFORT cleanup warning: the ONE place the manager writes a cleanup/teardown warning, and it can never
+    /// throw. Cleanup runs inside catch blocks; a throwing logger (a synchronous sink that faults, a disposed
+    /// logger factory, a test double that asserts) would otherwise ESCAPE that catch, mask the original
+    /// connect/migration failure, and skip every remaining cleanup step — composer disposal, the actual teardown
+    /// join, subscriber cleanup, attachment policy, unregister and cache eviction. Any logger fault is swallowed and
+    /// the remaining steps always run; the settled outcome (including the ORIGINAL failure) is never altered.
+    /// </summary>
+    /// <param name="exception">The cleanup failure being reported (payload unchanged from the direct call it replaces).</param>
+    /// <param name="message">The warning template — identical to the text that appears when the logger works.</param>
+    /// <param name="userId">The user whose runtime is being cleaned up (the <c>{UserId}</c> property).</param>
+    private void LogCleanupWarning(Exception exception, string message, int userId)
+    {
+        try { _logger.LogWarning(exception, message, userId); }
+        catch
+        {
+            // Deliberately swallowed: reporting a cleanup failure must never become a second, louder failure.
+            // Diagnostics must not throw, and this one runs on the failure path where a throw is most damaging.
+        }
     }
 }
