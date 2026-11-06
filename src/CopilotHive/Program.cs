@@ -347,7 +347,7 @@ public sealed class Program
     /// <param name="field">The config field name to name in the warning.</param>
     /// <param name="logger">Optional logger for the degradation warning.</param>
     /// <returns>The parsed effort, or <c>null</c> when unset or unrecognised.</returns>
-    private static Microsoft.Extensions.AI.ReasoningEffort? ParseConfiguredReasoningEffort(
+    internal static Microsoft.Extensions.AI.ReasoningEffort? ParseConfiguredReasoningEffort(
         string? value, string field, ILogger? logger)
     {
         try
@@ -809,51 +809,18 @@ public sealed class Program
 
             // Composer agent (always registered — with no valid default it is a disconnected shell)
             // Registered BEFORE GoalDispatcher so the IClarificationRouter forwarding is available.
-            builder.Services.AddSingleton(sp =>
-            {
-                var config = sp.GetRequiredService<HiveConfigFile>();
-
-                // ONE resolution of the Composer's default model (Slice 1A1 resolver): the
-                // resolved value is used BOTH for construction and (via Composer.StartupDefaultModel)
-                // for the startup-connect gate. No fall-through to orchestrator.model /
-                // Constants.DefaultWorkerModel — resolver-only construction.
-                var resolvedDefault = config.ResolveComposerDefaultModel();
-
-                var maxCtx = resolvedDefault is not null
-                    ? config.TryGetContextWindowForModel(resolvedDefault)
-                        ?? Constants.DefaultBrainContextWindow
-                    : Constants.DefaultBrainContextWindow;
-                var maxSteps = config.Composer?.MaxSteps ?? config.Orchestrator.BrainMaxSteps;
-                var availableModels = config.GetComposerAvailableModels();
-
-                return new Composer(resolvedDefault, sp.GetRequiredService<ILogger<Composer>>(),
-                    sp.GetRequiredService<IGoalStore>(),
-                    maxCtx, maxSteps,
-                    sp.GetService<IBrainRepoManager>(),
-                    stateDir,
-                    sp, // IServiceProvider — lazy resolution of GoalDispatcher to avoid circular DI
-                    !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
-                    ollamaApiKey,
-                    config,
-                    sp.GetService<ConfigRepoManager>(),
-                    availableModels,
-                    compactionModel: config.GetCompactionModel(),
-                    knowledgeGraph: sp.GetService<KnowledgeGraph>(),
-                    goalReviewService: sp.GetService<GoalReviewService>(),
-                    sessionRegistry: sp.GetService<LlmSessionRegistry>(),
-                    goalReadyNotifier: sp.GetService<GoalReadyNotifier>(),
-                    attachmentService: sp.GetService<ComposerAttachmentService>(),
-                    reasoningEffort: ParseConfiguredReasoningEffort(
-                        // Composer-specific override → orchestrator reasoning effort.
-                        !string.IsNullOrWhiteSpace(config.Composer?.ReasoningEffort)
-                            ? config.Composer.ReasoningEffort
-                            : config.Orchestrator?.ReasoningEffort,
-                        "composer.reasoning_effort",
-                        sp.GetService<ILogger<Composer>>()),
-                    issueStore: sp.GetService<IIssueStore>(),
-                    eventSubscriber: sp.GetService<ComposerEventSubscriber>(),
-                    eventBus: sp.GetService<IEventBus>());
-            });
+            // The model/config resolution and full dependency wiring live in ONE shared seam
+            // (ComposerFactory): the legacy singleton below and the per-user runtime manager both
+            // consume it. The legacy Composer keeps userState null, the legacy root attachment
+            // service and the legacy shared event subscriber.
+            builder.Services.AddSingleton(sp => new ComposerFactory(sp, stateDir, ollamaApiKey));
+            builder.Services.AddSingleton(sp => sp.GetRequiredService<ComposerFactory>().CreateLegacy());
+            // Per-user runtime manager (creation/cache/re-check only). Not yet wired to any UI,
+            // facade or routing: the legacy singleton above remains the sole live user-facing runtime.
+            builder.Services.AddSingleton(sp => new ComposerRuntimeManager(
+                sp.GetRequiredService<ComposerFactory>(),
+                sp.GetRequiredService<UserService>(),
+                sp.GetRequiredService<ILogger<ComposerRuntimeManager>>()));
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
             // Composer runtime facade: ALWAYS registered so the Composer endpoints and the
