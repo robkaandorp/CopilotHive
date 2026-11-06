@@ -181,6 +181,9 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
     /// </summary>
     internal Action<int, Task>? OnJoiningTeardown { get; set; }
 
+    /// <summary>Test-only observation of the exact shared operation being joined; null is inert.</summary>
+    internal Action<int, Task>? OnJoiningOperation { get; set; }
+
     /// <summary>Creates the manager.</summary>
     /// <param name="factory">The shared Composer construction seam.</param>
     /// <param name="users">The persisted user directory used for identity resolution and re-checks.</param>
@@ -406,6 +409,8 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
 
             // The operation never throws; a connect aborted by the cancellation disposed its own partial
             // runtime (and joined its actual teardown) itself.
+            try { OnJoiningOperation?.Invoke(userId, entry.Operation); }
+            catch { /* Observation must never change teardown, even if a test hook throws. */ }
             var settled = await entry.Operation;
             if (settled.Runtime is { } runtime)
                 await DisposeRuntimeAsync(runtime, clearAttachments: false);

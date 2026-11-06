@@ -94,7 +94,8 @@ public sealed partial class ComposerRuntimeManagerTests
     private static async Task DriveActorDisposeTimeoutAsync(ControlledTimeProvider clock)
     {
         // Rendezvous on the REAL 5 s dispose timer armed by Actor.DisposeAsync, then advance exactly that window.
-        await clock.WaitForPendingTimerAsync(Actor<IComposerMessage>.DisposeTimeout, Ct);
+        await GuardAsync(clock.WaitForPendingTimerAsync(Actor<IComposerMessage>.DisposeTimeout, Ct),
+            "Actor.DisposeAsync armed the controlled drain-timeout timer");
         clock.Advance(Actor<IComposerMessage>.DisposeTimeout);
     }
 
@@ -205,8 +206,11 @@ public sealed partial class ComposerRuntimeManagerTests
         using var cts = new CancellationTokenSource();
         var cancelled = Request(manager, second, cts.Token);
         Assert.False(cancelled.IsCompleted);
-        cts.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(cancelled, "cancelled recreation wait"));
+        Assert.False(ActorCompleted(old!));
+        Assert.False(old!.TeardownCompletion.IsCompleted);
+        await cts.CancelAsync();
+        var cancellation = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(cancelled, "cancelled recreation wait"));
+        Assert.Equal(cts.Token, cancellation.CancellationToken);
         Assert.False(removal.IsCompleted);
         Assert.False(old!.TeardownCompletion.IsCompleted);
         var stillBlocked = Request(manager, second);
@@ -251,6 +255,9 @@ public sealed partial class ComposerRuntimeManagerTests
 
         Assert.False(shutdown.IsCompleted); // B is long gone, but A's actor is still running
         Assert.False(ActorCompleted(stuckComposer!));
+        // A's timeout/join milestone does not establish that B's independently scheduled
+        // teardown ran. Join B's authoritative completion rather than assuming it ran first.
+        await GuardAsync(runtimeB.Composer.TeardownCompletion, "idle user's actual shutdown teardown");
         Assert.True(ActorCompleted(runtimeB.Composer));
 
         // Creation is refused for the user being torn down, for an idle user, and for every call kind.
@@ -297,6 +304,8 @@ public sealed partial class ComposerRuntimeManagerTests
         await DriveActorDisposeTimeoutAsync(clock);
         await GuardAsync(recorder.When(t => ReferenceEquals(t, old!.TeardownCompletion)), "removal blocked on actual teardown");
 
+        Assert.False(ActorCompleted(old!));
+        Assert.False(old!.TeardownCompletion.IsCompleted);
         var shutdown = manager.ShutdownAsync(); // must JOIN the in-progress teardown, not skip the Removing entry
         Assert.False(shutdown.IsCompleted);
         Assert.False(removal.IsCompleted);
@@ -414,32 +423,120 @@ public sealed partial class ComposerRuntimeManagerTests
         var (first, second) = await TwoUsersAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
-
+        var turnA = new StreamTurn("reply-A-unique");
+        var turnB1 = new StreamTurn("reply-B-first-unique");
+        var turnB2 = new StreamTurn("reply-B-second-unique");
+        using var clientA = new StreamingScript(turnA);
+        using var clientB = new StreamingScript(turnB1, turnB2);
+        _clientFactory = _ => Volatile.Read(ref _clientCreations) switch
+        {
+            1 => clientA,
+            2 => clientB,
+            _ => new Mock<IChatClient>().Object,
+        };
         var a = await Request(manager, first);
         var b = await Request(manager, second);
-        Assert.Equal(ComposerRuntimeStatus.Connected, a.Status);
-        Assert.Equal(ComposerRuntimeStatus.Connected, b.Status);
-        Assert.NotSame(a.Runtime, b.Runtime);
-        Assert.NotSame(Field<object>(a.Runtime!.Composer, "_actor"), Field<object>(b.Runtime!.Composer, "_actor"));
-        Assert.Equal(["composer:1", "composer:2"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId).Order());
+        using var aTerminal = new TerminalWatch(a.Runtime!.Composer);
+        using var bTerminal = new TerminalWatch(b.Runtime!.Composer);
+        try
+        {
+            Assert.Equal(ComposerRuntimeStatus.Connected, a.Status);
+            Assert.Equal(ComposerRuntimeStatus.Connected, b.Status);
+            Assert.NotSame(a.Runtime, b.Runtime);
+            Assert.NotSame(Field<object>(a.Runtime.Composer, "_actor"), Field<object>(b.Runtime.Composer, "_actor"));
+            var registry = sp.GetRequiredService<LlmSessionRegistry>();
+            Assert.Equal(["composer:1", "composer:2"], registry.GetAll().Select(s => s.SessionId).Order());
+            await a.Runtime.Composer.SaveSessionAsync(Ct);
+            await b.Runtime.Composer.SaveSessionAsync(Ct);
+            using var contentA = new MemoryStream([1, 5, 1, 5]);
+            using var contentB = new MemoryStream([2, 6, 2, 6]);
+            var savedA = await a.Runtime.Attachments.SaveAsync("A.png", contentA, Ct);
+            var savedB = await b.Runtime.Attachments.SaveAsync("B.png", contentB, Ct);
+            Assert.True(savedA.Success, savedA.Error);
+            Assert.True(savedB.Success, savedB.Error);
+            var fileA = Path.Combine(a.Runtime.Attachments.AttachmentsRootPath, savedA.Attachment!.SavedRelativePath);
+            var fileB = Path.Combine(b.Runtime.Attachments.AttachmentsRootPath, savedB.Attachment!.SavedRelativePath);
+            var sessionA = ComposerUserState.SessionFilePath(StateDir, a.Runtime.State);
+            var sessionB = ComposerUserState.SessionFilePath(StateDir, b.Runtime.State);
 
-        Assert.True(await Remove(manager, first.UserId));
+            await a.Runtime.Composer.SendMessageWithEventsAsync("user-A-turn");
+            await b.Runtime.Composer.SendMessageWithEventsAsync("user-B-first-turn");
+            await GuardAsync(Task.WhenAll(turnA.Entered.Task, turnB1.Entered.Task), "both users independently entered real streams");
+            Assert.True(a.Runtime.Composer.IsStreaming);
+            Assert.True(b.Runtime.Composer.IsStreaming);
+            Assert.All(registry.GetAll(), row => Assert.Equal("streaming", row.Status));
+            turnA.Release.TrySetResult();
+            await GuardAsync(aTerminal.Completed.Task, "A's production terminal transition while B stays streaming");
+            Assert.False(a.Runtime.Composer.IsStreaming);
+            Assert.True(b.Runtime.Composer.IsStreaming);
+            Assert.Contains(turnA.Reply, a.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            Assert.DoesNotContain(turnA.Reply, b.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            var bRow = registry.GetAll().Single(row => row.SessionId == "composer:2");
+            var beforeEvent = new SystemEvent(EventType.GoalCompleted, "buffer-before-A-removal", GoalId: "before-A");
+            _bus.Publish(beforeEvent);
+            Assert.Same(beforeEvent, Assert.Single(a.Runtime.Subscriber!.PeekPendingEvents()));
+            Assert.Same(beforeEvent, Assert.Single(b.Runtime.Subscriber!.PeekPendingEvents()));
+            var bytesA = await File.ReadAllBytesAsync(sessionA, Ct);
+            var bytesB = await File.ReadAllBytesAsync(sessionB, Ct);
 
-        Assert.True(a.Runtime.Composer.TeardownCompletion.IsCompleted);
-        Assert.True(ActorCompleted(a.Runtime.Composer));
-        Assert.False(ActorCompleted(b.Runtime.Composer));
-        var bAgain = await Request(manager, second);
-        Assert.Same(b.Runtime, bAgain.Runtime);
-        Assert.True(bAgain.Runtime!.Composer.IsConnected);
-        await bAgain.Runtime.Composer.SaveSessionAsync(Ct); // B is still fully usable
-        Assert.True(File.Exists(ComposerUserState.SessionFilePath(StateDir, b.Runtime.State)));
-        Assert.Equal(["composer:2"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(s => s.SessionId));
-        Assert.Equal(1, _bus.SubscriberCount);
+            Assert.True(await Bounded(Remove(manager, first.UserId), "remove A without cancelling B's held stream"));
 
-        var aReborn = await Request(manager, first); // A can come back as a fresh runtime
-        Assert.Equal(ComposerRuntimeStatus.Connected, aReborn.Status);
-        Assert.NotSame(a.Runtime, aReborn.Runtime);
-        Assert.Equal(3, _clientCreations);
-        Assert.Equal(2, _bus.SubscriberCount);
+            Assert.True(a.Runtime.Composer.TeardownCompletion.IsCompleted);
+            Assert.True(ActorCompleted(a.Runtime.Composer));
+            Assert.False(ActorCompleted(b.Runtime.Composer));
+            Assert.True(b.Runtime.Composer.IsStreaming);
+            Assert.Same(bRow, Assert.Single(registry.GetAll()));
+            Assert.Same(beforeEvent, Assert.Single(b.Runtime.Subscriber.PeekPendingEvents()));
+            var afterEvent = new SystemEvent(EventType.GoalFailed, "buffer-after-A-removal", GoalId: "after-A");
+            _bus.Publish(afterEvent);
+            Assert.Same(beforeEvent, Assert.Single(a.Runtime.Subscriber.PeekPendingEvents()));
+            Assert.Collection(b.Runtime.Subscriber.PeekPendingEvents(),
+                evt => Assert.Same(beforeEvent, evt), evt => Assert.Same(afterEvent, evt));
+            Assert.Equal(bytesA, await File.ReadAllBytesAsync(sessionA, Ct));
+            Assert.Equal(bytesB, await File.ReadAllBytesAsync(sessionB, Ct));
+            Assert.Equal(new byte[] { 1, 5, 1, 5 }, await File.ReadAllBytesAsync(fileA, Ct));
+            Assert.Equal(new byte[] { 2, 6, 2, 6 }, await File.ReadAllBytesAsync(fileB, Ct));
+            var bAgain = await Request(manager, second);
+            Assert.Same(b.Runtime, bAgain.Runtime);
+            Assert.True(bAgain.Runtime!.Composer.IsConnected);
+            await bAgain.Runtime.Composer.SaveSessionAsync(Ct); // retained original usability assertion
+            Assert.True(File.Exists(ComposerUserState.SessionFilePath(StateDir, b.Runtime.State)));
+            Assert.Equal(["composer:2"], registry.GetAll().Select(s => s.SessionId));
+            Assert.Equal(1, _bus.SubscriberCount);
+            turnB1.Release.TrySetResult();
+            await GuardAsync(bTerminal.Completed.Task, "B's first actual terminal transition after A removal");
+            Assert.Contains(turnB1.Reply, b.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            Assert.DoesNotContain(turnA.Reply, b.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            Assert.DoesNotContain(turnB1.Reply, a.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            using var bSecondTerminal = new TerminalWatch(b.Runtime.Composer);
+            await b.Runtime.Composer.SendMessageWithEventsAsync("user-B-second-turn-after-A-removal");
+            await GuardAsync(turnB2.Entered.Task, "surviving B starts a second real stream");
+            Assert.True(b.Runtime.Composer.IsStreaming);
+            Assert.Same(b.Runtime, (await Request(manager, second)).Runtime);
+            turnB2.Release.TrySetResult();
+            await GuardAsync(bSecondTerminal.Completed.Task, "surviving B completes its second real stream");
+            Assert.Contains(turnB2.Reply, b.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            var persistedB = await File.ReadAllTextAsync(sessionB, Ct);
+            Assert.Contains(turnB1.Reply, persistedB);
+            Assert.Contains(turnB2.Reply, persistedB);
+            Assert.DoesNotContain(turnA.Reply, persistedB);
+            Assert.Equal(bytesA, await File.ReadAllBytesAsync(sessionA, Ct));
+            Assert.Equal(1, clientA.Calls);
+            Assert.Equal(2, clientB.Calls);
+
+            var aReborn = await Request(manager, first); // A can come back as a fresh runtime
+            Assert.Equal(ComposerRuntimeStatus.Connected, aReborn.Status);
+            Assert.NotSame(a.Runtime, aReborn.Runtime);
+            Assert.Contains(turnA.Reply, aReborn.Runtime!.Composer.GetChatHistory().Select(message => message.Content));
+            Assert.DoesNotContain(turnB2.Reply, aReborn.Runtime.Composer.GetChatHistory().Select(message => message.Content));
+            Assert.Equal(3, _clientCreations);
+            Assert.Equal(2, _bus.SubscriberCount);
+        }
+        finally
+        {
+            clientA.ReleaseAll();
+            clientB.ReleaseAll();
+            await GuardAsync(manager.ShutdownAsync(), "streaming lifecycle cleanup joins both actors and agents");
+        }
     }
 }

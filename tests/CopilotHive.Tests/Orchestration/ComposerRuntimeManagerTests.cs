@@ -73,9 +73,10 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
                 };
             foreach (var removal in _removals)
                 yield return () => GuardAsync(removal, "owned removal completion");
-            foreach (var (manager, userIds) in _managerUsers)
-                foreach (var userId in userIds)
-                    yield return () => GuardAsync(manager.RemoveAsync(userId), "fixture removes managed runtime");
+            // RemoveAsync returns false for entries already owned by removal/shutdown. Only
+            // ShutdownAsync joins those entries too, before providers/databases can be released.
+            foreach (var manager in _managerUsers.Keys)
+                yield return () => GuardAsync(manager.ShutdownAsync(), "fixture joins all actual manager teardowns");
             foreach (var sentinel in _legacySentinels)
             {
                 yield return () => { sentinel.AssertUntouched(); return Task.CompletedTask; };
