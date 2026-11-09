@@ -53,8 +53,16 @@ public sealed partial class Composer
         [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null,
         [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null,
         [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null,
-        [Description("Comma-separated knowledge document IDs to attach to this goal")] string? documents = null)
+        [Description("Comma-separated knowledge document IDs to attach to this goal")] string? documents = null,
+        CancellationToken ct = default)
     {
+        // InteractiveMember enforcement BEFORE any store write: create_goal ALWAYS drafts, so it is a
+        // member action — but the CAPABILITY ASSIGNMENT governs which principal passes, never whether a
+        // check happens. A direct call bypassing the SharpCoder hook is therefore refused for a Viewer or a
+        // disabled account instead of persisting a row.
+        if (await AuthorizationDenialAsync("create_goal", ct) is { } denyCreateGoal)
+            return denyCreateGoal;
+
         var isValidId = IsValidGoalId(id);
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
@@ -138,8 +146,11 @@ public sealed partial class Composer
 
     [Description("Approve a Draft goal, changing its status to Pending for dispatch.")]
     internal async Task<string> ApproveGoalAsync(
-        [Description("Goal ID to approve")] string id)
+        [Description("Goal ID to approve")] string id, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("approve_goal", ct) is { } deny_approve_goal)
+            return deny_approve_goal;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"));
         if (error is not null) return error;
@@ -161,8 +172,11 @@ public sealed partial class Composer
 
     [Description("Permanently delete a goal. Only Draft or Failed goals can be deleted.")]
     internal async Task<string> DeleteGoalAsync(
-        [Description("Goal ID to delete")] string id)
+        [Description("Goal ID to delete")] string id, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("delete_goal", ct) is { } deny_delete_goal)
+            return deny_delete_goal;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"));
         if (error is not null) return error;
@@ -210,8 +224,11 @@ public sealed partial class Composer
 
     [Description("Cancel an InProgress or Pending goal, stopping its execution.")]
     internal async Task<string> CancelGoalAsync(
-        [Description("Goal ID to cancel")] string id)
+        [Description("Goal ID to cancel")] string id, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("cancel_goal", ct) is { } deny_cancel_goal)
+            return deny_cancel_goal;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"));
         if (error is not null) return error;
@@ -238,8 +255,11 @@ public sealed partial class Composer
     [Description(Composer.ExtendGoalIterationsToolDescription)]
     internal async Task<string> ExtendGoalIterationsAsync(
         [Description("Goal ID to resume with additional iterations")] string id,
-        [Description("Number of additional iterations to grant (1-100, default 5)")] int additionalIterations = 5)
+        [Description("Number of additional iterations to grant (1-100, default 5)")] int additionalIterations = 5, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("extend_goal_iterations", ct) is { } deny_extend_goal_iterations)
+            return deny_extend_goal_iterations;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (additionalIterations > 0 && additionalIterations <= 100, "additionalIterations must be between 1 and 100"));
@@ -259,8 +279,11 @@ public sealed partial class Composer
 
     [Description("Trigger a pre-execution review on a Draft goal. Returns the review verdict, issues, and recommendations.")]
     internal async Task<string> ReviewGoalAsync(
-        [Description("Goal ID to review")] string goal_id)
+        [Description("Goal ID to review")] string goal_id, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("review_goal", ct) is { } deny_review_goal)
+            return deny_review_goal;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(goal_id), "goal_id is required"));
         if (error is not null) return error;
@@ -303,8 +326,14 @@ public sealed partial class Composer
     internal async Task<string> UpdateGoalAsync(
         [Description("Goal ID to update")] string id,
         [Description("Field to update: description, priority, scope, repositories, target_repositories, depends_on, documents, status, or release")] string field,
-        [Description("New value for the field")] string value)
+        [Description("New value for the field")] string value, CancellationToken ct = default)
     {
+        // Field-sensitive enforcement: an unsupported field is refused outright, and a supported one
+        // requires the ExecutionOperator capability. Checked against the field this method ACTUALLY
+        // received, before any read or write, so it cannot be bypassed by a call that skips the hook.
+        if (await UpdateGoalAuthorizationDenialAsync(field, ct) is { } denyUpdateGoal)
+            return denyUpdateGoal;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (!string.IsNullOrWhiteSpace(field), "field is required"),
@@ -1023,8 +1052,11 @@ public sealed partial class Composer
         [Description("Unique release ID (e.g. 'v1.2.0')")] string id,
         [Description("Version tag for the release (e.g. 'v1.2.0')")] string tag,
         [Description("Optional notes or changelog summary")] string? notes = null,
-        [Description("Comma-separated repository names this release applies to")] string? repositories = null)
+        [Description("Comma-separated repository names this release applies to")] string? repositories = null, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("create_release", ct) is { } deny_create_release)
+            return deny_create_release;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (!string.IsNullOrWhiteSpace(tag), "tag is required"));
@@ -1115,8 +1147,11 @@ public sealed partial class Composer
     internal async Task<string> UpdateReleaseAsync(
         [Description("Release ID to update")] string id,
         [Description("Field to update: tag, notes, or repositories")] string field,
-        [Description("New value for the field. For repositories, provide a comma-separated list (or empty to clear)")] string value)
+        [Description("New value for the field. For repositories, provide a comma-separated list (or empty to clear)")] string value, CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("update_release", ct) is { } deny_update_release)
+            return deny_update_release;
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (!string.IsNullOrWhiteSpace(field), "field is required"));

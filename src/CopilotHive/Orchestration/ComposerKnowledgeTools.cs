@@ -22,6 +22,9 @@ public sealed partial class Composer
         [Description("Optional JSON array of link objects: [{\"target\":\"doc-id\",\"type\":\"related\",\"description\":\"why\"}]")] string? links = null,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("create_document", cancellationToken) is { } deny_create_document)
+            return deny_create_document;
+
         if (_knowledgeGraph is null)
             return "❌ Knowledge graph tools are not available — no config repo configured.";
 
@@ -171,6 +174,9 @@ public sealed partial class Composer
         [Description("Append this text to the existing body instead of replacing it (optional)")] string? append_content = null,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("update_document", cancellationToken) is { } deny_update_document)
+            return deny_update_document;
+
         if (_knowledgeGraph is null)
             return "❌ Knowledge graph tools are not available — no config repo configured.";
 
@@ -243,6 +249,9 @@ public sealed partial class Composer
         [Description("Document ID to delete")] string document_id,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("delete_document", cancellationToken) is { } deny_delete_document)
+            return deny_delete_document;
+
         if (_knowledgeGraph is null)
             return "❌ Knowledge graph tools are not available — no config repo configured.";
 
@@ -370,6 +379,9 @@ public sealed partial class Composer
         [Description("Optional description of why this link exists")] string? description = null,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("link_document", cancellationToken) is { } deny_link_document)
+            return deny_link_document;
+
         if (_knowledgeGraph is null)
             return "❌ Knowledge graph tools are not available — no config repo configured.";
 
@@ -425,6 +437,9 @@ public sealed partial class Composer
         [Description("Link type to remove: parent, supersedes, depends_on, implements, related, or references")] string link_type,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("unlink_document", cancellationToken) is { } deny_unlink_document)
+            return deny_unlink_document;
+
         if (_knowledgeGraph is null)
             return "❌ Knowledge graph tools are not available — no config repo configured.";
 

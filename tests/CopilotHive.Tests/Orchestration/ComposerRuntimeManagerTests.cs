@@ -175,6 +175,14 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
         services.AddSingleton<IEventBus>(_bus);
         services.AddSingleton<ComposerEventSubscriber>();
         services.AddSingleton(authEnabled ? HiveAuthMode.AuthenticationEnabled : HiveAuthMode.Open);
+        // The COMPLETE security-primitive set. The per-user runtimes these tests create are identity-bound, and
+        // identity-bound construction now REQUIRES a tool-authorization gate (a partial registration fails
+        // closed), so a provider missing the policy catalog or the resolver could not build a runtime at all.
+        services.AddSingleton<HivePolicy>();
+        services.AddSingleton(sp => new HivePrincipalResolver(
+            sp.GetRequiredService<UserService>(),
+            sp.GetRequiredService<HiveAuthMode>(),
+            NullLogger<HivePrincipalResolver>.Instance));
         services.AddSingleton<LlmSessionRegistry>();
         var provider = services.BuildServiceProvider();
         _providers.Add(provider);

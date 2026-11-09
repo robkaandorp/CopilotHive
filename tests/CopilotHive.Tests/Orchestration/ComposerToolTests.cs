@@ -54,7 +54,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync("add-auth", "Add JWT authentication");
+        var result = await _composer.CreateGoalAsync("add-auth", "Add JWT authentication", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Draft", result);
@@ -70,7 +70,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("fix-bug", "Fix the parser bug", "repo-a, repo-b");
+        await _composer.CreateGoalAsync("fix-bug", "Fix the parser bug", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
 
         var goal = await _store.GetGoalAsync("fix-bug", ct);
         Assert.NotNull(goal);
@@ -86,7 +86,7 @@ public sealed class ComposerToolTests : IDisposable
 
         var result = await _composer.CreateGoalAsync(
             "multi-repo-targets", "Fix across repos", "Repo-A, Repo-B, Repo-C",
-            target_repositories: "repo-b, REPO-A, repo-b");
+            target_repositories: "repo-b, REPO-A, repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: Repo-B,Repo-A", result);
@@ -103,7 +103,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync("all-targets", "All repos", "repo-a, repo-b");
+        var result = await _composer.CreateGoalAsync("all-targets", "All repos", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("target_repositories: all", result);
 
@@ -121,7 +121,7 @@ public sealed class ComposerToolTests : IDisposable
             "invalid-targets",
             "Invalid target repos",
             "repo-a",
-            target_repositories: "repo-x");
+            target_repositories: "repo-x", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not in the goal's repositories", result);
@@ -136,7 +136,7 @@ public sealed class ComposerToolTests : IDisposable
         var result = await _composer.CreateGoalAsync(
             "targets-no-repos",
             "Targets but no repos",
-            target_repositories: "repo-a");
+            target_repositories: "repo-a", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("no repositories", result);
@@ -147,8 +147,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("targets-update", "Test goal", "repo-a, repo-b, repo-c");
-        var result = await _composer.UpdateGoalAsync("targets-update", "target_repositories", "repo-b, repo-c");
+        await _composer.CreateGoalAsync("targets-update", "Test goal", "repo-a, repo-b, repo-c", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("targets-update", "target_repositories", "repo-b, repo-c", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: repo-b,repo-c", result);
@@ -165,8 +165,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("targets-clear", "Clear targets", "repo-a, repo-b", target_repositories: "repo-a");
-        var result = await _composer.UpdateGoalAsync("targets-clear", "target_repositories", "");
+        await _composer.CreateGoalAsync("targets-clear", "Clear targets", "repo-a, repo-b", target_repositories: "repo-a", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("targets-clear", "target_repositories", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: all", result);
@@ -181,8 +181,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("targets-invalid-update", "Invalid update", "repo-a");
-        var result = await _composer.UpdateGoalAsync("targets-invalid-update", "target_repositories", "repo-x");
+        await _composer.CreateGoalAsync("targets-invalid-update", "Invalid update", "repo-a", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("targets-invalid-update", "target_repositories", "repo-x", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not in the goal's repositories", result);
@@ -193,8 +193,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("prune-targets", "Prune targets", "repo-a, repo-b, repo-c", target_repositories: "repo-b, repo-c");
-        var result = await _composer.UpdateGoalAsync("prune-targets", "repositories", "repo-a, repo-b");
+        await _composer.CreateGoalAsync("prune-targets", "Prune targets", "repo-a, repo-b, repo-c", target_repositories: "repo-b, repo-c", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("prune-targets", "repositories", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: repo-b", result);
@@ -210,8 +210,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("prune-all", "Prune all targets", "repo-a, repo-b", target_repositories: "repo-a, repo-b");
-        var result = await _composer.UpdateGoalAsync("prune-all", "repositories", "repo-c");
+        await _composer.CreateGoalAsync("prune-all", "Prune all targets", "repo-a, repo-b", target_repositories: "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("prune-all", "repositories", "repo-c", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: all", result);
@@ -227,8 +227,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("null-targets-stay", "Null targets", "repo-a, repo-b");
-        var result = await _composer.UpdateGoalAsync("null-targets-stay", "repositories", "repo-a, repo-c");
+        await _composer.CreateGoalAsync("null-targets-stay", "Null targets", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("null-targets-stay", "repositories", "repo-a, repo-c", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         // The update_goal(repositories) response must emit target_repositories.
@@ -247,8 +247,8 @@ public sealed class ComposerToolTests : IDisposable
         // Null targets + repos [A,B] → [B]: targets stay null (all repos, just B).
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("null-targets-shrink", "Null targets shrink", "repo-a, repo-b");
-        var result = await _composer.UpdateGoalAsync("null-targets-shrink", "repositories", "repo-b");
+        await _composer.CreateGoalAsync("null-targets-shrink", "Null targets shrink", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("null-targets-shrink", "repositories", "repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         // The update_goal(repositories) response must emit target_repositories.
@@ -268,8 +268,8 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _composer.CreateGoalAsync("explicit-add-repo", "Explicit add repo", "repo-a, repo-b",
-            target_repositories: "repo-a, repo-b");
-        var result = await _composer.UpdateGoalAsync("explicit-add-repo", "repositories", "repo-a, repo-b, repo-c");
+            target_repositories: "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("explicit-add-repo", "repositories", "repo-a, repo-b, repo-c", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: repo-a,repo-b", result);
@@ -289,8 +289,8 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _composer.CreateGoalAsync("prune-single-target", "Prune single target", "repo-a, repo-b",
-            target_repositories: "repo-a");
-        var result = await _composer.UpdateGoalAsync("prune-single-target", "repositories", "repo-b");
+            target_repositories: "repo-a", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("prune-single-target", "repositories", "repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: all", result);
@@ -308,8 +308,8 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _composer.CreateGoalAsync("prune-one-remainder", "Prune one remainder", "repo-a, repo-b",
-            target_repositories: "repo-a, repo-b");
-        var result = await _composer.UpdateGoalAsync("prune-one-remainder", "repositories", "repo-a");
+            target_repositories: "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("prune-one-remainder", "repositories", "repo-a", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("target_repositories: repo-a", result);
@@ -325,13 +325,13 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("targets-nondraft", "Test goal");
+        await _composer.CreateGoalAsync("targets-nondraft", "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("targets-nondraft", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Pending;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("targets-nondraft", "target_repositories", "repo-a");
+        var result = await _composer.UpdateGoalAsync("targets-nondraft", "target_repositories", "repo-a", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit target_repositories", result);
@@ -343,7 +343,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("get-targets", "Show targets", "repo-a, repo-b", target_repositories: "repo-a");
+        await _composer.CreateGoalAsync("get-targets", "Show targets", "repo-a, repo-b", target_repositories: "repo-a", ct: TestContext.Current.CancellationToken);
         var result = await _composer.GetGoalAsync("get-targets");
 
         Assert.Contains("target_repositories: repo-a", result);
@@ -356,7 +356,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _composer.CreateGoalAsync("get-targets-multi", "Show multi targets", "repo-a, repo-b, repo-c",
-            target_repositories: "repo-c, repo-a");
+            target_repositories: "repo-c, repo-a", ct: TestContext.Current.CancellationToken);
         var result = await _composer.GetGoalAsync("get-targets-multi");
 
         Assert.Contains("target_repositories: repo-c,repo-a", result);
@@ -368,7 +368,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("get-targets-all", "Show all targets", "repo-a, repo-b");
+        await _composer.CreateGoalAsync("get-targets-all", "Show all targets", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
         var result = await _composer.GetGoalAsync("get-targets-all");
 
         Assert.Contains("target_repositories: all", result);
@@ -379,7 +379,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("urgent-fix", "Fix critical bug", priority: "High");
+        await _composer.CreateGoalAsync("urgent-fix", "Fix critical bug", priority: "High", ct: TestContext.Current.CancellationToken);
 
         var goal = await _store.GetGoalAsync("urgent-fix", ct);
         Assert.NotNull(goal);
@@ -391,8 +391,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("dup-goal", "First");
-        var result = await _composer.CreateGoalAsync("dup-goal", "Second");
+        await _composer.CreateGoalAsync("dup-goal", "First", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.CreateGoalAsync("dup-goal", "Second", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("already exists", result);
@@ -403,7 +403,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync("Invalid ID!", "Description");
+        var result = await _composer.CreateGoalAsync("Invalid ID!", "Description", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("kebab-case", result);
@@ -414,7 +414,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync("my-goal", "");
+        var result = await _composer.CreateGoalAsync("my-goal", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("description is required", result);
@@ -425,7 +425,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("scoped-goal", "Add new capability", scope: "Feature");
+        await _composer.CreateGoalAsync("scoped-goal", "Add new capability", scope: "Feature", ct: TestContext.Current.CancellationToken);
 
         var goal = await _store.GetGoalAsync("scoped-goal", ct);
         Assert.NotNull(goal);
@@ -435,7 +435,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task CreateGoal_WithBreakingScope_IncludesScopeInResponse()
     {
-        var result = await _composer.CreateGoalAsync("breaking-goal", "Breaking change", scope: "Breaking");
+        var result = await _composer.CreateGoalAsync("breaking-goal", "Breaking change", scope: "Breaking", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Breaking", result);
@@ -447,7 +447,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("default-scope-goal", "Patch something");
+        await _composer.CreateGoalAsync("default-scope-goal", "Patch something", ct: TestContext.Current.CancellationToken);
 
         var goal = await _store.GetGoalAsync("default-scope-goal", ct);
         Assert.NotNull(goal);
@@ -461,8 +461,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("to-approve", "A draft goal");
-        var result = await _composer.ApproveGoalAsync("to-approve");
+        await _composer.CreateGoalAsync("to-approve", "A draft goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.ApproveGoalAsync("to-approve", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Pending", result);
@@ -479,7 +479,7 @@ public sealed class ComposerToolTests : IDisposable
         var goal = new Goal { Id = "pending-goal", Description = "Already pending", Status = GoalStatus.Pending };
         await _store.CreateGoalAsync(goal, ct);
 
-        var result = await _composer.ApproveGoalAsync("pending-goal");
+        var result = await _composer.ApproveGoalAsync("pending-goal", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not Draft", result);
@@ -490,7 +490,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.ApproveGoalAsync("does-not-exist");
+        var result = await _composer.ApproveGoalAsync("does-not-exist", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
@@ -503,8 +503,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("update-me", "Test goal");
-        var result = await _composer.UpdateGoalAsync("update-me", "status", "Pending");
+        await _composer.CreateGoalAsync("update-me", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("update-me", "status", "Pending", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("update-me", ct);
@@ -516,8 +516,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("update-me2", "Test goal");
-        var result = await _composer.UpdateGoalAsync("update-me2", "description", "New desc");
+        await _composer.CreateGoalAsync("update-me2", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("update-me2", "description", "New desc", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("update-me2", ct);
@@ -529,8 +529,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("update-me3", "Test goal");
-        var result = await _composer.UpdateGoalAsync("update-me3", "color", "blue");
+        await _composer.CreateGoalAsync("update-me3", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("update-me3", "color", "blue", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Unknown field", result);
@@ -540,8 +540,8 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_InvalidTransition_DraftToCompleted_ReturnsError()
     {
         // Goal starts in Draft; transitioning to Completed is blocked by the valid-values guard
-        await _composer.CreateGoalAsync("transition-invalid1", "Test goal");
-        var result = await _composer.UpdateGoalAsync("transition-invalid1", "status", "Completed");
+        await _composer.CreateGoalAsync("transition-invalid1", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("transition-invalid1", "status", "Completed", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Can only set status to Draft or Pending", result);
@@ -551,9 +551,9 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_InvalidTransition_PendingToCompleted_ReturnsError()
     {
         // Pending→Completed is blocked by the valid-values guard
-        await _composer.CreateGoalAsync("transition-invalid2", "Test goal");
-        await _composer.UpdateGoalAsync("transition-invalid2", "status", "Pending");
-        var result = await _composer.UpdateGoalAsync("transition-invalid2", "status", "Completed");
+        await _composer.CreateGoalAsync("transition-invalid2", "Test goal", ct: TestContext.Current.CancellationToken);
+        await _composer.UpdateGoalAsync("transition-invalid2", "status", "Pending", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("transition-invalid2", "status", "Completed", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Can only set status to Draft or Pending", result);
@@ -563,8 +563,8 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_InvalidTransition_DraftToDraft_ReturnsError()
     {
         // Draft→Draft is not a valid transition
-        await _composer.CreateGoalAsync("transition-invalid3", "Test goal");
-        var result = await _composer.UpdateGoalAsync("transition-invalid3", "status", "Draft");
+        await _composer.CreateGoalAsync("transition-invalid3", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("transition-invalid3", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid transition", result);
@@ -574,9 +574,9 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_InvalidTransition_PendingToPending_ReturnsError()
     {
         // Pending→Pending is not a valid transition
-        await _composer.CreateGoalAsync("transition-invalid4", "Test goal");
-        await _composer.UpdateGoalAsync("transition-invalid4", "status", "Pending"); // Draft→Pending
-        var result = await _composer.UpdateGoalAsync("transition-invalid4", "status", "Pending");
+        await _composer.CreateGoalAsync("transition-invalid4", "Test goal", ct: TestContext.Current.CancellationToken);
+        await _composer.UpdateGoalAsync("transition-invalid4", "status", "Pending", ct: TestContext.Current.CancellationToken); // Draft→Pending
+        var result = await _composer.UpdateGoalAsync("transition-invalid4", "status", "Pending", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid transition", result);
@@ -586,9 +586,9 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_ValidTransition_PendingToDraft_ReturnsSuccess()
     {
         // Draft→Pending→Draft is a valid round-trip
-        await _composer.CreateGoalAsync("transition-valid1", "Test goal");
-        await _composer.UpdateGoalAsync("transition-valid1", "status", "Pending");
-        var result = await _composer.UpdateGoalAsync("transition-valid1", "status", "Draft");
+        await _composer.CreateGoalAsync("transition-valid1", "Test goal", ct: TestContext.Current.CancellationToken);
+        await _composer.UpdateGoalAsync("transition-valid1", "status", "Pending", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("transition-valid1", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
     }
@@ -597,14 +597,14 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_InvalidTransition_InProgressToDraft_ReturnsError()
     {
         // Set goal to InProgress directly then try to update to Draft
-        await _composer.CreateGoalAsync("transition-inprogress1", "Test goal");
+        await _composer.CreateGoalAsync("transition-inprogress1", "Test goal", ct: TestContext.Current.CancellationToken);
         var ct = TestContext.Current.CancellationToken;
         var goal = await _store.GetGoalAsync("transition-inprogress1", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.InProgress;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("transition-inprogress1", "status", "Draft");
+        var result = await _composer.UpdateGoalAsync("transition-inprogress1", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid transition", result);
@@ -614,14 +614,14 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_InvalidTransition_CompletedToDraft_ReturnsError()
     {
         // Set goal to Completed directly then try to update to Draft
-        await _composer.CreateGoalAsync("transition-completed1", "Test goal");
+        await _composer.CreateGoalAsync("transition-completed1", "Test goal", ct: TestContext.Current.CancellationToken);
         var ct = TestContext.Current.CancellationToken;
         var goal = await _store.GetGoalAsync("transition-completed1", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Completed;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("transition-completed1", "status", "Draft");
+        var result = await _composer.UpdateGoalAsync("transition-completed1", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid transition", result);
@@ -631,14 +631,14 @@ public sealed class ComposerToolTests : IDisposable
     public async Task UpdateGoal_Status_ValidTransition_FailedToDraft_Succeeds()
     {
         // Failed→Draft is now a valid "retry" transition
-        await _composer.CreateGoalAsync("transition-failed1", "Test goal");
+        await _composer.CreateGoalAsync("transition-failed1", "Test goal", ct: TestContext.Current.CancellationToken);
         var ct = TestContext.Current.CancellationToken;
         var goal = await _store.GetGoalAsync("transition-failed1", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Failed;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("transition-failed1", "status", "Draft");
+        var result = await _composer.UpdateGoalAsync("transition-failed1", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Draft", result);
@@ -650,7 +650,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a goal with repositories and set it to Failed with iteration data
-        await _composer.CreateGoalAsync("retry-reset-iter", "Test goal", repositories: "repo-a, repo-b");
+        await _composer.CreateGoalAsync("retry-reset-iter", "Test goal", repositories: "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("retry-reset-iter", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Failed;
@@ -662,7 +662,7 @@ public sealed class ComposerToolTests : IDisposable
         await _store.UpdateGoalAsync(goal, ct);
 
         // Transition Failed → Draft
-        var result = await _composer.UpdateGoalAsync("retry-reset-iter", "status", "Draft");
+        var result = await _composer.UpdateGoalAsync("retry-reset-iter", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Draft", result);
@@ -684,7 +684,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a goal with repositories
-        await _composer.CreateGoalAsync("retry-branch-cleanup", "Test goal", repositories: "repo-x, repo-y");
+        await _composer.CreateGoalAsync("retry-branch-cleanup", "Test goal", repositories: "repo-x, repo-y", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("retry-branch-cleanup", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Failed;
@@ -706,7 +706,7 @@ public sealed class ComposerToolTests : IDisposable
             repoManager: mockRepoManager.Object,
             stateDir: Path.GetTempPath());
 
-        var result = await composer.UpdateGoalAsync("retry-branch-cleanup", "status", "Draft");
+        var result = await composer.UpdateGoalAsync("retry-branch-cleanup", "status", "Draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Draft", result);
@@ -723,10 +723,10 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("release-goal-set", "Goal to assign to a release");
+        await _composer.CreateGoalAsync("release-goal-set", "Goal to assign to a release", ct: TestContext.Current.CancellationToken);
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
 
-        var result = await _composer.UpdateGoalAsync("release-goal-set", "release", "v1.0.0");
+        var result = await _composer.UpdateGoalAsync("release-goal-set", "release", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("v1.0.0", result);
@@ -742,13 +742,13 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
-        await _composer.CreateGoalAsync("release-goal-clear-none", "Goal to clear release via none");
+        await _composer.CreateGoalAsync("release-goal-clear-none", "Goal to clear release via none", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("release-goal-clear-none", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "v1.0.0";
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("release-goal-clear-none", "release", "none");
+        var result = await _composer.UpdateGoalAsync("release-goal-clear-none", "release", "none", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("cleared", result);
@@ -763,13 +763,13 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
-        await _composer.CreateGoalAsync("release-goal-clear-empty", "Goal to clear release via empty string");
+        await _composer.CreateGoalAsync("release-goal-clear-empty", "Goal to clear release via empty string", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("release-goal-clear-empty", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "v1.0.0";
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("release-goal-clear-empty", "release", "");
+        var result = await _composer.UpdateGoalAsync("release-goal-clear-empty", "release", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("cleared", result);
@@ -783,9 +783,9 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("release-goal-invalid", "Goal with invalid release");
+        await _composer.CreateGoalAsync("release-goal-invalid", "Goal with invalid release", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateGoalAsync("release-goal-invalid", "release", "nonexistent-release");
+        var result = await _composer.UpdateGoalAsync("release-goal-invalid", "release", "nonexistent-release", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
@@ -802,8 +802,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("priority-draft", "Test goal");
-        var result = await _composer.UpdateGoalAsync("priority-draft", "priority", "High");
+        await _composer.CreateGoalAsync("priority-draft", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("priority-draft", "priority", "High", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("priority-draft", ct);
@@ -813,8 +813,8 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateGoal_Priority_InvalidValue_ReturnsError()
     {
-        await _composer.CreateGoalAsync("priority-invalid", "Test goal");
-        var result = await _composer.UpdateGoalAsync("priority-invalid", "priority", "SuperHigh");
+        await _composer.CreateGoalAsync("priority-invalid", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("priority-invalid", "priority", "SuperHigh", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid priority", result);
@@ -826,8 +826,8 @@ public sealed class ComposerToolTests : IDisposable
     [InlineData("999")]
     public async Task UpdateGoal_Priority_NumericString_ReturnsError(string numericValue)
     {
-        await _composer.CreateGoalAsync($"priority-numeric-{numericValue}", "Test goal");
-        var result = await _composer.UpdateGoalAsync($"priority-numeric-{numericValue}", "priority", numericValue);
+        await _composer.CreateGoalAsync($"priority-numeric-{numericValue}", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync($"priority-numeric-{numericValue}", "priority", numericValue, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid priority", result);
@@ -838,8 +838,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("repos-draft", "Test goal");
-        var result = await _composer.UpdateGoalAsync("repos-draft", "repositories", "repo-a, repo-b");
+        await _composer.CreateGoalAsync("repos-draft", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("repos-draft", "repositories", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("repos-draft", ct);
@@ -853,8 +853,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("scope-draft", "Test goal");
-        var result = await _composer.UpdateGoalAsync("scope-draft", "scope", "Feature");
+        await _composer.CreateGoalAsync("scope-draft", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("scope-draft", "scope", "Feature", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("scope-draft", ct);
@@ -864,8 +864,8 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateGoal_Scope_InvalidValue_ReturnsError()
     {
-        await _composer.CreateGoalAsync("scope-invalid", "Test goal");
-        var result = await _composer.UpdateGoalAsync("scope-invalid", "scope", "Enormous");
+        await _composer.CreateGoalAsync("scope-invalid", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("scope-invalid", "scope", "Enormous", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid scope", result);
@@ -877,8 +877,8 @@ public sealed class ComposerToolTests : IDisposable
     [InlineData("999")]
     public async Task UpdateGoal_Scope_NumericString_ReturnsError(string numericValue)
     {
-        await _composer.CreateGoalAsync($"scope-numeric-{numericValue}", "Test goal");
-        var result = await _composer.UpdateGoalAsync($"scope-numeric-{numericValue}", "scope", numericValue);
+        await _composer.CreateGoalAsync($"scope-numeric-{numericValue}", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync($"scope-numeric-{numericValue}", "scope", numericValue, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid scope", result);
@@ -889,8 +889,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("depends-draft", "Test goal");
-        var result = await _composer.UpdateGoalAsync("depends-draft", "depends_on", "goal-a, goal-b");
+        await _composer.CreateGoalAsync("depends-draft", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("depends-draft", "depends_on", "goal-a, goal-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("depends-draft", ct);
@@ -904,8 +904,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("depends-clear", "Test goal", depends_on: "goal-x");
-        var result = await _composer.UpdateGoalAsync("depends-clear", "depends_on", "");
+        await _composer.CreateGoalAsync("depends-clear", "Test goal", depends_on: "goal-x", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("depends-clear", "depends_on", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("depends-clear", ct);
@@ -917,8 +917,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("docs-draft", "Test goal");
-        var result = await _composer.UpdateGoalAsync("docs-draft", "documents", "doc-1, doc-2");
+        await _composer.CreateGoalAsync("docs-draft", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("docs-draft", "documents", "doc-1, doc-2", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("docs-draft", ct);
@@ -932,8 +932,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("docs-clear", "Test goal", documents: "doc-x");
-        var result = await _composer.UpdateGoalAsync("docs-clear", "documents", "");
+        await _composer.CreateGoalAsync("docs-clear", "Test goal", documents: "doc-x", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("docs-clear", "documents", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync("docs-clear", ct);
@@ -953,12 +953,12 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"desc-nondraft-{statusName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Original desc");
+        await _composer.CreateGoalAsync(goalId, "Original desc", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync(goalId, ct);
         goal!.Status = Enum.Parse<GoalStatus>(statusName);
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync(goalId, "description", "New desc");
+        var result = await _composer.UpdateGoalAsync(goalId, "description", "New desc", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit description", result);
@@ -977,12 +977,12 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"prio-nondraft-{statusName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Test goal");
+        await _composer.CreateGoalAsync(goalId, "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync(goalId, ct);
         goal!.Status = Enum.Parse<GoalStatus>(statusName);
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync(goalId, "priority", "High");
+        var result = await _composer.UpdateGoalAsync(goalId, "priority", "High", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit priority", result);
@@ -1001,12 +1001,12 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"scope-nondraft-{statusName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Test goal");
+        await _composer.CreateGoalAsync(goalId, "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync(goalId, ct);
         goal!.Status = Enum.Parse<GoalStatus>(statusName);
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync(goalId, "scope", "Feature");
+        var result = await _composer.UpdateGoalAsync(goalId, "scope", "Feature", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit scope", result);
@@ -1025,12 +1025,12 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"repos-nondraft-{statusName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Test goal");
+        await _composer.CreateGoalAsync(goalId, "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync(goalId, ct);
         goal!.Status = Enum.Parse<GoalStatus>(statusName);
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync(goalId, "repositories", "repo-a");
+        var result = await _composer.UpdateGoalAsync(goalId, "repositories", "repo-a", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit repositories", result);
@@ -1049,12 +1049,12 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"deps-nondraft-{statusName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Test goal");
+        await _composer.CreateGoalAsync(goalId, "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync(goalId, ct);
         goal!.Status = Enum.Parse<GoalStatus>(statusName);
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync(goalId, "depends_on", "other-goal");
+        var result = await _composer.UpdateGoalAsync(goalId, "depends_on", "other-goal", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit depends_on", result);
@@ -1073,12 +1073,12 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"docs-nondraft-{statusName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Test goal");
+        await _composer.CreateGoalAsync(goalId, "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync(goalId, ct);
         goal!.Status = Enum.Parse<GoalStatus>(statusName);
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync(goalId, "documents", "doc-1");
+        var result = await _composer.UpdateGoalAsync(goalId, "documents", "doc-1", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Cannot edit documents", result);
@@ -1089,8 +1089,8 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateGoal_Metadata_NotValidField_ReturnsUnknownFieldError()
     {
-        await _composer.CreateGoalAsync("metadata-goal", "Test goal");
-        var result = await _composer.UpdateGoalAsync("metadata-goal", "metadata", "key=value");
+        await _composer.CreateGoalAsync("metadata-goal", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("metadata-goal", "metadata", "key=value", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Unknown field", result);
@@ -1099,8 +1099,8 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateGoal_Id_NotValidField_ReturnsUnknownFieldError()
     {
-        await _composer.CreateGoalAsync("id-goal", "Test goal");
-        var result = await _composer.UpdateGoalAsync("id-goal", "id", "new-id");
+        await _composer.CreateGoalAsync("id-goal", "Test goal", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.UpdateGoalAsync("id-goal", "id", "new-id", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Unknown field", result);
@@ -1113,7 +1113,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("detail-goal", "A detailed goal description");
+        await _composer.CreateGoalAsync("detail-goal", "A detailed goal description", ct: TestContext.Current.CancellationToken);
         var result = await _composer.GetGoalAsync("detail-goal");
 
         Assert.Contains("detail-goal", result);
@@ -1136,7 +1136,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("review-goal", "A goal with review status");
+        await _composer.CreateGoalAsync("review-goal", "A goal with review status", ct: TestContext.Current.CancellationToken);
         // Set the review status via the store directly
         var goal = await _store.GetGoalAsync("review-goal", ct);
         Assert.NotNull(goal);
@@ -1158,10 +1158,10 @@ public sealed class ComposerToolTests : IDisposable
 
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("goal-a", "First goal");
-        await _composer.CreateGoalAsync("goal-b", "Second goal");
+        await _composer.CreateGoalAsync("goal-a", "First goal", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("goal-b", "Second goal", ct: TestContext.Current.CancellationToken);
 
-        await _composer.CreateGoalAsync("released-goal", "In a released release");
+        await _composer.CreateGoalAsync("released-goal", "In a released release", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1180,7 +1180,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("draft-1", "Draft goal");
+        await _composer.CreateGoalAsync("draft-1", "Draft goal", ct: TestContext.Current.CancellationToken);
         var pendingGoal = new Goal { Id = "pending-1", Description = "Pending goal", Status = GoalStatus.Pending };
         await _store.CreateGoalAsync(pendingGoal, ct);
 
@@ -1211,7 +1211,7 @@ public sealed class ComposerToolTests : IDisposable
         var goal = new Goal { Id = "heading-goal", Description = "## My Goal Title\nSome details here", Status = GoalStatus.Draft };
         await _store.CreateGoalAsync(goal, ct);
 
-        await _composer.CreateGoalAsync("released-goal", "In a released release");
+        await _composer.CreateGoalAsync("released-goal", "In a released release", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1235,7 +1235,7 @@ public sealed class ComposerToolTests : IDisposable
         var goal = new Goal { Id = "newline-goal", Description = "First line\nSecond line", Status = GoalStatus.Draft };
         await _store.CreateGoalAsync(goal, ct);
 
-        await _composer.CreateGoalAsync("released-goal", "In a released release");
+        await _composer.CreateGoalAsync("released-goal", "In a released release", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1253,7 +1253,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("unassigned-goal", "Not assigned to a release");
+        await _composer.CreateGoalAsync("unassigned-goal", "Not assigned to a release", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.ListGoalsAsync(release: "unreleased");
 
@@ -1267,7 +1267,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Released }, ct);
-        await _composer.CreateGoalAsync("released-goal", "In a released release");
+        await _composer.CreateGoalAsync("released-goal", "In a released release", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "v1.0.0";
@@ -1285,7 +1285,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
-        await _composer.CreateGoalAsync("planning-goal", "In a planning release");
+        await _composer.CreateGoalAsync("planning-goal", "In a planning release", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("planning-goal", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "v1.0.0";
@@ -1302,7 +1302,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("unknown-release-goal", "Unknown release");
+        await _composer.CreateGoalAsync("unknown-release-goal", "Unknown release", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("unknown-release-goal", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "no-such-release";
@@ -1326,9 +1326,9 @@ public sealed class ComposerToolTests : IDisposable
 
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("variant-goal", "Variant goal");
+        await _composer.CreateGoalAsync("variant-goal", "Variant goal", ct: TestContext.Current.CancellationToken);
 
-        await _composer.CreateGoalAsync("released-goal", "In a released release");
+        await _composer.CreateGoalAsync("released-goal", "In a released release", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1351,21 +1351,21 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Released }, ct);
         await _store.CreateReleaseAsync(new Release { Id = "v2.0.0", Tag = "v2.0.0", Status = ReleaseStatus.Planning }, ct);
 
-        await _composer.CreateGoalAsync("unassigned-goal", "No release");
+        await _composer.CreateGoalAsync("unassigned-goal", "No release", ct: TestContext.Current.CancellationToken);
 
-        await _composer.CreateGoalAsync("released-goal", "Released release");
+        await _composer.CreateGoalAsync("released-goal", "Released release", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "v1.0.0";
         await _store.UpdateGoalAsync(releasedGoal, ct);
 
-        await _composer.CreateGoalAsync("planning-goal", "Planning release");
+        await _composer.CreateGoalAsync("planning-goal", "Planning release", ct: TestContext.Current.CancellationToken);
         var planningGoal = await _store.GetGoalAsync("planning-goal", ct);
         Assert.NotNull(planningGoal);
         planningGoal!.ReleaseId = "v2.0.0";
         await _store.UpdateGoalAsync(planningGoal, ct);
 
-        await _composer.CreateGoalAsync("unknown-release-goal", "Unknown release");
+        await _composer.CreateGoalAsync("unknown-release-goal", "Unknown release", ct: TestContext.Current.CancellationToken);
         var unknownGoal = await _store.GetGoalAsync("unknown-release-goal", ct);
         Assert.NotNull(unknownGoal);
         unknownGoal!.ReleaseId = "no-such-release";
@@ -1388,19 +1388,19 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-alpha1", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-alpha2", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
 
-        await _composer.CreateGoalAsync("alpha1-goal", "First alpha goal");
+        await _composer.CreateGoalAsync("alpha1-goal", "First alpha goal", ct: TestContext.Current.CancellationToken);
         var g1 = await _store.GetGoalAsync("alpha1-goal", ct);
         Assert.NotNull(g1);
         g1!.ReleaseId = "v1.0.0-alpha1";
         await _store.UpdateGoalAsync(g1, ct);
 
-        await _composer.CreateGoalAsync("alpha2-goal", "Second alpha goal");
+        await _composer.CreateGoalAsync("alpha2-goal", "Second alpha goal", ct: TestContext.Current.CancellationToken);
         var g2 = await _store.GetGoalAsync("alpha2-goal", ct);
         Assert.NotNull(g2);
         g2!.ReleaseId = "v1.0.0-alpha2";
         await _store.UpdateGoalAsync(g2, ct);
 
-        await _composer.CreateGoalAsync("unassigned-goal", "Unassigned");
+        await _composer.CreateGoalAsync("unassigned-goal", "Unassigned", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.ListGoalsAsync(release: "v1.0.0-alpha1");
 
@@ -1418,13 +1418,13 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-alpha1", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-shipped", Tag = "v1.0.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("alpha-goal", "Alpha goal");
+        await _composer.CreateGoalAsync("alpha-goal", "Alpha goal", ct: TestContext.Current.CancellationToken);
         var g1 = await _store.GetGoalAsync("alpha-goal", ct);
         Assert.NotNull(g1);
         g1!.ReleaseId = "v1.0.0-alpha1";
         await _store.UpdateGoalAsync(g1, ct);
 
-        await _composer.CreateGoalAsync("shipped-goal", "Shipped goal");
+        await _composer.CreateGoalAsync("shipped-goal", "Shipped goal", ct: TestContext.Current.CancellationToken);
         var g2 = await _store.GetGoalAsync("shipped-goal", ct);
         Assert.NotNull(g2);
         g2!.ReleaseId = "v1.0.0-shipped";
@@ -1442,13 +1442,13 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("unknown-rel-goal", "Goal with unknown release");
+        await _composer.CreateGoalAsync("unknown-rel-goal", "Goal with unknown release", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("unknown-rel-goal", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "unknown-rel";
         await _store.UpdateGoalAsync(goal, ct);
 
-        await _composer.CreateGoalAsync("other-goal", "Other goal");
+        await _composer.CreateGoalAsync("other-goal", "Other goal", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.ListGoalsAsync(release: "unknown-rel");
 
@@ -1464,20 +1464,20 @@ public sealed class ComposerToolTests : IDisposable
 
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
 
-        await _composer.CreateGoalAsync("draft-in-release", "Draft in release");
+        await _composer.CreateGoalAsync("draft-in-release", "Draft in release", ct: TestContext.Current.CancellationToken);
         var draftInRelease = await _store.GetGoalAsync("draft-in-release", ct);
         Assert.NotNull(draftInRelease);
         draftInRelease!.ReleaseId = "v1.0.0";
         await _store.UpdateGoalAsync(draftInRelease, ct);
 
-        await _composer.CreateGoalAsync("pending-in-release", "Pending in release");
+        await _composer.CreateGoalAsync("pending-in-release", "Pending in release", ct: TestContext.Current.CancellationToken);
         var pendingInRelease = await _store.GetGoalAsync("pending-in-release", ct);
         Assert.NotNull(pendingInRelease);
         pendingInRelease!.Status = GoalStatus.Pending;
         pendingInRelease!.ReleaseId = "v1.0.0";
         await _store.UpdateGoalAsync(pendingInRelease, ct);
 
-        await _composer.CreateGoalAsync("draft-unassigned", "Draft unassigned");
+        await _composer.CreateGoalAsync("draft-unassigned", "Draft unassigned", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.ListGoalsAsync(status: "Draft", release: "v1.0.0");
 
@@ -1531,8 +1531,8 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("auth-goal", "Implement JWT authentication for the API");
-        await _composer.CreateGoalAsync("ui-goal", "Add dark mode toggle to settings page");
+        await _composer.CreateGoalAsync("auth-goal", "Implement JWT authentication for the API", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("ui-goal", "Add dark mode toggle to settings page", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.SearchGoalsAsync("JWT");
 
@@ -1566,8 +1566,8 @@ public sealed class ComposerToolTests : IDisposable
         // Seed a Released release so a goal in it WOULD be filtered out by "unreleased".
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("search-free", "Shared keyword for matching");
-        await _composer.CreateGoalAsync("search-released", "Shared keyword for matching in released");
+        await _composer.CreateGoalAsync("search-free", "Shared keyword for matching", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("search-released", "Shared keyword for matching in released", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("search-released", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1597,8 +1597,8 @@ public sealed class ComposerToolTests : IDisposable
 
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("search-free", "Shared keyword for matching");
-        await _composer.CreateGoalAsync("search-released", "Shared keyword for matching in released");
+        await _composer.CreateGoalAsync("search-free", "Shared keyword for matching", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("search-released", "Shared keyword for matching in released", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("search-released", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1631,14 +1631,14 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
         await _store.CreateReleaseAsync(new Release { Id = "rel-planning", Tag = "v2.0", Status = ReleaseStatus.Planning }, ct);
 
-        await _composer.CreateGoalAsync("null-release-goal", "Shared keyword alpha");
-        await _composer.CreateGoalAsync("released-goal", "Shared keyword alpha released");
+        await _composer.CreateGoalAsync("null-release-goal", "Shared keyword alpha", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("released-goal", "Shared keyword alpha released", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
         await _store.UpdateGoalAsync(releasedGoal, ct);
 
-        await _composer.CreateGoalAsync("planning-goal", "Shared keyword alpha planning");
+        await _composer.CreateGoalAsync("planning-goal", "Shared keyword alpha planning", ct: TestContext.Current.CancellationToken);
         var planningGoal = await _store.GetGoalAsync("planning-goal", ct);
         Assert.NotNull(planningGoal);
         planningGoal!.ReleaseId = "rel-planning";
@@ -1661,13 +1661,13 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-alpha1", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
         await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-shipped", Tag = "v1.0.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("alpha-goal", "Shared keyword beta");
+        await _composer.CreateGoalAsync("alpha-goal", "Shared keyword beta", ct: TestContext.Current.CancellationToken);
         var alphaGoal = await _store.GetGoalAsync("alpha-goal", ct);
         Assert.NotNull(alphaGoal);
         alphaGoal!.ReleaseId = "v1.0.0-alpha1";
         await _store.UpdateGoalAsync(alphaGoal, ct);
 
-        await _composer.CreateGoalAsync("shipped-goal", "Shared keyword beta shipped");
+        await _composer.CreateGoalAsync("shipped-goal", "Shared keyword beta shipped", ct: TestContext.Current.CancellationToken);
         var shippedGoal = await _store.GetGoalAsync("shipped-goal", ct);
         Assert.NotNull(shippedGoal);
         shippedGoal!.ReleaseId = "v1.0.0-shipped";
@@ -1687,13 +1687,13 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Goal with ReleaseId pointing to an ID that does NOT match any created release.
-        await _composer.CreateGoalAsync("unknown-rel-goal", "Shared keyword gamma");
+        await _composer.CreateGoalAsync("unknown-rel-goal", "Shared keyword gamma", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("unknown-rel-goal", ct);
         Assert.NotNull(goal);
         goal!.ReleaseId = "no-such-release";
         await _store.UpdateGoalAsync(goal, ct);
 
-        await _composer.CreateGoalAsync("other-goal", "Shared keyword gamma other");
+        await _composer.CreateGoalAsync("other-goal", "Shared keyword gamma other", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.SearchGoalsAsync("gamma", release: "no-such-release");
 
@@ -1720,14 +1720,14 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
         await _store.CreateReleaseAsync(new Release { Id = "rel-planning", Tag = "v2.0", Status = ReleaseStatus.Planning }, ct);
 
-        await _composer.CreateGoalAsync("null-release-goal", "Shared keyword delta");
-        await _composer.CreateGoalAsync("released-goal", "Shared keyword delta released");
+        await _composer.CreateGoalAsync("null-release-goal", "Shared keyword delta", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("released-goal", "Shared keyword delta released", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
         await _store.UpdateGoalAsync(releasedGoal, ct);
 
-        await _composer.CreateGoalAsync("planning-goal", "Shared keyword delta planning");
+        await _composer.CreateGoalAsync("planning-goal", "Shared keyword delta planning", ct: TestContext.Current.CancellationToken);
         var planningGoal = await _store.GetGoalAsync("planning-goal", ct);
         Assert.NotNull(planningGoal);
         planningGoal!.ReleaseId = "rel-planning";
@@ -1749,8 +1749,8 @@ public sealed class ComposerToolTests : IDisposable
 
         await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
 
-        await _composer.CreateGoalAsync("draft-free", "Shared keyword phi");
-        await _composer.CreateGoalAsync("draft-released", "Shared keyword phi released");
+        await _composer.CreateGoalAsync("draft-free", "Shared keyword phi", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateGoalAsync("draft-released", "Shared keyword phi released", ct: TestContext.Current.CancellationToken);
         var releasedGoal = await _store.GetGoalAsync("draft-released", ct);
         Assert.NotNull(releasedGoal);
         releasedGoal!.ReleaseId = "rel-released";
@@ -1782,17 +1782,17 @@ public sealed class ComposerToolTests : IDisposable
         await _store.CreateReleaseAsync(new Release { Id = "rel-planning", Tag = "v2.0", Status = ReleaseStatus.Planning }, ct);
 
         // Draft goal with null ReleaseId — matches status=Draft AND unreleased.
-        await _composer.CreateGoalAsync("draft-free", "Shared keyword epsilon");
+        await _composer.CreateGoalAsync("draft-free", "Shared keyword epsilon", ct: TestContext.Current.CancellationToken);
 
         // Pending goal with null ReleaseId — matches unreleased but NOT status=Draft.
-        await _composer.CreateGoalAsync("pending-free", "Shared keyword epsilon pending");
+        await _composer.CreateGoalAsync("pending-free", "Shared keyword epsilon pending", ct: TestContext.Current.CancellationToken);
         var pendingGoal = await _store.GetGoalAsync("pending-free", ct);
         Assert.NotNull(pendingGoal);
         pendingGoal!.Status = GoalStatus.Pending;
         await _store.UpdateGoalAsync(pendingGoal, ct);
 
         // Draft goal in a Planning release — matches status=Draft AND unreleased (Planning is unreleased).
-        await _composer.CreateGoalAsync("draft-in-planning", "Shared keyword epsilon planning");
+        await _composer.CreateGoalAsync("draft-in-planning", "Shared keyword epsilon planning", ct: TestContext.Current.CancellationToken);
         var draftInPlanning = await _store.GetGoalAsync("draft-in-planning", ct);
         Assert.NotNull(draftInPlanning);
         draftInPlanning!.ReleaseId = "rel-planning";
@@ -1848,7 +1848,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync(id, "Test");
+        var result = await _composer.CreateGoalAsync(id, "Test", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
     }
@@ -1863,7 +1863,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync(id, "Test");
+        var result = await _composer.CreateGoalAsync(id, "Test", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
     }
@@ -1874,9 +1874,9 @@ public sealed class ComposerToolTests : IDisposable
     public async Task DeleteGoal_DraftGoal_Deletes()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateGoalAsync("del-draft", "To be deleted");
+        await _composer.CreateGoalAsync("del-draft", "To be deleted", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.DeleteGoalAsync("del-draft");
+        var result = await _composer.DeleteGoalAsync("del-draft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("deleted", result);
@@ -1888,12 +1888,12 @@ public sealed class ComposerToolTests : IDisposable
     public async Task DeleteGoal_FailedGoal_Deletes()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateGoalAsync("del-failed", "Will fail");
+        await _composer.CreateGoalAsync("del-failed", "Will fail", ct: TestContext.Current.CancellationToken);
         var goal = (await _store.GetGoalAsync("del-failed", ct))!;
         goal.Status = GoalStatus.Failed;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.DeleteGoalAsync("del-failed");
+        var result = await _composer.DeleteGoalAsync("del-failed", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
     }
@@ -1902,10 +1902,10 @@ public sealed class ComposerToolTests : IDisposable
     public async Task DeleteGoal_PendingGoal_Rejected()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateGoalAsync("del-pending", "Active goal");
-        await _composer.ApproveGoalAsync("del-pending");
+        await _composer.CreateGoalAsync("del-pending", "Active goal", ct: TestContext.Current.CancellationToken);
+        await _composer.ApproveGoalAsync("del-pending", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.DeleteGoalAsync("del-pending");
+        var result = await _composer.DeleteGoalAsync("del-pending", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Pending", result);
@@ -1918,7 +1918,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync("dep-goal", "Goal with deps", depends_on: "goal-a, goal-b");
+        var result = await _composer.CreateGoalAsync("dep-goal", "Goal with deps", depends_on: "goal-a, goal-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("Dependencies: goal-a, goal-b", result);
@@ -1935,7 +1935,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("no-dep-goal", "Goal without deps");
+        await _composer.CreateGoalAsync("no-dep-goal", "Goal without deps", ct: TestContext.Current.CancellationToken);
 
         var goal = await _store.GetGoalAsync("no-dep-goal", ct);
         Assert.NotNull(goal);
@@ -1945,7 +1945,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task DeleteGoal_NotFound_ReturnsError()
     {
-        var result = await _composer.DeleteGoalAsync("nonexistent");
+        var result = await _composer.DeleteGoalAsync("nonexistent", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
@@ -1957,7 +1957,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a failed goal with two repositories
-        await _composer.CreateGoalAsync("failed-goal-branches", "Will fail", repositories: "repo-a, repo-b");
+        await _composer.CreateGoalAsync("failed-goal-branches", "Will fail", repositories: "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
         var goal = (await _store.GetGoalAsync("failed-goal-branches", ct))!;
         goal.Status = GoalStatus.Failed;
         await _store.UpdateGoalAsync(goal, ct);
@@ -1978,7 +1978,7 @@ public sealed class ComposerToolTests : IDisposable
             repoManager: mockRepoManager.Object,
             stateDir: Path.GetTempPath());
 
-        var result = await composer.DeleteGoalAsync("failed-goal-branches");
+        var result = await composer.DeleteGoalAsync("failed-goal-branches", ct: TestContext.Current.CancellationToken);
 
         // Verify goal deleted successfully
         Assert.Contains("✅", result);
@@ -1997,7 +1997,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a draft goal with a repository
-        await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a");
+        await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a", ct: TestContext.Current.CancellationToken);
 
         // Mock the repo manager
         var mockRepoManager = new Mock<IBrainRepoManager>();
@@ -2011,7 +2011,7 @@ public sealed class ComposerToolTests : IDisposable
             repoManager: mockRepoManager.Object,
             stateDir: Path.GetTempPath());
 
-        var result = await composer.DeleteGoalAsync("draft-no-branch");
+        var result = await composer.DeleteGoalAsync("draft-no-branch", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         // Goal is removed from store (Draft goals delete fine with no branch cleanup)
@@ -2028,7 +2028,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a failed goal with repositories
-        await _composer.CreateGoalAsync("failed-cleanup", "Will fail", repositories: "repo-a");
+        await _composer.CreateGoalAsync("failed-cleanup", "Will fail", repositories: "repo-a", ct: TestContext.Current.CancellationToken);
         var goal = (await _store.GetGoalAsync("failed-cleanup", ct))!;
         goal.Status = GoalStatus.Failed;
         await _store.UpdateGoalAsync(goal, ct);
@@ -2047,7 +2047,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
 
         // DeleteRemoteBranchAsync returns Failed, but goal deletion should still succeed - this is "best-effort"
-        var result = await composer.DeleteGoalAsync("failed-cleanup");
+        var result = await composer.DeleteGoalAsync("failed-cleanup", ct: TestContext.Current.CancellationToken);
 
         // Verify the goal was deleted despite branch cleanup issues
         Assert.Contains("✅", result);
@@ -2064,7 +2064,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
         var goalId = "del-doc-cleanup";
-        await _composer.CreateGoalAsync(goalId, "Goal with knowledge docs");
+        await _composer.CreateGoalAsync(goalId, "Goal with knowledge docs", ct: TestContext.Current.CancellationToken);
 
         // Create a knowledge graph with progress/review docs and register the cleanup service
         var kg = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
@@ -2089,7 +2089,7 @@ public sealed class ComposerToolTests : IDisposable
             serviceProvider: sp,
             knowledgeGraph: kg);
 
-        var result = await composer.DeleteGoalAsync(goalId);
+        var result = await composer.DeleteGoalAsync(goalId, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var goal = await _store.GetGoalAsync(goalId, ct);
@@ -2103,7 +2103,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
         var goalId = "del-doc-throw";
-        await _composer.CreateGoalAsync(goalId, "Goal whose doc cleanup throws");
+        await _composer.CreateGoalAsync(goalId, "Goal whose doc cleanup throws", ct: TestContext.Current.CancellationToken);
 
         // Graph backed by a config repo whose DeleteFileAsync always throws OCE
         var throwingRepo = new ThrowingConfigRepoManager(Path.GetTempPath());
@@ -2127,7 +2127,7 @@ public sealed class ComposerToolTests : IDisposable
             knowledgeGraph: kg);
 
         // Cleanup throws, but goal deletion must still succeed (best-effort)
-        var result = await composer.DeleteGoalAsync(goalId);
+        var result = await composer.DeleteGoalAsync(goalId, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("deleted", result);
@@ -2140,7 +2140,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
         var goalId = "del-no-docs";
-        await _composer.CreateGoalAsync(goalId, "Goal without knowledge docs");
+        await _composer.CreateGoalAsync(goalId, "Goal without knowledge docs", ct: TestContext.Current.CancellationToken);
 
         var kg = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
         var services = new ServiceCollection();
@@ -2157,7 +2157,7 @@ public sealed class ComposerToolTests : IDisposable
             serviceProvider: sp,
             knowledgeGraph: kg);
 
-        var result = await composer.DeleteGoalAsync(goalId);
+        var result = await composer.DeleteGoalAsync(goalId, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("deleted", result);
@@ -2176,7 +2176,7 @@ public sealed class ComposerToolTests : IDisposable
         try
         {
             // Create goal and set to InProgress
-            await _composer.CreateGoalAsync("cancel-inprogress", "Goal to cancel");
+            await _composer.CreateGoalAsync("cancel-inprogress", "Goal to cancel", ct: TestContext.Current.CancellationToken);
             var goal = await _store.GetGoalAsync("cancel-inprogress", ct);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.InProgress;
@@ -2205,7 +2205,7 @@ public sealed class ComposerToolTests : IDisposable
                 stateDir: tmpDir,
                 serviceProvider: BuildServiceProvider(dispatcher));
 
-            var result = await composer.CancelGoalAsync("cancel-inprogress");
+            var result = await composer.CancelGoalAsync("cancel-inprogress", ct: TestContext.Current.CancellationToken);
 
             Assert.Contains("✅", result);
             Assert.Contains("cancelled", result);
@@ -2231,8 +2231,8 @@ public sealed class ComposerToolTests : IDisposable
         try
         {
             // Create goal in Pending status
-            await _composer.CreateGoalAsync("cancel-pending", "Goal to cancel");
-            await _composer.ApproveGoalAsync("cancel-pending"); // Draft → Pending
+            await _composer.CreateGoalAsync("cancel-pending", "Goal to cancel", ct: TestContext.Current.CancellationToken);
+            await _composer.ApproveGoalAsync("cancel-pending", ct: TestContext.Current.CancellationToken); // Draft → Pending
 
             var goal = await _store.GetGoalAsync("cancel-pending", ct);
             Assert.NotNull(goal);
@@ -2260,7 +2260,7 @@ public sealed class ComposerToolTests : IDisposable
                 stateDir: tmpDir,
                 serviceProvider: BuildServiceProvider(dispatcher));
 
-            var result = await composer.CancelGoalAsync("cancel-pending");
+            var result = await composer.CancelGoalAsync("cancel-pending", ct: TestContext.Current.CancellationToken);
 
             Assert.Contains("✅", result);
             Assert.Contains("cancelled", result);
@@ -2283,13 +2283,13 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create goal and set to Completed
-        await _composer.CreateGoalAsync("cancel-completed", "Completed goal");
+        await _composer.CreateGoalAsync("cancel-completed", "Completed goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("cancel-completed", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Completed;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.CancelGoalAsync("cancel-completed");
+        var result = await _composer.CancelGoalAsync("cancel-completed", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Only InProgress or Pending goals can be cancelled", result);
@@ -2298,7 +2298,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task CancelGoal_NonExistentGoal_ReturnsErrorMessage()
     {
-        var result = await _composer.CancelGoalAsync("nonexistent-goal");
+        var result = await _composer.CancelGoalAsync("nonexistent-goal", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
@@ -2315,7 +2315,7 @@ public sealed class ComposerToolTests : IDisposable
         try
         {
             // Create failed goal with iteration exhaustion
-            await _composer.CreateGoalAsync("extend-iterations", "Goal to extend");
+            await _composer.CreateGoalAsync("extend-iterations", "Goal to extend", ct: TestContext.Current.CancellationToken);
             var goal = await _store.GetGoalAsync("extend-iterations", ct);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -2351,7 +2351,7 @@ public sealed class ComposerToolTests : IDisposable
                 stateDir: tmpDir,
                 serviceProvider: BuildServiceProvider(dispatcher));
 
-            var result = await composer.ExtendGoalIterationsAsync("extend-iterations", 5);
+            var result = await composer.ExtendGoalIterationsAsync("extend-iterations", 5, ct: TestContext.Current.CancellationToken);
 
             Assert.Contains("✅", result);
             Assert.Contains("Resumed", result);
@@ -2367,7 +2367,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task ExtendGoalIterations_InvalidIterationsZero_ReturnsErrorMessage()
     {
-        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-zero", additionalIterations: 0);
+        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-zero", additionalIterations: 0, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("between 1 and 100", result);
@@ -2376,7 +2376,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task ExtendGoalIterations_InvalidIterationsAbove100_ReturnsErrorMessage()
     {
-        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-above", additionalIterations: 101);
+        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-above", additionalIterations: 101, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("between 1 and 100", result);
@@ -2386,7 +2386,7 @@ public sealed class ComposerToolTests : IDisposable
     public async Task ExtendGoalIterations_NullServiceProvider_ReturnsDispatcherNotAvailable()
     {
         // _composer is constructed without a serviceProvider
-        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-null", additionalIterations: 5);
+        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-null", additionalIterations: 5, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not available", result);
@@ -2424,7 +2424,7 @@ public sealed class ComposerToolTests : IDisposable
                 stateDir: tmpDir,
                 serviceProvider: BuildServiceProvider(dispatcher));
 
-            var result = await composer.ExtendGoalIterationsAsync("nonexistent-goal", additionalIterations: 5);
+            var result = await composer.ExtendGoalIterationsAsync("nonexistent-goal", additionalIterations: 5, ct: TestContext.Current.CancellationToken);
 
             Assert.Contains("❌", result);
             Assert.Contains("not found", result);
@@ -2439,7 +2439,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task ExtendGoalIterations_BlankId_ReturnsValidationError()
     {
-        var result = await _composer.ExtendGoalIterationsAsync("   ", additionalIterations: 5);
+        var result = await _composer.ExtendGoalIterationsAsync("   ", additionalIterations: 5, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("id is required", result);
@@ -2451,7 +2451,7 @@ public sealed class ComposerToolTests : IDisposable
         // The default value for additionalIterations is 5; with a null serviceProvider
         // we can't reach the dispatcher, but we can verify the default doesn't trigger
         // the bounds error (i.e. 5 is within 1–100).
-        var result = await _composer.ExtendGoalIterationsAsync("some-goal");
+        var result = await _composer.ExtendGoalIterationsAsync("some-goal", ct: TestContext.Current.CancellationToken);
 
         // Should NOT contain bounds error — should reach the dispatcher-not-available path.
         Assert.DoesNotContain("between 1 and 100", result);
@@ -2694,7 +2694,7 @@ public sealed class ComposerToolTests : IDisposable
         try
         {
             // Failed goal with an iteration-exhaustion reason and NO recorded coder branch.
-            await _composer.CreateGoalAsync("resume-branchless", "Branchless exhaustion goal");
+            await _composer.CreateGoalAsync("resume-branchless", "Branchless exhaustion goal", ct: TestContext.Current.CancellationToken);
             var goal = await _store.GetGoalAsync("resume-branchless", ct);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -2731,7 +2731,7 @@ public sealed class ComposerToolTests : IDisposable
                 stateDir: tmpDir,
                 serviceProvider: BuildServiceProvider(dispatcher));
 
-            var result = await composer.ExtendGoalIterationsAsync("resume-branchless", 5);
+            var result = await composer.ExtendGoalIterationsAsync("resume-branchless", 5, ct: TestContext.Current.CancellationToken);
 
             // The branchless exhaustion path (variant B) must resume without a recorded branch.
             Assert.Contains("✅", result);
@@ -2758,7 +2758,7 @@ public sealed class ComposerToolTests : IDisposable
         try
         {
             // Eligible non-exhaustion failure (a review/test issue) WITH a canonical feature branch.
-            await _composer.CreateGoalAsync("resume-branch-backed", "Branch-backed review failure", repositories: "test-repo");
+            await _composer.CreateGoalAsync("resume-branch-backed", "Branch-backed review failure", repositories: "test-repo", ct: TestContext.Current.CancellationToken);
             var goal = await _store.GetGoalAsync("resume-branch-backed", ct);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -2797,7 +2797,7 @@ public sealed class ComposerToolTests : IDisposable
                 stateDir: tmpDir,
                 serviceProvider: BuildServiceProvider(dispatcher));
 
-            var result = await composer.ExtendGoalIterationsAsync("resume-branch-backed", 5);
+            var result = await composer.ExtendGoalIterationsAsync("resume-branch-backed", 5, ct: TestContext.Current.CancellationToken);
 
             // The branch-backed path (variant A) accepts a non-exhaustion failure.
             Assert.Contains("✅", result);
@@ -2822,7 +2822,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("iter-detail", "Goal with iterations");
+        await _composer.CreateGoalAsync("iter-detail", "Goal with iterations", ct: TestContext.Current.CancellationToken);
 
         var summary = new IterationSummary
         {
@@ -2855,7 +2855,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("iter-no-review", "Goal without review");
+        await _composer.CreateGoalAsync("iter-no-review", "Goal without review", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -2875,7 +2875,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("iter-no-counts", "Goal without test counts");
+        await _composer.CreateGoalAsync("iter-no-counts", "Goal without test counts", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -2955,7 +2955,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-render", "Goal with usage");
+        await _composer.CreateGoalAsync("usage-render", "Goal with usage", ct: TestContext.Current.CancellationToken);
 
         await _store.AddIterationAsync("usage-render", new IterationSummary
         {
@@ -3055,7 +3055,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-complete", "Goal with complete usage");
+        await _composer.CreateGoalAsync("usage-complete", "Goal with complete usage", ct: TestContext.Current.CancellationToken);
         await _store.AddIterationAsync("usage-complete", new IterationSummary
         {
             Iteration = 1,
@@ -3164,7 +3164,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-zero-calls", "Goal whose task made no model calls");
+        await _composer.CreateGoalAsync("usage-zero-calls", "Goal whose task made no model calls", ct: TestContext.Current.CancellationToken);
         await _store.AddIterationAsync("usage-zero-calls", new IterationSummary
         {
             Iteration = 1,
@@ -3218,7 +3218,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-zero-reported", "Goal whose calls reported no categories");
+        await _composer.CreateGoalAsync("usage-zero-reported", "Goal whose calls reported no categories", ct: TestContext.Current.CancellationToken);
         await _store.AddIterationAsync("usage-zero-reported", new IterationSummary
         {
             Iteration = 1,
@@ -3300,7 +3300,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-all-three", "Goal using workers, Brain and reviews");
+        await _composer.CreateGoalAsync("usage-all-three", "Goal using workers, Brain and reviews", ct: TestContext.Current.CancellationToken);
         await _store.AddIterationAsync("usage-all-three", new IterationSummary
         {
             Iteration = 1,
@@ -3360,7 +3360,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-brain-only", "Goal planned but not executed");
+        await _composer.CreateGoalAsync("usage-brain-only", "Goal planned but not executed", ct: TestContext.Current.CancellationToken);
         await _store.AddGoalUsageAsync("usage-brain-only", GoalUsageKind.Brain, BrainUsageReport(), ct);
 
         var result = await _composer.GetGoalAsync("usage-brain-only");
@@ -3382,7 +3382,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("usage-review-only", "Goal reviewed but not executed");
+        await _composer.CreateGoalAsync("usage-review-only", "Goal reviewed but not executed", ct: TestContext.Current.CancellationToken);
         await _store.AddGoalUsageAsync("usage-review-only", GoalUsageKind.PreExecutionReview, ReviewUsageReport(), ct);
 
         var result = await _composer.GetGoalAsync("usage-review-only");
@@ -3439,7 +3439,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("iter-clarif", "Goal with clarifications");
+        await _composer.CreateGoalAsync("iter-clarif", "Goal with clarifications", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3474,7 +3474,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("iter-multi-clarif", "Goal with multiple clarifications");
+        await _composer.CreateGoalAsync("iter-multi-clarif", "Goal with multiple clarifications", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3521,7 +3521,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("iter-no-clarif", "Goal without clarifications");
+        await _composer.CreateGoalAsync("iter-no-clarif", "Goal without clarifications", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3543,7 +3543,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-out", "Goal for phase output");
+        await _composer.CreateGoalAsync("phase-out", "Goal for phase output", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3565,7 +3565,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-case", "Goal for case test");
+        await _composer.CreateGoalAsync("phase-case", "Goal for case test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3583,7 +3583,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-fallback", "Goal for fallback test");
+        await _composer.CreateGoalAsync("phase-fallback", "Goal for fallback test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3608,7 +3608,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var goalId = $"phase-map-{phaseName.ToLower()}";
 
-        await _composer.CreateGoalAsync(goalId, "Role key mapping test");
+        await _composer.CreateGoalAsync(goalId, "Role key mapping test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 2,
@@ -3627,7 +3627,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-trunc", "Truncation test");
+        await _composer.CreateGoalAsync("phase-trunc", "Truncation test", ct: TestContext.Current.CancellationToken);
         var longOutput = string.Join('\n', Enumerable.Range(1, 300).Select(i => $"Line {i}"));
         var summary = new IterationSummary
         {
@@ -3657,7 +3657,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-no-iter", "No iterations");
+        await _composer.CreateGoalAsync("phase-no-iter", "No iterations", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetPhaseOutputAsync("phase-no-iter", 5, "Coding");
 
@@ -3669,7 +3669,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-no-phase", "Has iteration but no such phase");
+        await _composer.CreateGoalAsync("phase-no-phase", "Has iteration but no such phase", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3687,7 +3687,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-unknown", "Unknown phase test");
+        await _composer.CreateGoalAsync("phase-unknown", "Unknown phase test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3706,7 +3706,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-numeric", "Numeric phase string test");
+        await _composer.CreateGoalAsync("phase-numeric", "Numeric phase string test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3734,7 +3734,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-nonworker", "Non-worker phase test");
+        await _composer.CreateGoalAsync("phase-nonworker", "Non-worker phase test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3752,7 +3752,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("phase-no-output", "No output recorded");
+        await _composer.CreateGoalAsync("phase-no-output", "No output recorded", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3799,7 +3799,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("content-output", "Goal for content output test");
+        await _composer.CreateGoalAsync("content-output", "Goal for content output test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -3817,7 +3817,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("no-pipeline", "Goal without pipeline conversation");
+        await _composer.CreateGoalAsync("no-pipeline", "Goal without pipeline conversation", ct: TestContext.Current.CancellationToken);
 
         // Without persisted iteration data, there's no brain prompt to retrieve
         var result = await _composer.GetPhaseOutputAsync("no-pipeline", 1, "Coding", content: "brain_prompt");
@@ -3830,7 +3830,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("no-pipeline-wp", "Goal without pipeline conversation");
+        await _composer.CreateGoalAsync("no-pipeline-wp", "Goal without pipeline conversation", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetPhaseOutputAsync("no-pipeline-wp", 1, "Coding", content: "worker_prompt");
 
@@ -3854,7 +3854,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
 
         // Create a goal with persisted iteration summary containing brain prompt
-        await composerWithPipeline.CreateGoalAsync("brain-prompt-goal", "Goal with brain prompt");
+        await composerWithPipeline.CreateGoalAsync("brain-prompt-goal", "Goal with brain prompt", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("brain-prompt-goal", ct);
         Assert.NotNull(goal);
 
@@ -3896,7 +3896,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
 
         // Create a goal with persisted iteration summary containing worker prompt
-        await composerWithPipeline.CreateGoalAsync("worker-prompt-goal", "Goal with worker prompt");
+        await composerWithPipeline.CreateGoalAsync("worker-prompt-goal", "Goal with worker prompt", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("worker-prompt-goal", ct);
         Assert.NotNull(goal);
 
@@ -3938,7 +3938,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
 
         // Create a goal and pipeline with conversation for Coding phase only
-        await composerWithPipeline.CreateGoalAsync("partial-prompt-goal", "Goal with partial prompts");
+        await composerWithPipeline.CreateGoalAsync("partial-prompt-goal", "Goal with partial prompts", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("partial-prompt-goal", ct);
         Assert.NotNull(goal);
 
@@ -3968,7 +3968,7 @@ public sealed class ComposerToolTests : IDisposable
             storeWithPipeline,
             stateDir: Path.GetTempPath());
 
-        await composerWithPipeline.CreateGoalAsync("brain-prompt-trunc", "Goal for brain_prompt truncation test");
+        await composerWithPipeline.CreateGoalAsync("brain-prompt-trunc", "Goal for brain_prompt truncation test", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("brain-prompt-trunc", ct);
         Assert.NotNull(goal);
 
@@ -4013,7 +4013,7 @@ public sealed class ComposerToolTests : IDisposable
             storeWithPipeline,
             stateDir: Path.GetTempPath());
 
-        await composerWithPipeline.CreateGoalAsync("worker-prompt-trunc", "Goal for worker_prompt truncation test");
+        await composerWithPipeline.CreateGoalAsync("worker-prompt-trunc", "Goal for worker_prompt truncation test", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("worker-prompt-trunc", ct);
         Assert.NotNull(goal);
 
@@ -4054,7 +4054,7 @@ public sealed class ComposerToolTests : IDisposable
     [InlineData("")]
     public async Task GetPhaseOutput_InvalidContent_ReturnsValidationError(string invalidContent)
     {
-        await _composer.CreateGoalAsync("invalid-content", "Goal for invalid content test");
+        await _composer.CreateGoalAsync("invalid-content", "Goal for invalid content test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4076,7 +4076,7 @@ public sealed class ComposerToolTests : IDisposable
     public async Task GetPhaseOutput_InvalidNarrativesContent_CaseSensitiveWhitelist(string invalidContent)
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateGoalAsync("narr-case", "Goal for narratives case test");
+        await _composer.CreateGoalAsync("narr-case", "Goal for narratives case test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4096,7 +4096,7 @@ public sealed class ComposerToolTests : IDisposable
         var t1 = new DateTime(2025, 1, 1, 10, 0, 0, DateTimeKind.Utc);
         var t2 = new DateTime(2025, 1, 1, 10, 0, 5, DateTimeKind.Utc);
 
-        await _composer.CreateGoalAsync("narr-pop", "Populated narratives");
+        await _composer.CreateGoalAsync("narr-pop", "Populated narratives", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4136,7 +4136,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-mixed", "Mixed narrative states");
+        await _composer.CreateGoalAsync("narr-mixed", "Mixed narrative states", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4165,7 +4165,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-legacy", "Legacy narrative data");
+        await _composer.CreateGoalAsync("narr-legacy", "Legacy narrative data", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4192,7 +4192,7 @@ public sealed class ComposerToolTests : IDisposable
 
         Assert.Equal("Goal not found", await _composer.GetPhaseOutputAsync("narr-missing", 1, "Coding", content: "narratives"));
 
-        await _composer.CreateGoalAsync("narr-no-iter", "No iterations");
+        await _composer.CreateGoalAsync("narr-no-iter", "No iterations", ct: TestContext.Current.CancellationToken);
         Assert.Equal("Iteration 1 not found", await _composer.GetPhaseOutputAsync("narr-no-iter", 1, "Coding", content: "narratives"));
 
         var summary = new IterationSummary
@@ -4209,7 +4209,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-isolation", "Isolation test");
+        await _composer.CreateGoalAsync("narr-isolation", "Isolation test", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4241,7 +4241,7 @@ public sealed class ComposerToolTests : IDisposable
 
         // Mixed occurrence metadata: one with Occurrence set, one legacy with null —
         // both rendered regardless of the occurrence metadata.
-        await _composer.CreateGoalAsync("narr-dup-occ", "Duplicate occurrence metadata");
+        await _composer.CreateGoalAsync("narr-dup-occ", "Duplicate occurrence metadata", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4310,7 +4310,7 @@ public sealed class ComposerToolTests : IDisposable
         var t1 = new DateTime(2025, 3, 4, 8, 1, 2, DateTimeKind.Utc);
         var t2 = new DateTime(2025, 3, 4, 8, 5, 9, DateTimeKind.Utc);
 
-        await _composer.CreateGoalAsync("narr-tool-sqlite", "Real SQLite persistence round-trip");
+        await _composer.CreateGoalAsync("narr-tool-sqlite", "Real SQLite persistence round-trip", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4371,7 +4371,7 @@ public sealed class ComposerToolTests : IDisposable
             "\n" + new string('L', 4001) + "-LONG-LINE-END";
         var longTail = "TAIL: last narrative line must survive NARR-TAIL-EVIDENCE";
 
-        await _composer.CreateGoalAsync("narr-tool-long", "Long narrative content");
+        await _composer.CreateGoalAsync("narr-tool-long", "Long narrative content", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4416,7 +4416,7 @@ public sealed class ComposerToolTests : IDisposable
         var ts = new DateTime(2025, 7, 7, 12, 34, 56, DateTimeKind.Utc);
         var content = "exact-metadata narrative\nwith a second line";
 
-        await _composer.CreateGoalAsync("narr-tool-meta", "Exact metadata checks");
+        await _composer.CreateGoalAsync("narr-tool-meta", "Exact metadata checks", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 3,
@@ -4455,7 +4455,7 @@ public sealed class ComposerToolTests : IDisposable
         var t1 = new DateTime(2025, 8, 8, 8, 8, 8, DateTimeKind.Utc);
         var t2 = new DateTime(2025, 8, 8, 8, 9, 9, DateTimeKind.Utc);
 
-        await _composer.CreateGoalAsync("narr-tail-empty", "Final record with empty content");
+        await _composer.CreateGoalAsync("narr-tail-empty", "Final record with empty content", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 2,
@@ -4494,7 +4494,7 @@ public sealed class ComposerToolTests : IDisposable
         var ts = new DateTime(2025, 9, 9, 9, 9, 9, DateTimeKind.Utc);
         var whitespaceOnly = "  \t \n \t ";
 
-        await _composer.CreateGoalAsync("narr-tail-ws", "Final record whitespace-only content");
+        await _composer.CreateGoalAsync("narr-tail-ws", "Final record whitespace-only content", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4528,7 +4528,7 @@ public sealed class ComposerToolTests : IDisposable
         // Trailing evidence at the very end of the response: spaces, tabs, and newlines.
         var trailing = "TAIL-EVIDENCE body line\nsecond line   \t\n\n  \t";
 
-        await _composer.CreateGoalAsync("narr-tail-trailing", "Final record ending in whitespace");
+        await _composer.CreateGoalAsync("narr-tail-trailing", "Final record ending in whitespace", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 5,
@@ -4579,7 +4579,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var ts = new DateTime(2025, 11, 11, 11, 11, 11, DateTimeKind.Utc);
 
-        await _composer.CreateGoalAsync("narr-tail-vector", "Final-record trailing-character vector");
+        await _composer.CreateGoalAsync("narr-tail-vector", "Final-record trailing-character vector", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4618,7 +4618,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-tail-states", "Exact response for null/empty states");
+        await _composer.CreateGoalAsync("narr-tail-states", "Exact response for null/empty states", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4648,7 +4648,7 @@ public sealed class ComposerToolTests : IDisposable
         var t2 = new DateTime(2025, 2, 2, 1, 1, 0, DateTimeKind.Utc);
         var t3 = new DateTime(2025, 2, 2, 1, 2, 0, DateTimeKind.Utc);
 
-        await _composer.CreateGoalAsync("narr-tool-occ", "Repeated occurrences");
+        await _composer.CreateGoalAsync("narr-tool-occ", "Repeated occurrences", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4690,7 +4690,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-tool-multi-iter", "Multiple iterations same phase");
+        await _composer.CreateGoalAsync("narr-tool-multi-iter", "Multiple iterations same phase", ct: TestContext.Current.CancellationToken);
         var summary1 = new IterationSummary
         {
             Iteration = 1,
@@ -4724,7 +4724,7 @@ public sealed class ComposerToolTests : IDisposable
         // One iteration, three matching Coding entries: null, empty, populated.
         // WorkerOutput and PhaseOutputs carry data markers that must never leak as substitute
         // narrative content for the unavailable/empty entries.
-        await _composer.CreateGoalAsync("narr-tool-states", "Null vs empty vs populated");
+        await _composer.CreateGoalAsync("narr-tool-states", "Null vs empty vs populated", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4779,7 +4779,7 @@ public sealed class ComposerToolTests : IDisposable
 
         // BrainPrompt/WorkerPrompt data on the matching entries must never appear as substitute
         // narrative content when Narratives is null or empty.
-        await _composer.CreateGoalAsync("narr-tool-prompt-markers", "Prompt data markers");
+        await _composer.CreateGoalAsync("narr-tool-prompt-markers", "Prompt data markers", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4826,7 +4826,7 @@ public sealed class ComposerToolTests : IDisposable
         var multiline = "line one\nline two\n\nline four with trailing spaces   \n... evidence truncated at ...\nEND marker";
         var duplicateContent = "exact duplicate record";
 
-        await _composer.CreateGoalAsync("narr-tool-dupes", "Duplicates and literal payload");
+        await _composer.CreateGoalAsync("narr-tool-dupes", "Duplicates and literal payload", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4870,7 +4870,7 @@ public sealed class ComposerToolTests : IDisposable
             await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-absent", 1, "Coding", content: "narratives"));
 
         // Absent iteration
-        await _composer.CreateGoalAsync("narr-tool-absent-iter", "No iterations yet");
+        await _composer.CreateGoalAsync("narr-tool-absent-iter", "No iterations yet", ct: TestContext.Current.CancellationToken);
         Assert.Equal("Iteration 1 not found",
             await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-absent-iter", 1, "Coding", content: "narratives"));
 
@@ -4959,7 +4959,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // First Coding occurrence (output mode) + last Coding occurrence (prompt mode) in one iteration.
-        await _composer.CreateGoalAsync("narr-tool-regression", "Regression guard for other modes");
+        await _composer.CreateGoalAsync("narr-tool-regression", "Regression guard for other modes", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -4993,7 +4993,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-tool-output-fallback", "Registered output fallback guard");
+        await _composer.CreateGoalAsync("narr-tool-output-fallback", "Registered output fallback guard", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -5021,7 +5021,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var longOutput = string.Join("\n", Enumerable.Range(1, 300).Select(i => $"Guard line {i}"));
 
-        await _composer.CreateGoalAsync("narr-tool-maxlines", "max_lines truncation guard");
+        await _composer.CreateGoalAsync("narr-tool-maxlines", "max_lines truncation guard", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -5045,7 +5045,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("narr-tool-case", "Case sensitivity through the registry");
+        await _composer.CreateGoalAsync("narr-tool-case", "Case sensitivity through the registry", ct: TestContext.Current.CancellationToken);
         var summary = new IterationSummary
         {
             Iteration = 1,
@@ -8265,7 +8265,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", "Initial release");
+        var result = await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", "Initial release", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("v1.0.0", result);
@@ -8284,7 +8284,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", repositories: "CopilotHive, CopilotHive-Config");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", repositories: "CopilotHive, CopilotHive-Config", ct: TestContext.Current.CancellationToken);
 
         var release = await _store.GetReleaseAsync("v1.0.0", ct);
         Assert.NotNull(release);
@@ -8296,8 +8296,8 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task CreateRelease_DuplicateId_ReturnsError()
     {
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
-        var result = await _composer.CreateReleaseAsync("v1.0.0", "v1.0.1");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
+        var result = await _composer.CreateReleaseAsync("v1.0.0", "v1.0.1", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("already exists", result);
@@ -8306,7 +8306,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task CreateRelease_MissingId_ReturnsError()
     {
-        var result = await _composer.CreateReleaseAsync("", "v1.0.0");
+        var result = await _composer.CreateReleaseAsync("", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("id is required", result);
@@ -8315,7 +8315,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task CreateRelease_MissingTag_ReturnsError()
     {
-        var result = await _composer.CreateReleaseAsync("v1.0.0", "");
+        var result = await _composer.CreateReleaseAsync("v1.0.0", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("tag is required", result);
@@ -8337,8 +8337,8 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create releases
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
-        await _composer.CreateReleaseAsync("v2.0.0", "v2.0.0");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
+        await _composer.CreateReleaseAsync("v2.0.0", "v2.0.0", ct: TestContext.Current.CancellationToken);
 
         // Create goals assigned to releases
         await _store.CreateGoalAsync(new Goal
@@ -8382,7 +8382,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
 
         // Create a goal and pipeline with conversation
-        await composerWithPipeline.CreateGoalAsync("deleted-brain-prompt", "Goal to be deleted");
+        await composerWithPipeline.CreateGoalAsync("deleted-brain-prompt", "Goal to be deleted", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("deleted-brain-prompt", ct);
         Assert.NotNull(goal);
 
@@ -8417,7 +8417,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
 
         // Create a goal and pipeline with conversation
-        await composerWithPipeline.CreateGoalAsync("deleted-worker-prompt", "Goal to be deleted");
+        await composerWithPipeline.CreateGoalAsync("deleted-worker-prompt", "Goal to be deleted", ct: TestContext.Current.CancellationToken);
         var goal = await storeWithPipeline.GetGoalAsync("deleted-worker-prompt", ct);
         Assert.NotNull(goal);
 
@@ -8662,7 +8662,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // (a) No GoalPipelineManager registered at all.
-        await _composer.CreateGoalAsync("live-none-registered", "No live source registered");
+        await _composer.CreateGoalAsync("live-none-registered", "No live source registered", ct: TestContext.Current.CancellationToken);
         Assert.Equal("Iteration 1 not found", await _composer.GetPhaseOutputAsync("live-none-registered", 1, "Coding"));
         Assert.Equal("Iteration 1 not found", await _composer.GetPhaseOutputAsync("live-none-registered", 1, "Coding", content: "narratives"));
         Assert.Equal(
@@ -8670,7 +8670,7 @@ public sealed class ComposerToolTests : IDisposable
             await _composer.GetPhaseOutputAsync("live-none-registered", 1, "Coding", content: "brain_prompt"));
 
         // (b) A registered GoalPipelineManager that has NO pipeline for the requested goal.
-        await _composer.CreateGoalAsync("live-absent-goal", "No pipeline exists for this goal");
+        await _composer.CreateGoalAsync("live-absent-goal", "No pipeline exists for this goal", ct: TestContext.Current.CancellationToken);
         var manager = new GoalPipelineManager();
         var otherGoal = await _store.GetGoalAsync("live-none-registered", ct);
         Assert.NotNull(otherGoal);
@@ -8694,7 +8694,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("live-empty-log", "Live iteration with an empty phase log");
+        await _composer.CreateGoalAsync("live-empty-log", "Live iteration with an empty phase log", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("live-empty-log", ct);
         Assert.NotNull(goal);
 
@@ -8991,10 +8991,10 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath(),
             goalReviewService: new StubGoalReviewService(new ReviewResult("Approved", "No issues found", "Goal looks good")));
 
-        await composer.CreateGoalAsync("review-nondraft", "Test goal");
-        await composer.ApproveGoalAsync("review-nondraft"); // Draft → Pending
+        await composer.CreateGoalAsync("review-nondraft", "Test goal", ct: TestContext.Current.CancellationToken);
+        await composer.ApproveGoalAsync("review-nondraft", ct: TestContext.Current.CancellationToken); // Draft → Pending
 
-        var result = await composer.ReviewGoalAsync("review-nondraft");
+        var result = await composer.ReviewGoalAsync("review-nondraft", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Draft", result);
@@ -9012,13 +9012,13 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath(),
             goalReviewService: new StubGoalReviewService(new ReviewResult("Approved", "No issues found", "Goal looks good")));
 
-        await composer.CreateGoalAsync("review-pending", "Test goal");
+        await composer.CreateGoalAsync("review-pending", "Test goal", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("review-pending", ct);
         Assert.NotNull(goal);
         goal!.ReviewStatus = ReviewStatus.Pending;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await composer.ReviewGoalAsync("review-pending");
+        var result = await composer.ReviewGoalAsync("review-pending", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("already in progress", result);
@@ -9034,9 +9034,9 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath(),
             goalReviewService: new StubGoalReviewService(new ReviewResult("Approved", "No issues found", "Goal looks good")));
 
-        await composer.CreateGoalAsync("review-approved-goal", "Test goal");
+        await composer.CreateGoalAsync("review-approved-goal", "Test goal", ct: TestContext.Current.CancellationToken);
 
-        var result = await composer.ReviewGoalAsync("review-approved-goal");
+        var result = await composer.ReviewGoalAsync("review-approved-goal", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("approved", result);
@@ -9052,9 +9052,9 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath(),
             goalReviewService: new StubGoalReviewService(new ReviewResult("NeedsChanges", "Missing acceptance criteria", "Add clear acceptance criteria")));
 
-        await composer.CreateGoalAsync("review-needs-changes-goal", "Test goal");
+        await composer.CreateGoalAsync("review-needs-changes-goal", "Test goal", ct: TestContext.Current.CancellationToken);
 
-        var result = await composer.ReviewGoalAsync("review-needs-changes-goal");
+        var result = await composer.ReviewGoalAsync("review-needs-changes-goal", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Missing acceptance criteria", result);
@@ -9065,9 +9065,9 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task ReviewGoal_ServiceNull_ReturnsError()
     {
-        await _composer.CreateGoalAsync("review-no-service", "Test goal");
+        await _composer.CreateGoalAsync("review-no-service", "Test goal", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.ReviewGoalAsync("review-no-service");
+        var result = await _composer.ReviewGoalAsync("review-no-service", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not available", result);
@@ -9088,9 +9088,9 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath(),
             goalReviewService: new UnconfiguredReviewerGoalReviewService());
 
-        await composer.CreateGoalAsync("review-unconfigured", "Test goal");
+        await composer.CreateGoalAsync("review-unconfigured", "Test goal", ct: TestContext.Current.CancellationToken);
 
-        var result = await composer.ReviewGoalAsync("review-unconfigured");
+        var result = await composer.ReviewGoalAsync("review-unconfigured", ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(
             "Review cannot start — no reviewer model is configured. Configure a reviewer model in the configuration page, then retry.",
@@ -9133,7 +9133,7 @@ public sealed class ComposerToolTests : IDisposable
             stateDir: Path.GetTempPath(),
             goalReviewService: reviewService);
 
-        await composer.CreateGoalAsync("review-concurrent-ioe", "Test goal");
+        await composer.CreateGoalAsync("review-concurrent-ioe", "Test goal", ct: TestContext.Current.CancellationToken);
 
         // Start the first review directly on the service — it blocks inside the agent call.
         var goal = await _store.GetGoalAsync("review-concurrent-ioe", TestContext.Current.CancellationToken);
@@ -9143,7 +9143,7 @@ public sealed class ComposerToolTests : IDisposable
 
         // The Composer's second review hits the service-level in-memory concurrency guard.
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => composer.ReviewGoalAsync("review-concurrent-ioe"));
+            () => composer.ReviewGoalAsync("review-concurrent-ioe", ct: TestContext.Current.CancellationToken));
 
         Assert.Equal("A review is already in progress for goal review-concurrent-ioe", ex.Message);
 
@@ -9241,7 +9241,7 @@ public sealed class ComposerToolTests : IDisposable
         var raw = new string('e', 600) + "\nBOUNDARY EVIDENCE TOOL-MALFORMED-PAST-500\n" +
                   "FINAL LINE: trailing evidence TOOL-MALFORMED-TAIL must survive at the very end.";
         var (composer, kg) = CreateComposerWithRealReviewService(raw);
-        await composer.CreateGoalAsync("review-tool-malformed", "Test goal");
+        await composer.CreateGoalAsync("review-tool-malformed", "Test goal", ct: TestContext.Current.CancellationToken);
 
         var toolResult = await InvokeReviewGoalToolAsync(composer, "review-tool-malformed");
 
@@ -9291,7 +9291,7 @@ public sealed class ComposerToolTests : IDisposable
         });
 
         var (composer, kg) = CreateComposerWithRealReviewService(raw);
-        await composer.CreateGoalAsync("review-tool-longvalid", "Test goal");
+        await composer.CreateGoalAsync("review-tool-longvalid", "Test goal", ct: TestContext.Current.CancellationToken);
 
         var toolResult = await InvokeReviewGoalToolAsync(composer, "review-tool-longvalid");
 
@@ -9322,13 +9322,13 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("review-reset-desc", "Original desc");
+        await _composer.CreateGoalAsync("review-reset-desc", "Original desc", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("review-reset-desc", ct);
         Assert.NotNull(goal);
         goal!.ReviewStatus = ReviewStatus.Approved;
         await _store.UpdateGoalAsync(goal, ct);
 
-        var result = await _composer.UpdateGoalAsync("review-reset-desc", "description", "Updated desc");
+        var result = await _composer.UpdateGoalAsync("review-reset-desc", "description", "Updated desc", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         var updated = await _store.GetGoalAsync("review-reset-desc", ct);
@@ -9343,7 +9343,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("release-present", "Goal with release", repositories: "repo-a");
+        await _composer.CreateGoalAsync("release-present", "Goal with release", repositories: "repo-a", ct: TestContext.Current.CancellationToken);
         await _store.CreateReleaseAsync(new Release { Id = "v2.0.0", Tag = "v2.0.0" }, ct);
         var goal = await _store.GetGoalAsync("release-present", ct);
         Assert.NotNull(goal);
@@ -9358,7 +9358,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task GetGoal_ReleaseAbsent_OmitsReleaseLine()
     {
-        await _composer.CreateGoalAsync("release-absent", "Goal without release");
+        await _composer.CreateGoalAsync("release-absent", "Goal without release", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetGoalAsync("release-absent");
 
@@ -9373,7 +9373,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("deps-present", "Goal with depends_on", depends_on: "goal-alpha, goal-beta");
+        await _composer.CreateGoalAsync("deps-present", "Goal with depends_on", depends_on: "goal-alpha, goal-beta", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("deps-present", ct);
         Assert.NotNull(goal);
         Assert.Equal(2, goal!.DependsOn.Count);
@@ -9386,7 +9386,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task GetGoal_DependsOnAbsent_OmitsDependsOnLine()
     {
-        await _composer.CreateGoalAsync("deps-absent", "Goal without depends_on");
+        await _composer.CreateGoalAsync("deps-absent", "Goal without depends_on", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetGoalAsync("deps-absent");
 
@@ -9401,7 +9401,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("docs-present", "Goal with documents", documents: "doc-1, doc-2");
+        await _composer.CreateGoalAsync("docs-present", "Goal with documents", documents: "doc-1, doc-2", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("docs-present", ct);
         Assert.NotNull(goal);
         Assert.Equal(2, goal!.Documents.Count);
@@ -9414,7 +9414,7 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task GetGoal_DocumentsAbsent_OmitsDocumentsLine()
     {
-        await _composer.CreateGoalAsync("docs-absent", "Goal without documents");
+        await _composer.CreateGoalAsync("docs-absent", "Goal without documents", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetGoalAsync("docs-absent");
 
@@ -9446,7 +9446,7 @@ public sealed class ComposerToolTests : IDisposable
         knowledgeGraph.AddLink("doc-b", new CopilotHive.Knowledge.DocumentLink("doc-a", CopilotHive.Knowledge.LinkType.DependsOn));
 
         // Create a goal that references both documents
-        await composer.CreateGoalAsync("link-goal", "Goal with linked docs", documents: "doc-a, doc-b");
+        await composer.CreateGoalAsync("link-goal", "Goal with linked docs", documents: "doc-a, doc-b", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("link-goal", ct);
         Assert.NotNull(goal);
 
@@ -9464,7 +9464,7 @@ public sealed class ComposerToolTests : IDisposable
     public async Task GetGoal_DocumentLinks_NullGraph_OmitsLinkLineAndNoThrow()
     {
         // _composer is constructed without a knowledgeGraph (null by default)
-        await _composer.CreateGoalAsync("null-graph-goal", "Goal with docs but null graph", documents: "doc-x");
+        await _composer.CreateGoalAsync("null-graph-goal", "Goal with docs but null graph", documents: "doc-x", ct: TestContext.Current.CancellationToken);
 
         // Should not throw and should not contain Document Links
         var result = await _composer.GetGoalAsync("null-graph-goal");
@@ -9500,7 +9500,7 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Empty(knowledgeGraph.GetOutgoingLinks("doc-missing"));
 
         // Goal references both an existing doc and a non-existing doc
-        await composer.CreateGoalAsync("missing-doc-goal", "Goal with missing doc ref", documents: "doc-existing, doc-missing");
+        await composer.CreateGoalAsync("missing-doc-goal", "Goal with missing doc ref", documents: "doc-existing, doc-missing", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("missing-doc-goal", ct);
         Assert.NotNull(goal);
 
@@ -9544,7 +9544,7 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Empty(outgoingForMissing);
 
         // Goal references ONLY the missing doc
-        await composer.CreateGoalAsync("missing-incoming-goal", "Goal referencing missing doc with incoming link", documents: "missing-doc");
+        await composer.CreateGoalAsync("missing-incoming-goal", "Goal referencing missing doc with incoming link", documents: "missing-doc", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("missing-incoming-goal", ct);
         Assert.NotNull(goal);
 
@@ -9578,7 +9578,7 @@ public sealed class ComposerToolTests : IDisposable
         Assert.NotEmpty(knowledgeGraph.GetIncomingLinks("missing-doc"));
 
         // Goal references BOTH the existing doc and the missing doc
-        await composer.CreateGoalAsync("mixed-missing-goal", "Goal with existing and missing doc", documents: "doc-a, missing-doc");
+        await composer.CreateGoalAsync("mixed-missing-goal", "Goal with existing and missing doc", documents: "doc-a, missing-doc", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("mixed-missing-goal", ct);
         Assert.NotNull(goal);
 
@@ -9610,7 +9610,7 @@ public sealed class ComposerToolTests : IDisposable
         await knowledgeGraph.CreateDocumentAsync("doc-nolink-1", "No Link 1", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
         await knowledgeGraph.CreateDocumentAsync("doc-nolink-2", "No Link 2", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
 
-        await composer.CreateGoalAsync("no-links-goal", "Goal with unlinked docs", documents: "doc-nolink-1, doc-nolink-2");
+        await composer.CreateGoalAsync("no-links-goal", "Goal with unlinked docs", documents: "doc-nolink-1, doc-nolink-2", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("no-links-goal", ct);
         Assert.NotNull(goal);
 
@@ -9629,7 +9629,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("plain-goal", "A plain goal with no extras");
+        await _composer.CreateGoalAsync("plain-goal", "A plain goal with no extras", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("plain-goal", ct);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Failed;
@@ -9680,7 +9680,7 @@ public sealed class ComposerToolTests : IDisposable
         knowledgeGraph.AddLink("order-doc-1", new CopilotHive.Knowledge.DocumentLink("order-doc-2", CopilotHive.Knowledge.LinkType.Related));
 
         // Create a goal with release, depends_on, and documents — all set
-        await composer.CreateGoalAsync("order-goal", "Ordering test goal", repositories: "repo-a", depends_on: "order-dep-1, order-dep-2", documents: "order-doc-1, order-doc-2");
+        await composer.CreateGoalAsync("order-goal", "Ordering test goal", repositories: "repo-a", depends_on: "order-dep-1, order-dep-2", documents: "order-doc-1, order-doc-2", ct: TestContext.Current.CancellationToken);
         await _store.CreateReleaseAsync(new Release { Id = "order-release", Tag = "order-release" }, ct);
         var goal = await _store.GetGoalAsync("order-goal", ct);
         Assert.NotNull(goal);
@@ -9902,9 +9902,9 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     public async Task UpdateRelease_UpdatesTag_ReturnsSuccess()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "v1.0.1");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "v1.0.1", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.Contains("tag", result);
@@ -9917,9 +9917,9 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     public async Task UpdateRelease_UpdatesNotes_ReturnsSuccess()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "notes", "Initial release notes");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "notes", "Initial release notes", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
 
@@ -9931,9 +9931,9 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     public async Task UpdateRelease_UpdatesRepositories_ReturnsSuccess()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "repositories", "repo-a, repo-b");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "repositories", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
 
@@ -9948,9 +9948,9 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     public async Task UpdateRelease_ClearsRepositoriesWhenEmpty()
     {
         var ct = TestContext.Current.CancellationToken;
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", repositories: "repo-a");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", repositories: "repo-a", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "repositories", "");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "repositories", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
 
@@ -9962,7 +9962,7 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateRelease_ReleaseNotFound_ReturnsError()
     {
-        var result = await _composer.UpdateReleaseAsync("nonexistent", "tag", "v1.0.1");
+        var result = await _composer.UpdateReleaseAsync("nonexistent", "tag", "v1.0.1", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
@@ -9981,7 +9981,7 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
             CreatedAt = DateTime.UtcNow,
         }, ct);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "v1.0.1");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "v1.0.1", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Released", result);
@@ -9990,9 +9990,9 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateRelease_UnknownField_ReturnsError()
     {
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "invalid_field", "some-value");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "invalid_field", "some-value", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("Unknown field", result);
@@ -10001,9 +10001,9 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateRelease_EmptyTagValue_ReturnsError()
     {
-        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "");
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("❌", result);
         Assert.Contains("empty", result);
@@ -10012,7 +10012,7 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     [Fact]
     public async Task UpdateRelease_MissingId_ReturnsError()
     {
-        var result = await _composer.UpdateReleaseAsync("", "tag", "v1.0.1");
+        var result = await _composer.UpdateReleaseAsync("", "tag", "v1.0.1", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("ERROR", result);
         Assert.Contains("id is required", result);
@@ -10056,7 +10056,7 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateReleaseAsync("v9.9.9", "v9.9.9", "Test notes");
+        await _composer.CreateReleaseAsync("v9.9.9", "v9.9.9", "Test notes", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetReleaseAsync("v9.9.9");
 
@@ -10075,7 +10075,7 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         var releaseId = "v2.0.0";
-        await _composer.CreateReleaseAsync(releaseId, "v2.0.0", "Release with goals", "repo-a, repo-b");
+        await _composer.CreateReleaseAsync(releaseId, "v2.0.0", "Release with goals", "repo-a, repo-b", ct: TestContext.Current.CancellationToken);
 
         var goal1 = new Goal
         {
@@ -11980,7 +11980,7 @@ public sealed class ComposerKnowledgeToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("goal-with-docs", "Goal with knowledge documents");
+        await _composer.CreateGoalAsync("goal-with-docs", "Goal with knowledge documents", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("goal-with-docs", ct);
         Assert.NotNull(goal);
         goal!.Documents = ["arch-brain", "features-auth"];
@@ -11996,7 +11996,7 @@ public sealed class ComposerKnowledgeToolTests : IDisposable
     [Fact]
     public async Task GetGoal_NoDocuments_OmitsDocumentsField()
     {
-        await _composer.CreateGoalAsync("goal-no-docs", "Goal without docs");
+        await _composer.CreateGoalAsync("goal-no-docs", "Goal without docs", ct: TestContext.Current.CancellationToken);
 
         var result = await _composer.GetGoalAsync("goal-no-docs");
 
@@ -12587,14 +12587,14 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
         await _composer.CreateDocumentAsync("arch", "brain", "Brain Architecture", "implementation", "Brain content", cancellationToken: ct);
         await _composer.CreateDocumentAsync("features", "design", "Feature Design", "feature", "Design content", cancellationToken: ct);
 
-        await _composer.CreateGoalAsync("goal-docs-update", "A goal with documents attached");
+        await _composer.CreateGoalAsync("goal-docs-update", "A goal with documents attached", ct: TestContext.Current.CancellationToken);
         var goal = await _store.GetGoalAsync("goal-docs-update", ct);
         Assert.NotNull(goal);
         goal!.Documents = ["arch-brain", "features-design"];
         await _store.UpdateGoalAsync(goal, ct);
 
         // Update status Draft→Pending triggers AppendDocuments
-        var result = await _composer.UpdateGoalAsync("goal-docs-update", "status", "Pending");
+        var result = await _composer.UpdateGoalAsync("goal-docs-update", "status", "Pending", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
 
@@ -12611,9 +12611,9 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        await _composer.CreateGoalAsync("goal-no-docs-update", "A goal without documents");
+        await _composer.CreateGoalAsync("goal-no-docs-update", "A goal without documents", ct: TestContext.Current.CancellationToken);
 
-        var result = await _composer.UpdateGoalAsync("goal-no-docs-update", "status", "Pending");
+        var result = await _composer.UpdateGoalAsync("goal-no-docs-update", "status", "Pending", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
         Assert.DoesNotContain("Documents", result);
@@ -12632,7 +12632,7 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
         var result = await _composer.CreateGoalAsync(
             "goal-with-docs-create",
             "Goal with knowledge documents",
-            documents: "arch-brain2,features-auth");
+            documents: "arch-brain2,features-auth", ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("✅", result);
 

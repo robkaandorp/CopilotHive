@@ -561,7 +561,10 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
                 : await ComposerUserState.ResolveAsync(_users, principal.UserId, CancellationToken.None);
             attachments = _factory.CreateUserAttachments(state);
             subscriber = _factory.CreateUserSubscriber();
-            build = _factory.CreateForUser(state, attachments, subscriber);
+            // The RESOLVER-PRODUCED principal travels with the identity it belongs to: identity-bound
+            // construction requires a principal for the SAME account, and the Composer rejects an absent
+            // or mismatched one instead of falling back to legacy-admin authority.
+            build = _factory.CreateForUser(state, attachments, subscriber, principal);
             var composer = build.Composer;
             var runtime = new ComposerUserRuntime(state, composer, attachments, subscriber, build.Configuration);
 

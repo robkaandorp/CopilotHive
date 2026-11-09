@@ -327,6 +327,9 @@ public sealed partial class Composer
         [Description("Specific branch to fetch. If omitted, fetches all branches.")] string? branch = null,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("git_fetch", cancellationToken) is { } deny_git_fetch)
+            return deny_git_fetch;
+
         if (_repoManager is null)
             return "Git tools are not available — no repository manager configured.";
 

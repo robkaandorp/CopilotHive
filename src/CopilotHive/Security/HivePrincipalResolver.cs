@@ -201,6 +201,130 @@ public sealed class HivePrincipalResolver
     }
 
     /// <summary>
+    /// Resolves the acting principal of a KNOWN internal account id from CURRENT stored state.
+    /// <para>
+    /// This is the identity-by-id counterpart of <see cref="ResolveAsync"/>: instead of a
+    /// <see cref="ClaimsPrincipal"/> it takes the account id a caller already holds (for example the
+    /// id a per-user Composer runtime was created for) and re-reads that account through the trusted
+    /// directory on EVERY call — <see cref="UserService.GetActivatedUserByIdAsync"/> for the account
+    /// and <see cref="UserService.GetAdminUserAsync"/> for originality. No role, enabled flag or name
+    /// from the caller's own reference is treated as authorization truth, so a role change, a demotion
+    /// or a disablement between two calls takes effect on the next call.
+    /// </para>
+    /// <para>
+    /// The SAME fail-closed classifications as the claims path apply, through the same machinery: a
+    /// non-positive or unknown id is <see cref="PrincipalRefusalReason.UnknownAccount"/>, a disabled
+    /// account is <see cref="PrincipalRefusalReason.DisabledAccount"/>, an unrecognised persisted role
+    /// is <see cref="PrincipalRefusalReason.UnknownRole"/> (classified by
+    /// <see cref="RefuseReadFailure"/> / <see cref="IsUnknownPersistedRoleFailure"/>, exactly like the
+    /// claims path) and any other directory failure is
+    /// <see cref="PrincipalRefusalReason.DirectoryFailure"/>. Every one of those produces an explicit
+    /// refusal carrying NO principal and never throws at the caller; caller cancellation is not an
+    /// authorization answer, so it propagates unchanged.
+    /// </para>
+    /// <para>
+    /// There is deliberately NO open-mode branch here: this method authorizes a PERSISTED account, and
+    /// the open/no-auth local operator has none. A caller that legitimately runs in open mode resolves
+    /// through <see cref="ResolveAsync"/> instead.
+    /// </para>
+    /// </summary>
+    /// <param name="userId">The internal account id whose CURRENT persisted state is authoritative.</param>
+    /// <param name="ct">Cancellation token; cancellation is never converted into a refusal.</param>
+    /// <returns>A resolved principal, or a <see cref="PrincipalResolution"/> refusal carrying no principal.</returns>
+    public async Task<PrincipalResolution> ResolveByUserIdAsync(int userId, CancellationToken ct)
+    {
+        // The id is only ever an IDENTITY to look up. Because the activated-account projection cannot
+        // carry a non-positive row, a non-positive id is refused instead of being looked up.
+        if (userId <= 0)
+        {
+            return Refuse(
+                PrincipalRefusalReason.UnknownAccount,
+                "The supplied account id is not a positive internal account id.",
+                subject: null);
+        }
+
+        // The id is the only identity fragment known before the read, so it travels in the DETAIL (the
+        // subject parameter is the log's GitHub-identity slot) — never a credential.
+        var idText = userId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        // Re-read the account on EVERY resolution so role/enabled changes take effect immediately.
+        ActivatedUserSummary? account;
+        try
+        {
+            account = await _userService.GetActivatedUserByIdAsync(userId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A directory read that cannot be completed proves nothing: a refusal, never a success.
+            return RefuseReadFailure(ex, idText);
+        }
+
+        // The read is by id, but the returned row is verified against it: a directory that answered with
+        // something else proved nothing about this account.
+        if (account is null || account.Id != userId)
+        {
+            return Refuse(
+                PrincipalRefusalReason.UnknownAccount,
+                $"No activated CopilotHive account exists under internal id {idText}.",
+                subject: null);
+        }
+
+        // Project into locals immediately: the secret-free summary is never retained past this method.
+        var storedGitHubId = account.GitHubId;
+        var role = account.Role;
+        var enabled = account.Enabled;
+
+        // A disabled account is refused BEFORE any status (including originality) is considered.
+        if (!enabled)
+        {
+            return Refuse(
+                PrincipalRefusalReason.DisabledAccount,
+                "The account is disabled.",
+                subject: storedGitHubId);
+        }
+
+        // One directory read identifies the original/bootstrap account (lowest-id activated row).
+        int? originalUserId;
+        try
+        {
+            var original = await _userService.GetAdminUserAsync(ct).ConfigureAwait(false);
+            originalUserId = original?.Id;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return RefuseReadFailure(ex, storedGitHubId);
+        }
+
+        try
+        {
+            var principal = ActingUserPrincipal.ForActivatedAccount(
+                userId,
+                storedGitHubId,
+                role,
+                enabled,
+                isOriginal: originalUserId == userId);
+
+            return PrincipalResolution.Resolved(principal);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // An undefined role value (or a non-positive id) means the stored row is unreadable: a
+            // refusal, never a default role.
+            return Refuse(
+                PrincipalRefusalReason.UnknownRole,
+                "The persisted account role is not a supported CopilotHive role.",
+                subject: storedGitHubId);
+        }
+        catch (ArgumentException)
+        {
+            return Refuse(
+                PrincipalRefusalReason.DirectoryFailure,
+                "The persisted account row cannot form a principal (it carries no GitHub identity).",
+                subject: null);
+        }
+    }
+
+    /// <summary>
     /// Classifies a failed directory read. Cancellation is the caller's, so it propagates; an
     /// unrecognised PERSISTED ROLE is reported as <see cref="PrincipalRefusalReason.UnknownRole"/>;
     /// every other failure is reported as <see cref="PrincipalRefusalReason.DirectoryFailure"/>.

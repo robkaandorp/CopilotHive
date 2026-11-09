@@ -2,11 +2,13 @@ using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using Moq;
@@ -117,18 +119,67 @@ public sealed class ComposerLegacyMigrationContractTests : IDisposable
         await s.SaveAsync(LegacyFile, Ct);
     }
 
-    private static ComposerAgentService CreateAgent(
+    private ComposerAgentService CreateAgent(
         string stateDir, ComposerUserState? user, LlmSessionRegistry? registry) =>
         new("test-model", 64000, 50, null, null, "system prompt", new List<AITool>(), null, stateDir,
             null, NullLogger<ComposerAgentService>.Instance, _ => new Mock<IChatClient>().Object,
-            registry, ["test-model"], null, null, false, [], null, user);
+            registry, ["test-model"], null, null, false, [], null, user,
+            user is null ? null : ToolAuthorizationGateFor(user));
 
-    private static Composer CreateComposer(
+    private Composer CreateComposer(
         GoalStore store, string stateDir, ComposerUserState? user,
         Func<string, IChatClient>? factory = null, LlmSessionRegistry? registry = null) =>
         new("test-model", NullLogger<Composer>.Instance, store, stateDir: stateDir,
+            serviceProvider: user is null ? null : SecurityPrimitives,
             chatClientFactory: factory ?? (_ => new Mock<IChatClient>().Object),
-            sessionRegistry: registry, userState: user);
+            sessionRegistry: registry, userState: user,
+            principal: user is null ? null : PrincipalFor(user));
+
+    /// <summary>
+    /// The RESOLVER-PRODUCED acting principal of <paramref name="user"/>'s account, read through the
+    /// REAL production <see cref="HivePrincipalResolver"/> over this fixture's user directory. An
+    /// identity-bound Composer requires one for the SAME account (there is no legacy-admin fallback),
+    /// so every identity-bound construction here supplies exactly this.
+    /// </summary>
+    private ActingUserPrincipal PrincipalFor(ComposerUserState user)
+    {
+        var resolver = new HivePrincipalResolver(
+            _users, HiveAuthMode.AuthenticationEnabled, NullLogger<HivePrincipalResolver>.Instance);
+        var resolution = resolver.ResolveByUserIdAsync(user.UserId, Ct).GetAwaiter().GetResult();
+        Assert.True(resolution.IsResolved, $"The fixture account {user.UserId} did not resolve to a principal.");
+        return resolution.Principal!;
+    }
+
+    /// <summary>
+    /// A service provider holding the COMPLETE security-primitive set over this fixture's user directory. An
+    /// identity-bound Composer REQUIRES a tool-authorization gate (a partial registration fails closed), so
+    /// every identity-bound construction here is handed one.
+    /// </summary>
+    private IServiceProvider SecurityPrimitives => _securityPrimitives ??= BuildSecurityPrimitives();
+
+    private ServiceProvider? _securityPrimitives;
+
+    private ServiceProvider BuildSecurityPrimitives()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        services.AddSingleton(_users);
+        services.AddSingleton(HiveAuthMode.AuthenticationEnabled);
+        services.AddSingleton<HivePolicy>();
+        services.AddSingleton(sp => new HivePrincipalResolver(
+            sp.GetRequiredService<UserService>(),
+            sp.GetRequiredService<HiveAuthMode>(),
+            NullLogger<HivePrincipalResolver>.Instance));
+        services.AddSingleton(typeof(Microsoft.Extensions.Logging.ILogger<>), typeof(NullLogger<>));
+        return services.BuildServiceProvider();
+    }
+
+    /// <summary>
+    /// The per-identity authorization gate an identity-bound <see cref="ComposerAgentService"/> now requires,
+    /// bound through the SAME central helper the Composer uses. It reads the fixture's real user directory.
+    /// </summary>
+    private ComposerToolAuthorizationGate ToolAuthorizationGateFor(ComposerUserState user) =>
+        ComposerToolAuthorization.FromServiceProvider(SecurityPrimitives)!.Bind(user.UserId);
+
 
     /// <summary>
     /// Reads the Composer's live agent session through the private agent-service field.

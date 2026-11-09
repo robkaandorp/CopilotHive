@@ -4,6 +4,7 @@ using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
+using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
@@ -70,6 +71,22 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly IServiceProvider? _serviceProvider;
     private readonly string _stateDir;
     private readonly ComposerUserState? _userState;
+
+    /// <summary>
+    /// The RESOLVER-PRODUCED acting principal of this runtime's account, or <c>null</c> for a legacy
+    /// Composer. For identity-bound construction it is REQUIRED and must match the identity — see
+    /// <see cref="ValidatePrincipalMatchesIdentity"/>.
+    /// </summary>
+    private readonly ActingUserPrincipal? _principal;
+
+    /// <summary>
+    /// THIS runtime's authorization boundary, or <c>null</c> when the container supplied no security
+    /// primitives (legacy/unit-test construction, which keeps the prior behaviour). It is bound to
+    /// <see cref="_userState"/>'s fixed id and re-reads current stored state on every check, so it
+    /// holds no authorization truth of its own.
+    /// </summary>
+    private readonly ComposerToolAuthorizationGate? _toolAuthorizationGate;
+
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly string? _ollamaApiKey;
     private readonly ComposerAgentService _agentService;
@@ -483,7 +500,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         IIssueStore? issueStore = null,
         ComposerEventSubscriber? eventSubscriber = null,
         IEventBus? eventBus = null,
-        ComposerUserState? userState = null)
+        ComposerUserState? userState = null,
+        ActingUserPrincipal? principal = null)
     {
         // Constructor normalization: null/whitespace model ⇒ null (no model configured).
         // The Composer then registers as a disconnected shell — no client, IsConnected false.
@@ -497,6 +515,19 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _stateDir = stateDir ?? "/app/state";
         _userState = userState;
         ValidateAttachmentServiceMatchesIdentity(attachmentService);
+        ValidatePrincipalMatchesIdentity(principal);
+        _principal = principal;
+
+        // The ONE authorization boundary this runtime's tools are checked against. It is bound to the
+        // runtime's FIXED account id (the legacy Composer passes null and re-resolves per invocation), so
+        // the tool surface can never authorize a different account than the one that owns this state.
+        // FromServiceProvider returns null ONLY when no provider exists at all; a PARTIAL registration
+        // throws rather than degrading to "unguarded". ValidateToolAuthorizationGate then refuses to let
+        // IDENTITY-BOUND state run without a gate.
+        _toolAuthorizationGate = ComposerToolAuthorization
+            .FromServiceProvider(serviceProvider)
+            ?.Bind(userState?.UserId);
+        ValidateToolAuthorizationGate();
         _httpClientFactory = httpClientFactory;
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
         _hiveConfig = hiveConfig;
@@ -576,7 +607,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             subAgentsEnabled,
             subAgentModels,
             attachmentService?.AttachmentsRootPath,
-            _userState);
+            _userState,
+            _toolAuthorizationGate);
 
         _handleSubAgentChanged = info => OnSubAgentChanged?.Invoke(info);
         _agentService.OnSubAgentChanged += _handleSubAgentChanged;
@@ -1056,6 +1088,42 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// IDENTITY-BOUND PRINCIPAL ENFORCEMENT: when this Composer has a per-user identity, the acting
+    /// principal is REQUIRED and must be the RESOLVER-PRODUCED principal of that SAME activated account.
+    /// <list type="bullet">
+    /// <item>A null principal for identity-bound state is rejected — there is NO legacy-admin fallback
+    /// and no silent proceed, so an identity-bound Composer can never run unauthenticated.</item>
+    /// <item>A principal of a DIFFERENT account is rejected, so one user's state can never be driven by
+    /// another user's authority.</item>
+    /// <item>A local-operator (open-mode) principal is rejected for identity-bound state: open mode has
+    /// no persisted account, and an identity-bound Composer exists only for one.</item>
+    /// </list>
+    /// A LEGACY Composer (<c>userState == null</c>) accepts <c>null</c> unchanged — that is the legacy
+    /// exception, and it is the only place an absent principal is legitimate.
+    /// </summary>
+    private void ValidatePrincipalMatchesIdentity(ActingUserPrincipal? principal)
+    {
+        if (_userState is null)
+            return;
+
+        if (principal is null)
+        {
+            throw new ArgumentException(
+                $"Composer user state for account {_userState.UserId} requires the resolver-produced acting principal " +
+                "of that SAME account; no principal was supplied, and there is no legacy fallback for identity-bound state.",
+                nameof(principal));
+        }
+
+        if (principal.IsLocalOperator || principal.UserId != _userState.UserId)
+        {
+            throw new ArgumentException(
+                $"The acting principal ({(principal.IsLocalOperator ? "open-mode local operator" : $"user {principal.UserId}")}) " +
+                $"does not match the Composer's identity (user {_userState.UserId}).",
+                nameof(principal));
+        }
+    }
+
     /// <summary>Refreshes the <c>composer</c> registry entry with the current session tokens and status.</summary>
     private void RefreshComposerRegistry(string status = "idle", long? currentTokens = null)
     {
@@ -1138,6 +1206,87 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     }
 
     private async Task RecreateAgentAsync() => await _agentService.RecreateAgentAsync();
+
+    /// <summary>
+    /// IDENTITY-BOUND AUTHORIZATION IS MANDATORY: a Composer carrying per-user state must have a tool
+    /// authorization gate. <see cref="_toolAuthorizationGate"/> is <c>null</c> only when the construction
+    /// supplies NO security primitives at all, and that is legitimate EXCLUSIVELY for the approved legacy
+    /// exception — <c>userState == null</c> (the legacy original-admin singleton, or the explicit
+    /// open/no-auth local operator including the system <see cref="IClarificationRouter"/>).
+    /// <para>
+    /// Identity-bound state with no gate is rejected here, at construction, because proceeding would leave
+    /// every tool unguarded for a real account: the hook would be absent and every method-level guard a
+    /// no-op. A partially registered container never reaches this method — it throws inside
+    /// <see cref="ComposerToolAuthorization.FromServiceProvider"/> instead of degrading to unguarded.
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Identity-bound state was constructed without any security primitives.
+    /// </exception>
+    private void ValidateToolAuthorizationGate()
+    {
+        if (_userState is null || _toolAuthorizationGate is not null)
+            return;
+
+        throw new InvalidOperationException(
+            $"Composer user state for account {_userState.UserId} requires the security primitives: no tool " +
+            "authorization boundary was configured, so every Composer tool would run unguarded. Supply the " +
+            "primary constructor's service provider with " + nameof(ComposerToolAuthorization) +
+            "'s primitives registered, or construct the legacy (state-less) Composer instead.");
+    }
+
+    /// <summary>
+    /// METHOD-LEVEL ENFORCEMENT for one Composer tool: returns the model-visible denial text, or
+    /// <c>null</c> when the call may proceed. It asks the SAME per-runtime
+    /// <see cref="ComposerToolAuthorizationGate"/> the SharpCoder hook uses, so the enforcement is not
+    /// hook-only: a mutating tool called directly (by a future seam, or a test) is still refused before it
+    /// can touch anything.
+    /// <para>
+    /// NO GATE has exactly two meanings, and they must not be conflated:
+    /// <list type="bullet">
+    /// <item>APPROVED LEGACY EXCEPTION — <c>userState == null</c> (the legacy original-admin singleton, or
+    /// the explicit open/no-auth local operator including the system <see cref="IClarificationRouter"/>)
+    /// over a container with genuinely NONE of the primitives. There is no per-user authority to check, so
+    /// the call proceeds exactly as before, keeping legacy behaviour byte-identical.</item>
+    /// <item>IDENTITY-BOUND STATE — impossible: <see cref="ValidateToolAuthorizationGate"/> rejects that
+    /// construction. The defensive branch below therefore DENIES rather than allowing, so no future path
+    /// can leave a real account's tool surface unguarded.</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    /// <param name="toolName">The tool name whose capability is required.</param>
+    /// <param name="ct">
+    /// The CALLER's cancellation token, threaded into the fresh directory lookup. Cancellation observed
+    /// during that lookup propagates out of the tool method rather than becoming a refusal.
+    /// </param>
+    private Task<string?> AuthorizationDenialAsync(string toolName, CancellationToken ct = default) =>
+        _toolAuthorizationGate is { } gate
+            ? gate.ToolDenialAsync(toolName, ct)
+            : Task.FromResult(_userState is null ? null : LegacyUnauthorizedReason(toolName));
+
+    /// <summary>
+    /// METHOD-LEVEL ENFORCEMENT for <c>update_goal</c>: the unsupported-field rule AND the
+    /// ExecutionOperator capability, checked against the field the method actually received.
+    /// </summary>
+    /// <param name="field">The <c>field</c> argument of the call.</param>
+    /// <param name="ct">
+    /// The CALLER's cancellation token, threaded into the fresh directory lookup (see
+    /// <see cref="AuthorizationDenialAsync"/>).
+    /// </param>
+    private Task<string?> UpdateGoalAuthorizationDenialAsync(string? field, CancellationToken ct = default) =>
+        _toolAuthorizationGate is { } gate
+            ? gate.UpdateGoalFieldDenialAsync(field, ct)
+            : Task.FromResult(_userState is null ? null : LegacyUnauthorizedReason("update_goal"));
+
+    /// <summary>
+    /// The fixed, model-visible denial text for identity-bound state that somehow reached a tool without a
+    /// gate. Unreachable through construction (<see cref="ValidateToolAuthorizationGate"/> rejects it), kept
+    /// as defence in depth; it never contains host state.
+    /// </summary>
+    /// <param name="toolName">The tool that was refused.</param>
+    private static string LegacyUnauthorizedReason(string toolName) =>
+        $"The current user's account could not be verified, so '{toolName}' was refused.";
+
 
     internal List<AITool> BuildComposerTools()
     {

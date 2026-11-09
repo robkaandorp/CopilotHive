@@ -79,6 +79,13 @@ public sealed partial class Composer
         if (_issueStore is null)
             return "Issue tracking not available.";
 
+        // InteractiveMember enforcement BEFORE any store write: create_issue is a member action, but the
+        // CAPABILITY ASSIGNMENT governs which principal passes, never whether a check happens. A direct call
+        // bypassing the SharpCoder hook is therefore refused for a Viewer or a disabled account instead of
+        // persisting a row.
+        if (await AuthorizationDenialAsync("create_issue", ct) is { } denyCreateIssue)
+            return denyCreateIssue;
+
         if (string.IsNullOrWhiteSpace(type))
             return "Type is required.";
 
@@ -253,6 +260,9 @@ public sealed partial class Composer
         [Description("Optional linked goal ID. null = no change, empty string = clear, non-empty = set.")] string? linked_goal_id = null,
         CancellationToken ct = default)
     {
+        if (await AuthorizationDenialAsync("update_issue", ct) is { } deny_update_issue)
+            return deny_update_issue;
+
         if (_issueStore is null)
             return "Issue tracking not available.";
 

@@ -100,6 +100,9 @@ public sealed partial class Composer
         [Description("New full content for the AGENTS.md file.")] string content,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("update_agents_md", cancellationToken) is { } deny_update_agents_md)
+            return deny_update_agents_md;
+
         if (_configRepo is null)
             return "❌ Config repo tools are not available — no config repo configured.";
 
@@ -133,6 +136,9 @@ public sealed partial class Composer
         [Description("The replacement text.")] string new_string,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("edit_agents_md", cancellationToken) is { } deny_edit_agents_md)
+            return deny_edit_agents_md;
+
         if (_configRepo is null)
             return "❌ Config repo tools are not available — no config repo configured.";
 
@@ -174,6 +180,9 @@ public sealed partial class Composer
         [Description("Commit message describing what was changed and why.")] string message,
         CancellationToken cancellationToken = default)
     {
+        if (await AuthorizationDenialAsync("commit_config_changes", cancellationToken) is { } deny_commit_config_changes)
+            return deny_commit_config_changes;
+
         if (_configRepo is null)
             return "❌ Config repo tools are not available — no config repo configured.";
 

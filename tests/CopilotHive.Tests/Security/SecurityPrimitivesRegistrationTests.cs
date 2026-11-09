@@ -131,14 +131,20 @@ public sealed class SecurityPrimitivesRegistrationTests
     }
 
     /// <summary>
-    /// THIS SLICE ENFORCES NOTHING: no existing endpoint, facade, hub, route, Composer tool, actor or
-    /// the user directory itself references the new primitives, so their mere presence cannot change
-    /// any existing behaviour. <c>Program.cs</c> is the single allowed reference (its DI registration),
-    /// and <see cref="UserService"/> / <see cref="CopilotHive.Persistence.Entities.UserEntity"/> are
-    /// untouched contracts the primitives consume rather than modify.
+    /// ENFORCEMENT STOPS AT THE COMPOSER TOOL SURFACE: the authorization primitives are consumed ONLY by
+    /// the Composer tool surface this goal wires (the Composer, its tool partials and its agent service) and
+    /// by the new central Composer tool-authorization helper. Every OTHER boundary — endpoints, hubs,
+    /// facades, routes, the user directory and the credential entity — still references none of them, so
+    /// nothing outside the Composer tools gained enforcement.
+    /// <para>
+    /// The Composer files are deliberately NOT in the pinned list: wiring them is exactly what the goal
+    /// requires. <see cref="UserService"/> and
+    /// <see cref="CopilotHive.Persistence.Entities.UserEntity"/> remain untouched contracts the primitives
+    /// consume rather than modify, and <c>Program.cs</c> remains the DI registration site.
+    /// </para>
     /// </summary>
     [Fact]
-    public void ExistingBoundaries_ReferenceNoneOfTheNewPrimitives()
+    public void BoundariesOutsideTheComposerToolSurface_ReferenceNoneOfTheNewPrimitives()
     {
         var repoRoot = TestRepoRoot.Find();
         var src = Path.Combine(repoRoot, "src", "CopilotHive");
@@ -158,12 +164,6 @@ public sealed class SecurityPrimitivesRegistrationTests
             "Components/Routes.razor",
             "Components/Pages/ComposerChat.razor",
             "Components/Layout/NavMenu.razor",
-            "Orchestration/Composer.cs",
-            "Orchestration/ComposerGoalTools.cs",
-            "Orchestration/ComposerConfigTools.cs",
-            "Orchestration/ComposerIssueTools.cs",
-            "Orchestration/ComposerKnowledgeTools.cs",
-            "Orchestration/ComposerAgentService.cs",
             "Actors/ComposerActor.cs",
             "Persistence/Entities/UserEntity.cs",
         };
@@ -176,6 +176,7 @@ public sealed class SecurityPrimitivesRegistrationTests
             "ActingUserPrincipal",
             "HivePolicy",
             "PrincipalResolution",
+            "ComposerToolAuthorization",
             "CopilotHive.Security",
         ];
 
@@ -191,6 +192,45 @@ public sealed class SecurityPrimitivesRegistrationTests
             {
                 Assert.DoesNotContain(primitive, body, StringComparison.Ordinal);
             }
+        }
+    }
+
+    /// <summary>
+    /// THE COMPOSER TOOL SURFACE IS THE ONLY PLACE THE PRIMITIVES ARE ENFORCED, and the central helper is a
+    /// genuine single seam: the capability map, the fresh resolution and the policy evaluation live in ONE
+    /// type, which the tool partials consume rather than re-deriving.
+    /// </summary>
+    [Fact]
+    public void TheComposerToolSurface_EnforcesThroughOneCentralHelper()
+    {
+        var repoRoot = TestRepoRoot.Find();
+        var composerRoot = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration");
+
+        // The helper exists and is where the map lives.
+        var helperPath = Path.Combine(repoRoot, "src", "CopilotHive", "Security", "ComposerToolAuthorization.cs");
+        Assert.True(File.Exists(helperPath), $"Central helper not found at {helperPath}");
+        var helperBody = TestSourceScanner.StripNonCode(File.ReadAllText(helperPath).ReplaceLineEndings("\n"));
+        Assert.Contains("HiveCapability", helperBody, StringComparison.Ordinal);
+        Assert.Contains("HivePolicy", helperBody, StringComparison.Ordinal);
+        Assert.Contains("ResolveByUserIdAsync", helperBody, StringComparison.Ordinal);
+
+        // The mutating tool partials consult the ONE helper's gate, never the resolver/policy directly, so
+        // no second, divergent authorization path can appear next to the hook.
+        foreach (var file in new[]
+        {
+            "ComposerGoalTools.cs",
+            "ComposerConfigTools.cs",
+            "ComposerIssueTools.cs",
+            "ComposerKnowledgeTools.cs",
+            "ComposerGitTools.cs",
+        })
+        {
+            var body = TestSourceScanner.StripNonCode(
+                File.ReadAllText(Path.Combine(composerRoot, file)).ReplaceLineEndings("\n"));
+
+            Assert.DoesNotContain("HivePolicy", body, StringComparison.Ordinal);
+            Assert.DoesNotContain("HivePrincipalResolver", body, StringComparison.Ordinal);
+            Assert.Contains("AuthorizationDenialAsync", body, StringComparison.Ordinal);
         }
     }
 }

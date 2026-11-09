@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
+using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
@@ -53,7 +54,8 @@ internal sealed class ComposerAgentService(
     bool subAgentsEnabled,
     IReadOnlyList<ModelEntry> subAgentModels,
     string? additionalImagesRoot = null,
-    ComposerUserState? userState = null) : IAsyncDisposable
+    ComposerUserState? userState = null,
+    ComposerToolAuthorizationGate? toolAuthorizationGate = null) : IAsyncDisposable
 {
     private string? _model = string.IsNullOrWhiteSpace(model) ? null : model;
     private int _maxContextTokens = maxContextTokens;
@@ -80,6 +82,19 @@ internal sealed class ComposerAgentService(
     private readonly bool _subAgentsEnabled = subAgentsEnabled;
     private readonly string? _additionalImagesRoot = additionalImagesRoot;
     private readonly ComposerUserState? _userState = userState;
+
+    /// <summary>
+    /// THIS runtime's tool-authorization boundary (the central
+    /// <see cref="CopilotHive.Security.ComposerToolAuthorization"/> bound to the runtime's fixed identity),
+    /// or <c>null</c> when the container supplied no security primitives. <c>null</c> is legitimate ONLY for
+    /// the approved legacy exception (<c>userState == null</c>); identity-bound state without a gate is
+    /// rejected here at construction, because that agent would be built with NO hook and every tool would run
+    /// unguarded. The pair handed to SharpCoder's
+    /// <see cref="AgentOptions.AuthorizeTool"/>/<see cref="AgentOptions.ToolAuthorizationCorrelationId"/> is
+    /// captured ONCE per <see cref="CodingAgent"/> construction, so a recreated agent always captures the
+    /// current pair. The gate itself caches nothing: every guarded call re-reads current stored state.
+    /// </summary>
+    private readonly ComposerToolAuthorizationGate? _toolAuthorizationGate = toolAuthorizationGate;
 
     /// <summary>
     /// Immutable construction-time snapshot of the sub-agent model catalog. Deliberately NOT read
@@ -799,6 +814,16 @@ internal sealed class ComposerAgentService(
         if (_chatClient is null)
             throw new InvalidOperationException("Composer not connected");
 
+        // IDENTITY-BOUND AUTHORIZATION IS MANDATORY: refuse to build an agent for per-user state with no
+        // authorization gate, which would register NO SharpCoder hook and let every tool run unguarded.
+        // A null gate is legitimate only for the approved legacy exception (userState == null).
+        if (_userState is not null && _toolAuthorizationGate is null)
+        {
+            throw new InvalidOperationException(
+                $"The Composer agent service for account {_userState.UserId} requires a tool-authorization gate: " +
+                "no authorization boundary was configured, so its tools would run unguarded.");
+        }
+
         // Agent-only replacement: client retained, only the old agent is disposed.
         // Non-failure path: disposal failure MAY propagate.
         var oldAgent = _agent;
@@ -837,6 +862,13 @@ internal sealed class ComposerAgentService(
                 _onCompacted?.Invoke(r);
             },
             SubAgents = BuildSubAgentOptions(),
+            // The delivered SharpCoder boundary: called for EVERY locally invokable tool (custom Composer
+            // tools, the built-in read tools, the four sub-agent tools) immediately before it can produce
+            // a side effect. Both members are captured together once at CodingAgent construction and stay
+            // fixed for that agent's lifetime; the gate itself re-reads current stored state per call, so a
+            // demote/promote/disable between calls takes effect on the next call.
+            AuthorizeTool = _toolAuthorizationGate is null ? null : _toolAuthorizationGate.AuthorizeToolAsync,
+            ToolAuthorizationCorrelationId = _toolAuthorizationGate?.CorrelationId,
         };
 
         _agent = new CodingAgent(_chatClient, _agentOptions);

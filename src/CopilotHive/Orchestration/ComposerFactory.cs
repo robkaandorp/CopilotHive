@@ -116,6 +116,12 @@ public sealed class ComposerFactory
     /// Builds the legacy single-admin Composer: <c>userState</c> null, the legacy root attachment
     /// service and the legacy shared event subscriber, exactly as resolved from DI. Legacy construction and its
     /// startup inputs are unchanged: its deferral is evaluated once by the legacy coordinator, not by this factory.
+    /// <para>
+    /// A legacy Composer carries NO principal: while authentication is enabled it re-resolves the original
+    /// account on every effective invocation (<see cref="ComposerToolAuthorization"/>), and in open/no-auth
+    /// mode it is the explicit local operator. Passing no principal here is the only place an absent principal
+    /// is legitimate, because there is no identity-bound state for one to match.
+    /// </para>
     /// </summary>
     public Composer CreateLegacy() =>
         Build(userState: null, _sp.GetService<ComposerAttachmentService>(), _sp.GetService<ComposerEventSubscriber>()).Composer;
@@ -124,9 +130,19 @@ public sealed class ComposerFactory
     /// Builds a Composer bound to one validated per-user identity and its own attachment service / subscriber,
     /// together with the construction-captured configuration its deferral decisions are evaluated against.
     /// </summary>
+    /// <param name="userState">The validated per-user identity.</param>
+    /// <param name="attachments">The runtime's own attachment service.</param>
+    /// <param name="subscriber">The runtime's own event subscriber, or <c>null</c>.</param>
+    /// <param name="principal">
+    /// The RESOLVER-PRODUCED acting principal of the SAME activated account. It is an optional trailing
+    /// parameter only so legacy call sites keep their shape: identity-bound construction (a non-null
+    /// <paramref name="userState"/>) REQUIRES it, and <see cref="Composer"/> itself rejects an absent or
+    /// mismatched principal — there is no legacy-admin fallback and no silent proceed.
+    /// </param>
     internal ComposerBuildResult CreateForUser(
-        ComposerUserState userState, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber) =>
-        Build(userState ?? throw new ArgumentNullException(nameof(userState)), attachments, subscriber);
+        ComposerUserState userState, ComposerAttachmentService attachments, ComposerEventSubscriber? subscriber,
+        ActingUserPrincipal? principal = null) =>
+        Build(userState ?? throw new ArgumentNullException(nameof(userState)), attachments, subscriber, principal);
 
     /// <summary>Creates the per-user attachment service rooted at <c>{stateDir}/composer/users/N/attachments</c>.</summary>
     internal ComposerAttachmentService CreateUserAttachments(ComposerUserState userState) =>
@@ -141,7 +157,8 @@ public sealed class ComposerFactory
         _sp.GetService<LlmSessionRegistry>()?.Unregister(ComposerUserState.RegistryId(userState));
 
     private ComposerBuildResult Build(
-        ComposerUserState? userState, ComposerAttachmentService? attachmentService, ComposerEventSubscriber? eventSubscriber)
+        ComposerUserState? userState, ComposerAttachmentService? attachmentService, ComposerEventSubscriber? eventSubscriber,
+        ActingUserPrincipal? principal = null)
     {
         var config = _sp.GetRequiredService<HiveConfigFile>();
 
@@ -192,7 +209,8 @@ public sealed class ComposerFactory
             issueStore: _sp.GetService<IIssueStore>(),
             eventSubscriber: eventSubscriber,
             eventBus: _sp.GetService<IEventBus>(),
-            userState: userState);
+            userState: userState,
+            principal: principal);
 
         return new ComposerBuildResult(composer, constructionConfiguration);
     }
