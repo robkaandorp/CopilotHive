@@ -37,7 +37,11 @@ public interface IBrainRepoManager
     /// If the clone already exists, pulls the latest changes on the default branch.
     /// </summary>
     /// <param name="repoName">Short name of the repository (used in the directory name).</param>
-    /// <param name="repoUrl">Remote URL of the repository (with credentials if needed).</param>
+    /// <param name="repoUrl">
+    /// Remote URL of the repository. A caller-supplied credential-bearing URL is used EXACTLY as
+    /// supplied (the operator trust boundary); a host-resolved credential is delivered separately
+    /// through the operation-scoped askpass helper and never written to the origin.
+    /// </param>
     /// <param name="defaultBranch">Default branch to check out (e.g. "main", "develop").</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>Absolute path to the clone directory.</returns>
@@ -154,7 +158,17 @@ public interface IBrainRepoManager
 /// </summary>
 /// <param name="WorkingDirectory">Working directory the git process runs in.</param>
 /// <param name="Arguments">The git arguments, already split into individual tokens.</param>
-public readonly record struct BrainGitRequest(string WorkingDirectory, IReadOnlyList<string> Arguments);
+/// <param name="ChildEnvironment">
+/// The COMPLETE child environment this launch would use, or <c>null</c> when the launch inherits
+/// the parent process environment unchanged (a local-only command of an operation that resolved no
+/// credential). It is the same dictionary the real-process runner installs on the child, so a seam
+/// observes the ACTUAL environment — including the operation-scoped askpass wiring and the ABSENCE
+/// of every inherited credential variable — rather than only the argument list.
+/// </param>
+public readonly record struct BrainGitRequest(
+    string WorkingDirectory,
+    IReadOnlyList<string> Arguments,
+    IReadOnlyDictionary<string, string?>? ChildEnvironment = null);
 
 /// <summary>
 /// The RAW result of a git invocation performed through the <see cref="BrainRepoManager"/>
@@ -196,13 +210,15 @@ public readonly record struct BrainFetchResult(bool Success, string Output, stri
 /// <para>
 /// <b>Credentials.</b> Every NETWORK-BEARING operation resolves ONE credential for its whole
 /// duration — the stored OAuth admin token (via the optional live lookup) falling back to the
-/// <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> environment chain — and refreshes the clone's
-/// <c>origin</c> with it immediately before the operation's FIRST network command, under the
-/// per-repository lock. Only the repository's currently CONFIGURED, eligible URL (parsed HTTPS,
-/// host exactly <c>github.com</c>, effective port 443) is ever credentialed. When no credential
-/// resolves, the persisted origin is left completely untouched: a stale credential can survive in
-/// <c>.git/config</c> until a later successful resolution replaces it — there is no revocation
-/// cleanup and no guarantee of secret-free on-disk origins.
+/// <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> environment chain — and authenticates its network commands
+/// with an OPERATION-SCOPED, token-free askpass helper (<see cref="HostGitAskpassHelper"/>)
+/// against the SANITIZED configured origin. The credential therefore never reaches
+/// <c>.git/config</c>, a git argument list, or this process's own (long-lived) environment.
+/// Only the repository's currently CONFIGURED, eligible URL (parsed HTTPS, host exactly
+/// <c>github.com</c>, effective port 443) is ever credentialed. When no credential resolves, the
+/// persisted origin is left completely untouched: a stale credential can survive in
+/// <c>.git/config</c> until a later operation that normalizes the origin replaces it — there is no
+/// revocation cleanup and no guarantee of secret-free on-disk origins.
 /// </para>
 /// </summary>
 public sealed class BrainRepoManager : IBrainRepoManager
@@ -215,6 +231,14 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// the single private process-based runner (<see cref="RunGitCoreAsync"/>) is used.
     /// </summary>
     private readonly Func<BrainGitRequest, BrainGitResult>? _gitRunner;
+
+    /// <summary>
+    /// TEST SEAM — overrides the platform predicate <see cref="HostGitAskpassHelper.TryCreate"/>
+    /// uses (<see cref="OperatingSystem.IsLinux"/> by default). <c>null</c> in production, where the
+    /// real predicate is the single authority: on any non-Linux platform the helper fails closed and
+    /// no credential is transported at all.
+    /// </summary>
+    internal Func<bool>? AskpassPlatformSupported { get; set; }
 
     /// <summary>
     /// Optional LIVE lookup of the stored OAuth admin credential. <c>null</c> when the manager is
@@ -232,11 +256,15 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <summary>The placeholder substituted for a raw credential in any constructed message.</summary>
     private const string CredentialPlaceholder = "[redacted]";
 
-    /// <summary>The userinfo user name GitHub accepts alongside a token password.</summary>
-    private const string CredentialUserName = "x-access-token";
-
     /// <summary>The only host whose HTTPS URLs may receive the admin credential.</summary>
     private const string GitHubHost = "github.com";
+
+    /// <summary>
+    /// The BOUND on a failed/cancelled clone's residual origin normalization. Deliberately short:
+    /// this is a local <c>remote set-url</c>, and a hung cleanup must never delay the primary
+    /// exception or cancellation it is unwinding.
+    /// </summary>
+    private static readonly TimeSpan ResidualCleanupTimeout = TimeSpan.FromSeconds(5);
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _repoLocks =
         new(StringComparer.OrdinalIgnoreCase);
@@ -345,7 +373,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
         // A lookup that observes the cancellation but RETURNS NORMALLY (rather than throwing an
         // OperationCanceledException) must not be allowed to hand back a credential that then
-        // reaches AttachCredential and starts a credential-bearing git process. Cancellation is
+        // reaches the transport and starts an authenticated git process. Cancellation is
         // re-checked here, after the await, so it is observed BEFORE any credential is selected.
         ct.ThrowIfCancellationRequested();
 
@@ -408,21 +436,26 @@ public sealed class BrainRepoManager : IBrainRepoManager
     }
 
     /// <summary>
-    /// Returns <paramref name="eligibleUrl"/> with its userinfo REPLACED by the URI-escaped
-    /// <paramref name="credential"/>. Only ever called with a URL that passed
-    /// <see cref="IsCredentialEligible"/>, so the result is always an HTTPS GitHub URL.
+    /// Returns the CREDENTIAL-FREE form of <paramref name="eligibleUrl"/>: any userinfo is removed
+    /// (including a caller-supplied or previously persisted credential) and the repository identity
+    /// — scheme, host, port, path, query and fragment — is preserved verbatim.
     /// </summary>
-    private static string AttachCredential(string eligibleUrl, string credential)
+    /// <remarks>
+    /// This is the ONLY origin form an authenticated operation may persist or hand to git. It is
+    /// applied through <see cref="BrainGitAuth.SanitizedOriginUrl"/>, so no host-resolved credential
+    /// ever reaches <c>.git/config</c> or an argument list.
+    /// </remarks>
+    private static string SanitizeOriginUrl(string eligibleUrl)
     {
         var uri = new Uri(eligibleUrl.Trim(), UriKind.Absolute);
         var authority = uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
-        return $"{uri.Scheme}://{CredentialUserName}:{Uri.EscapeDataString(credential)}@{authority}{uri.PathAndQuery}{uri.Fragment}";
+        return $"{uri.Scheme}://{authority}{uri.PathAndQuery}{uri.Fragment}";
     }
 
     /// <summary>
-    /// The single per-repository credential-refresh core for an EXISTING clone. It runs under the
-    /// caller's already-acquired per-repository semaphore, issues only LOCAL git commands, and
-    /// returns the credential the whole operation must reuse (<c>null</c> when none was resolved).
+    /// The single per-repository credential-resolution core for an EXISTING clone. It runs under
+    /// the caller's already-acquired per-repository semaphore, issues only LOCAL git commands, and
+    /// returns the operation's authenticated transport (<c>null</c> when nothing was resolved).
     /// <para>
     /// <b>Unconfigured compatibility.</b> With no configured-URL lookup — or a blank/ineligible
     /// configured URL — this is a complete no-op: no OAuth lookup, no origin inspection, no
@@ -432,17 +465,25 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <b>Existing-origin policy.</b> The persisted <c>origin</c> is read and its credential-free
     /// identity compared against the configured URL. A mismatch, multiple/conflicting fetch
     /// destinations, or an explicit <c>pushurl</c> are rejected with a fixed, credential-free
-    /// error BEFORE any credential is attached and before any network command runs — a working
+    /// error BEFORE any credential is resolved and before any network command runs — a working
     /// tree is never redirected at a different repository.
     /// </para>
     /// <para>
-    /// <b>The stale-origin rule.</b> When NO credential resolves, nothing is written: a transient
-    /// lookup failure must never strip a working persisted credential. The declared and accepted
-    /// consequence is that a revoked credential can persist in <c>.git/config</c> until a later
-    /// successful resolution replaces it; there is no automatic removal.
+    /// <b>Normalization BEFORE the network, and the sanitized origin is permanent.</b> Once a
+    /// credential resolves, the persisted origin is FIRST normalized to the sanitized configured
+    /// URL. If that normalization fails, NO network command runs. A network failure or cancellation
+    /// afterwards leaves the sanitized origin in place — a stale tokenized origin is NEVER restored,
+    /// because the credential never needed to be in it in the first place.
+    /// </para>
+    /// <para>
+    /// <b>The stale-origin rule (unchanged).</b> When NO credential resolves, nothing is written: a
+    /// transient lookup failure must never strip a working persisted credential. The declared and
+    /// accepted consequence is that a revoked credential can persist in <c>.git/config</c> until a
+    /// later successful resolution replaces it; there is no automatic removal.
     /// </para>
     /// </summary>
-    private async Task<string?> RefreshOriginCredentialAsync(
+    /// <returns>The operation's authenticated transport, or <c>null</c> when none was resolved.</returns>
+    private async Task<BrainGitAuth?> RefreshOriginCredentialAsync(
         string repoName, string clonePath, CancellationToken ct, CredentialBox? box = null)
     {
         // Caller cancellation is honoured before ANY lookup, mutation or git command.
@@ -486,7 +527,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // LOCAL read: an explicit pushurl would silently keep sending pushes elsewhere.
         //
         // This inspection must FAIL CLOSED — the destination policy has to be positively
-        // established before any credential is attached:
+        // established before any credential is used:
         //   • exit 1  is git's "key is not set" signal — the ONLY accepted absence.
         //   • exit 0  means the key EXISTS. Any value is rejected, including an explicitly empty
         //             or whitespace one: an empty pushurl is still an explicit override whose
@@ -512,27 +553,58 @@ public sealed class BrainRepoManager : IBrainRepoManager
         if (credential is null)
             return null;
 
+        var sanitizedOrigin = SanitizeOriginUrl(configuredUrl!);
+
         // Final pre-MUTATION cancellation check. Everything above is read-only inspection; this is
-        // the last point before the origin is rewritten with a credential-bearing URL.
+        // the last point before the origin is rewritten.
         ct.ThrowIfCancellationRequested();
 
-        await RunGitAsync(
-            clonePath,
-            ["remote", "set-url", "origin", AttachCredential(configuredUrl!, credential)],
-            ct,
-            credential);
+        // NORMALIZE FIRST, AUTHENTICATE SECOND. A failed normalization throws out of RunGitAsync
+        // (credential-free text: the URL is the sanitized one), so no network command runs against
+        // an origin whose destination policy was never established.
+        await RunGitAsync(clonePath, ["remote", "set-url", "origin", sanitizedOrigin], ct);
 
-        return credential;
+        // FAIL CLOSED on the platform: no helper means no credential transport at all, reported as
+        // an honest, credential-free error — never a silent fallback to a tokenized URL.
+        var auth = CreateAuth(credential, sanitizedOrigin);
+        if (auth is null)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to authenticate git network operations for '{repoName}': the "
+                + "operation-scoped credential helper is unavailable on this platform.");
+        }
+
+        return auth;
     }
 
     /// <summary>
-    /// Credential resolution for a NEW clone: the SUPPLIED URL is authenticated directly, but only
-    /// when it is the repository's currently configured, eligible URL. An unconfigured repository —
-    /// or a caller-supplied URL that denotes a DIFFERENT repository than the configured one — is
-    /// cloned exactly as supplied, with no credential resolution at all.
+    /// Builds the operation-scoped authenticated transport for a resolved
+    /// <paramref name="credential"/>, or <c>null</c> when this platform cannot execute the helper
+    /// (an explicit fail-closed result — never a tokenized-URL fallback).
     /// </summary>
-    /// <returns>The URL to clone from and the credential the operation must reuse.</returns>
-    private async Task<(string CloneUrl, string? Credential)> ResolveCloneUrlAsync(
+    private BrainGitAuth? CreateAuth(string credential, string sanitizedOrigin)
+    {
+        var helper = HostGitAskpassHelper.TryCreate(AskpassPlatformSupported);
+        return helper is null
+            ? null
+            : new BrainGitAuth(credential, sanitizedOrigin, helper);
+    }
+
+    /// <summary>
+    /// Credential resolution for a NEW clone: the SUPPLIED URL is authenticated, but only when it is
+    /// the repository's currently configured, eligible URL. An unconfigured repository — or a
+    /// caller-supplied URL that denotes a DIFFERENT repository than the configured one — is cloned
+    /// exactly as supplied, with no credential resolution at all.
+    /// </summary>
+    /// <remarks>
+    /// <b>The operator trust boundary is unchanged.</b> A caller-supplied URL is passed through
+    /// VERBATIM, including one that already carries a credential: the operator's own URL is their
+    /// decision and the host guarantee covers only host-resolved/injected credentials. When a
+    /// credential DOES resolve, the clone runs against the SANITIZED configured URL with the
+    /// operation-scoped helper, so the credential reaches git through no persistent channel.
+    /// </remarks>
+    /// <returns>The URL to clone from and the operation's authenticated transport, if any.</returns>
+    private async Task<(string CloneUrl, BrainGitAuth? Auth)> ResolveCloneUrlAsync(
         string repoName, string repoUrl, CancellationToken ct, CredentialBox? box = null)
     {
         ct.ThrowIfCancellationRequested();
@@ -545,16 +617,28 @@ public sealed class BrainRepoManager : IBrainRepoManager
         if (credential is null)
             return (repoUrl, null);
 
-        // Publish the selection BEFORE the credential is ever attached to a URL, so the
-        // operation-level boundary can redact a failure in the clone that follows.
+        // Publish the selection BEFORE the credential is used, so the operation-level boundary can
+        // redact a failure in the clone that follows.
         if (box is not null)
             box.Credential = credential;
+
+        var sanitizedOrigin = SanitizeOriginUrl(configuredUrl!);
 
         // Final pre-mutation cancellation check: nothing credential-bearing is constructed — and
         // therefore nothing can be handed to git — after the caller has cancelled.
         ct.ThrowIfCancellationRequested();
 
-        return (AttachCredential(configuredUrl!, credential), credential);
+        // FAIL CLOSED exactly like the refresh path, so a new clone never degrades to a tokenized
+        // URL on an unsupported platform.
+        var auth = CreateAuth(credential, sanitizedOrigin);
+        if (auth is null)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to authenticate git network operations for '{repoName}': the "
+                + "operation-scoped credential helper is unavailable on this platform.");
+        }
+
+        return (sanitizedOrigin, auth);
     }
 
     /// <summary>
@@ -588,7 +672,6 @@ public sealed class BrainRepoManager : IBrainRepoManager
         /// <summary>The operation's selected credential, or <c>null</c> when none was resolved.</summary>
         public string? Credential { get; set; }
     }
-
     /// <summary>
     /// Returns an exception that is safe to propagate or log: <paramref name="ex"/> itself when its
     /// COMPLETE payload is already credential-free, otherwise a fresh
@@ -708,21 +791,24 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
 
             if (Directory.Exists(Path.Combine(clonePath, ".git")))
             {
-                // Refresh the persisted origin credential BEFORE the fetch (the first network
-                // command). The resolved credential is reused for every command below.
-                var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+                // Normalize the persisted origin to its sanitized form BEFORE the fetch (the first
+                // network command). The operation's transport is reused for every command below.
+                auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
                 _logger.LogInformation(
                     "Brain clone exists for {Repo}, pulling latest on {Branch}",
                     repoName, defaultBranch);
 
-                await RunGitAsync(clonePath, ["fetch", "origin"], ct, credential);
+                await RunGitAsync(clonePath, ["fetch", "origin"], ct, auth);
 
                 if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
                 {
@@ -732,38 +818,59 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 }
                 else
                 {
-                    await RunGitAsync(clonePath, ["checkout", defaultBranch], ct, credential);
-                    await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, credential);
+                    await RunGitAsync(clonePath, ["checkout", defaultBranch], ct, auth);
+                    await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, auth);
                 }
             }
             else
             {
-                // A NEW clone authenticates the SUPPLIED URL directly — but only when it is the
-                // repository's currently configured, eligible URL.
-                var (cloneUrl, credential) = await ResolveCloneUrlAsync(repoName, repoUrl, ct, credentialBox);
+                // A NEW clone authenticates the repository's configured, eligible URL — but only
+                // when the SUPPLIED URL denotes that same repository. Every other supplied URL —
+                // unconfigured, ineligible, mismatching, or already carrying a credential — is
+                // cloned exactly as supplied, with no credential resolution at all.
+                var (cloneUrl, cloneAuth) = await ResolveCloneUrlAsync(repoName, repoUrl, ct, credentialBox);
+                auth = cloneAuth;
 
-                // The clone URL carries credentials, so the credential-free form is logged.
-                // The raw URL still goes to git unchanged below.
+                // The credential-free form of whatever URL is actually handed to git is logged.
                 _logger.LogInformation(
                     "Creating Brain clone for {Repo} from {Url} (branch: {Branch})",
-                    repoName, Sanitize(cloneUrl, credential), defaultBranch);
+                    repoName, Sanitize(cloneUrl, auth?.Credential), defaultBranch);
 
                 Directory.CreateDirectory(WorkDirectory);
+
+                // BOTH clone attempts — the --branch attempt AND the missing-upstream-branch retry —
+                // sit inside ONE residual-cleanup boundary, so a usable repository left by EITHER a
+                // failed or cancelled attempt gets the same best-effort origin normalization under
+                // the same independent bounded token, and the primary exception/cancellation of
+                // whichever attempt failed is what propagates.
                 try
                 {
-                    await RunGitAsync(WorkDirectory,
-                        ["clone", "--branch", defaultBranch, cloneUrl, repoName], ct, credential);
+                    try
+                    {
+                        await RunGitAsync(WorkDirectory,
+                            ["clone", "--branch", defaultBranch, cloneUrl, repoName], ct, auth);
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message.Contains("not found in upstream"))
+                    {
+                        _logger.LogWarning(
+                            "Branch '{Branch}' not found in upstream for {Repo} — retrying clone without --branch",
+                            defaultBranch, repoName);
+
+                        if (Directory.Exists(clonePath))
+                            await ForceDeleteDirectoryAsync(clonePath);
+
+                        await RunGitAsync(WorkDirectory, ["clone", cloneUrl, repoName], ct, auth);
+                    }
                 }
-                catch (InvalidOperationException ex) when (ex.Message.Contains("not found in upstream"))
+                catch (Exception) when (auth is not null)
                 {
-                    _logger.LogWarning(
-                        "Branch '{Branch}' not found in upstream for {Repo} — retrying clone without --branch",
-                        defaultBranch, repoName);
-
-                    if (Directory.Exists(clonePath))
-                        await ForceDeleteDirectoryAsync(clonePath);
-
-                    await RunGitAsync(WorkDirectory, ["clone", cloneUrl, repoName], ct, credential);
+                    // A failed or CANCELLED clone may still have created a usable repository. The
+                    // residual origin is normalized best-effort with a bounded LOCAL cleanup that
+                    // does NOT use the caller's token, so it still runs after a cancellation. The
+                    // primary exception — including the cancellation — is preserved and rethrown
+                    // below by the outer handlers; cleanup faults never replace it.
+                    await TryNormalizeResidualCloneOriginAsync(clonePath, auth, repoName);
+                    throw;
                 }
 
                 // Configure git identity for merge commits
@@ -782,7 +889,65 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// Best-effort normalization of a clone's <c>origin</c> back to the SANITIZED configured URL
+    /// after a failed or cancelled clone attempt.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why it is bounded and token-independent.</b> The caller's token may already be cancelled,
+    /// which is precisely the case this exists for, so the cleanup runs under a FRESH short-lived
+    /// token. Nothing here needs network access or the operation's credential: this is a local
+    /// <c>remote set-url</c> against an already-created repository.
+    /// </para>
+    /// <para>
+    /// <b>Never masks the primary outcome.</b> If no repository was created there is nothing to
+    /// normalize. If the repository is unreadable, the config is locked, or the cleanup cannot
+    /// complete within the bound, a CREDENTIAL-FREE diagnostic is emitted and the operation proceeds
+    /// — normalization is best-effort and is never claimed as guaranteed.
+    /// </para>
+    /// </remarks>
+    private async Task TryNormalizeResidualCloneOriginAsync(
+        string clonePath, BrainGitAuth auth, string repoName)
+    {
+        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+            return; // No repository was created — nothing to normalize.
+
+        using var cleanupCts = new CancellationTokenSource(ResidualCleanupTimeout);
+        try
+        {
+            var (exitCode, _, stderr) = await RunGitCoreAsync(
+                clonePath, ["remote", "set-url", "origin", auth.SanitizedOriginUrl], cleanupCts.Token);
+
+            if (exitCode != 0)
+            {
+                // Sanitized with the operation's credential so neither the argument list nor git's
+                // stderr can carry a secret into the log.
+                _logger.LogWarning(
+                    "Could not normalize the residual origin of the failed clone for {Repo} "
+                    + "(exit {ExitCode}; the sanitized URL may not be in place): {Error}",
+                    repoName, exitCode, Sanitize(stderr.Trim(), auth.Credential));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Could not normalize the residual origin of the failed clone for {Repo} within "
+                + "{TimeoutSeconds}s; the sanitized URL is not guaranteed to be in place.",
+                repoName, ResidualCleanupTimeout.TotalSeconds);
+        }
+        catch (Exception ex)
+        {
+            // Credential-free, exception-object free: the repository may be unreadable or its
+            // config locked, and the exception's own text could carry a path or a URL.
+            _logger.LogWarning(
+                "Could not normalize the residual origin of the failed clone for {Repo}: {Error}",
+                repoName, Sanitize(ex.Message, auth.Credential));
         }
     }
 
@@ -822,6 +987,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
@@ -832,12 +1000,13 @@ public sealed class BrainRepoManager : IBrainRepoManager
             _logger.LogInformation("Squash-merging {Branch} into {Base} for {Repo}",
                 featureBranch, defaultBranch, repoName);
 
-            // Refresh the persisted origin credential BEFORE the fetch (the first network
-            // command). The resolved credential is reused for every command below.
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize the persisted origin to its SANITIZED form BEFORE the fetch (the first
+            // network command). The operation's authenticated transport is reused for every
+            // command below, so no credential ever reaches argv or .git/config.
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
             // Ensure we're on the base branch with latest remote state
-            await RunGitAsync(clonePath, ["fetch", "origin"], ct, credential);
+            await RunGitAsync(clonePath, ["fetch", "origin"], ct, auth);
 
             if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
             {
@@ -857,19 +1026,19 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     "Default branch '{DefaultBranch}' does not exist on origin for '{Repo}'. Creating it from feature branch '{FeatureBranch}'.",
                     defaultBranch, repoName, featureBranch);
 
-                await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct, credential);
-                await RunGitAsync(clonePath, ["checkout", "-B", defaultBranch, $"origin/{featureBranch}"], ct, credential);
-                await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct, credential);
+                await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct, auth);
+                await RunGitAsync(clonePath, ["checkout", "-B", defaultBranch, $"origin/{featureBranch}"], ct, auth);
+                await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct, auth);
 
-                var newBranchHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, credential);
+                var newBranchHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, auth);
                 return newBranchHash.Trim();
             }
 
-            await RunGitAsync(clonePath, ["checkout", defaultBranch], ct, credential);
-            await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, credential);
+            await RunGitAsync(clonePath, ["checkout", defaultBranch], ct, auth);
+            await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, auth);
 
             // Fetch the feature branch and attempt squash merge
-            await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct, credential);
+            await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct, auth);
 
             try
             {
@@ -878,16 +1047,16 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 // colon. Go through the raw core runner instead so BOTH streams reach the caller
                 // (the message travels to HandleMergeFailureAsync via ex.Message and names the
                 // conflicting files). Both streams are redacted with the operation's credential:
-                // stdout can echo the credential-bearing remote URL.
+                // stdout can echo a remote URL (a stale persisted one, or a caller-supplied one).
                 var (mergeExitCode, mergeStdout, mergeStderr) = await RunGitCoreAsync(
-                    clonePath, ["merge", "--squash", $"origin/{featureBranch}"], ct);
+                    clonePath, ["merge", "--squash", $"origin/{featureBranch}"], ct, auth);
 
                 if (mergeExitCode != 0)
                 {
                     throw new InvalidOperationException(Sanitize(
                         $"git merge --squash {featureBranch} failed (exit {mergeExitCode}): "
                         + $"{mergeStderr}{mergeStdout}",
-                        credential));
+                        auth?.Credential));
                 }
             }
             catch (Exception mergeEx)
@@ -895,7 +1064,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 // Sanitized at the log site: this exception is rethrown below and would ALSO be
                 // caught by the operation boundary, but the log entry itself is written here.
                 _logger.LogWarning(
-                    SanitizeException(mergeEx, credential),
+                    SanitizeException(mergeEx, auth?.Credential),
                     "Squash merge failed for {Repo} — resetting clone to clean state", repoName);
 
                 // Abort the merge and reset to clean state. The abort is best-effort, but a CALLER
@@ -904,7 +1073,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 // operation continue running further git commands.
                 try
                 {
-                    await RunGitAsync(clonePath, ["merge", "--abort"], ct, credential);
+                    await RunGitAsync(clonePath, ["merge", "--abort"], ct, auth);
                 }
                 catch (Exception abortEx)
                 {
@@ -914,14 +1083,14 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     // Best-effort: ignore failures (e.g., no merge in progress).
                 }
 
-                await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, credential);
-                await RunGitAsync(clonePath, ["clean", "-fd"], ct, credential);
+                await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct, auth);
+                await RunGitAsync(clonePath, ["clean", "-fd"], ct, auth);
 
                 throw;
             }
 
             // Check whether the squash produced any staged changes before committing
-            var statusResult = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct, credential);
+            var statusResult = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct, auth);
             if (string.IsNullOrWhiteSpace(statusResult))
             {
                 _logger.LogInformation(
@@ -929,20 +1098,20 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     featureBranch, defaultBranch, repoName);
 
                 // Return the current HEAD since nothing new was committed
-                var currentHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, credential);
+                var currentHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, auth);
                 return currentHash.Trim();
             }
 
             // Commit the squashed changes as a single commit
-            await RunGitAsync(clonePath, ["commit", "-m", commitMessage], ct, credential);
+            await RunGitAsync(clonePath, ["commit", "-m", commitMessage], ct, auth);
 
             // Push the squash commit
-            await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct, credential);
+            await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct, auth);
 
             _logger.LogInformation("Successfully squash-merged {Branch} into {Base} for {Repo}",
                 featureBranch, defaultBranch, repoName);
 
-            var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, credential);
+            var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, auth);
             return hashResult.Trim();
         }
         catch (Exception ex) when (TryBuildSafeException(ex, credentialBox, out var safe))
@@ -954,6 +1123,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }
@@ -995,22 +1165,23 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <param name="workingDir">Working directory for the git process.</param>
     /// <param name="args">Arguments to pass to git.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <param name="credential">
-    /// The operation's already-resolved credential, used for the literal redaction pass.
-    /// <c>null</c> for local-only commands and for operations that resolved nothing.
+    /// <param name="auth">
+    /// The operation's authenticated transport, used both for the child environment and for the
+    /// literal redaction pass. <c>null</c> for local-only commands and for operations that resolved
+    /// nothing.
     /// </param>
     /// <returns>The standard output of the git command, RAW and unmodified.</returns>
     private async Task<string> RunGitWithOutputAsync(
-        string workingDir, string[] args, CancellationToken ct, string? credential = null)
+        string workingDir, string[] args, CancellationToken ct, BrainGitAuth? auth = null)
     {
-        var (exitCode, stdout, stderr) = await RunGitCoreAsync(workingDir, args, ct);
+        var (exitCode, stdout, stderr) = await RunGitCoreAsync(workingDir, args, ct, auth);
 
         if (exitCode != 0)
         {
-            // Same construction boundary as RunGitAsync: the argument list and stderr can both
-            // embed a credential-bearing remote URL, or the bare credential itself.
+            // Same construction boundary as RunGitAsync: stderr can embed a remote URL, or the bare
+            // credential itself.
             throw new InvalidOperationException(Sanitize(
-                $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}", credential));
+                $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}", auth?.Credential));
         }
 
         // Returned VERBATIM: callers parse SHAs, porcelain status and ref listings out of it.
@@ -1042,6 +1213,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
@@ -1053,14 +1227,14 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 return BranchDeleteResult.NotFound;
             }
 
-            // Refresh the persisted origin credential BEFORE the delete push (the first — and
-            // only — network command in this method).
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize the persisted origin to its SANITIZED form BEFORE the delete push (the
+            // first — and only — network command in this method).
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
             BranchDeleteResult result;
             try
             {
-                await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct, credential);
+                await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct, auth);
                 _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
                 result = BranchDeleteResult.Success;
             }
@@ -1092,7 +1266,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     // operation-level boundary never sees it — it must be sanitized at this log
                     // site or a throwing runner's credential would land in the log verbatim.
                     _logger.LogWarning(
-                        SanitizeException(ex, credential),
+                        SanitizeException(ex, auth?.Credential),
                         "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
                     result = BranchDeleteResult.Failed;
                 }
@@ -1126,6 +1300,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }
@@ -1202,22 +1377,26 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// exit code. Routed through the optional runner seam when one was supplied.
     /// </summary>
     /// <remarks>
-    /// The failure message embeds the complete git argument list — which for a clone or a
-    /// <c>remote set-url</c> contains the credential-bearing remote URL — and git's stderr, which
-    /// echoes the remote back. Both are therefore redacted at the point the message is
-    /// CONSTRUCTED, using the URL scanner plus a literal pass over the operation's credential.
-    /// The raw stdout/stderr are never mutated: they stay functional data for the callers that
-    /// parse them.
+    /// The failure message embeds the complete git argument list and git's stderr, which echoes the
+    /// remote back. Both are therefore redacted at the point the message is CONSTRUCTED, using the
+    /// URL scanner plus a literal pass over the operation's credential. The raw stdout/stderr are
+    /// never mutated: they stay functional data for the callers that parse them.
+    /// <para>
+    /// With the sanitized-origin transport the argument list no longer carries a credential at all;
+    /// the redaction pass is kept because stderr still echoes remote URLs (potentially a stale
+    /// persisted one on a clone whose origin was never normalized) and because a bare credential can
+    /// appear in git's remote output.
+    /// </para>
     /// </remarks>
     private async Task RunGitAsync(
-        string workingDir, string[] args, CancellationToken ct, string? credential = null)
+        string workingDir, string[] args, CancellationToken ct, BrainGitAuth? auth = null)
     {
-        var (exitCode, _, stderr) = await RunGitCoreAsync(workingDir, args, ct);
+        var (exitCode, _, stderr) = await RunGitCoreAsync(workingDir, args, ct, auth);
 
         if (exitCode != 0)
         {
             throw new InvalidOperationException(Sanitize(
-                $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}", credential));
+                $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}", auth?.Credential));
         }
     }
 
@@ -1232,6 +1411,18 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// message construction (and redaction) is the caller's job.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>The operation-scoped credential transport.</b> When <paramref name="auth"/> is non-null the
+    /// child is launched with the COMPLETE operation environment
+    /// (<see cref="HostGitAskpassHelper.BuildChildEnvironment"/>): inherited credential helpers
+    /// disabled, persistent credential storage disabled, every inherited token variable scrubbed, and
+    /// the credential supplied only through the token-free askpass script and a child-only variable.
+    /// The same dictionary is what the runner seam observes on
+    /// <see cref="BrainGitRequest.ChildEnvironment"/>, so a test sees the ACTUAL child environment.
+    /// With <paramref name="auth"/> <c>null</c> (local-only commands, and operations that resolved no
+    /// credential) the child inherits the parent environment exactly as before.
+    /// </para>
+    /// <para>
     /// <b>Cancellation.</b> <c>ReadToEndAsync(ct)</c>/<c>WaitForExitAsync(ct)</c> observe the token
     /// but do NOT terminate the child process, so a cancelled caller would otherwise return while
     /// git is still mutating the clone (and would release the per-repo semaphore on a clone that is
@@ -1239,20 +1430,25 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// termination before rethrowing, through the ONE shared
     /// <see cref="GitProcessTermination.TerminateTreeBestEffort"/> helper. Nothing here can block
     /// indefinitely, and failing to confirm termination never suppresses the cancellation.
+    /// </para>
     /// </remarks>
     private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCoreAsync(
-        string workingDir, string[] args, CancellationToken ct)
+        string workingDir, string[] args, CancellationToken ct, BrainGitAuth? auth = null)
     {
+        // Built BEFORE either launch path so the process path and the seam observe the identical
+        // dictionary. null means "inherit the parent environment unchanged".
+        var childEnvironment = auth?.BuildChildEnvironment();
+
         if (_gitRunner is { } runner)
         {
             ct.ThrowIfCancellationRequested();
-            var injected = runner(new BrainGitRequest(workingDir, args));
+            var injected = runner(new BrainGitRequest(workingDir, args, childEnvironment));
             return (injected.ExitCode, injected.Stdout, injected.Stderr);
         }
 
         // The SAME pre-launch cancellation check the fake-runner branch performs. Without it a
-        // credential-bearing `clone`/`remote set-url` could still be launched after the caller
-        // cancelled, because Process.Start itself observes no token.
+        // `clone`/`fetch`/`push` could still be launched after the caller cancelled, because
+        // Process.Start itself observes no token.
         ct.ThrowIfCancellationRequested();
 
         var psi = new ProcessStartInfo("git")
@@ -1265,6 +1461,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
+
+        if (childEnvironment is not null)
+            ApplyChildEnvironment(psi, childEnvironment);
 
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start git process");
@@ -1292,13 +1491,39 @@ public sealed class BrainRepoManager : IBrainRepoManager
     }
 
     /// <summary>
+    /// Replaces the child's inherited environment with <paramref name="environment"/>, which is the
+    /// COMPLETE operation environment (see <see cref="HostGitAskpassHelper.BuildChildEnvironment"/>),
+    /// so no inherited entry survives by omission. A <c>null</c> value is skipped: an environment
+    /// block cannot represent one, and skipping is exactly the "absent variable" semantics the
+    /// builder's scrubbing relies on.
+    /// </summary>
+    private static void ApplyChildEnvironment(
+        ProcessStartInfo psi, IReadOnlyDictionary<string, string?> environment)
+    {
+        psi.Environment.Clear();
+        foreach (var (key, value) in environment)
+        {
+            if (value is not null)
+                psi.Environment[key] = value;
+        }
+    }
+
+    /// <summary>
     /// Test-only entry point that drives the real core runner (the <c>gitRunner</c> seam is left
     /// <c>null</c> by the caller) so cancellation and process termination can be observed against a
     /// REAL git process.
     /// </summary>
+    /// <param name="workingDir">Working directory for the git process.</param>
+    /// <param name="args">Arguments to pass to git.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="auth">
+    /// Optional operation transport. When supplied the REAL child receives the operation
+    /// environment, which is how a test proves the environment is installed on the actual process
+    /// rather than only reported to the seam.
+    /// </param>
     internal Task<(int ExitCode, string Stdout, string Stderr)> RunGitForTestAsync(
-        string workingDir, string[] args, CancellationToken ct) =>
-        RunGitCoreAsync(workingDir, args, ct);
+        string workingDir, string[] args, CancellationToken ct, BrainGitAuth? auth = null) =>
+        RunGitCoreAsync(workingDir, args, ct, auth);
 
     /// <summary>
     /// Merges a source branch into a target branch (non-squash) and pushes the result.
@@ -1324,6 +1549,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
@@ -1333,17 +1561,18 @@ public sealed class BrainRepoManager : IBrainRepoManager
             _logger.LogInformation("Merging {Source} into {Target} for {Repo}",
                 sourceBranch, targetBranch, repoName);
 
-            // Refresh the persisted origin credential BEFORE the fetch (the first network command).
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize the persisted origin to its SANITIZED form BEFORE the fetch (the first
+            // network command).
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
-            await RunGitAsync(clonePath, ["fetch", "origin"], ct, credential);
+            await RunGitAsync(clonePath, ["fetch", "origin"], ct, auth);
 
             // Clean worktree so checkout/merge operations are not blocked by leftover state.
-            var status = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct, credential);
+            var status = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct, auth);
             if (!string.IsNullOrWhiteSpace(status))
             {
-                await RunGitAsync(clonePath, ["reset", "--hard"], ct, credential);
-                await RunGitAsync(clonePath, ["clean", "-fd"], ct, credential);
+                await RunGitAsync(clonePath, ["reset", "--hard"], ct, auth);
+                await RunGitAsync(clonePath, ["clean", "-fd"], ct, auth);
             }
 
             if (!await RemoteBranchExistsAsync(clonePath, targetBranch, ct))
@@ -1354,9 +1583,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 throw new InvalidOperationException(
                     $"Remote branch 'origin/{sourceBranch}' does not exist for '{repoName}'.");
 
-            await RunGitAsync(clonePath, ["checkout", "-B", targetBranch, $"origin/{targetBranch}"], ct, credential);
+            await RunGitAsync(clonePath, ["checkout", "-B", targetBranch, $"origin/{targetBranch}"], ct, auth);
 
-            var preMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, credential)).Trim();
+            var preMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, auth)).Trim();
 
             // The merge command is run with a directly-managed Process (NOT RunGitCoreAsync) so
             // that on cancellation we can Kill(entireProcessTree) and block until the process is
@@ -1378,6 +1607,12 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 mergePsi.ArgumentList.Add("merge");
                 mergePsi.ArgumentList.Add($"origin/{sourceBranch}");
                 mergePsi.ArgumentList.Add("--no-edit");
+
+                // This launch bypasses RunGitCoreAsync (the caller needs the raw Process to kill),
+                // so it must install the SAME operation environment explicitly — otherwise a merge
+                // hook or a credential re-prompt could reach git's inherited environment.
+                if (auth is not null)
+                    ApplyChildEnvironment(mergePsi, auth.BuildChildEnvironment());
 
                 mergeProcess = Process.Start(mergePsi)
                     ?? throw new InvalidOperationException("Failed to start git merge process");
@@ -1436,13 +1671,13 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     }
 
                     throw new InvalidOperationException(Sanitize(
-                        $"git merge origin/{sourceBranch} failed (exit {exitCode}): {stderr}", credential));
+                        $"git merge origin/{sourceBranch} failed (exit {exitCode}): {stderr}", auth?.Credential));
                 }
 
                 // Merge succeeded cleanly — no MERGE state remains, so cleanup is not needed.
                 mergeStarted = false;
 
-                var postMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, credential)).Trim();
+                var postMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct, auth)).Trim();
                 if (postMergeSha == preMergeSha)
                 {
                     _logger.LogInformation(
@@ -1451,7 +1686,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     return null;
                 }
 
-                await RunGitAsync(clonePath, ["push", "origin", targetBranch], ct, credential);
+                await RunGitAsync(clonePath, ["push", "origin", targetBranch], ct, auth);
 
                 _logger.LogInformation("Successfully merged {Source} into {Target} for {Repo}",
                     sourceBranch, targetBranch, repoName);
@@ -1472,9 +1707,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     try
                     {
                         var (verifyExit, _, _) = await RunGitCoreAsync(
-                            clonePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"], cleanupCts.Token);
+                            clonePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"], cleanupCts.Token, auth);
                         if (verifyExit == 0)
-                            await RunGitCoreAsync(clonePath, ["merge", "--abort"], cleanupCts.Token);
+                            await RunGitCoreAsync(clonePath, ["merge", "--abort"], cleanupCts.Token, auth);
                     }
                     catch
                     {
@@ -1492,6 +1727,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }
@@ -1708,6 +1944,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
@@ -1716,18 +1955,19 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             _logger.LogInformation("Creating tag {Tag} on {Branch} for {Repo}", tag, branch, repoName);
 
-            // Refresh the persisted origin credential BEFORE the ls-remote (the first network
-            // command). The resolved credential is reused for every command below.
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize the persisted origin to its SANITIZED form BEFORE the ls-remote (the first
+            // network command).
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
             // Check whether the tag already exists on origin (no fetch needed).
-            // The clone's `origin` is the credential-bearing URL refreshed above, so a
-            // failing REMOTE command echoes it through stderr — redact where the message is built.
+            // `origin` is the SANITIZED URL normalized above, but git's stderr can echo a remote URL
+            // (including a stale persisted one, or a caller-supplied clone URL), so redact where the
+            // message is built.
             var (lsExit, lsStdout, lsStderr) = await RunGitCoreAsync(
-                clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
+                clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct, auth);
             if (lsExit != 0)
                 throw new InvalidOperationException(Sanitize(
-                    $"Failed to query remote tags for '{repoName}': {lsStderr}", credential));
+                    $"Failed to query remote tags for '{repoName}': {lsStderr}", auth?.Credential));
             if (!string.IsNullOrWhiteSpace(lsStdout))
             {
                 _logger.LogInformation("Tag {Tag} already exists on origin for {Repo} — skipping", tag, repoName);
@@ -1736,21 +1976,21 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             // Fetch the branch (without tags) so we can point the tag at its tip.
             await RunGitAsync(clonePath,
-                ["fetch", "--no-tags", "origin", $"+refs/heads/{branch}:refs/remotes/origin/{branch}"], ct, credential);
+                ["fetch", "--no-tags", "origin", $"+refs/heads/{branch}:refs/remotes/origin/{branch}"], ct, auth);
 
             if (!await RemoteBranchExistsAsync(clonePath, branch, ct))
                 throw new InvalidOperationException(
                     $"Remote branch 'origin/{branch}' does not exist for '{repoName}'.");
 
-            await RunGitAsync(clonePath, ["checkout", "-B", branch, $"origin/{branch}"], ct, credential);
+            await RunGitAsync(clonePath, ["checkout", "-B", branch, $"origin/{branch}"], ct, auth);
 
             // Delete any stale local tag with the same name before recreating it.
-            var localTag = await RunGitWithOutputAsync(clonePath, ["tag", "-l", tag], ct, credential);
+            var localTag = await RunGitWithOutputAsync(clonePath, ["tag", "-l", tag], ct, auth);
             if (!string.IsNullOrWhiteSpace(localTag))
-                await RunGitAsync(clonePath, ["tag", "-d", tag], ct, credential);
+                await RunGitAsync(clonePath, ["tag", "-d", tag], ct, auth);
 
-            await RunGitAsync(clonePath, ["tag", "-a", tag, "-m", message], ct, credential);
-            await RunGitAsync(clonePath, ["push", "origin", tag], ct, credential);
+            await RunGitAsync(clonePath, ["tag", "-a", tag, "-m", message], ct, auth);
+            await RunGitAsync(clonePath, ["push", "origin", tag], ct, auth);
 
             _logger.LogInformation("Successfully created and pushed tag {Tag} for {Repo}", tag, repoName);
             return true;
@@ -1764,6 +2004,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }
@@ -1782,17 +2023,21 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
             if (!Directory.Exists(Path.Combine(clonePath, ".git")))
                 throw new InvalidOperationException($"Repository '{repoName}' is not cloned.");
 
-            // Refresh the persisted origin credential BEFORE the fetch (the first network command).
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize the persisted origin to its SANITIZED form BEFORE the fetch (the first
+            // network command).
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
-            await RunGitAsync(clonePath, ["fetch", "--prune", "origin"], ct, credential);
-            var output = await RunGitWithOutputAsync(clonePath, ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"], ct, credential);
+            await RunGitAsync(clonePath, ["fetch", "--prune", "origin"], ct, auth);
+            var output = await RunGitWithOutputAsync(clonePath, ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"], ct, auth);
 
             var branches = new List<string>();
             foreach (var line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
@@ -1822,6 +2067,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }
@@ -1854,14 +2100,17 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
             if (!Directory.Exists(Path.Combine(clonePath, ".git")))
                 throw new InvalidOperationException($"Repository '{repoName}' is not cloned.");
 
-            // Refresh under THIS lock acquisition, immediately before the fetch it authenticates.
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize under THIS lock acquisition, immediately before the fetch it authenticates.
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
             // The leading '+' forces the tracking-ref update so a rewound/non-fast-forward remote
             // branch still refreshes refs/remotes/origin/{branch}.
@@ -1869,7 +2118,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 ? ["fetch", "origin", $"+refs/heads/{branch}:refs/remotes/origin/{branch}"]
                 : ["fetch", "origin"];
 
-            var (exitCode, stdout, stderr) = await RunGitCoreAsync(clonePath, args, ct);
+            var (exitCode, stdout, stderr) = await RunGitCoreAsync(clonePath, args, ct, auth);
 
             if (exitCode != 0)
             {
@@ -1879,11 +2128,11 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     Success: false,
                     Output: string.Empty,
                     Error: Sanitize(
-                        $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}", credential));
+                        $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}", auth?.Credential));
             }
 
             return new BrainFetchResult(
-                Success: true, Output: Sanitize(stdout, credential), Error: null);
+                Success: true, Output: Sanitize(stdout, auth?.Credential), Error: null);
         }
         catch (Exception ex) when (TryBuildSafeException(ex, credentialBox, out var safe))
         {
@@ -1894,6 +2143,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }
@@ -1915,6 +2165,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
         // Holds the credential this operation selects, so the catch below can redact an exception
         // THROWN by the git-runner seam (or a failed process launch) with the right credential.
         var credentialBox = new CredentialBox();
+        // The operation's authenticated transport, disposed by the finally below on EVERY exit path
+        // (success, failure and cancellation) so its temporary helper directory cannot leak.
+        BrainGitAuth? auth = null;
         try
         {
             var clonePath = GetClonePath(repoName);
@@ -1923,25 +2176,25 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             _logger.LogInformation("Deleting tag {Tag} for {Repo}", tag, repoName);
 
-            // Refresh the persisted origin credential BEFORE the ls-remote (the first network
-            // command). The resolved credential is reused for every command and diagnostic below.
-            var credential = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
+            // Normalize the persisted origin to its SANITIZED form BEFORE the ls-remote (the first
+            // network command).
+            auth = await RefreshOriginCredentialAsync(repoName, clonePath, ct, credentialBox);
 
-            // The REMOTE query talks to the credential-bearing `origin`, so its stderr can echo
-            // the full clone URL. Redact where the exception message is constructed.
+            // The REMOTE query talks to the remote, so its stderr can echo a full URL (a stale
+            // persisted one, or a caller-supplied clone URL). Redact where the message is built.
             var (remoteExit, remoteStdout, remoteStderr) = await RunGitCoreAsync(
-                clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
+                clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct, auth);
             if (remoteExit != 0)
                 throw new InvalidOperationException(Sanitize(
-                    $"Failed to query remote tags for '{repoName}': {remoteStderr}", credential));
+                    $"Failed to query remote tags for '{repoName}': {remoteStderr}", auth?.Credential));
 
             // The LOCAL query never contacts origin, but its message is constructed the same way
             // so a remote-bearing message can never slip through this boundary either.
             var (localExit, localStdout, localStderr) = await RunGitCoreAsync(
-                clonePath, ["tag", "-l", tag], ct);
+                clonePath, ["tag", "-l", tag], ct, auth);
             if (localExit != 0)
                 throw new InvalidOperationException(Sanitize(
-                    $"Failed to query local tags for '{repoName}': {localStderr}", credential));
+                    $"Failed to query local tags for '{repoName}': {localStderr}", auth?.Credential));
 
             var remoteExists = !string.IsNullOrWhiteSpace(remoteStdout);
             var localExists = !string.IsNullOrWhiteSpace(localStdout);
@@ -1960,7 +2213,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
             // (it is not caught here), rather than being recorded as a partial deletion error.
             if (localExists)
             {
-                var (delExit, _, delStderr) = await RunGitCoreAsync(clonePath, ["tag", "-d", tag], ct);
+                var (delExit, _, delStderr) = await RunGitCoreAsync(clonePath, ["tag", "-d", tag], ct, auth);
                 if (delExit == 0)
                     anyDeleted = true;
                 else
@@ -1970,7 +2223,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
             if (remoteExists)
             {
                 var (pushExit, _, pushStderr) = await RunGitCoreAsync(
-                    clonePath, ["push", "origin", $":refs/tags/{tag}"], ct);
+                    clonePath, ["push", "origin", $":refs/tags/{tag}"], ct, auth);
                 if (pushExit == 0)
                     anyDeleted = true;
                 else
@@ -1980,14 +2233,14 @@ public sealed class BrainRepoManager : IBrainRepoManager
             if (anyDeleted)
             {
                 // At least one side was deleted. Any failure on the other side is logged but
-                // does not fail the operation. `remoteError` comes from a `push origin` against
-                // the credential-bearing remote, so both warnings redact at construction.
+                // does not fail the operation. `remoteError` comes from a `push origin`, whose
+                // stderr can echo a URL, so both warnings redact at construction.
                 if (localError is not null)
                     _logger.LogWarning("Local tag delete failed for {Tag} in {Repo}: {Error}",
-                        tag, repoName, Sanitize(localError, credential));
+                        tag, repoName, Sanitize(localError, auth?.Credential));
                 if (remoteError is not null)
                     _logger.LogWarning("Remote tag delete failed for {Tag} in {Repo}: {Error}",
-                        tag, repoName, Sanitize(remoteError, credential));
+                        tag, repoName, Sanitize(remoteError, auth?.Credential));
 
                 _logger.LogInformation("Successfully deleted tag {Tag} for {Repo}", tag, repoName);
                 return true;
@@ -1997,7 +2250,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
             // this covers both "existed on both, both failed" and "existed on one side, that
             // sole deletion failed". Surface a genuine failure, with both stderr copies redacted.
             throw new InvalidOperationException(Sanitize(
-                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError ?? "(n/a)"}; Remote error: {remoteError ?? "(n/a)"}", credential));
+                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError ?? "(n/a)"}; Remote error: {remoteError ?? "(n/a)"}", auth?.Credential));
         }
         catch (Exception ex) when (TryBuildSafeException(ex, credentialBox, out var safe))
         {
@@ -2008,6 +2261,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
         finally
         {
+            auth?.Dispose();
             semaphore.Release();
         }
     }

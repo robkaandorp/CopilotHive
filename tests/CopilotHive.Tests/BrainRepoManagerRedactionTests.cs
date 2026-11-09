@@ -569,7 +569,19 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
     internal const string StoredToken = "gho_stored_admin_token";
     internal const string RotatedToken = "gho_rotated_admin_token";
 
-    /// <summary>The exact origin the manager must write for <see cref="StoredToken"/>.</summary>
+    /// <summary>
+    /// The exact origin the manager writes for <see cref="StoredToken"/>: the SANITIZED configured
+    /// URL. The credential never appears there — it travels only through the operation-scoped
+    /// askpass helper (see <see cref="HostGitAskpassHelper"/>).
+    /// </summary>
+    internal const string SanitizedOrigin = ConfiguredUrl;
+
+    /// <summary>
+    /// A CREDENTIAL-BEARING URL of the same repository, used only as ECHOED TEXT in simulated git
+    /// output — never as an origin the manager writes. The redaction boundary must still scrub such
+    /// text, because a stale persisted origin (from before the sanitized contract, or written by an
+    /// operator) can surface in git's stderr.
+    /// </summary>
     internal const string CredentialOrigin =
         $"https://x-access-token:{StoredToken}@github.com/acme/widgets.git";
 
@@ -662,9 +674,29 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         runner.Joined().FindIndex(j => NetworkVerbs.Any(v =>
             j.StartsWith(v + " ", StringComparison.Ordinal) || j == v));
 
-    /// <summary>Index of the credential-attaching <c>remote set-url origin</c>, or -1.</summary>
+    /// <summary>Index of the origin-normalizing <c>remote set-url origin</c>, or -1.</summary>
     private static int SetUrlIndex(CredentialRunner runner) =>
         runner.Joined().FindIndex(j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
+
+    /// <summary>
+    /// The DISTINCT credentials recorded launches carried through their CHILD ENVIRONMENT, in first
+    /// seen order. This is the ONLY channel a resolved credential may travel on, so it is what the
+    /// resolver-order tests assert against — argv carries no credential at all under the sanitized
+    /// contract, and every authenticated launch of ONE operation carries the SAME credential.
+    /// </summary>
+    private static List<string> CredentialsCarriedInChildEnv(CredentialRunner runner)
+    {
+        lock (runner.Requests)
+        {
+            return runner.Requests
+                .Select(r => r.ChildEnvironment)
+                .Where(env => env is not null)
+                .Select(env => env![HostGitAskpassHelper.CredentialEnvName])
+                .OfType<string>()
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+        }
+    }
 
     /// <summary>Builds a manager wired to a live token lookup and a live configured-URL lookup.</summary>
     private BrainRepoManager CreateManager(
@@ -697,8 +729,13 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
     // ── OAuth-only fresh clone ────────────────────────────────────────────────
 
+    /// <summary>
+    /// A fresh clone of the repository's configured URL authenticates WITHOUT putting the
+    /// credential in argv: the clone argument list carries the SANITIZED URL and the credential
+    /// arrives only through the operation-scoped askpass child environment.
+    /// </summary>
     [Fact]
-    public async Task EnsureCloneAsync_OAuthOnlyFreshClone_ClonesWithTheStoredCredential()
+    public async Task EnsureCloneAsync_OAuthOnlyFreshClone_ClonesTheSanitizedUrlWithAskpass()
     {
         var runner = new CredentialRunner();
         // No clone on disk: this is the FRESH-clone path.
@@ -709,7 +746,17 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken);
 
         var clone = Assert.Single(runner.Requests, r => r.Arguments.Contains("clone"));
-        Assert.Contains(CredentialOrigin, clone.Arguments);
+        Assert.Contains(ConfiguredUrl, clone.Arguments);
+
+        // NO SECRET IN ARGV — neither the token nor a credential-bearing URL.
+        var cloneArgv = string.Join(' ', clone.Arguments);
+        Assert.DoesNotContain(StoredToken, cloneArgv);
+        Assert.DoesNotContain("x-access-token", cloneArgv);
+
+        // …and the credential really did reach the child, through the token-free helper only.
+        var env = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(clone.ChildEnvironment);
+        Assert.Equal(StoredToken, env[HostGitAskpassHelper.CredentialEnvName]);
+        Assert.EndsWith(HostGitAskpassHelper.ScriptFileName, env[HostGitAskpassHelper.AskpassEnvName]);
     }
 
     [Fact]
@@ -729,8 +776,12 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
     // ── Existing stale origin ─────────────────────────────────────────────────
 
+    /// <summary>
+    /// A stale tokenized origin is REPLACED by the sanitized configured URL: the stale credential
+    /// is STRIPPED rather than rotated, and no new credential is written.
+    /// </summary>
     [Fact]
-    public async Task ExistingCloneWithStaleOrigin_IsRefreshedToTheCurrentCredential()
+    public async Task ExistingCloneWithStaleOrigin_IsNormalizedToTheSanitizedUrl()
     {
         var runner = new CredentialRunner
         {
@@ -742,18 +793,25 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         await manager.EnsureCloneAsync(
             RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken);
 
-        Assert.Contains($"remote set-url origin {CredentialOrigin}", runner.Joined());
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", runner.Joined());
+
+        // Neither the stale token nor the freshly resolved one is written anywhere.
+        var setUrl = Assert.Single(
+            runner.Joined(), j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
+        Assert.DoesNotContain("gho_expired_token", setUrl);
+        Assert.DoesNotContain(StoredToken, setUrl);
     }
 
     [Fact]
-    public async Task ExistingCloneWithCredentialFreeOrigin_IsRefreshedToTheCurrentCredential()
+    public async Task ExistingCloneWithCredentialFreeOrigin_StaysOnTheSanitizedUrl()
     {
         var runner = new CredentialRunner { Origins = [ConfiguredUrl] };
         var manager = CreateManager(runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl));
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        Assert.Contains($"remote set-url origin {CredentialOrigin}", runner.Joined());
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", runner.Joined());
+        Assert.DoesNotContain(StoredToken, string.Join(" | ", runner.Joined()));
     }
 
     /// <summary>A trailing <c>.git</c>/slash difference is the SAME repository, not a mismatch.</summary>
@@ -769,11 +827,16 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        Assert.Contains($"remote set-url origin {CredentialOrigin}", runner.Joined());
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", runner.Joined());
     }
 
     // ── Token rotation ────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Token rotation reaches the SECOND call through the child environment only: the persisted
+    /// origin written on both calls is the same SANITIZED URL, so nothing in <c>.git/config</c>
+    /// tracks the rotation.
+    /// </summary>
     [Fact]
     public async Task ConsecutiveCalls_AfterTokenRotation_UseTheNewToken()
     {
@@ -791,10 +854,15 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             .Where(j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal))
             .ToList();
 
+        // Both calls normalized the SAME sanitized origin — rotation never touches it.
         Assert.Equal(2, setUrls.Count);
-        Assert.Contains(StoredToken, setUrls[0]);
-        Assert.Contains(RotatedToken, setUrls[1]);
-        Assert.DoesNotContain(StoredToken, setUrls[1]);
+        Assert.All(setUrls, u => Assert.Equal($"remote set-url origin {SanitizedOrigin}", u));
+
+        // The credential each call actually authenticated with is the rotated one.
+        var carried = CredentialsCarriedInChildEnv(runner);
+        Assert.Equal(StoredToken, carried[0]);
+        Assert.Equal(RotatedToken, carried[^1]);
+        Assert.DoesNotContain(StoredToken, string.Join(" | ", runner.Joined()));
     }
 
     /// <summary>
@@ -815,10 +883,11 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await secondManager.ListRemoteBranchesAsync(RepoName, ct);
 
-        Assert.Contains(
-            second.Joined(),
-            j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal)
-                 && j.Contains(RotatedToken, StringComparison.Ordinal));
+        // The RESTARTED manager uses the CURRENT configuration's credential…
+        Assert.Contains(RotatedToken, CredentialsCarriedInChildEnv(second));
+        // …and still writes only the sanitized origin.
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", second.Joined());
+        Assert.DoesNotContain(RotatedToken, string.Join(" | ", second.Joined()));
     }
 
     /// <summary>
@@ -849,7 +918,8 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         liveRepositories.Add((RepoName, ConfiguredUrl));
 
         await manager.ListRemoteBranchesAsync(RepoName, ct);
-        Assert.Contains($"remote set-url origin {CredentialOrigin}", runner.Joined());
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", runner.Joined());
+        Assert.Equal(StoredToken, Assert.Single(CredentialsCarriedInChildEnv(runner)));
     }
 
     // ── Blank-aware chain and lookup failure ──────────────────────────────────
@@ -868,10 +938,10 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        var setUrl = Assert.Single(
-            runner.Joined(), j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
-        Assert.Contains("gh_env_token", setUrl);
-        Assert.DoesNotContain("github_env_token", setUrl);
+        // The CHILD environment is the transport, so it is what proves which candidate won.
+        var carried = Assert.Single(CredentialsCarriedInChildEnv(runner));
+        Assert.Equal("gh_env_token", carried);
+        Assert.DoesNotContain("github_env_token", string.Join(" | ", runner.Joined()));
     }
 
     [Theory]
@@ -888,9 +958,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        var setUrl = Assert.Single(
-            runner.Joined(), j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
-        Assert.Contains("github_env_token", setUrl);
+        Assert.Equal("github_env_token", Assert.Single(CredentialsCarriedInChildEnv(runner)));
     }
 
     [Fact]
@@ -904,11 +972,10 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        var setUrl = Assert.Single(
-            runner.Joined(), j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
-        Assert.Contains(StoredToken, setUrl);
-        Assert.DoesNotContain("gh_env_token", setUrl);
-        Assert.DoesNotContain("github_env_token", setUrl);
+        Assert.Equal(StoredToken, Assert.Single(CredentialsCarriedInChildEnv(runner)));
+        var joined = string.Join(" | ", runner.Joined());
+        Assert.DoesNotContain("gh_env_token", joined);
+        Assert.DoesNotContain("github_env_token", joined);
     }
 
     [Fact]
@@ -924,9 +991,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        var setUrl = Assert.Single(
-            runner.Joined(), j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
-        Assert.Contains("gh_env_token", setUrl);
+        Assert.Equal("gh_env_token", Assert.Single(CredentialsCarriedInChildEnv(runner)));
     }
 
     /// <summary>
@@ -2569,7 +2634,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
 
         await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
 
-        Assert.Contains($"remote set-url origin {CredentialOrigin}", runner.Joined());
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", runner.Joined());
     }
 
     // ── Locked serialization ──────────────────────────────────────────────────
@@ -2634,9 +2699,11 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             var joined = string.Join(' ', request.Arguments);
             var isParkPoint = phase switch
             {
-                // The credential attachment: the refresh is IN PROGRESS.
-                ParkPhase.Refresh => joined.StartsWith("remote set-url origin ", StringComparison.Ordinal)
-                                     && joined.Contains(TokenA, StringComparison.Ordinal),
+                // The FIRST request of an operation's refresh: the refresh is IN PROGRESS. Under
+                // the sanitized contract the origin normalization carries no credential, so the
+                // park point is the origin INSPECTION rather than an attribution-by-token set-url.
+                ParkPhase.Refresh =>
+                    joined.Equals("remote get-url --all origin", StringComparison.Ordinal),
                 // The network command: the refresh is already COMPLETE.
                 ParkPhase.Fetch => joined.Contains($"refs/heads/{BranchA}:", StringComparison.Ordinal),
                 _ => throw new InvalidOperationException($"Unhandled phase '{phase}'."),
@@ -2649,7 +2716,8 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             releaseFirst.Wait(TimeSpan.FromSeconds(30));
         };
 
-        // Each caller gets its OWN credential, so every set-url is unambiguously attributable.
+        // Each caller gets its OWN credential, so every credential-carrying launch is attributable
+        // through its CHILD ENVIRONMENT (argv carries no credential at all).
         var issued = 0;
         var manager = CreateManager(
             runner,
@@ -2674,8 +2742,7 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
                 // refresh-only lock would already have been released at this instant.
                 Assert.Contains(
                     beforeContender,
-                    j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal)
-                         && j.Contains(TokenA, StringComparison.Ordinal));
+                    j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
             }
 
             // ── The deterministic contention probe ────────────────────────────
@@ -2692,9 +2759,8 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             var afterContender = runner.Joined();
             Assert.Equal(beforeContender.Count, afterContender.Count);
             Assert.DoesNotContain(
-                afterContender, j => j.Contains(TokenB, StringComparison.Ordinal));
-            Assert.DoesNotContain(
                 afterContender, j => j.Contains($"refs/heads/{BranchB}:", StringComparison.Ordinal));
+            Assert.DoesNotContain(CredentialsCarriedInChildEnv(runner), c => c == TokenB);
         }
         finally
         {
@@ -2712,21 +2778,25 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
         Assert.True(first!.IsCompletedSuccessfully);
         Assert.True(second!.IsCompletedSuccessfully);
 
-        // Strict ordering: the contender's FIRST request comes after the first caller's LAST one.
+        // Strict ordering. Both callers write the SAME sanitized origin, so the normalizations are
+        // attributed POSITIONALLY: each operation performs exactly one, and its own fetch follows.
         var joinedAll = runner.Joined();
-        var refreshA = joinedAll.FindIndex(j =>
-            j.StartsWith("remote set-url origin ", StringComparison.Ordinal)
-            && j.Contains(TokenA, StringComparison.Ordinal));
+        var setUrlIndices = joinedAll
+            .Select((text, index) => (Text: text, Index: index))
+            .Where(x => x.Text.StartsWith("remote set-url origin ", StringComparison.Ordinal))
+            .Select(x => x.Index)
+            .ToList();
         var fetchA = joinedAll.FindIndex(j =>
             j.Contains($"refs/heads/{BranchA}:", StringComparison.Ordinal));
-        var refreshB = joinedAll.FindIndex(j =>
-            j.StartsWith("remote set-url origin ", StringComparison.Ordinal)
-            && j.Contains(TokenB, StringComparison.Ordinal));
         var fetchB = joinedAll.FindIndex(j =>
             j.Contains($"refs/heads/{BranchB}:", StringComparison.Ordinal));
 
-        Assert.True(refreshA >= 0 && fetchA >= 0 && refreshB >= 0 && fetchB >= 0,
+        Assert.True(fetchA >= 0 && fetchB >= 0,
             $"Not every expected request was recorded: {string.Join(" | ", joinedAll)}");
+        Assert.Equal(2, setUrlIndices.Count);
+
+        var refreshA = setUrlIndices[0];
+        var refreshB = setUrlIndices[1];
 
         Assert.True(refreshA < fetchA, "The first caller fetched before refreshing.");
         Assert.True(fetchA < refreshB,
@@ -2734,9 +2804,15 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             + "not hold the lock across its network command.");
         Assert.True(refreshB < fetchB, "The contender fetched before refreshing.");
 
-        // No cross-contamination: each caller used only its own credential.
-        Assert.DoesNotContain(TokenB, joinedAll[refreshA]);
-        Assert.DoesNotContain(TokenA, joinedAll[refreshB]);
+        // No cross-contamination: each caller's network command authenticated with ONLY its own
+        // credential, observed in the ACTUAL child environment of that launch.
+        lock (runner.Requests)
+        {
+            Assert.Equal(
+                TokenA, runner.Requests[fetchA].ChildEnvironment![HostGitAskpassHelper.CredentialEnvName]);
+            Assert.Equal(
+                TokenB, runner.Requests[fetchB].ChildEnvironment![HostGitAskpassHelper.CredentialEnvName]);
+        }
     }
 
     /// <summary>
@@ -2755,4 +2831,477 @@ public sealed class BrainRepoManagerCredentialTests : IDisposable
             // Outcome is asserted by the caller when relevant.
         }
     }
+    // ── The sanitized-origin transport contract ───────────────────────────────
+    //
+    // Everything below asserts the SAME guarantee from different angles: a credential the HOST
+    // resolved never reaches .git/config, argv, or this process's own environment. The credential's
+    // ONLY channel is the operation-scoped askpass helper, observed here through the ACTUAL child
+    // environment each launch would receive.
+
+    /// <summary>
+    /// AFTER a successful credential resolution the persisted origin is normalized to the SANITIZED
+    /// configured URL BEFORE the authenticated network command, and the network command itself runs
+    /// with the operation-scoped askpass environment.
+    /// </summary>
+    /// <remarks>
+    /// This pins the ORDER and the CONTENT in one test: a tokenized origin would satisfy neither the
+    /// sanitized set-url assertion nor the argv assertions, and a refresh placed after the fetch
+    /// fails the index comparison.
+    /// </remarks>
+    [Fact]
+    public async Task ResolvedCredential_NormalizesTheOriginBeforeTheNetwork_AndAuthenticatesByAskpass()
+    {
+        var runner = new CredentialRunner();
+        var manager = CreateManager(runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl));
+
+        await manager.FetchOriginAsync(RepoName, null, TestContext.Current.CancellationToken);
+
+        var joined = runner.Joined();
+        var setUrl = SetUrlIndex(runner);
+        var firstNetwork = FirstNetworkIndex(runner);
+
+        // The normalization writes the SANITIZED URL — no token in .git/config's origin.
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", joined);
+
+        // …and it precedes the first network command.
+        Assert.True(setUrl >= 0 && firstNetwork >= 0);
+        Assert.True(setUrl < firstNetwork,
+            $"The fetch at index {firstNetwork} ran BEFORE the origin normalization at {setUrl}.");
+
+        // NO host credential anywhere in argv, for ANY command.
+        var argv = string.Join(" | ", joined);
+        Assert.DoesNotContain(StoredToken, argv);
+        Assert.DoesNotContain("x-access-token", argv);
+
+        // The fetch launch carries the operation environment, and nothing inherited.
+        lock (runner.Requests)
+        {
+            var fetch = runner.Requests[firstNetwork];
+            var env = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(fetch.ChildEnvironment);
+
+            Assert.Equal(StoredToken, env[HostGitAskpassHelper.CredentialEnvName]);
+            Assert.Equal("0", env[HostGitAskpassHelper.PromptDisabledEnvName]);
+            Assert.EndsWith(HostGitAskpassHelper.ScriptFileName, env[HostGitAskpassHelper.AskpassEnvName]);
+            Assert.False(env.ContainsKey("GH_TOKEN"));
+            Assert.False(env.ContainsKey("GITHUB_TOKEN"));
+
+            // The inherited credential helper list is RESET for this invocation only.
+            Assert.Equal(string.Empty, env["GIT_CONFIG_VALUE_0"]);
+            Assert.Equal("credential.helper", env["GIT_CONFIG_KEY_0"]);
+        }
+    }
+
+    /// <summary>
+    /// A LOCAL-ONLY command (no credential resolved, no network) is launched with the INHERITED
+    /// environment — the seam reports no child environment at all, exactly as before the change.
+    /// </summary>
+    [Fact]
+    public async Task LocalOnlyCommandOfAnUnauthenticatedOperation_CarriesNoChildEnvironment()
+    {
+        var runner = new CredentialRunner();
+        // Unconfigured: nothing resolves, nothing is normalized, and no network command runs.
+        var manager = CreateManager(runner, TokenLookup(StoredToken), urlLookup: null);
+
+        await manager.FetchOriginAsync(RepoName, null, TestContext.Current.CancellationToken);
+
+        lock (runner.Requests)
+        {
+            Assert.NotEmpty(runner.Requests);
+            Assert.All(runner.Requests, r => Assert.Null(r.ChildEnvironment));
+        }
+    }
+
+    /// <summary>
+    /// A FAILED normalization means NO network command runs at all: the origin's destination policy
+    /// was never established, so authenticating against it is refused.
+    /// </summary>
+    [Fact]
+    public async Task FailedOriginNormalization_NeverRunsANetworkCommand()
+    {
+        var runner = new CredentialRunner(request =>
+            request.Arguments.Contains("set-url")
+                ? new BrainGitResult(1, string.Empty, "error: could not lock config file .git/config")
+                : new BrainGitResult(0, string.Empty, string.Empty));
+        var manager = CreateManager(runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken));
+
+        Assert.Contains("could not lock config file", ex.Message);
+        Assert.DoesNotContain(StoredToken, ex.Message);
+
+        // The failure really was the normalization, and no network command followed it.
+        Assert.Contains(runner.Joined(), j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
+        Assert.DoesNotContain(runner.Joined(), j => NetworkVerbs.Any(v => j.StartsWith(v + " ", StringComparison.Ordinal)));
+    }
+
+    /// <summary>
+    /// A NETWORK failure leaves the SANITIZED origin in place — the stale tokenized origin is never
+    /// restored, because the credential never needed to be in it.
+    /// </summary>
+    [Fact]
+    public async Task NetworkFailure_LeavesTheSanitizedOriginInPlace()
+    {
+        var runner = new CredentialRunner(request =>
+            request.Arguments.Contains("fetch")
+                ? new BrainGitResult(128, string.Empty, "fatal: Authentication failed")
+                : new BrainGitResult(0, string.Empty, string.Empty))
+        {
+            Origins = ["https://x-access-token:gho_stale_before_failure@github.com/acme/widgets.git"],
+        };
+        var manager = CreateManager(runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken));
+
+        Assert.Contains("Authentication failed", ex.Message);
+
+        var joined = runner.Joined();
+        // Exactly ONE set-url, and it is the sanitized form.
+        var setUrls = joined.Where(j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal)).ToList();
+        Assert.Equal([$"remote set-url origin {SanitizedOrigin}"], setUrls);
+
+        // No restore of the stale origin, anywhere.
+        Assert.DoesNotContain(joined, j => j.Contains("gho_stale_before_failure", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A CALLER CANCELLATION during the network command also leaves the sanitized origin in place,
+    /// and the helper directory is cleaned up on the way out.
+    /// </summary>
+    [Fact]
+    public async Task CancelledNetworkCommand_LeavesTheSanitizedOrigin_AndCleansUpTheHelper()
+    {
+        using var cts = new CancellationTokenSource();
+        var helperScriptPath = string.Empty;
+
+        var runner = new CredentialRunner(request =>
+        {
+            if (!request.Arguments.Contains("fetch"))
+                return new BrainGitResult(0, string.Empty, string.Empty);
+
+            // Capture where the helper lives, then cancel exactly like a shutdown would.
+            helperScriptPath = request.ChildEnvironment![HostGitAskpassHelper.AskpassEnvName]!;
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+        var manager = CreateManager(runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => manager.ListRemoteBranchesAsync(RepoName, cts.Token));
+
+        var joined = runner.Joined();
+        Assert.Equal([$"remote set-url origin {SanitizedOrigin}"],
+            joined.Where(j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal)).ToList());
+
+        // The operation's helper directory is gone: cleanup runs on the cancellation path too.
+        Assert.NotEmpty(helperScriptPath);
+        Assert.False(File.Exists(helperScriptPath));
+    }
+
+    /// <summary>
+    /// An UNSUPPORTED platform FAILS CLOSED: no credential transport is created and the operation
+    /// reports an honest, credential-free error instead of ever falling back to a tokenized URL.
+    /// </summary>
+    [Fact]
+    public async Task UnsupportedPlatform_FailsClosed_AndWritesOnlyTheSanitizedOrigin()
+    {
+        var runner = new CredentialRunner();
+        var manager = CreateManager(runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl));
+        manager.AskpassPlatformSupported = () => false;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.FetchOriginAsync(RepoName, null, TestContext.Current.CancellationToken));
+
+        // Honest and credential-free.
+        Assert.Contains("credential helper is unavailable on this platform", ex.Message);
+        Assert.DoesNotContain(StoredToken, ex.Message);
+        Assert.DoesNotContain("x-access-token", ex.Message);
+
+        // The origin was still normalized to the sanitized form, and NO network command ran.
+        var joined = runner.Joined();
+        Assert.Contains($"remote set-url origin {SanitizedOrigin}", joined);
+        Assert.DoesNotContain(joined, j => NetworkVerbs.Any(v => j.StartsWith(v + " ", StringComparison.Ordinal)));
+        // No tokenized fallback exists anywhere.
+        Assert.DoesNotContain(StoredToken, string.Join(" | ", joined));
+    }
+
+    /// <summary>
+    /// A NO-CREDENTIAL resolution preserves the stale-origin rule EXACTLY: nothing is written, so a
+    /// stale tokenized origin survives (the documented and accepted consequence).
+    /// </summary>
+    [Fact]
+    public async Task NoCredentialResolution_LeavesAStaleTokenizedOriginUntouched()
+    {
+        var runner = new CredentialRunner
+        {
+            Origins = ["https://x-access-token:gho_stale_survivor@github.com/acme/widgets.git"],
+        };
+        var manager = CreateManager(runner, TokenLookup(null), UrlLookup(ConfiguredUrl));
+
+        await manager.ListRemoteBranchesAsync(RepoName, TestContext.Current.CancellationToken);
+
+        // The stale-origin rule: NO write at all.
+        Assert.DoesNotContain(
+            runner.Joined(), j => j.StartsWith("remote set-url", StringComparison.Ordinal));
+
+        // …and the network command still ran, with no credential transported.
+        lock (runner.Requests)
+        {
+            Assert.All(
+                runner.Requests.Where(r => NetworkVerbs.Any(v =>
+                    r.Arguments.Count > 0 && r.Arguments[0] == v)),
+                r => Assert.Null(r.ChildEnvironment));
+        }
+    }
+
+    // ── Clone residual normalization ─────────────────────────────────────────
+
+    /// <summary>
+    /// A FAILED clone that left a usable repository has its origin normalized to the sanitized URL
+    /// by a bounded LOCAL cleanup, and the PRIMARY clone failure is what propagates.
+    /// </summary>
+    [Fact]
+    public async Task FailedClone_WithResidualRepo_NormalizesTheOriginAndPreservesThePrimaryFailure()
+    {
+        string clonePath;
+        var runner = new CredentialRunner(request =>
+        {
+            if (request.Arguments.Contains("clone"))
+                throw new InvalidOperationException("clone transport exploded");
+
+            return new BrainGitResult(0, string.Empty, string.Empty);
+        });
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), createClone: false);
+        clonePath = manager.GetClonePath(RepoName);
+
+        // OnRequest hook fires BEFORE the clone runs, which is where the residual repo has to exist.
+        runner.OnRequest = request =>
+        {
+            if (request.Arguments.Contains("clone"))
+                Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken));
+
+        // The PRIMARY exception survives — not a cleanup error.
+        Assert.Equal("clone transport exploded", ex.Message);
+
+        // The residual origin was normalized to the sanitized URL…
+        Assert.Contains(
+            runner.Joined(), j => j.Equals($"remote set-url origin {SanitizedOrigin}", StringComparison.Ordinal));
+        // …and nothing carried the credential in argv.
+        Assert.DoesNotContain(StoredToken, string.Join(" | ", runner.Joined()));
+    }
+
+    /// <summary>
+    /// A CANCELLED clone still normalizes a residual repository: the cleanup uses its OWN bounded
+    /// token, so the caller's cancellation cannot suppress it. The cancellation still propagates.
+    /// </summary>
+    [Fact]
+    public async Task CancelledClone_WithResidualRepo_StillNormalizesTheOrigin()
+    {
+        using var cts = new CancellationTokenSource();
+        string clonePath;
+        var runner = new CredentialRunner(_ => new BrainGitResult(0, string.Empty, string.Empty));
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), createClone: false);
+        clonePath = manager.GetClonePath(RepoName);
+
+        runner.OnRequest = request =>
+        {
+            if (!request.Arguments.Contains("clone"))
+                return;
+
+            Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", cts.Token));
+
+        Assert.Contains(
+            runner.Joined(), j => j.Equals($"remote set-url origin {SanitizedOrigin}", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A failed clone that created NO repository has nothing to normalize: no cleanup command is
+    /// issued at all, and the primary failure propagates unchanged.
+    /// </summary>
+    [Fact]
+    public async Task FailedClone_WithoutResidualRepo_IssuesNoCleanupCommand()
+    {
+        var runner = new CredentialRunner(request =>
+            request.Arguments.Contains("clone")
+                ? throw new InvalidOperationException("clone transport exploded")
+                : new BrainGitResult(0, string.Empty, string.Empty));
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), createClone: false);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken));
+
+        Assert.Equal("clone transport exploded", ex.Message);
+        Assert.DoesNotContain(
+            runner.Joined(), j => j.StartsWith("remote set-url", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// When the residual cleanup itself fails, a CREDENTIAL-FREE diagnostic is written and the
+    /// primary exception still propagates: normalization is best-effort, never a new failure.
+    /// </summary>
+    [Fact]
+    public async Task FailedResidualCleanup_EmitsACredentialFreeDiagnostic_AndPreservesThePrimaryFailure()
+    {
+        var logger = new TestLogger<BrainRepoManager>();
+        var runner = new CredentialRunner(request =>
+        {
+            if (request.Arguments.Contains("clone"))
+                throw new InvalidOperationException("clone transport exploded");
+
+            if (request.Arguments.Contains("set-url"))
+                throw new InvalidOperationException(
+                    $"config is unreadable for {CredentialOrigin} with {StoredToken}");
+
+            return new BrainGitResult(0, string.Empty, string.Empty);
+        });
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), logger, createClone: false);
+        var clonePath = manager.GetClonePath(RepoName);
+
+        runner.OnRequest = request =>
+        {
+            if (request.Arguments.Contains("clone"))
+                Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken));
+
+        Assert.Equal("clone transport exploded", ex.Message);
+
+        // A diagnostic WAS emitted, and it carries no secret in its message or its exception object.
+        var diagnostic = Assert.Single(
+            logger.LogEntries, e => e.Message.Contains("residual origin", StringComparison.Ordinal));
+        Assert.DoesNotContain(StoredToken, diagnostic.Message);
+        Assert.DoesNotContain("x-access-token", diagnostic.Message);
+        var payload = diagnostic.Exception?.ToString() ?? string.Empty;
+        Assert.DoesNotContain(StoredToken, payload);
+        Assert.DoesNotContain("x-access-token", payload);
+    }
+    // ── Fallback (retry-without---branch) clone: the SAME residual-cleanup contract ──────────
+
+    /// <summary>
+    /// Scripts the missing-upstream-branch shape: the FIRST clone exits non-zero with git's
+    /// "not found in upstream" text (which triggers the retry), and EVERY clone launch leaves a usable
+    /// repository behind. <paramref name="onRetryClone"/> decides what the SECOND clone does.
+    /// </summary>
+    private (CredentialRunner Runner, BrainRepoManager Manager, TestLogger<BrainRepoManager> Logger) CreateRetryScenario(
+        Func<BrainGitResult> onRetryClone, bool failSetUrl = false)
+    {
+        var logger = new TestLogger<BrainRepoManager>();
+        var clones = 0;
+        string clonePath = string.Empty;
+        var runner = new CredentialRunner(request =>
+        {
+            if (request.Arguments.Contains("clone"))
+            {
+                return Interlocked.Increment(ref clones) == 1
+                    ? new BrainGitResult(128, string.Empty, "fatal: Remote branch main not found in upstream origin")
+                    : onRetryClone();
+            }
+
+            if (failSetUrl && request.Arguments.Contains("set-url"))
+                throw new InvalidOperationException(
+                    $"config is locked for {CredentialOrigin} with {StoredToken}");
+
+            return new BrainGitResult(0, string.Empty, string.Empty);
+        });
+        var manager = CreateManager(
+            runner, TokenLookup(StoredToken), UrlLookup(ConfiguredUrl), logger, createClone: false);
+        clonePath = manager.GetClonePath(RepoName);
+
+        // Every clone attempt leaves a usable repository (the retry deletes the first one first).
+        runner.OnRequest = request =>
+        {
+            if (request.Arguments.Contains("clone"))
+                Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
+        };
+
+        return (runner, manager, logger);
+    }
+
+    /// <summary>
+    /// The RETRY clone FAILS leaving a residual repository: its origin is normalized (AFTER the retry
+    /// clone, not after the first attempt) and the retry's PRIMARY exception propagates.
+    /// </summary>
+    [Fact]
+    public async Task FallbackClone_Failure_WithResidualRepo_NormalizesTheOriginAndPreservesThePrimaryFailure()
+    {
+        var (runner, manager, _) = CreateRetryScenario(
+            () => throw new InvalidOperationException("retry clone exploded"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken));
+
+        Assert.Equal("retry clone exploded", ex.Message);
+
+        var joined = runner.Joined();
+        var cloneIndices = joined.Select((j, i) => (j, i)).Where(x => x.j.StartsWith("clone ", StringComparison.Ordinal)).Select(x => x.i).ToList();
+        Assert.Equal(2, cloneIndices.Count); // the retry really ran
+        var setUrl = Assert.Single(joined, j => j.StartsWith("remote set-url origin ", StringComparison.Ordinal));
+        Assert.Equal($"remote set-url origin {SanitizedOrigin}", setUrl);
+        Assert.True(joined.IndexOf(setUrl) > cloneIndices[1], "Normalization must follow the RETRY clone.");
+        Assert.DoesNotContain(StoredToken, string.Join(" | ", joined));
+    }
+
+    /// <summary>
+    /// The RETRY clone is CANCELLED leaving a residual repository: the cleanup still runs (independent
+    /// token) and the cancellation is what propagates.
+    /// </summary>
+    [Fact]
+    public async Task FallbackClone_Cancellation_WithResidualRepo_StillNormalizesTheOrigin_AndPropagatesCancellation()
+    {
+        using var cts = new CancellationTokenSource();
+        var (runner, manager, _) = CreateRetryScenario(() =>
+        {
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", cts.Token));
+        Assert.Equal(cts.Token, ex.CancellationToken);
+
+        var joined = runner.Joined();
+        var lastClone = joined.FindLastIndex(j => j.StartsWith("clone ", StringComparison.Ordinal));
+        var setUrl = joined.FindIndex(j => j.Equals($"remote set-url origin {SanitizedOrigin}", StringComparison.Ordinal));
+        Assert.True(setUrl > lastClone && lastClone >= 0, "Cleanup must run after the cancelled retry clone.");
+    }
+
+    /// <summary>
+    /// The retry's residual cleanup CANNOT complete: a credential-free diagnostic is emitted and the
+    /// retry's primary exception still propagates.
+    /// </summary>
+    [Fact]
+    public async Task FallbackClone_CleanupCannotComplete_EmitsACredentialFreeDiagnostic_AndPreservesThePrimaryFailure()
+    {
+        var (_, manager, logger) = CreateRetryScenario(
+            () => throw new InvalidOperationException("retry clone exploded"), failSetUrl: true);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.EnsureCloneAsync(RepoName, ConfiguredUrl, "main", TestContext.Current.CancellationToken));
+        Assert.Equal("retry clone exploded", ex.Message);
+
+        var diagnostic = Assert.Single(
+            logger.LogEntries, e => e.Message.Contains("residual origin", StringComparison.Ordinal));
+        Assert.DoesNotContain(StoredToken, diagnostic.Message);
+        Assert.DoesNotContain("x-access-token", diagnostic.Message);
+        var payload = diagnostic.Exception?.ToString() ?? string.Empty;
+        Assert.DoesNotContain(StoredToken, payload);
+    }
+
 }

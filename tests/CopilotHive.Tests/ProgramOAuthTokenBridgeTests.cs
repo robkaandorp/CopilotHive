@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Persistence;
 using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
@@ -547,6 +548,7 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
         Directory.CreateDirectory(Path.Combine(local, ".git"));
 
         var commands = new List<string>();
+        var launchEnvironments = new List<IReadOnlyDictionary<string, string?>?>();
         var manager = new ConfigRepoManager("https://github.com/org/config.git", local)
         {
             GitRunner = (_, args, _) =>
@@ -554,17 +556,56 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
                 commands.Add(string.Join(' ', args));
                 return Task.FromResult(new ConfigRepoManager.GitRunResult(0, string.Empty, string.Empty));
             },
+            GitLaunchObserver = (_, _, env) => launchEnvironments.Add(env),
             TokenResolver = ct => Program.PreBuildOAuthTokenLookup(dbPath, ct),
         };
 
         await manager.SyncRepoAsync(TestContext.Current.CancellationToken);
 
+        // The origin the bridge result causes to be written is the SANITIZED configured URL: the
+        // token is no longer stored in .git/config or in argv.
         Assert.Equal(
             [
-                "remote set-url origin https://x-access-token:gho_bridge_token@github.com/org/config.git",
+                "remote set-url origin https://github.com/org/config.git",
                 "pull",
             ],
             commands);
+        Assert.DoesNotContain(commands, c => c.Contains("x-access-token", StringComparison.Ordinal));
+
+        // …and the bridge token really did reach the credential transport: it is carried ONLY in the
+        // child environment of the authenticated launch (the token-free askpass variable).
+        var carried = launchEnvironments
+            .Where(env => env is not null)
+            .Select(env => env![HostGitAskpassHelper.CredentialEnvName])
+            .OfType<string>()
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(["gho_bridge_token"], carried);
+
+        // The claim this test exists for is the BRIDGE→RESOLVER→TRANSPORT chain: the token came
+        // out of the DATABASE through the pre-build lookup, and reached git. A control proves the
+        // DATABASE is what supplied it: with an EMPTY database the same wiring resolves nothing.
+        var emptyDbPath = NewDbPath();
+        await SeedAsync(emptyDbPath);
+        var controlEnvironments = new List<IReadOnlyDictionary<string, string?>?>();
+        var controlManager = new ConfigRepoManager("https://github.com/org/config.git", local)
+        {
+            GitRunner = (_, args, _) =>
+                Task.FromResult(new ConfigRepoManager.GitRunResult(0, string.Empty, string.Empty)),
+            GitLaunchObserver = (_, _, env) => controlEnvironments.Add(env),
+            TokenResolver = ct => Program.PreBuildOAuthTokenLookup(emptyDbPath, ct),
+        };
+
+        await controlManager.SyncRepoAsync(TestContext.Current.CancellationToken);
+
+        // The empty database resolves NO BRIDGE credential: the bridge — not the environment — is
+        // what supplied the token above. (The ambient environment may still provide a token of its
+        // own, so the claim is about the BRIDGE token specifically.)
+        Assert.DoesNotContain(
+            controlEnvironments,
+            env => env is not null
+                && env.TryGetValue(HostGitAskpassHelper.CredentialEnvName, out var value)
+                && value == "gho_bridge_token");
     }
 
     // ── AttachLiveTokenResolver ───────────────────────────────────────────────
@@ -665,11 +706,13 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
         Directory.CreateDirectory(Path.Combine(manager.LocalPath, ".git"));
 
         var commands = new List<string>();
+        var launchEnvironments = new List<IReadOnlyDictionary<string, string?>?>();
         manager.GitRunner = (_, args, _) =>
         {
             commands.Add(string.Join(' ', args));
             return Task.FromResult(new ConfigRepoManager.GitRunResult(0, string.Empty, string.Empty));
         };
+        manager.GitLaunchObserver = (_, _, env) => launchEnvironments.Add(env);
 
         var (provider, service, db) = CreateProvider(manager);
         using var _p = provider;
@@ -681,12 +724,46 @@ public sealed class ProgramOAuthTokenBridgeTests : IDisposable
         Program.AttachLiveTokenResolver(provider, service);
         await manager.SyncRepoAsync(ct);
 
+        // The live-resolved token no longer reaches the written origin or argv; that origin is the
+        // SANITIZED configured URL.
         Assert.Equal(
             [
-                "remote set-url origin https://x-access-token:gho_live_token@github.com/org/config.git",
+                "remote set-url origin https://github.com/org/config.git",
                 "pull",
             ],
             commands);
+        Assert.DoesNotContain(commands, c => c.Contains("x-access-token", StringComparison.Ordinal));
+
+        // The live token IS carried — by the operation-scoped credential transport, observed in the
+        // ACTUAL child environment of the authenticated launch.
+        var carried = launchEnvironments
+            .Where(env => env is not null)
+            .Select(env => env![HostGitAskpassHelper.CredentialEnvName])
+            .OfType<string>()
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(["gho_live_token"], carried);
+
+        // The claim this test exists for is the LIVE-RESOLVER→TRANSPORT chain: the token came out
+        // of the LIVE user service, and reached git. A control proves the SERVICE is what supplied
+        // it: with the live resolver attached but NO admin token stored, nothing is transported.
+        var (controlProvider, controlService, controlDb) = CreateProvider(manager);
+        using var _cp = controlProvider;
+        using var _cd = controlDb;
+
+        var controlEnvironments = new List<IReadOnlyDictionary<string, string?>?>();
+        manager.GitLaunchObserver = (_, _, env) => controlEnvironments.Add(env);
+
+        Program.AttachLiveTokenResolver(controlProvider, controlService);
+        await manager.SyncRepoAsync(ct);
+
+        // Nothing was stored, so the live resolver resolves NO LIVE credential: the live service —
+        // not the environment — is what supplied the token above.
+        Assert.DoesNotContain(
+            controlEnvironments,
+            env => env is not null
+                && env.TryGetValue(HostGitAskpassHelper.CredentialEnvName, out var value)
+                && value == "gho_live_token");
     }
 }
 
