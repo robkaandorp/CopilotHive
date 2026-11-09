@@ -160,13 +160,19 @@ internal sealed class HostGitAskpassHelper : IDisposable
     /// The operation-scoped git configuration appended to the child's environment config list,
     /// AFTER every inherited entry. <c>credential.helper</c> with an EMPTY value RESETS the
     /// accumulated helper list for this invocation only (inherited <c>get</c> and <c>store</c>
-    /// alike); <c>credential.interactive=false</c> additionally turns off a helper's interactive
-    /// prompting where a helper honours it.
+    /// alike).
     /// </summary>
+    /// <remarks>
+    /// <c>credential.interactive</c> is deliberately NOT set. Since git 2.47.0 it is a TOTAL askpass
+    /// suppression: <c>credential_getpass()</c> returns before <c>credential_ask_one()</c> (the code
+    /// that runs <c>GIT_ASKPASS</c>), so <c>credential.interactive=false</c> makes git fail with
+    /// <c>fatal: unable to get password from user</c> without ever invoking this operation's askpass
+    /// helper. Terminal prompting is prevented instead by <c>GIT_TERMINAL_PROMPT=0</c> and
+    /// <c>GCM_INTERACTIVE=never</c>, which <see cref="BuildChildEnvironment"/> always sets.
+    /// </remarks>
     private static readonly (string Key, string Value)[] OperationConfigEntries =
     [
         ("credential.helper", string.Empty),
-        ("credential.interactive", "false"),
     ];
 
     private int _disposed;

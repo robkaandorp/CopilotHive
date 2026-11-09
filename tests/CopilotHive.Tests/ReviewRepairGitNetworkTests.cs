@@ -347,6 +347,51 @@ public sealed class ReviewRepairGitNetworkTests : IDisposable
         Assert.Contains("password=" + Token, accepted.Stdout);
     }
 
+    /// <summary>
+    /// A successful fill must actually invoke the production askpass with Git's exact prompt
+    /// bytes, including the trailing space. This pins the git >= 2.47 interactive=false regression
+    /// without relying on a version check or only testing manually constructed shell prompts.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("x-access-token")]
+    public async Task CredentialFill_EligibleRealPrompts_InvokeProductionHelper_WithExactBytes(string? username)
+    {
+        RequireLinux();
+        Directory.CreateDirectory(_root);
+        var (wrapper, promptLog) = CreatePromptForwarder();
+        using var helper = HostGitAskpassHelper.TryCreate();
+        Assert.NotNull(helper);
+        Assert.DoesNotContain(Token, File.ReadAllText(wrapper));
+        Assert.DoesNotContain(Token, File.ReadAllText(helper.ScriptPath));
+        var env = new Dictionary<string, string?>(helper.BuildChildEnvironment(Token))
+        {
+            [HostGitAskpassHelper.AskpassEnvName] = wrapper,
+            ["REVIEW_REAL_ASKPASS"] = helper.ScriptPath,
+            ["REVIEW_PROMPT_LOG"] = promptLog,
+        };
+        Assert.Equal("0", env[HostGitAskpassHelper.PromptDisabledEnvName]);
+        Assert.Equal(HostGitAskpassHelper.GcmInteractiveNever, env[HostGitAskpassHelper.GcmInteractiveEnvName]);
+
+        var input = "protocol=https\nhost=github.com\n"
+            + (username is null ? "" : $"username={username}\n") + "\n";
+        var result = await RunCredentialProtocol(_root, env, input);
+        // Include full stderr in a failing control, but never render a credential-bearing stdout.
+        Assert.True(result.ExitCode == 0, $"git credential fill exited {result.ExitCode}: {result.Stderr}");
+        Assert.Equal(string.Empty, result.Stderr);
+        Assert.Contains("protocol=https\n", result.Stdout);
+        Assert.Contains("host=github.com\n", result.Stdout);
+        Assert.Contains("username=x-access-token\n", result.Stdout);
+        Assert.Contains($"password={Token}\n", result.Stdout);
+
+        // The token-free forwarder adds ONE LF per invocation; comparison is byte-exact, so it
+        // also pins one call when the username is supplied, two otherwise, and no extra prompts.
+        var expected = (username is null ? "Username for 'https://github.com': \n" : "")
+            + "Password for 'https://x-access-token@github.com': \n";
+        Assert.True(File.Exists(promptLog), "Git never invoked the production askpass forwarder.");
+        Assert.Equal(Encoding.UTF8.GetBytes(expected), File.ReadAllBytes(promptLog));
+    }
+
     private (string Script, string Log) CreatePromptForwarder()
     {
         var script = Path.Combine(_root, "forward-askpass.sh");

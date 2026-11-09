@@ -245,14 +245,20 @@ public sealed class HostGitAskpassHelperTests : IDisposable
 
             var environment = helper!.BuildChildEnvironment(Token);
 
-            // Two inherited entries plus the two operation-scoped ones.
-            Assert.Equal("4", environment[HostGitAskpassHelper.ConfigCountEnvName]);
+            // Two inherited entries plus the one operation-scoped helper reset.
+            Assert.Equal("3", environment[HostGitAskpassHelper.ConfigCountEnvName]);
 
             // Appended LAST — highest precedence for this invocation.
             Assert.Equal("credential.helper", environment["GIT_CONFIG_KEY_2"]);
             Assert.Equal(string.Empty, environment["GIT_CONFIG_VALUE_2"]);
-            Assert.Equal("credential.interactive", environment["GIT_CONFIG_KEY_3"]);
-            Assert.Equal("false", environment["GIT_CONFIG_VALUE_3"]);
+            // The higher-precedence channel must carry the SAME reset and no interactive setting.
+            Assert.Equal("'credential.helper='", environment[HostGitAskpassHelper.ConfigParametersEnvName]);
+            // credential.interactive must NOT be configured (git >= 2.47 would then never run askpass);
+            // terminal prompting stays disabled through the dedicated environment variables.
+            Assert.False(environment.ContainsKey("GIT_CONFIG_KEY_3"));
+            Assert.False(environment.ContainsKey("GIT_CONFIG_VALUE_3"));
+            Assert.Equal("0", environment[HostGitAskpassHelper.PromptDisabledEnvName]);
+            Assert.Equal(HostGitAskpassHelper.GcmInteractiveNever, environment[HostGitAskpassHelper.GcmInteractiveEnvName]);
 
             // The INHERITED entries are untouched; nothing was rewritten.
             Assert.Equal("credential.helper", environment["GIT_CONFIG_KEY_0"]);
@@ -287,10 +293,15 @@ public sealed class HostGitAskpassHelperTests : IDisposable
 
             var environment = helper!.BuildChildEnvironment(Token);
 
-            Assert.Equal("2", environment[HostGitAskpassHelper.ConfigCountEnvName]);
+            Assert.Equal("1", environment[HostGitAskpassHelper.ConfigCountEnvName]);
             Assert.Equal("credential.helper", environment["GIT_CONFIG_KEY_0"]);
             Assert.Equal(string.Empty, environment["GIT_CONFIG_VALUE_0"]);
-            Assert.Equal("credential.interactive", environment["GIT_CONFIG_KEY_1"]);
+            Assert.Equal("'credential.helper='", environment[HostGitAskpassHelper.ConfigParametersEnvName]);
+            // credential.interactive must NOT be configured (git >= 2.47 would then never run askpass).
+            Assert.False(environment.ContainsKey("GIT_CONFIG_KEY_1"));
+            Assert.False(environment.ContainsKey("GIT_CONFIG_VALUE_1"));
+            Assert.Equal("0", environment[HostGitAskpassHelper.PromptDisabledEnvName]);
+            Assert.Equal(HostGitAskpassHelper.GcmInteractiveNever, environment[HostGitAskpassHelper.GcmInteractiveEnvName]);
         }
         finally
         {
@@ -630,11 +641,26 @@ public sealed class HostGitAskpassHelperTests : IDisposable
         try
         {
             using var helper = HostGitAskpassHelper.TryCreate();
-            var value = helper!.BuildChildEnvironment(Token)[HostGitAskpassHelper.ConfigParametersEnvName];
+            Assert.NotNull(helper);
+            var environment = helper.BuildChildEnvironment(Token);
+            var value = environment[HostGitAskpassHelper.ConfigParametersEnvName];
 
             Assert.DoesNotContain("/evil/helper", value, StringComparison.Ordinal);
             Assert.DoesNotContain("core.pager", value, StringComparison.Ordinal);
-            Assert.Equal("'credential.helper=' 'credential.interactive=false'", value);
+            Assert.Equal("'credential.helper='", value);
+
+            // Replacing the legacy channel must not remove the indexed reset or add an
+            // interactive=false setting there (which would suppress the operation's askpass).
+            var count = int.Parse(environment[HostGitAskpassHelper.ConfigCountEnvName]!,
+                System.Globalization.CultureInfo.InvariantCulture);
+            Assert.True(count > 0);
+            Assert.Equal("credential.helper", environment[$"GIT_CONFIG_KEY_{count - 1}"]);
+            Assert.Equal(string.Empty, environment[$"GIT_CONFIG_VALUE_{count - 1}"]);
+            for (var i = 0; i < count; i++)
+                Assert.False(string.Equals("credential.interactive", environment[$"GIT_CONFIG_KEY_{i}"],
+                    StringComparison.OrdinalIgnoreCase));
+            Assert.Equal("0", environment[HostGitAskpassHelper.PromptDisabledEnvName]);
+            Assert.Equal(HostGitAskpassHelper.GcmInteractiveNever, environment[HostGitAskpassHelper.GcmInteractiveEnvName]);
         }
         finally
         {
