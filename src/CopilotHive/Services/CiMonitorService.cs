@@ -64,14 +64,25 @@ internal sealed record CheckRunData(
     string? RunId);
 
 /// <summary>
-/// Outcome of parsing CI log content: the extracted test failures and, when the log
-/// cannot be parsed into failures, a sanitized snippet of the raw log for context.
+/// Outcome of parsing CI log content: the extracted test failures, a bounded head+tail
+/// sanitized excerpt of the log for the no-failure fallback, and the overflow summary of
+/// failures that were parsed but not retained because a retention bound was reached.
 /// </summary>
 /// <param name="Failures">Test failures parsed from the log; empty when none could be parsed.</param>
-/// <param name="FallbackSnippet">Sanitized raw-log snippet to use when <paramref name="Failures"/> is empty, or <c>null</c>.</param>
+/// <param name="FallbackSnippet">
+/// Bounded sanitized head+tail excerpt of the redacted log, used only when <paramref name="Failures"/>
+/// is empty, or <c>null</c> when the log carried nothing.
+/// </param>
+/// <param name="Overflow">
+/// Summary of the parsed failure OCCURRENCES that were dropped to stay inside the retention
+/// bounds, or <c>null</c> when every parsed failure was retained. Callers must render it whenever
+/// it is non-null — retained failures plus omitted occurrences must always add up to the number of
+/// failures parsed from the log.
+/// </param>
 internal sealed record LogFetchResult(
     List<(string TestName, string Error, string StackTrace)> Failures,
-    string? FallbackSnippet);
+    string? FallbackSnippet,
+    string? Overflow = null);
 
 /// <summary>
 /// Monitors CI status for a goal's merge commit via the GitHub API, publishes
@@ -111,139 +122,9 @@ public class CiMonitorService
         @"Failed\s+([A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+)",
         RegexOptions.Compiled);
 
-    /// <summary>
-    /// Matches an xUnit failure header line: <c>Failed {name} [duration]</c>. The name is
-    /// captured non-greedily up to the trailing duration bracket, so theory names containing
-    /// spaces still parse. Multiline so headers are anchored to their own line, and leading
-    /// whitespace is tolerated because console output indents failure lines.
-    /// </summary>
-    private static readonly Regex XUnitFailedTestRegex = new(
-        @"^\s*Failed\s+(.+?)\s+\[\d+[^\]]*\]\s*$",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    /// <summary>
-    /// Matches a Microsoft.Testing.Platform (MTP) failure header line:
-    /// <c>failed {identity} ({duration})</c>. MTP prints the word <c>failed</c> in lower case and
-    /// the duration in parentheses rather than xUnit's upper-case <c>Failed {name} [duration]</c>
-    /// shape, so the VSTest header regex never matches it. The identity is captured non-greedily
-    /// up to the trailing duration parentheses, so theory names containing spaces, parentheses,
-    /// and quotes (e.g. <c>…​(label: "case with spaces")</c>) still parse. MTP's
-    /// HumanReadableDurationFormatter emits space-separated multi-component durations
-    /// (<c>0ms</c>, <c>234ms</c>, <c>1s 234ms</c>, <c>4m 54s 690ms</c>), so each component is
-    /// digit-led and further components may follow it separated by whitespace; the identity stays
-    /// anchored because the duration must run to the end of the line.
-    /// </summary>
-    private static readonly Regex MtpFailedTestRegex = new(
-        @"^\s*failed\s+(.+?)\s+\(\d+[^\s)]*(?:\s+\d+[^\s)]*)*\)\s*$",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    /// <summary>
-    /// Matches the indented <c>from {dll} ({tfm}|{arch})</c> line MTP prints directly under a
-    /// failure header, identifying the assembly the test ran in.
-    /// </summary>
-    private static readonly Regex MtpFromLineRegex = new(
-        @"^\s*from\s+.+?\([^)]*\)\s*$",
-        RegexOptions.Compiled);
-
-    /// <summary>
-    /// Matches a bare stack-frame line (<c>at {method} …</c>) inside an MTP failure block. MTP
-    /// prints no <c>Stack Trace:</c> label, so the trailing run of such lines is the trace. The
-    /// leading whitespace is optional because <see cref="StripActionsTimestamp"/> consumes the
-    /// indentation that follows a GitHub Actions timestamp prefix.
-    /// </summary>
-    private static readonly Regex MtpStackTraceLineRegex = new(
-        @"^\s*at\s+\S",
-        RegexOptions.Compiled);
-
     /// <summary>Extracts the GitHub Actions run ID from a check run's <c>details_url</c>.</summary>
     private static readonly Regex ActionsRunIdRegex = new(
         @"/actions/runs/(\d+)",
-        RegexOptions.Compiled);
-
-    /// <summary>Redacts <c>ghp_</c> GitHub personal-access tokens (36-character secrets).</summary>
-    private static readonly Regex GhpTokenRegex = new(
-        @"ghp_[A-Za-z0-9]{36}",
-        RegexOptions.Compiled);
-
-    /// <summary>Redacts <c>gho_</c> GitHub OAuth access tokens (36-character secrets).</summary>
-    private static readonly Regex GhoTokenRegex = new(
-        @"gho_[A-Za-z0-9]{36}",
-        RegexOptions.Compiled);
-
-    /// <summary>Redacts <c>ghs_</c> GitHub user-to-server tokens (36-character secrets).</summary>
-    private static readonly Regex GhsTokenRegex = new(
-        @"ghs_[A-Za-z0-9]{36}",
-        RegexOptions.Compiled);
-
-    /// <summary>Redacts HTTP <c>Bearer</c> authorization tokens (any base64-ish value).</summary>
-    private static readonly Regex BearerTokenRegex = new(
-        @"Bearer [A-Za-z0-9._\-]+",
-        RegexOptions.Compiled);
-
-    /// <summary>
-    /// Redacts secret-looking environment variables (names containing TOKEN, KEY, SECRET, or
-    /// PASSWORD) while preserving the key name. Multiline (<c>RegexOptions.Multiline</c>) and
-    /// case-sensitive so ordinary words such as <c>token</c> in prose are never touched.
-    /// </summary>
-    private static readonly Regex SecretEnvVarRegex = new(
-        @"^([A-Z_]*(TOKEN|KEY|SECRET|PASSWORD)[A-Z_]*)=.+$",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    /// <summary>Redacts ADO-style <c>Password=...</c> connection-string fragments.</summary>
-    private static readonly Regex PasswordAssignmentRegex = new(
-        @"Password=[^;]+",
-        RegexOptions.Compiled);
-
-    /// <summary>Matches the <c>Error Message:</c> section header of an xUnit failure block.</summary>
-    private static readonly Regex XUnitErrorMessageRegex = new(
-        @"^\s*Error Message:\s*$",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    /// <summary>Matches the <c>Stack Trace:</c> section header of an xUnit failure block.</summary>
-    private static readonly Regex XUnitStackTraceRegex = new(
-        @"^\s*Stack Trace:\s*$",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    /// <summary>
-    /// Matches the <c>--- End of stack trace ---</c> marker that terminates a stack-trace
-    /// section in .NET/xUnit output.
-    /// </summary>
-    private static readonly Regex StackTraceEndMarkerRegex = new(
-        @"^\s*---\s*End of stack trace",
-        RegexOptions.Compiled);
-
-    /// <summary>
-    /// Matches the ISO-8601 timestamp prefix GitHub Actions prepends to every raw log line
-    /// (e.g. <c>2026-08-22T09:47:38.1197374Z </c>). Stripped before failure parsing so headers
-    /// and section markers anchor to the start of the line.
-    /// </summary>
-    private static readonly Regex GitHubActionsTimestampRegex = new(
-        @"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\s+",
-        RegexOptions.Compiled);
-
-    /// <summary>
-    /// Matches the line that terminates a Microsoft.Testing.Platform failure block: the next
-    /// per-test result line (<c>failed|passed|skipped|…</c> followed by a dotted identity, in
-    /// either case so a following VSTest-format block also terminates it) or a run-level footer
-    /// such as <c>Test run summary:</c>, <c>Exit code:</c>, or <c>Standard output:</c>. MTP blocks
-    /// are not blank-line separated, so without this bound the last failure in a log would swallow
-    /// the following result and footer lines into its error text.
-    /// </summary>
-    private static readonly Regex MtpBlockTerminatorRegex = new(
-        @"^\s*(?:(?i:failed|passed|skipped|errored|error|canceled|cancelled|timed\s+out)\s+[A-Za-z_][\w.]*\.[A-Za-z_]\w*|Test run summary:|Test run completed|Exit code:|In process file artifacts|Standard output:|Standard error:)",
-        RegexOptions.Compiled);
-
-    /// <summary>
-    /// Matches MTP's per-assembly result footer, e.g.
-    /// <c>{path}.dll (net10.0|x64) failed with 3 error(s) (4m 54s 690ms)</c> or
-    /// <c>{path}.dll (net10.0|x64) passed (4m 56s 611ms)</c>. This line always closes the final
-    /// failure block, and it matches neither <see cref="MtpBlockTerminatorRegex"/> (the result word
-    /// is preceded by the assembly name) nor the failure headers, so it is recognised separately.
-    /// The <c>from {dll} ({tfm}|{arch})</c> location line has no result word after the parentheses
-    /// and therefore never matches.
-    /// </summary>
-    private static readonly Regex MtpAssemblyResultRegex = new(
-        @"^\s*\S+\.dll\s+\([^)]*\)\s+(?i:passed|failed|skipped|errored|completed)\b",
         RegexOptions.Compiled);
 
     private readonly IGoalStore? _goalStore;
@@ -297,16 +178,13 @@ public class CiMonitorService
     private readonly Queue<string> _logFetchCacheOrder = new();
 
     /// <summary>
-    /// Hard cap (in raw bytes) on how much of a job log body is read into memory. The retained
-    /// 4 MiB prefix is kept as-is — earlier bytes are never evicted.
+    /// Label the log-fallback issue bodies use for the bounded head+tail log excerpt. The size
+    /// figures come from <see cref="CiLogStreamParser.FallbackHeadChars"/> (characters kept from
+    /// the start of the log) and <see cref="CiLogStreamParser.FallbackTailChars"/> (characters kept
+    /// from its end).
     /// </summary>
-    private const int LogReadMaxBytes = 4 * 1024 * 1024;
-
-    /// <summary>
-    /// UTF-8 decoder with a replacement fallback: a truncated multi-byte sequence at the cap
-    /// boundary decodes to U+FFFD instead of throwing.
-    /// </summary>
-    private static readonly UTF8Encoding LenientUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+    internal static readonly string FallbackExcerptLabel =
+        $"Log output (first {CiLogStreamParser.FallbackHeadChars} and last {CiLogStreamParser.FallbackTailChars} chars):";
 
     /// <summary>
     /// Initialises a new <see cref="CiMonitorService"/> with optional dependencies.
@@ -1352,15 +1230,24 @@ public class CiMonitorService
         if (failedJobIds.Count == 0)
             return null; // no failed jobs → no logs to fetch
 
-        var combinedFailures = new List<(string TestName, string Error, string StackTrace)>();
-        string? lastSuccessfulJobLog = null;
+        // One retention budget for the whole run: the bounds apply to the aggregate of every
+        // failed job's log, not per job, so a run with many failing jobs cannot multiply them.
+        var retention = CiFailureRetention.CreateProduction();
+        var parsedFailureOccurrences = 0;
+        CiLogStreamParser? lastSuccessfulJobLog = null;
 
         foreach (var jobId in failedJobIds)
         {
-            string? sanitizedLog;
+            // The scan offers this job's failures to the SHARED retention as it streams, before it is
+            // known whether the download completes. A job that does not complete contributes
+            // nothing: its partial retention is rolled back so it can neither displace later jobs nor
+            // desynchronise the occurrence count (which only counts completed jobs).
+            var checkpoint = retention.Mark();
+
+            CiLogStreamParser? jobLog;
             try
             {
-                sanitizedLog = await FetchJobLogAsync(jobId, owner, repo, token, client, ct);
+                jobLog = await FetchJobLogAsync(jobId, owner, repo, token, client, retention, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -1368,44 +1255,74 @@ public class CiMonitorService
             }
             catch (Exception ex)
             {
+                retention.Rollback(checkpoint);
                 _logger.LogWarning(ex, "Failed to fetch CI log for job {JobId} run {RunId}", jobId, runId);
                 continue; // job failure — partial success is allowed
             }
 
-            if (sanitizedLog is null)
+            if (jobLog is null)
+            {
+                retention.Rollback(checkpoint);
                 continue; // log not fetched (HTTP error) — job failure
+            }
 
-            lastSuccessfulJobLog = sanitizedLog;
-
-            var jobFailures = ParseTestFailuresFromLogs(sanitizedLog);
-            combinedFailures.AddRange(jobFailures);
+            lastSuccessfulJobLog = jobLog;
+            parsedFailureOccurrences += jobLog.ParsedFailureCount;
         }
 
         if (lastSuccessfulJobLog is null)
             return null; // every job's log fetch failed
 
-        if (combinedFailures.Count > 0)
-            return new LogFetchResult(combinedFailures, null);
+        // Computed once for this log fetch and carried on the result, so HandleCiFailureAsync can
+        // render it in every issue format it may choose.
+        var overflow = BuildOverflowSummary(parsedFailureOccurrences, retention.Failures.Count);
 
-        // No parseable failures: fall back to a sanitized tail of the last successful log.
-        if (string.IsNullOrWhiteSpace(lastSuccessfulJobLog))
-            return new LogFetchResult([], null);
+        if (retention.Failures.Count > 0)
+            return new LogFetchResult(retention.Failures, null, overflow);
 
-        var snippet = lastSuccessfulJobLog.Length <= 500
-            ? lastSuccessfulJobLog
-            : lastSuccessfulJobLog[^500..];
-        return new LogFetchResult([], snippet);
+        if (string.IsNullOrWhiteSpace(lastSuccessfulJobLog.FallbackDiagnostics))
+            return new LogFetchResult([], null, overflow);
+
+        return new LogFetchResult([], lastSuccessfulJobLog.FallbackDiagnostics, overflow);
+    }
+
+    /// <summary>
+    /// Builds the overflow summary for a log fetch whose retention bounds dropped parsed failures.
+    /// Counts parsed failure OCCURRENCES (not distinct tests): the same test name can appear more
+    /// than once in a log. Contains counts and bounds only — never log content — so it needs no
+    /// redaction.
+    /// </summary>
+    /// <param name="parsedOccurrences">Total parseable failure occurrences found in the run's logs.</param>
+    /// <param name="retainedOccurrences">How many of them were retained.</param>
+    /// <returns>The summary, or <c>null</c> when every parsed occurrence was retained.</returns>
+    private static string? BuildOverflowSummary(int parsedOccurrences, int retainedOccurrences)
+    {
+        var omitted = parsedOccurrences - retainedOccurrences;
+        if (omitted <= 0)
+            return null;
+
+        return FormattableString.Invariant(
+            $"Omitted failures: {omitted:N0} of {parsedOccurrences:N0} parsed test failure occurrence(s) were not retained — CI log retention is bounded to the first {CiLogStreamParser.MaxRetainedFailureCount:N0} failures and {CiLogStreamParser.MaxRetainedFailureChars:N0} characters per run. The complete log is available on the CI run page.");
     }
 
     /// <summary>
     /// Fetches one failed job's log: requests <c>/actions/jobs/{jobId}/logs</c> with bearer
     /// auth, manually follows the 302 redirect to the cross-host signed URL WITHOUT auth, and
-    /// reads the body as a bounded in-memory full read (up to 4 MiB of raw bytes, keeping the
-    /// retained prefix as-is). The decoded text is sanitized before it is returned.
+    /// STREAMS the body through <see cref="CiLogStreamParser"/> — the whole log is consumed in
+    /// bounded chunks regardless of its size, so failure blocks anywhere in it (including far past
+    /// the first few MiB) are extracted, and only a bounded amount of it is ever held in memory.
     /// </summary>
-    /// <returns>The sanitized log text, or <c>null</c> when the job's log could not be fetched.</returns>
-    private async Task<string?> FetchJobLogAsync(
-        long jobId, string owner, string repo, string token, HttpClient client, CancellationToken ct)
+    /// <param name="jobId">The GitHub Actions job ID.</param>
+    /// <param name="owner">GitHub repository owner.</param>
+    /// <param name="repo">GitHub repository name.</param>
+    /// <param name="token">Bearer token for the GitHub API call.</param>
+    /// <param name="client">The <c>github-api-logs</c> HTTP client (no auto-redirect).</param>
+    /// <param name="retention">The run-wide bounded retention budget for parsed failures.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates to the caller.</param>
+    /// <returns>The completed parser for the job's log, or <c>null</c> when it could not be fetched.</returns>
+    private async Task<CiLogStreamParser?> FetchJobLogAsync(
+        long jobId, string owner, string repo, string token, HttpClient client,
+        CiFailureRetention retention, CancellationToken ct)
     {
         var logsUrl = $"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{jobId}/logs";
         using (var request = CreateAuthorizedRequest(HttpMethod.Get, logsUrl, token))
@@ -1452,7 +1369,7 @@ public class CiMonitorService
                     return null;
                 }
 
-                return await ReadLogBodyAsync(redirectResponse, ct);
+                return await ReadLogBodyAsync(redirectResponse, retention, ct);
             }
 
             if (!response.IsSuccessStatusCode)
@@ -1463,42 +1380,25 @@ public class CiMonitorService
                 return null;
             }
 
-            return await ReadLogBodyAsync(response, ct);
+            return await ReadLogBodyAsync(response, retention, ct);
         }
     }
 
     /// <summary>
-    /// Reads the log body as a bounded in-memory full read: up to <see cref="LogReadMaxBytes"/>
-    /// raw bytes are accumulated and the retained prefix is kept as-is (no tail-only slide).
-    /// The bytes are decoded as UTF-8 leniently — an incomplete multi-byte sequence at the cap
-    /// boundary decodes to the replacement character instead of throwing — and the result is
-    /// sanitized.
+    /// Streams the log body through <see cref="CiLogStreamParser.ScanAsync"/>: the entire body is
+    /// read in <see cref="CiLogStreamParser.StreamChunkBytes"/> chunks (never buffered whole and
+    /// never cut off at a byte cap), decoded as UTF-8 leniently, redacted per complete line, and
+    /// parsed for failure blocks incrementally across chunk boundaries.
     /// </summary>
-    private static async Task<string> ReadLogBodyAsync(HttpResponseMessage response, CancellationToken ct)
+    /// <param name="response">The successful log response.</param>
+    /// <param name="retention">The run-wide bounded retention budget for parsed failures.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates to the caller.</param>
+    /// <returns>The completed parser, carrying the retained failures and the fallback excerpt.</returns>
+    private static async Task<CiLogStreamParser> ReadLogBodyAsync(
+        HttpResponseMessage response, CiFailureRetention retention, CancellationToken ct)
     {
         await using var stream = await response.Content.ReadAsStreamAsync(ct);
-        var buffer = new byte[LogReadMaxBytes];
-        var total = 0;
-        var chunk = new byte[8192];
-        while (true)
-        {
-            // Hard cap: the read REQUEST itself is clamped to the remaining capacity, so no
-            // byte beyond the cap is ever pulled off the stream. Clamping only the copy after
-            // an unclamped read would still consume (and then discard) up to a full chunk past
-            // the boundary, which the "read up to the cap and stop" contract forbids.
-            var remaining = buffer.Length - total;
-            if (remaining == 0)
-                break;
-
-            var read = await stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), ct);
-            if (read == 0)
-                break;
-
-            chunk.AsSpan(0, read).CopyTo(buffer.AsSpan(total, read));
-            total += read;
-        }
-
-        return SanitizeLogContent(LenientUtf8.GetString(buffer, 0, total));
+        return await CiLogStreamParser.ScanAsync(stream, retention, ct);
     }
 
     /// <summary>Creates a request with the GitHub bearer token attached.</summary>
@@ -1616,8 +1516,8 @@ public class CiMonitorService
                             : $"CI failure: {run.Name}";
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
-                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
-                            BuildUrlOnlyDedupAppend(run.HtmlUrl, _timeProvider.GetUtcNow().UtcDateTime), ct);
+                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl, overflow: null),
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl, overflow: null, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                         continue;
@@ -1639,8 +1539,8 @@ public class CiMonitorService
                             : $"CI failure: {run.Name}";
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
-                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
-                            BuildUrlOnlyDedupAppend(run.HtmlUrl, _timeProvider.GetUtcNow().UtcDateTime), ct);
+                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl, overflow: null),
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl, overflow: null, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                         continue;
@@ -1648,7 +1548,9 @@ public class CiMonitorService
 
                     if (logResult.Failures.Count > 0)
                     {
-                        // Log-derived issues, one per parsed test failure.
+                        // Log-derived issues, one per parsed test failure. The overflow summary is
+                        // rendered into every one of them so the reader always sees that more
+                        // failures were parsed than could be retained.
                         foreach (var failure in logResult.Failures)
                         {
                             var sanitizedTestName = SanitizeLogContent(failure.TestName);
@@ -1658,24 +1560,28 @@ public class CiMonitorService
                             var (c, u) = await CreateOrUpdateIssueAsync(
                                 goalId, repoName, title,
                                 BuildLogDerivedIssueDescription(
-                                    goalId, sha, run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace),
+                                    goalId, sha, run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace,
+                                    logResult.Overflow),
                                 BuildLogDerivedDedupAppend(
                                     run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace,
-                                    _timeProvider.GetUtcNow().UtcDateTime), ct);
+                                    logResult.Overflow, _timeProvider.GetUtcNow().UtcDateTime), ct);
                             created += c;
                             updated += u;
                         }
                     }
                     else if (!string.IsNullOrWhiteSpace(logResult.FallbackSnippet))
                     {
-                        // Log-derived fallback: no tests parsed, but the log yielded a snippet.
+                        // Log-derived fallback: no tests parsed, but the log yielded a bounded
+                        // head+tail diagnostic excerpt.
                         var title = string.IsNullOrWhiteSpace(run.Name)
                             ? "CI failure: unknown check"
                             : $"CI failure: {run.Name}";
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
-                            BuildLogFallbackIssueDescription(goalId, sha, run.HtmlUrl, logResult.FallbackSnippet),
-                            BuildLogFallbackDedupAppend(run.HtmlUrl, logResult.FallbackSnippet, _timeProvider.GetUtcNow().UtcDateTime), ct);
+                            BuildLogFallbackIssueDescription(goalId, sha, run.HtmlUrl, logResult.FallbackSnippet, logResult.Overflow),
+                            BuildLogFallbackDedupAppend(
+                                run.HtmlUrl, logResult.FallbackSnippet, logResult.Overflow,
+                                _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                     }
@@ -1683,13 +1589,15 @@ public class CiMonitorService
                     {
                         // Empty-snippet fallback: the log was fetched but carried nothing
                         // usable — use the URL-only format, not a log format with an empty body.
+                        // An overflow summary (if any) is still rendered so it can never be lost.
                         var title = string.IsNullOrWhiteSpace(run.Name)
                             ? "CI failure: unknown check"
                             : $"CI failure: {run.Name}";
                         var (c, u) = await CreateOrUpdateIssueAsync(
                             goalId, repoName, title,
-                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
-                            BuildUrlOnlyDedupAppend(run.HtmlUrl, _timeProvider.GetUtcNow().UtcDateTime), ct);
+                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl, logResult.Overflow),
+                            BuildUrlOnlyDedupAppend(
+                                run.HtmlUrl, logResult.Overflow, _timeProvider.GetUtcNow().UtcDateTime), ct);
                         created += c;
                         updated += u;
                     }
@@ -1810,25 +1718,17 @@ public class CiMonitorService
     /// Redacts secrets from raw CI log content: GitHub tokens (<c>ghp_</c>/<c>gho_</c>/<c>ghs_</c>),
     /// <c>Bearer</c> authorization headers, secret-looking environment variables, and
     /// <c>Password=</c> connection-string fragments. Never truncates the input — every line of
-    /// the log survives, with only the secret values replaced.
+    /// the log survives, with only the secret values replaced. Delegates to the single redaction
+    /// implementation shared with the streaming parser so the two can never drift apart.
     /// </summary>
     /// <param name="logContent">The raw log content to sanitize.</param>
     /// <returns>The sanitized log content.</returns>
-    internal static string SanitizeLogContent(string logContent)
-    {
-        var sanitized = GhpTokenRegex.Replace(logContent, "***REDACTED***");
-        sanitized = GhoTokenRegex.Replace(sanitized, "***REDACTED***");
-        sanitized = GhsTokenRegex.Replace(sanitized, "***REDACTED***");
-        sanitized = BearerTokenRegex.Replace(sanitized, "Bearer ***REDACTED***");
-        sanitized = SecretEnvVarRegex.Replace(sanitized, "$1=***REDACTED***");
-        sanitized = PasswordAssignmentRegex.Replace(sanitized, "Password=***REDACTED***");
-        return sanitized;
-    }
+    internal static string SanitizeLogContent(string logContent) => CiLogRedactor.Redact(logContent);
 
     /// <summary>
-    /// Parses test failures out of a CI log, in either of the two shapes this orchestrator sees.
-    /// VSTest/xUnit blocks have the shape <c>Failed {name} [duration]</c> followed by an
-    /// <c>Error Message:</c> section and a <c>Stack Trace:</c> section.
+    /// Parses test failures out of an in-memory CI log, in either of the two shapes this
+    /// orchestrator sees. VSTest/xUnit blocks have the shape <c>Failed {name} [duration]</c>
+    /// followed by an <c>Error Message:</c> section and a <c>Stack Trace:</c> section.
     /// Microsoft.Testing.Platform blocks have the shape <c>failed {identity} ({duration})</c>
     /// followed by an indented <c>from {dll} ({tfm}|{arch})</c> line, the bare error text, and the
     /// bare indented <c>at …</c> frames. GitHub Actions timestamp prefixes are stripped from every
@@ -1837,209 +1737,25 @@ public class CiMonitorService
     /// no failure headers (including count-only summaries such as <c>Failed: 0</c>, or prose
     /// such as <c>Failed to clone ...</c>) yield an empty list.
     /// </summary>
+    /// <remarks>
+    /// This is the whole-log entry point for text the caller already holds in memory. It runs the
+    /// SAME incremental parser the streaming job-log path uses (so both paths share one
+    /// implementation) but with unbounded line/block retention, because the input is already
+    /// bounded by being in memory, and without the streaming path's per-line redaction, because the
+    /// caller owns the text. The production job-log path never reaches this method.
+    /// </remarks>
     /// <param name="logContent">The raw (unsanitized) log content to parse.</param>
     /// <returns>The parsed failures, or an empty list when none could be parsed.</returns>
     internal static List<(string TestName, string Error, string StackTrace)> ParseTestFailuresFromLogs(string logContent)
     {
-        var failures = new List<(string TestName, string Error, string StackTrace)>();
-
         if (string.IsNullOrEmpty(logContent))
-            return failures;
+            return [];
 
-        // Split into lines, preserving positions so sections can be sliced by line index.
-        // Timestamps are stripped up front so every downstream match (and every captured
-        // Error/StackTrace field) sees timestamp-free text.
-        var lines = logContent.Split('\n');
-        for (var i = 0; i < lines.Length; i++)
-            lines[i] = StripActionsTimestamp(lines[i]);
-
-        for (var i = 0; i < lines.Length; i++)
-        {
-            // Microsoft.Testing.Platform emits a different failure shape than VSTest (lower-case
-            // "failed {identity} ({duration})", no Error Message:/Stack Trace: labels). It is
-            // handled by its own extractor so the xUnit/VSTest path below stays unchanged.
-            if (TryMatchMtpFailureHeader(lines[i], out _))
-            {
-                if (TryParseMtpFailureBlock(lines, i, out var mtpFailure))
-                    failures.Add(mtpFailure);
-                continue;
-            }
-
-            if (!TryMatchFailureHeader(lines[i], out var testName))
-                continue;
-
-            // The failure block ends at the next failure header of either format (or the end of
-            // the log).
-            var blockEnd = lines.Length;
-            for (var j = i + 1; j < lines.Length; j++)
-            {
-                if (TryMatchFailureHeader(lines[j], out _) || TryMatchMtpFailureHeader(lines[j], out _))
-                {
-                    blockEnd = j;
-                    break;
-                }
-            }
-
-            // Locate the Error Message: and Stack Trace: headers inside the block. Blank lines
-            // between the two sections do not terminate the block.
-            var errorHeaderIndex = -1;
-            var stackHeaderIndex = -1;
-            for (var j = i + 1; j < blockEnd; j++)
-            {
-                if (errorHeaderIndex < 0 && XUnitErrorMessageRegex.IsMatch(lines[j]))
-                {
-                    errorHeaderIndex = j;
-                    continue;
-                }
-                if (stackHeaderIndex < 0 && XUnitStackTraceRegex.IsMatch(lines[j]))
-                {
-                    stackHeaderIndex = j;
-                    break; // the stack trace is the last section of the failure block
-                }
-            }
-
-            if (errorHeaderIndex < 0)
-                continue; // header without a message section is not a parseable failure
-
-            var errorEnd = stackHeaderIndex >= 0 ? stackHeaderIndex : blockEnd;
-            var error = string.Join("\n", lines[(errorHeaderIndex + 1)..errorEnd]).Trim();
-
-            var stackTrace = string.Empty;
-            if (stackHeaderIndex >= 0)
-            {
-                // The stack trace runs until the end-of-stack-trace marker, a blank line, or the
-                // next failure header (whichever comes first).
-                var stackEnd = blockEnd;
-                for (var j = stackHeaderIndex + 1; j < blockEnd; j++)
-                {
-                    if (StackTraceEndMarkerRegex.IsMatch(lines[j]) || string.IsNullOrWhiteSpace(lines[j]))
-                    {
-                        stackEnd = j;
-                        break;
-                    }
-                }
-
-                stackTrace = string.Join("\n", lines[(stackHeaderIndex + 1)..stackEnd]).Trim();
-            }
-
-            failures.Add((testName, error, stackTrace));
-        }
-
-        return failures;
-    }
-
-    /// <summary>Removes a GitHub Actions ISO-8601 timestamp prefix from a single log line.</summary>
-    private static string StripActionsTimestamp(string line) =>
-        GitHubActionsTimestampRegex.Replace(line, string.Empty);
-
-    /// <summary>
-    /// Matches an xUnit failure header line and validates that the captured test name is a
-    /// dotted <c>Class.Method</c> identifier. This rejects prose lines such as
-    /// <c>Failed to clone repository [attempt 1]</c> and <c>Failed: 3</c> that would otherwise
-    /// satisfy the header shape.
-    /// </summary>
-    private static bool TryMatchFailureHeader(string line, out string testName)
-    {
-        testName = string.Empty;
-
-        var header = XUnitFailedTestRegex.Match(line);
-        if (!header.Success)
-            return false;
-
-        var candidate = header.Groups[1].Value.Trim();
-        if (!candidate.Contains('.', StringComparison.Ordinal))
-            return false;
-
-        testName = candidate;
-        return true;
-    }
-
-    /// <summary>
-    /// Matches a Microsoft.Testing.Platform failure header and validates that the captured
-    /// identity is a dotted <c>Class.Method</c> identifier (optionally followed by a theory
-    /// argument list). The same dotted-name guard as the VSTest header rejects prose such as
-    /// <c>failed to restore packages (3s)</c>.
-    /// </summary>
-    private static bool TryMatchMtpFailureHeader(string line, out string testName)
-    {
-        testName = string.Empty;
-
-        var header = MtpFailedTestRegex.Match(line);
-        if (!header.Success)
-            return false;
-
-        var candidate = header.Groups[1].Value.Trim();
-        if (!candidate.Contains('.', StringComparison.Ordinal))
-            return false;
-
-        testName = candidate;
-        return true;
-    }
-
-    /// <summary>
-    /// Extracts one Microsoft.Testing.Platform failure block starting at
-    /// <paramref name="headerIndex"/>. MTP prints no section labels: the header is followed by an
-    /// indented <c>from {dll} ({tfm}|{arch})</c> line, then the bare error-message lines, then the
-    /// run of bare indented <c>at …</c> frames that form the stack trace. The block ends at the
-    /// next failure header or result line of either format, at the per-assembly result footer, or
-    /// at the end of the log; trailing blank lines are trimmed before the frames are located so a
-    /// newline-terminated log still yields its full stack. A header whose remaining lines hold no
-    /// content at all is not a parseable failure.
-    /// </summary>
-    /// <param name="lines">The timestamp-stripped log lines.</param>
-    /// <param name="headerIndex">Index of the MTP failure header line.</param>
-    /// <param name="failure">The extracted (name, error, stack trace) tuple when successful.</param>
-    /// <returns><see langword="true"/> when the block was parsed.</returns>
-    private static bool TryParseMtpFailureBlock(
-        string[] lines, int headerIndex,
-        out (string TestName, string Error, string StackTrace) failure)
-    {
-        failure = default;
-
-        if (!TryMatchMtpFailureHeader(lines[headerIndex], out var testName))
-            return false;
-
-        var blockEnd = lines.Length;
-        for (var j = headerIndex + 1; j < lines.Length; j++)
-        {
-            if (MtpBlockTerminatorRegex.IsMatch(lines[j]) || MtpAssemblyResultRegex.IsMatch(lines[j]))
-            {
-                blockEnd = j;
-                break;
-            }
-        }
-
-        // Trailing blank/whitespace-only lines (the newline that ends the log, or the blank line
-        // preceding an assembly footer) must not stop the backwards stack-frame scan, so the body
-        // is trimmed from the end before the trailing run of "at …" frames is located.
-        var bodyEnd = blockEnd;
-        while (bodyEnd > headerIndex + 1 && string.IsNullOrWhiteSpace(lines[bodyEnd - 1]))
-            bodyEnd--;
-
-        // Skip MTP's indented "from <dll> (<tfm>|<arch>)" location line when present.
-        var bodyStart = headerIndex + 1;
-        if (bodyStart < bodyEnd && MtpFromLineRegex.IsMatch(lines[bodyStart]))
-            bodyStart++;
-
-        // The stack trace is the trailing run of bare "at …" frame lines; everything before it
-        // is the error text.
-        var stackStart = bodyEnd;
-        for (var j = bodyEnd - 1; j >= bodyStart; j--)
-        {
-            if (MtpStackTraceLineRegex.IsMatch(lines[j]))
-                stackStart = j;
-            else
-                break;
-        }
-
-        var error = string.Join("\n", lines[bodyStart..stackStart]).Trim();
-        var stackTrace = string.Join("\n", lines[stackStart..bodyEnd]).Trim();
-
-        if (error.Length == 0 && stackTrace.Length == 0)
-            return false; // header followed by nothing parseable
-
-        failure = (testName, error, stackTrace);
-        return true;
+        var retention = CiFailureRetention.CreateUnbounded();
+        var parser = CiLogStreamParser.CreateWholeLog(retention);
+        parser.Feed(logContent);
+        parser.Complete();
+        return retention.Failures;
     }
 
     private static string CombineOutput(CheckRunData run)
@@ -2070,32 +1786,58 @@ public class CiMonitorService
         return $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\n{errorOutput}\nCI run: {RenderHtmlUrl(run.HtmlUrl)}";
     }
 
-    /// <summary>Builds the description for a log-derived issue (one parsed test failure).</summary>
+    /// <summary>
+    /// Builds the description for a log-derived issue (one parsed test failure). When the log-fetch
+    /// retention bounds dropped parsed failures, the overflow summary is rendered here too, so the
+    /// issue shows the retained failure AND how many occurrences were omitted.
+    /// </summary>
     private static string BuildLogDerivedIssueDescription(
-        string goalId, string sha, string? htmlUrl, string testName, string error, string stackTrace) =>
-        $"CI failed for goal '{goalId}' (commit {sha}).\n\nTest: {testName}\n\nError: {error}\n\nStack Trace:\n{stackTrace}\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
+        string goalId, string sha, string? htmlUrl, string testName, string error, string stackTrace,
+        string? overflow) =>
+        $"CI failed for goal '{goalId}' (commit {sha}).\n\nTest: {testName}\n\nError: {error}\n\nStack Trace:\n{stackTrace}"
+        + (overflow is null ? string.Empty : $"\n\n{overflow}")
+        + $"\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
-    /// <summary>Builds the dedup-append text for a log-derived issue.</summary>
+    /// <summary>Builds the dedup-append text for a log-derived issue, including the overflow summary.</summary>
     private static string BuildLogDerivedDedupAppend(
-        string? htmlUrl, string testName, string error, string stackTrace, DateTime utcNow) =>
-        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nTest: {testName}\nError: {error}\nStack Trace:\n{stackTrace}\nCI run: {RenderHtmlUrl(htmlUrl)}";
+        string? htmlUrl, string testName, string error, string stackTrace, string? overflow, DateTime utcNow) =>
+        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nTest: {testName}\nError: {error}\nStack Trace:\n{stackTrace}"
+        + (overflow is null ? string.Empty : $"\n{overflow}")
+        + $"\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
-    /// <summary>Builds the description for a log-fallback issue (no tests parsed, snippet available).</summary>
+    /// <summary>
+    /// Builds the description for a log-fallback issue: no test failure parsed, so the issue carries
+    /// the bounded head+tail diagnostic excerpt of the redacted log. <paramref name="overflow"/> is
+    /// rendered when the retention bounds dropped parsed failures, so the summary is never hidden in
+    /// an excerpt the reader cannot see.
+    /// </summary>
     private static string BuildLogFallbackIssueDescription(
-        string goalId, string sha, string? htmlUrl, string snippet) =>
-        $"CI failed for goal '{goalId}' (commit {sha}).\n\nLog output (last 500 chars):\n{snippet}\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
+        string goalId, string sha, string? htmlUrl, string snippet, string? overflow) =>
+        $"CI failed for goal '{goalId}' (commit {sha}).\n\n{FallbackExcerptLabel}\n{snippet}"
+        + (overflow is null ? string.Empty : $"\n\n{overflow}")
+        + $"\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
-    /// <summary>Builds the dedup-append text for a log-fallback issue.</summary>
-    private static string BuildLogFallbackDedupAppend(string? htmlUrl, string snippet, DateTime utcNow) =>
-        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nLog output (last 500 chars):\n{snippet}\nCI run: {RenderHtmlUrl(htmlUrl)}";
+    /// <summary>Builds the dedup-append text for a log-fallback issue, including the overflow summary.</summary>
+    private static string BuildLogFallbackDedupAppend(
+        string? htmlUrl, string snippet, string? overflow, DateTime utcNow) =>
+        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\n{FallbackExcerptLabel}\n{snippet}"
+        + (overflow is null ? string.Empty : $"\n{overflow}")
+        + $"\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
-    /// <summary>Builds the description for a URL-only fallback issue (no logs or empty snippet).</summary>
-    private static string BuildUrlOnlyIssueDescription(string goalId, string sha, string? htmlUrl) =>
-        $"CI failed for goal '{goalId}' (commit {sha}).\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
+    /// <summary>
+    /// Builds the description for a URL-only fallback issue (no logs, or a log with nothing to show).
+    /// <paramref name="overflow"/> is rendered when retention dropped parsed failures.
+    /// </summary>
+    private static string BuildUrlOnlyIssueDescription(string goalId, string sha, string? htmlUrl, string? overflow) =>
+        $"CI failed for goal '{goalId}' (commit {sha})."
+        + (overflow is null ? string.Empty : $"\n\n{overflow}")
+        + $"\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
-    /// <summary>Builds the dedup-append text for a URL-only fallback issue.</summary>
-    private static string BuildUrlOnlyDedupAppend(string? htmlUrl, DateTime utcNow) =>
-        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]\nCI run: {RenderHtmlUrl(htmlUrl)}";
+    /// <summary>Builds the dedup-append text for a URL-only fallback issue, including the overflow summary.</summary>
+    private static string BuildUrlOnlyDedupAppend(string? htmlUrl, string? overflow, DateTime utcNow) =>
+        $"\n\n---\n[Updated {utcNow.ToString("O", CultureInfo.InvariantCulture)}]"
+        + (overflow is null ? string.Empty : $"\n{overflow}")
+        + $"\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Whether the response carries the named header at all, regardless of its value.</summary>
     private static bool HasHeader(HttpResponseMessage response, string name) =>

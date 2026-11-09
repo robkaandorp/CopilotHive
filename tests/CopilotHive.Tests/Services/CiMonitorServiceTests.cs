@@ -24,6 +24,22 @@ namespace CopilotHive.Tests.Services;
 public sealed class CiMonitorServiceTests : IDisposable
 {
     private const string TestToken = "test-token";
+
+    /// <summary>The streaming parser's per-read byte budget, mirrored here for geometry assertions.</summary>
+    private const int StreamChunkBytes = CiLogStreamParser.StreamChunkBytes;
+
+    /// <summary>The streaming parser's per-line decoded-character cap, mirrored here for assertions.</summary>
+    private const int MaxLogLineChars = CiLogStreamParser.MaxLogLineChars;
+
+    /// <summary>The streaming parser's per-block decoded-character cap, mirrored here for assertions.</summary>
+    private const int MaxFailureBlockChars = CiLogStreamParser.MaxFailureBlockChars;
+
+    /// <summary>The streaming parser's retained-failure occurrence cap, mirrored here for assertions.</summary>
+    private const int MaxRetainedFailureCount = CiLogStreamParser.MaxRetainedFailureCount;
+
+    /// <summary>The streaming parser's aggregate retained-character cap, mirrored here for assertions.</summary>
+    private const int MaxRetainedFailureChars = CiLogStreamParser.MaxRetainedFailureChars;
+
     /// <summary>Poll interval, a manual duration on the <see cref="ControlledTimeProvider"/>.</summary>
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(7);
 
@@ -3925,11 +3941,9 @@ public sealed class CiMonitorServiceTests : IDisposable
     /// <summary>
     /// A read-only stream that serves a fixed body but deliberately returns IRREGULAR PARTIAL
     /// read lengths (never more than <see cref="PartialReadSize"/> bytes per call, regardless of
-    /// how many were asked for). Because the partial size does not divide the 4 MiB read cap,
-    /// the reader's running total lands on an unaligned offset just below the cap — so a read
-    /// loop that hands the full chunk to <c>ReadAsync</c> would pull bytes PAST the cap off the
-    /// stream before discarding them. <see cref="MaxRequestedEndOffset"/> and
-    /// <see cref="TotalBytesRead"/> record exactly how far the reader reached.
+    /// how many were asked for). <see cref="MaxRequestedSize"/> and <see cref="TotalBytesRead"/>
+    /// record exactly how far the reader reached, so a streaming reader can be shown to consume the
+    /// WHOLE body while never requesting more than its documented chunk size at once.
     /// </summary>
     private sealed class PartialReadRecordingStream : Stream
     {
@@ -3941,8 +3955,8 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         public PartialReadRecordingStream(byte[] body) => _body = body;
 
-        /// <summary>Highest end offset (position + requested count) any read asked the stream for.</summary>
-        public int MaxRequestedEndOffset { get; private set; }
+        /// <summary>Largest number of bytes any single read asked the stream for.</summary>
+        public int MaxRequestedSize { get; private set; }
 
         /// <summary>Total bytes actually handed to the reader (i.e. consumed from the stream).</summary>
         public int TotalBytesRead => _position;
@@ -3953,7 +3967,7 @@ public sealed class CiMonitorServiceTests : IDisposable
         public override ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
         {
             ReadCallCount++;
-            MaxRequestedEndOffset = Math.Max(MaxRequestedEndOffset, _position + destination.Length);
+            MaxRequestedSize = Math.Max(MaxRequestedSize, destination.Length);
 
             var available = _body.Length - _position;
             var count = Math.Min(Math.Min(destination.Length, available), PartialReadSize);
@@ -3991,6 +4005,102 @@ public sealed class CiMonitorServiceTests : IDisposable
     {
         Content = new StreamContent(body)
     };
+
+    /// <summary>
+    /// A stream that serves its first chunk and then cancels the caller's token source and throws
+    /// <see cref="OperationCanceledException"/> — a cancellation that lands in the MIDDLE of the
+    /// streaming read, not before the request.
+    /// </summary>
+    private sealed class CancellingStream : Stream
+    {
+        private readonly CancellationTokenSource _cts;
+        private readonly byte[] _prefix;
+        private bool _served;
+
+        public CancellingStream(CancellationTokenSource cts, byte[] prefix)
+        {
+            _cts = cts;
+            _prefix = prefix;
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
+        {
+            if (_served)
+            {
+                _cts.Cancel();
+                throw new OperationCanceledException(_cts.Token);
+            }
+
+            _served = true;
+            var count = Math.Min(_prefix.Length, destination.Length);
+            _prefix.AsSpan(0, count).CopyTo(destination.Span);
+            return ValueTask.FromResult(count);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => _prefix.Length;
+        public override long Position
+        {
+            get => 0;
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// Appends filler LINES (never shorter than two characters) until the builder's length reaches
+    /// <paramref name="targetLength"/> exactly. The filler is pure ASCII, so the builder's
+    /// character count is also its UTF-8 byte count — which is what makes the chunk-boundary
+    /// arithmetic below exact.
+    /// </summary>
+    private static void AppendFillerTo(StringBuilder sb, int targetLength)
+    {
+        while (sb.Length < targetLength)
+        {
+            var room = targetLength - sb.Length;
+            var lineLength = Math.Min(100, room - 1);
+            sb.Append(new string('f', lineLength)).Append('\n');
+        }
+
+        Assert.Equal(targetLength, sb.Length);
+    }
+
+    /// <summary>
+    /// Builds a log in which each given block starts a fixed number of bytes BEFORE a stream-chunk
+    /// boundary, so the block's own header line is split across two chunk reads.
+    /// </summary>
+    /// <param name="blocks">
+    /// The blocks, in log order, with the number of characters of the block that precede the chunk
+    /// boundary.
+    /// </param>
+    /// <returns>
+    /// The assembled log (pure ASCII, so byte offsets and character offsets coincide) and the
+    /// start offset of each block within it.
+    /// </returns>
+    private static (string Log, int[] BlockStarts) BuildLogWithBlocksSplitAtChunkBoundaries(
+        IReadOnlyList<(string Block, int SplitBytesIntoBlock)> blocks)
+    {
+        var sb = new StringBuilder();
+        var starts = new int[blocks.Count];
+        for (var i = 0; i < blocks.Count; i++)
+        {
+            var boundary = StreamChunkBytes * (i + 1);
+            var start = boundary - blocks[i].SplitBytesIntoBlock;
+            AppendFillerTo(sb, start);
+            starts[i] = sb.Length;
+            sb.Append(blocks[i].Block);
+        }
+
+        return (sb.ToString(), starts);
+    }
 
     private static HttpResponseMessage JobsNotFoundResponse() => new(HttpStatusCode.NotFound);
 
@@ -4155,50 +4265,45 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Empty(handler.Captured);
     }
 
+    /// <summary>
+    /// A failure block that lies PAST the old 4 MiB prefix cap is still parsed and retained.
+    /// </summary>
+    /// <remarks>
+    /// The old implementation kept only the FIRST 4 MiB of the log body, so a block beyond that
+    /// boundary was never even read and the issue carried no diagnostics at all. The streaming
+    /// parser consumes the WHOLE body, so a block anywhere in it survives.
+    /// <para>
+    /// The control inside the test reconstructs the old prefix and proves the late block lies
+    /// OUTSIDE it (and that parsing that prefix alone yields nothing), so the assertion is
+    /// discriminating rather than incidental.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task FetchJobLogsAsync_LargeLog_FailurePastOldCapWithin4MiB_IsRetained()
+    public async Task FetchJobLogsAsync_LargeLog_FailureAfterOldPrefixCap_IsRetained()
     {
-        // The read is a bounded FULL read: up to 4 MiB of raw bytes are retained as a prefix
-        // (no tail-only slide), so a parseable failure block anywhere in the first 4 MiB
-        // survives to ParseTestFailuresFromLogs. The old 200 KB ring buffer kept only the most
-        // recent 200,000 bytes and evicted everything before them.
-        //
-        // The log below is 5,242,902 bytes: a parseable xUnit failure block ends exactly at the
-        // 4 MiB cap boundary (past the old 200 KB cap, within the first 4 MiB), followed by a
-        // marker and filler beyond the cap. The block's stack trace runs to the end of the
-        // retained log (no blank line / end-of-stack-trace marker after it), so if the read
-        // went past the cap the marker would leak into the parsed stack trace.
-        //
-        // Removal-proof: the old 200 KB tail ring would retain only the last 200,000 bytes
-        // (offsets [5,042,902 .. 5,242,902)) and evict the block at [4,194,202 .. 4,194,304),
-        // so the old code would parse NO failure. The new bounded full read retains the block.
-        const int CapBytes = 4 * 1024 * 1024;
-        const string BeyondCapMarker = "BEYOND_CAP_MARKER_XYZ";
-        const string TestName = "Tests.Mid.Failure";
+        const int OldPrefixCapBytes = 4 * 1024 * 1024;
+        const string LateTestName = "Tests.Late.MtpFailure";
 
-        var block = $$"""
-            Failed {{TestName}} [1 ms]
-              Error Message:
-                mid failure
-              Stack Trace:
-                at Mid.Failure()
-            """.Replace("\r\n", "\n", StringComparison.Ordinal);
-        // The block must end exactly at the cap boundary so its stack trace runs to the end of
-        // the retained log (no blank line / end marker after it).
-        var blockStart = CapBytes - block.Length;
-        var fillerBefore = new string('y', blockStart - 1) + "\n";
-        var beyondCap = BeyondCapMarker + "\n" + new string('z', 1_048_576);
-        var fullLog = fillerBefore + block + beyondCap;
+        // Filler past the old 4 MiB prefix cap, then a TIMESTAMPED MTP failure block late in the
+        // stream. Every filler line stays far below the per-line cap, so only the streaming
+        // geometry is under test here.
+        var sb = new StringBuilder();
+        while (sb.Length < OldPrefixCapBytes + 4_096)
+            sb.Append(new string('z', 1_023)).Append('\n');
+        sb.Append("2026-08-22T09:47:38.1197374Z failed Tests.Late.MtpFailure (12ms)\n");
+        sb.Append("2026-08-22T09:47:38.1197375Z   from /repo/bin/Release/net10.0/Tests.dll (net10.0|x64)\n");
+        sb.Append("2026-08-22T09:47:38.1197376Z   late mtp failure\n");
+        sb.Append("2026-08-22T09:47:38.1197377Z     at Late.MtpFailure() in /src/Late.MtpFailure.cs:line 7\n");
+        sb.Append("2026-08-22T09:47:38.1197378Z Test run summary: Failed!\n");
+        var fullLog = sb.ToString();
 
-        // Guard the geometry the assertions depend on (ASCII → 1 byte per char).
-        Assert.True(blockStart >= 200_000,
-            "The failure block must lie past the old 200 KB ring cap.");
-        Assert.True(blockStart + block.Length <= CapBytes,
-            "The failure block must lie entirely within the first 4 MiB.");
-        Assert.True(fullLog.Length > CapBytes,
-            "The log must exceed the 4 MiB cap.");
-        Assert.True(blockStart < fullLog.Length - 200_000,
-            "The old 200 KB tail ring would have evicted the block (removal-proof).");
+        Assert.True(fullLog.Length > OldPrefixCapBytes, "The log must exceed the old 4 MiB prefix cap.");
+
+        // CONTROL: the old reader kept only this prefix — it never carried the late block, and
+        // parsing it alone yields no failure at all.
+        var oldPrefix = fullLog[..OldPrefixCapBytes];
+        Assert.DoesNotContain(LateTestName, oldPrefix, StringComparison.Ordinal);
+        Assert.Empty(CiMonitorService.ParseTestFailuresFromLogs(oldPrefix));
 
         var jobsBody = JobsJson(1, (111, "failure"));
         var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(fullLog));
@@ -4209,78 +4314,152 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         Assert.NotNull(result);
 
-        // The failure past the old 200 KB cap survives the bounded full read.
+        // The late block is retained in full: name, error, and stack trace.
         var failure = Assert.Single(result!.Failures);
-        Assert.Equal(TestName, failure.TestName);
-        Assert.Equal("mid failure", failure.Error);
-        Assert.Equal("at Mid.Failure()", failure.StackTrace);
-
-        // Content beyond the 4 MiB cap is NOT present: the stack trace ends at the cap
-        // boundary, so the beyond-cap marker must not appear anywhere in the result.
-        Assert.DoesNotContain(BeyondCapMarker, failure.TestName, StringComparison.Ordinal);
-        Assert.DoesNotContain(BeyondCapMarker, failure.Error, StringComparison.Ordinal);
-        Assert.DoesNotContain(BeyondCapMarker, failure.StackTrace, StringComparison.Ordinal);
+        Assert.Equal(LateTestName, failure.TestName);
+        Assert.Equal("late mtp failure", failure.Error);
+        Assert.Equal("at Late.MtpFailure() in /src/Late.MtpFailure.cs:line 7", failure.StackTrace);
+        Assert.Null(result.Overflow); // nothing was dropped
     }
 
+    /// <summary>
+    /// A failure block in the MIDDLE of a large log is retained too — the streaming parser has no
+    /// special position, so a block past the old 200 KB tail ring and a block past the old 4 MiB
+    /// prefix cap are both ordinary.
+    /// </summary>
+    /// <remarks>
+    /// The block is closed by a blank line (the VSTest block terminator), so the filler that
+    /// follows it can never leak into the parsed stack trace.
+    /// </remarks>
     [Fact]
-    public async Task FetchJobLogsAsync_LargeLog_Utf8SequenceSplitAtCap_DecodesLeniently()
+    public async Task FetchJobLogsAsync_LargeLog_MiddleFailure_IsRetained()
     {
-        // The 4 MiB byte cap can land mid-way through a multi-byte UTF-8 character. The read
-        // must decode leniently: the truncated final sequence becomes U+FFFD (replacement) —
-        // never a throw. The body below is 4 MiB + 1 bytes: ASCII filler, then the first two
-        // bytes (0xE2 0x82) of a three-byte U+20AC (€) sequence. The read stops after 4 MiB
-        // bytes, i.e. with only the 0xE2 lead byte retained.
-        const int CapBytes = 4 * 1024 * 1024;
-        var bytes = new byte[CapBytes + 1];
-        Array.Fill(bytes, (byte)'a', 0, CapBytes - 1);
-        bytes[CapBytes - 1] = 0xE2; // lead byte of a 3-byte sequence
-        bytes[CapBytes] = 0x82;     // continuation byte — beyond the cap, never read
+        const int OldRingCapBytes = 200_000;
+        const string MiddleTestName = "Tests.Mid.Failure";
+
+        // The block sits near the middle of the log: the old 200 KB tail ring kept only the LAST
+        // 200,000 bytes, so the block must be more than that far from the end to be evicted by it.
+        const int fullLogTargetLength = OldRingCapBytes * 3;
+
+        var sb = new StringBuilder();
+        while (sb.Length < OldRingCapBytes + 4_096)
+            sb.Append(new string('y', 199)).Append('\n');
+        sb.Append("Failed Tests.Mid.Failure [1 ms]\n");
+        sb.Append("  Error Message:\n");
+        sb.Append("    mid failure\n");
+        sb.Append("  Stack Trace:\n");
+        sb.Append("    at Mid.Failure()\n");
+        sb.Append("\n");
+        // Trailing filler so the block lies OUTSIDE the old 200 KB tail ring window.
+        while (sb.Length < fullLogTargetLength)
+            sb.Append(new string('t', 199)).Append('\n');
+        var fullLog = sb.ToString();
+
+        // CONTROL: the old 200 KB tail ring would have evicted the block entirely.
+        Assert.True(fullLog.Length > OldRingCapBytes, "The log must exceed the old 200 KB ring cap.");
+        var oldRingWindow = fullLog[^OldRingCapBytes..];
+        Assert.DoesNotContain(MiddleTestName, oldRingWindow, StringComparison.Ordinal);
 
         var jobsBody = JobsJson(1, (111, "failure"));
-        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(bytes));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(fullLog));
         using var client = new HttpClient(handler, disposeHandler: false);
         var service = CreateServiceForLogFetch();
 
-        // Must not throw on the incomplete final sequence.
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal(MiddleTestName, failure.TestName);
+        Assert.Equal("mid failure", failure.Error);
+        Assert.Equal("at Mid.Failure()", failure.StackTrace);
+        Assert.Null(result.Overflow);
+    }
+
+    /// <summary>
+    /// A multi-byte UTF-8 sequence split across a stream-chunk boundary decodes leniently, and a
+    /// genuinely truncated final sequence decodes to the replacement character instead of throwing.
+    /// </summary>
+    /// <remarks>
+    /// The chunk boundary is now an ARBITRARY point in the stream (there is no byte cap), so the
+    /// test places the three bytes of U+20AC (€) exactly across the 16 KiB chunk boundary — the
+    /// lead byte is the last byte of chunk 1 and its continuations open chunk 2.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_LargeLog_Utf8SequenceSplitAtChunkBoundary_DecodesLeniently()
+    {
+        const int ChunkBytes = CiLogStreamParser.StreamChunkBytes;
+        var euro = Encoding.UTF8.GetBytes("€");
+        const int LineBytes = 200; // 199 'a' + '\n', well inside the per-line cap
+
+        // Fill exactly ChunkBytes - 1 bytes with short lines so the euro's lead byte is the final
+        // byte of the first chunk. Every line stays far below the per-line character cap, so nothing
+        // but chunk-boundary decoding is under test here.
+        var filler = new StringBuilder();
+        var remaining = ChunkBytes - 1;
+        while (remaining >= LineBytes)
+        {
+            filler.Append(new string('a', LineBytes - 1)).Append('\n');
+            remaining -= LineBytes;
+        }
+
+        filler.Append(new string('a', remaining - 1)).Append('\n');
+        Assert.Equal(ChunkBytes - 1, Encoding.UTF8.GetByteCount(filler.ToString()));
+
+        using var body = new MemoryStream();
+        var fillerBytes = Encoding.UTF8.GetBytes(filler.ToString());
+        body.Write(fillerBytes);
+        body.Write(euro);                             // straddles the chunk boundary
+        body.Write("\n"u8);
+        body.Write(Enumerable.Repeat((byte)'b', 10).ToArray());
+        body.Write([0xE2]);                           // lone lead byte at the end of the log
+        body.Position = 0;
+
+        Assert.Equal(3, euro.Length);
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(body));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        // Must not throw on the chunk-split sequence or the truncated final one.
         var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
 
         Assert.NotNull(result);
         Assert.Empty(result!.Failures); // filler only → no parseable failures
 
-        // Fallback snippet: last 500 chars of the sanitized log = 499 'a's + U+FFFD.
         Assert.NotNull(result.FallbackSnippet);
-        Assert.Equal(500, result.FallbackSnippet!.Length);
+        // The chunk-split sequence decoded to the real character...
+        Assert.Contains("€", result.FallbackSnippet, StringComparison.Ordinal);
+        // ...and the truncated final sequence decoded to the replacement character, not a throw.
         Assert.EndsWith("\uFFFD", result.FallbackSnippet, StringComparison.Ordinal);
-        Assert.DoesNotContain("\u20AC", result.FallbackSnippet, StringComparison.Ordinal);
-        Assert.All(result.FallbackSnippet[..^1], ch => Assert.Equal('a', ch));
+        Assert.DoesNotContain("\uFFFD", result.FallbackSnippet[..^1], StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The streaming read consumes the WHOLE body while every individual read REQUEST stays inside
+    /// the documented chunk size, so the parser's working memory stays bounded no matter how large
+    /// the log is.
+    /// </summary>
+    /// <remarks>
+    /// The stream serves irregular partial reads (never more than 8,191 bytes per call), so the
+    /// reader's running total lands on unaligned offsets — the geometry the old clamped-prefix
+    /// reader was built around. The marker text sits at the END of the log: it reaches the
+    /// fallback excerpt only if the whole body was streamed.
+    /// <para>
+    /// The oversized single line in the body exercises the per-line cap at the same time: it is
+    /// retained only up to <see cref="MaxLogLineChars"/> with an explicit truncation marker
+    /// reporting the DECODED characters dropped.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task FetchJobLogsAsync_PartialReads_NeverRequestsOrConsumesBeyond4MiBCap()
+    public async Task FetchJobLogsAsync_PartialReads_ConsumesWholeStreamWithBoundedRequests()
     {
-        // HARD cap: the read loop must clamp each read REQUEST to the remaining capacity, not
-        // merely discard over-read bytes afterwards. This stream returns at most 8,191 bytes per
-        // call, and 8,191 does not divide 4 MiB (4,194,304 = 8,191 x 512 + 512), so after 512
-        // reads the running total sits at 4,193,792 with only 512 bytes of capacity left.
-        //
-        // Removal-proof: an unclamped loop would hand the full 8,192-byte chunk to ReadAsync at
-        // that point, requesting through offset 4,201,984 and consuming 8,191 bytes — i.e.
-        // 7,679 bytes PAST the 4 MiB boundary — before Math.Min discarded them. The clamped loop
-        // requests exactly the remaining 512 bytes and then stops. A ByteArrayContent body
-        // cannot catch this: its reads are 8 KiB-aligned, so the boundary always falls on a
-        // chunk edge.
-        const int CapBytes = 4 * 1024 * 1024;
-        const string BeyondCapMarker = "BEYOND_CAP_MARKER_PARTIAL_READ";
+        const int BodyBytes = 4 * 1024 * 1024;
+        const string EndMarker = "END_OF_LOG_MARKER_AFTER_OLD_CAP";
 
-        // Guard the geometry the removal-proof depends on: the partial size must NOT divide the
-        // cap, otherwise the final read would land exactly on the boundary either way.
-        Assert.NotEqual(0, CapBytes % PartialReadRecordingStream.PartialReadSize);
-
-        var beyondCapBytes = Encoding.UTF8.GetBytes("\n" + BeyondCapMarker + "\n");
-        var body = new byte[CapBytes + beyondCapBytes.Length + 4096];
-        Array.Fill(body, (byte)'y', 0, CapBytes);
-        beyondCapBytes.CopyTo(body, CapBytes);
-        Array.Fill(body, (byte)'q', CapBytes + beyondCapBytes.Length, body.Length - CapBytes - beyondCapBytes.Length);
+        // One 4 MiB line (no newline) exercises the per-line cap too: it is retained only up to
+        // MaxLogLineChars with an explicit truncation marker reporting the DECODED characters dropped.
+        var body = Encoding.UTF8.GetBytes(new string('y', BodyBytes) + "\n" + EndMarker + "\n");
 
         var stream = new PartialReadRecordingStream(body);
         var jobsBody = JobsJson(1, (111, "failure"));
@@ -4292,21 +4471,66 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         Assert.NotNull(result);
 
-        // No byte beyond the cap was ever REQUESTED from the stream...
-        Assert.True(stream.MaxRequestedEndOffset <= CapBytes,
-            $"Read requested through offset {stream.MaxRequestedEndOffset}, past the {CapBytes}-byte cap.");
-        // ...and no byte beyond the cap was CONSUMED: the read stops exactly at the boundary.
-        Assert.Equal(CapBytes, stream.TotalBytesRead);
-        // The geometry really was partial/irregular (not one aligned pass).
-        Assert.True(stream.ReadCallCount > CapBytes / 8192,
-            "The stream must have served the body in irregular partial reads.");
+        // Every byte of the stream was consumed — nothing was cut off at a cap...
+        Assert.Equal(body.Length, stream.TotalBytesRead);
+        // ...and no single read requested more than the documented chunk size.
+        Assert.True(stream.MaxRequestedSize <= StreamChunkBytes,
+            $"A read requested {stream.MaxRequestedSize} bytes, past the {StreamChunkBytes}-byte chunk size.");
 
-        // Beyond-cap content is absent from the retained log.
         Assert.Empty(result!.Failures); // filler only → no parseable failures
         Assert.NotNull(result.FallbackSnippet);
-        Assert.Equal(500, result.FallbackSnippet!.Length);
-        Assert.DoesNotContain(BeyondCapMarker, result.FallbackSnippet, StringComparison.Ordinal);
-        Assert.All(result.FallbackSnippet, ch => Assert.Equal('y', ch));
+
+        // The end-of-log marker (far past the old cap) reaches the tail of the excerpt...
+        Assert.Contains(EndMarker, result.FallbackSnippet!, StringComparison.Ordinal);
+        // ...and the 4 MiB middle of the oversized line is reported by the head/tail gap marker, whose
+        // size counts DECODED characters of the whole stream: everything except the two windows.
+        // The marker is exact: head window + omitted + tail window accounts for every decoded character.
+        var totalChars = (long)BodyBytes + 1 + EndMarker.Length + 1;
+        var snippet = result.FallbackSnippet!;
+        var match = System.Text.RegularExpressions.Regex.Match(
+            snippet, @"…\[truncated: ([\d,]+) characters omitted between the head and the tail of the log\]…\n");
+        Assert.True(match.Success, "The gap marker is missing.");
+        var gap = long.Parse(match.Groups[1].Value, System.Globalization.NumberStyles.AllowThousands, CultureInfo.InvariantCulture);
+        var headLength = snippet.IndexOf("\n…[truncated", StringComparison.Ordinal);
+        var tailLength = snippet.Length - match.Index - match.Length;
+        Assert.Equal(totalChars, headLength + gap + tailLength);
+    }
+
+    /// <summary>
+    /// The log-fetch cache preserves the overflow summary: a cached result is the SAME result, so
+    /// the summary is neither lost nor recomputed on the cache hit, and no extra HTTP request is
+    /// issued.
+    /// </summary>
+    /// <remarks>
+    /// Removal-proof: if the cache stored only the retained failures (dropping the overflow field),
+    /// the cached result's summary would be <c>null</c> while the first result's was not.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_CachePreservesOverflowSummary()
+    {
+        var failureCount = MaxRetainedFailureCount + 7;
+        var failureLog = string.Concat(Enumerable.Range(0, failureCount).Select(i =>
+            $"Failed Tests.Cache.Overflow{i:D4} [1 ms]\n  Error Message:\n    boom {i}\n  Stack Trace:\n    at Cache.Overflow{i:D4}()\n\n"));
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(failureLog));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var first = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+        Assert.NotNull(first);
+        Assert.NotNull(first!.Overflow);
+        var requestCountAfterFirst = handler.Captured.Count;
+
+        var second = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        // The cache returns the same result object: same retained failures AND same overflow summary.
+        Assert.Same(first, second);
+        Assert.Equal(first.Overflow, second!.Overflow);
+        Assert.Equal(MaxRetainedFailureCount, second.Failures.Count);
+        Assert.Contains($"7 of {failureCount}", second.Overflow, StringComparison.Ordinal);
+        // No new HTTP traffic: the summary came from the cache, not a re-fetch.
+        Assert.Equal(requestCountAfterFirst, handler.Captured.Count);
     }
 
     [Fact]
@@ -4682,24 +4906,35 @@ public sealed class CiMonitorServiceTests : IDisposable
             service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, cts.Token));
     }
 
+    /// <summary>
+    /// The no-failure fallback excerpt is a bounded HEAD+TAIL of the redacted log with an explicit
+    /// decoded-character gap marker — not a last-500 slice.
+    /// </summary>
+    /// <remarks>
+    /// The old implementation took the last 500 characters of the sanitized log, so the reader
+    /// never saw the beginning of the log at all. The new excerpt keeps the first
+    /// <see cref="CiLogStreamParser.FallbackHeadChars"/> and the last
+    /// <see cref="CiLogStreamParser.FallbackTailChars"/> characters and states exactly how many
+    /// characters were dropped in between.
+    /// </remarks>
     [Fact]
-    public async Task FetchJobLogsAsync_FallbackSnippet_SanitizedBeforeTruncation()
+    public async Task FetchJobLogsAsync_FallbackSnippet_IsHeadPlusTailWithGapMarker()
     {
-        // Removal-proof: the fallback log is >500 chars and contains a ghp_ token positioned so
-        // it lands in the retained last-500 tail. The snippet must equal exactly the last 500
-        // chars of the SANITIZED full log — proving sanitization happens BEFORE the last-500
-        // truncation and that the secret is redacted in the retained tail. If truncation
-        // happened before sanitization (on the raw tail), the raw secret would survive.
-        var token = "ghp_" + new string('a', 36);
-        // Build a >500-char log whose last 500 chars contain the token.
-        var prefix = new string('z', 600);
-        // The token must be within the last 500 chars of the full log.
-        var suffix = "tail-" + token + "-end";
-        var totalLength = prefix.Length + suffix.Length;
-        // Ensure suffix (which contains the token) fits entirely within the last 500 chars.
-        Assert.True(suffix.Length <= 500);
-        Assert.True(totalLength > 500);
-        var log = prefix + suffix;
+        // Short lines keep every line inside the per-line cap, so only the head/tail excerpt
+        // arithmetic is under test here.
+        const int LineChars = 99; // 98 'w' + '\n'
+        const int LineCount = 200;
+        var log = "HEAD_MARKER_START\n"
+            + string.Concat(Enumerable.Repeat(new string('w', LineChars - 1) + "\n", LineCount))
+            + "TAIL_MARKER_END\n";
+
+        Assert.True(log.Length > CiLogStreamParser.FallbackHeadChars + CiLogStreamParser.FallbackTailChars,
+            "The log must exceed the head+tail excerpt so the excerpt really truncates.");
+
+        // CONTROL: the old last-500 slice would start at the END of the log — the head marker and
+        // the whole head window would be missing entirely.
+        var oldLast500 = log[^500..];
+        Assert.DoesNotContain("HEAD_MARKER_START", oldLast500, StringComparison.Ordinal);
 
         var jobsBody = JobsJson(1, (111, "failure"));
         var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
@@ -4709,17 +4944,70 @@ public sealed class CiMonitorServiceTests : IDisposable
         var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
 
         Assert.NotNull(result);
-        Assert.Empty(result!.Failures); // no parseable failures → fallback snippet
+        Assert.Empty(result!.Failures);
         Assert.NotNull(result.FallbackSnippet);
 
-        // The snippet must be the last 500 chars of the SANITIZED full log (sanitization first,
-        // then truncation to the last 500).
-        var sanitizedFull = CiMonitorService.SanitizeLogContent(log);
-        var expectedSnippet = sanitizedFull[^500..];
-        Assert.Equal(expectedSnippet, result.FallbackSnippet);
-        // The token must be redacted in the snippet.
-        Assert.DoesNotContain(token, result.FallbackSnippet);
-        Assert.Contains("***REDACTED***", result.FallbackSnippet);
+        var snippet = result.FallbackSnippet!;
+        var omittedChars = log.Length - CiLogStreamParser.FallbackHeadChars - CiLogStreamParser.FallbackTailChars;
+        var marker = $"…[truncated: {omittedChars:N0} characters omitted between the head and the tail of the log]…";
+
+        // Head window + explicit gap marker + tail window, nothing else.
+        Assert.Equal(
+            log[..CiLogStreamParser.FallbackHeadChars]
+                + "\n" + marker + "\n"
+                + log[(log.Length - CiLogStreamParser.FallbackTailChars)..],
+            snippet);
+        Assert.DoesNotContain("last 500", snippet, StringComparison.Ordinal);
+        // The head window is present: the log's beginning is no longer dropped.
+        Assert.StartsWith(log[..CiLogStreamParser.FallbackHeadChars], snippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The no-failure fallback excerpt is taken from the REDACTED text: a secret positioned inside
+    /// the retained tail window is redacted, never carried through verbatim.
+    /// </summary>
+    /// <remarks>
+    /// Removal-proof: if the excerpt were taken from the raw text first, the raw secret would
+    /// survive in the retained tail. The head window is present too, so the excerpt really is a
+    /// head+tail excerpt and not just the tail.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_FallbackSnippet_SanitizedBeforeExcerpt()
+    {
+        var token = "ghp_" + new string('a', 36);
+        const string TailText = "tail-";
+
+        // Short lines keep every line inside the per-line cap, so only the head/tail excerpt
+        // arithmetic is under test here.
+        var filler = string.Concat(Enumerable.Repeat("zzzzzzzzzz\n", 400)); // 4,000 chars
+        var log = filler + TailText + token + "-end\n";
+
+        Assert.True(log.Length > CiLogStreamParser.FallbackHeadChars + CiLogStreamParser.FallbackTailChars,
+            "The log must exceed the head+tail excerpt so the excerpt really truncates.");
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures); // no parseable failures → fallback excerpt
+        Assert.NotNull(result.FallbackSnippet);
+
+        // The token is redacted in the retained tail, and the tail itself survives.
+        Assert.DoesNotContain(token, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains("***REDACTED***", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains(TailText + "***REDACTED***-end", result.FallbackSnippet, StringComparison.Ordinal);
+        // The head window is present and the gap between the windows is reported explicitly.
+        Assert.StartsWith(log[..CiLogStreamParser.FallbackHeadChars], result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains("characters omitted between the head and the tail of the log", result.FallbackSnippet, StringComparison.Ordinal);
+
+        // The excerpt is taken from the REDACTED text: the tail window ends the excerpt exactly.
+        var redacted = CiMonitorService.SanitizeLogContent(log);
+        Assert.EndsWith(redacted[^CiLogStreamParser.FallbackTailChars..], result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.EndsWith("-end\n", result.FallbackSnippet, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -4793,12 +5081,57 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task FetchJobLogsAsync_FallbackSnippet_TruncatedToLast500AfterSanitization()
+    public async Task FetchJobLogsAsync_SecretSplitAcrossChunks_IsRedacted()
     {
-        // Boundary: the fallback snippet is truncated to the last 500 chars AFTER sanitization.
-        // A log with no parseable failures and >500 chars of plain text (no secrets) must yield
-        // a snippet of exactly 500 chars — the last 500 of the full log.
-        var log = new string('w', 800);
+        // A ghp_ token split across two stream chunks must not leak. Redaction runs on each COMPLETE
+        // line: the parser carries the incomplete tail of a chunk (the partial line) and only hands it
+        // to the redactor once the line's newline arrives, so both halves of the token are redacted
+        // together. The token starts exactly at the chunk boundary here — its "ghp" prefix ends chunk
+        // N and its 36-character suffix opens chunk N+1.
+        var chunk = CiLogStreamParser.StreamChunkBytes;
+        var token = "ghp_" + new string('c', 36);
+
+        // Pad to the chunk boundary minus 3 so the token's first three bytes ("ghp") are the last
+        // bytes of the first chunk. Short lines keep the per-line cap out of the picture.
+        var fillerLines = string.Concat(Enumerable.Repeat("0123456789\n", (chunk - 3) / 11));
+        var prefix = fillerLines + new string('x', chunk - 3 - fillerLines.Length);
+        Assert.Equal(chunk - 3, Encoding.UTF8.GetByteCount(prefix));
+
+        var log = prefix + token + "\nrest of the log\n";
+        var body = Encoding.UTF8.GetBytes(log);
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(body));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures); // no parseable failures → fallback excerpt
+        Assert.NotNull(result.FallbackSnippet);
+
+        // The raw token never appears, and its redaction marker does.
+        Assert.DoesNotContain(token, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain("ghp_", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains("***REDACTED***", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains("rest of the log", result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_SecretCutByLineCap_IsRedacted()
+    {
+        // Truncation-boundary redaction: a ghp_ token straddling the per-line cap is INCOMPLETE in
+        // the retained prefix, so the fixed-length token pattern cannot match it. The redactor's
+        // unredactable-tail trim replaces everything from the surviving trigger to the end of the
+        // retained line, so no fragment of the secret reaches the excerpt.
+        var token = "ghp_" + new string('d', 36);
+
+        // Start the token so the line cap cuts it roughly in half.
+        var line = new string('q', MaxLogLineChars - 20) + token + new string('e', 500);
+        Assert.True(line.Length > MaxLogLineChars, "The line must exceed the per-line cap.");
+
+        var log = line + "\nafter truncation\n";
 
         var jobsBody = JobsJson(1, (111, "failure"));
         var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
@@ -4810,8 +5143,2190 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.NotNull(result);
         Assert.Empty(result!.Failures);
         Assert.NotNull(result.FallbackSnippet);
-        Assert.Equal(500, result.FallbackSnippet!.Length);
-        Assert.All(result.FallbackSnippet, ch => Assert.Equal('w', ch));
+
+        var snippet = result.FallbackSnippet!;
+        // No fragment of the token survives, in any prefix form.
+        Assert.DoesNotContain("ghp_", snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('d', 36), snippet, StringComparison.Ordinal);
+        Assert.Contains("***REDACTED***", snippet, StringComparison.Ordinal);
+        // The fallback excerpt is bounded only by its own head/tail windows, not by the failure-extraction
+        // line cap, so this 8,712-character line is shown whole (its 520 dropped characters fit the tail
+        // ring) — with the cut token still redacted — and the log continues after it.
+        Assert.Contains(new string('e', 500), snippet, StringComparison.Ordinal);
+        Assert.Contains("after truncation", snippet, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_RetentionOverflow_CarriesVisibleSummary()
+    {
+        // More parseable failures than the retention bound: the earliest ones are retained, and the
+        // result carries an overflow summary counting the omitted OCCURRENCES. The summary lives on
+        // LogFetchResult.Overflow (not in the unused FallbackSnippet) so the caller always renders it.
+        // The cap is read into a runtime local first so the addition below is evaluated at
+        // runtime: a compile-time constant expression would overflow while building a mutant
+        // that raises the cap, which would turn a test failure into a build failure.
+        var retainedCap = CiLogStreamParser.MaxRetainedFailureCount;
+        var failureCount = retainedCap + 3;
+        var failureLog = string.Concat(Enumerable.Range(0, failureCount).Select(i =>
+            $"Failed Tests.Overflow.Case{i:D4} [1 ms]\n  Error Message:\n    boom {i}\n  Stack Trace:\n    at Case{i:D4}()\n\n"));
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(failureLog));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result!.Overflow);
+
+        // The EARLIEST failures as fit are retained, in log order...
+        Assert.Equal(CiLogStreamParser.MaxRetainedFailureCount, result.Failures.Count);
+        Assert.Equal("Tests.Overflow.Case0000", result.Failures[0].TestName);
+        Assert.Equal($"Tests.Overflow.Case{CiLogStreamParser.MaxRetainedFailureCount - 1:D4}", result.Failures[^1].TestName);
+
+        // ...and the summary reports the omitted OCCURRENCE count (parsed - retained).
+        Assert.Contains($"3 of {failureCount}", result.Overflow, StringComparison.Ordinal);
+        Assert.Contains("occurrence(s) were not retained", result.Overflow, StringComparison.Ordinal);
+        // No fallback excerpt is used when failures parsed.
+        Assert.Null(result.FallbackSnippet);
+    }
+
+    /// <summary>
+    /// A partial fixed-length GitHub token that is cut by the END of the log (the log simply stops
+    /// mid-token) is redacted, not carried through as a fragment.
+    /// </summary>
+    /// <remarks>
+    /// The fixed-length <c>ghp_</c>/<c>gho_</c>/<c>ghs_</c> patterns only match when all 36 trailing
+    /// characters are present, so an INCOMPLETE token never matches them. Redaction therefore runs
+    /// <see cref="CiLogRedactor.TrimUnredactableTail"/> on <em>every</em> complete line, not only on
+    /// lines cut by the per-line cap: the last line of a log can end early simply because the log
+    /// ends there.
+    /// <para>
+    /// Removal-proof: with the trim restricted to the truncation path (the previous behaviour) the
+    /// trigger and its partial suffix survive into the excerpt. The value-bounded categories
+    /// (<c>Bearer</c>, secret environment variables, <c>Password=</c>) were never affected because
+    /// they redact to the end of the line.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("ghp")]
+    [InlineData("gho")]
+    [InlineData("ghs")]
+    public async Task FetchJobLogsAsync_PartialFixedLengthTokenAtEndOfLog_IsRedacted(string category)
+    {
+        var partial = category + "_" + new string('a', 10);
+        var log = "some log text\n" + partial;
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result.FallbackSnippet);
+
+        // The partial token is gone, replaced by the redaction marker; the rest of the log survives.
+        Assert.DoesNotContain(partial, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(category + "_", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains("***REDACTED***", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Contains("some log text", result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The end-to-end consequence: a partial fixed-length token at the end of the log must not reach
+    /// the created issue's body, which is user- and model-visible.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_PartialFixedLengthTokenAtEndOfLog_DoesNotReachIssueBody()
+    {
+        var partial = "ghp_" + new string('a', 10);
+        var log = "some log text\n" + partial;
+
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => log);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(issueStore.Issues.Values);
+
+        // The partial token never reaches the issue body; its redaction marker does.
+        Assert.DoesNotContain(partial, issue.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("ghp_", issue.Description, StringComparison.Ordinal);
+        Assert.Contains("***REDACTED***", issue.Description, StringComparison.Ordinal);
+        Assert.Contains("some log text", issue.Description, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A read-only stream that serves a sequence of (bytes, repeat-count) segments WITHOUT materialising
+    /// them: a segment is one small byte array handed out <c>repeat</c> times. This lets a test stream
+    /// more than 2^31 decoded characters through the parser using a few kilobytes of memory. When
+    /// <c>failAtEnd</c> is set the stream throws <see cref="IOException"/> instead of reporting the end
+    /// of the body, simulating a download that breaks part-way.
+    /// </summary>
+    private sealed class SegmentedStream : Stream
+    {
+        private readonly (byte[] Bytes, long Repeat)[] _segments;
+        private readonly bool _failAtEnd;
+        private int _segment;
+        private long _repeatsDone;
+        private int _offsetInRepeat;
+
+        public SegmentedStream(bool failAtEnd, params (byte[] Bytes, long Repeat)[] segments)
+        {
+            _segments = segments;
+            _failAtEnd = failAtEnd;
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
+        {
+            while (_segment < _segments.Length && _repeatsDone >= _segments[_segment].Repeat)
+            {
+                _segment++;
+                _repeatsDone = 0;
+                _offsetInRepeat = 0;
+            }
+
+            if (_segment >= _segments.Length)
+            {
+                if (_failAtEnd)
+                    throw new IOException("simulated broken log download");
+                return ValueTask.FromResult(0);
+            }
+
+            var bytes = _segments[_segment].Bytes;
+            var count = Math.Min(destination.Length, bytes.Length - _offsetInRepeat);
+            bytes.AsSpan(_offsetInRepeat, count).CopyTo(destination.Span);
+            _offsetInRepeat += count;
+            if (_offsetInRepeat == bytes.Length)
+            {
+                _offsetInRepeat = 0;
+                _repeatsDone++;
+            }
+
+            return ValueTask.FromResult(count);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private static byte[] Utf8(string text) => Encoding.UTF8.GetBytes(text);
+
+    private static string FailureBlockText(string name, string error) =>
+        $"Failed {name} [1 ms]\n  Error Message:\n    {error}\n  Stack Trace:\n    at {name}()\n\n";
+
+    private async Task<LogFetchResult?> FetchSingleLogAsync(string body)
+    {
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ => LogResponse(body));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        return await CreateServiceForLogFetch().FetchJobLogsAsync(
+            "run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+    }
+
+    // ── Review-repair regressions (iteration 2) ─────────────────────────────
+
+    private const string StampPrefix = "2026-08-22T09:47:38.1197374Z ";
+
+    /// <summary>
+    /// Finding 1: a secret environment variable on a raw, TIMESTAMPED Actions line is redacted. Redaction
+    /// runs before the timestamp is stripped, and the env pattern is anchored at the line start, so the
+    /// timestamp used to hide the key from the pattern and the secret survived verbatim.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_TimestampedSecretEnvVar_IsRedacted()
+    {
+        var log = StampPrefix + "Starting\n" + StampPrefix + "MY_API_TOKEN=SuperSecretValue123\n" + StampPrefix + "done\n";
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("SuperSecretValue123", result!.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.DoesNotContain("SuperSecret", result.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.Contains(StampPrefix + "MY_API_TOKEN=***REDACTED***", result.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.Contains("done", result.FallbackSnippet!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SanitizeLogContent_TimestampedSecretEnvVar_RedactsValueKeepsTimestampAndKey()
+    {
+        var sanitized = CiMonitorService.SanitizeLogContent(StampPrefix + "DB_PASSWORD=hunter2\nplain line");
+
+        Assert.Equal(StampPrefix + "DB_PASSWORD=***REDACTED***\nplain line", sanitized);
+    }
+
+    /// <summary>Finding 1, chunk-split variant: the timestamped env line straddles the 16 KiB read boundary.</summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_TimestampedSecretEnvVar_SplitAcrossChunkBoundary_IsRedacted()
+    {
+        const string line = "MY_API_TOKEN=SuperSecretValue123";
+        var start = StreamChunkBytes - StampPrefix.Length - 20; // boundary falls 20 chars into the value
+        var sb = new StringBuilder();
+        AppendFillerTo(sb, start);
+        sb.Append(StampPrefix).Append(line).Append('\n').Append(StampPrefix).Append("end of log\n");
+        Assert.True(start + StampPrefix.Length < StreamChunkBytes && StreamChunkBytes < start + StampPrefix.Length + line.Length);
+
+        var result = await FetchSingleLogAsync(sb.ToString());
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("SuperSecret", result!.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.Contains("MY_API_TOKEN=***REDACTED***", result.FallbackSnippet!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 1, line-cap variant: 9,000 characters appended to the timestamped assignment used to leak it
+    /// through the truncation boundary (the secret stays in the retained head).
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_TimestampedSecretEnvVar_CutByLineCap_IsRedacted()
+    {
+        var log = StampPrefix + "MY_API_TOKEN=SuperSecretValue123" + new string('z', 9_000) + "\n" + StampPrefix + "after\n";
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("SuperSecret", result!.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.DoesNotContain("zzzzzzzzzz", result.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.Contains("MY_API_TOKEN=***REDACTED***", result.FallbackSnippet!, StringComparison.Ordinal);
+        Assert.Contains("after", result.FallbackSnippet!, StringComparison.Ordinal);
+    }
+
+    /// <summary>Finding 1, parsed-failure variant: a timestamped env line inside a failure's error text.</summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_TimestampedSecretEnvVar_InsideFailureError_IsRedacted()
+    {
+        var log = string.Join('\n',
+            StampPrefix + "failed Tests.Env.Case (1ms)",
+            StampPrefix + "  from /repo/Tests.dll (net10.0|x64)",
+            StampPrefix + "MY_API_TOKEN=SuperSecretValue123",
+            StampPrefix + "    at Env.Case()",
+            StampPrefix + "Test run summary: Failed!") + "\n";
+
+        var result = await FetchSingleLogAsync(log);
+
+        var failure = Assert.Single(result!.Failures);
+        Assert.DoesNotContain("SuperSecret", failure.Error + failure.StackTrace, StringComparison.Ordinal);
+        Assert.Equal("MY_API_TOKEN=***REDACTED***", failure.Error);
+    }
+
+    /// <summary>Finding 1, end to end: the secret reaches neither a created issue nor a dedup append.</summary>
+    [Fact]
+    public async Task MonitorMergeAsync_TimestampedSecretEnvVar_NeverReachesIssueOrDedupAppend()
+    {
+        var log = StampPrefix + "building\n" + StampPrefix + "MY_API_TOKEN=SuperSecretValue123\n";
+
+        // Created issue.
+        var created = new FakeIssueStore();
+        var service = CreateService(
+            new CiFailureRoutingHandler(CheckRunsJsonWithDetailsUrl("123", summary: null), _ => JobsJsonOneFailedJob(111), _ => log),
+            issueStore: created, eventBus: new RecordingEventBus());
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        var issue = Assert.Single(created.Issues.Values);
+        Assert.DoesNotContain("SuperSecret", issue.Description, StringComparison.Ordinal);
+        Assert.Contains("MY_API_TOKEN=***REDACTED***", issue.Description, StringComparison.Ordinal);
+
+        // Dedup append onto an existing issue.
+        var deduped = new FakeIssueStore();
+        var clock = new ControlledTimeProvider();
+        var dedupService = CreateService(
+            new CiFailureRoutingHandler(CheckRunsJsonWithDetailsUrl("123", summary: null), _ => JobsJsonOneFailedJob(111), _ => log),
+            issueStore: deduped, eventBus: new RecordingEventBus(), clock: clock);
+        SeedExistingIssue(deduped, "CI failure: build", "Original.");
+        await dedupService.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        var existing = Assert.Single(deduped.Issues.Values);
+        Assert.DoesNotContain("SuperSecret", existing.Description, StringComparison.Ordinal);
+        Assert.Contains("MY_API_TOKEN=***REDACTED***", existing.Description, StringComparison.Ordinal);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n", existing.Description);
+    }
+
+    /// <summary>
+    /// Finding 2: the fallback tail is the ACTUAL end of the stream even when the last line is far longer
+    /// than the failure-extraction line cap. The excerpt windows are bounded only by their own sizes.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_SingleHugeLine_FallbackTailIsTheActualStreamTail()
+    {
+        var log = "HEAD_MARKER" + new string('x', 20_000) + "ACTUAL_TAIL_MARKER";
+        Assert.True(log.Length > MaxLogLineChars);
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.Empty(result!.Failures);
+        var snippet = result.FallbackSnippet!;
+        Assert.StartsWith("HEAD_MARKER", snippet, StringComparison.Ordinal);
+        Assert.EndsWith("ACTUAL_TAIL_MARKER", snippet, StringComparison.Ordinal);
+        // Bounded: head window + gap marker + tail window, never the whole 20 KB line.
+        Assert.True(snippet.Length < CiLogStreamParser.FallbackHeadChars + CiLogStreamParser.FallbackTailChars + 200,
+            $"The excerpt is {snippet.Length} characters — the tail capture must stay bounded.");
+        // The gap is stated in decoded characters of the actual stream.
+        var gap = log.Length - CiLogStreamParser.FallbackHeadChars - (snippet.Length - snippet.IndexOf("]…\n", StringComparison.Ordinal) - "]…\n".Length);
+        Assert.Contains($"…[truncated: {gap:N0} characters omitted between the head and the tail of the log]…", snippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 2, secret-fragment variant: the tail window of an oversized line begins INSIDE a GitHub token
+    /// whose start was dropped, so no fragment of the token may be shown.
+    /// </summary>
+    [Theory]
+    [InlineData("ghp")]
+    [InlineData("gho")]
+    [InlineData("ghs")]
+    public async Task FetchJobLogsAsync_OversizedLine_TailStartingInsideToken_ShowsNoFragment(string prefix)
+    {
+        var token = prefix + "_" + new string('a', 36);
+        // The last FallbackTailChars of the line start 20 characters into the token body.
+        var log = new string('q', 9_000) + token + new string('.', CiLogStreamParser.FallbackTailChars - 20) + "\nend\n";
+
+        var result = await FetchSingleLogAsync(log);
+
+        var snippet = result!.FallbackSnippet!;
+        Assert.DoesNotContain("aaaaaaaa", snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(prefix + "_", snippet, StringComparison.Ordinal);
+        Assert.Contains("end", snippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 2, value-bounded secrets: when a Bearer / Password= / secret-env trigger passes through an
+    /// oversized line — including inside the dropped middle — the line's tail is not shown, because its
+    /// start may lie inside the secret value.
+    /// </summary>
+    [Theory]
+    [InlineData("bearer")]
+    [InlineData("password-in-dropped-middle")]
+    [InlineData("envvar")]
+    [InlineData("timestamped-envvar")]
+    public async Task FetchJobLogsAsync_OversizedLine_ValueBoundedSecretNeverReachesTail(string category)
+    {
+        var line = category switch
+        {
+            "bearer" => "Authorization: Bearer " + new string('B', 20_000) + "TAILSECRET",
+            "password-in-dropped-middle" => new string('x', 9_000) + "Password=" + new string('p', 20_000) + "TAILSECRET",
+            "envvar" => "MY_API_TOKEN=" + new string('S', 20_000) + "TAILSECRET",
+            _ => StampPrefix + "MY_API_TOKEN=" + new string('S', 20_000) + "TAILSECRET",
+        };
+
+        var result = await FetchSingleLogAsync(line + "\nafter\n");
+
+        var snippet = result!.FallbackSnippet!;
+        Assert.DoesNotContain("TAILSECRET", snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain("BBBBBBBB", snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain("pppppppp", snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain("SSSSSSSS", snippet, StringComparison.Ordinal);
+        Assert.Contains("after", snippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>Finding 2: a token straddling the head-window edge of the excerpt is already redacted whole.</summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_TokenStraddlingExcerptHeadEdge_IsRedactedWhole()
+    {
+        var token = "ghp_" + new string('c', 36);
+        var sb = new StringBuilder();
+        AppendFillerTo(sb, CiLogStreamParser.FallbackHeadChars - 10);
+        sb.Append("   ").Append(token).Append('\n');
+        AppendFillerTo(sb, sb.Length + 4_000);
+
+        var result = await FetchSingleLogAsync(sb.ToString());
+
+        var snippet = result!.FallbackSnippet!;
+        Assert.DoesNotContain("ghp_", snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain("cccccccc", snippet, StringComparison.Ordinal);
+    }
+
+    private static string BlockLinesLog(string header, IEnumerable<string> body, string closing) =>
+        header + "\n" + string.Join('\n', body) + "\n" + closing;
+
+    /// <summary>
+    /// Finding 3 (VSTest): a block whose stack runs past the block cap and is then closed by a blank line
+    /// reports the truncation marker and the omitted count. The blank line used to be admitted after the
+    /// longer lines were rejected, which ended the stack inside the retained lines and hid the truncation.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_VstestBlockBeyondCapClosedByBlankLine_ReportsTruncation()
+    {
+        var frames = Enumerable.Range(0, 1_000).Select(i => $"    at Big.Block.Frame{i:D4}()").ToList();
+        var lines = new List<string> { "  Error Message:", "    big error", "  Stack Trace:" };
+        lines.AddRange(frames);
+        lines.Add(string.Empty); // the closing blank line
+        var log = "Failed Tests.Big.Block [1 ms]\n" + string.Join('\n', lines) + "\n";
+
+        var (retainedCount, omitted) = StrictPrefixSplit(lines);
+        Assert.True(retainedCount < lines.Count - 1, "The cap must bind before the closing blank line.");
+
+        var failure = Assert.Single((await FetchSingleLogAsync(log))!.Failures);
+
+        var marker = $" …[truncated: {omitted:N0} characters omitted]…";
+        Assert.EndsWith(marker, failure.StackTrace, StringComparison.Ordinal);
+        Assert.Contains("Frame0000", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("Frame0999", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    /// <summary>Finding 3 (MTP): same defect — trailing blanks changed bodyEnd and suppressed the marker.</summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_MtpBlockBeyondCapFollowedByBlankAndFooter_ReportsTruncation()
+    {
+        var frames = Enumerable.Range(0, 1_000).Select(i => $"    at Big.Mtp.Frame{i:D4}()").ToList();
+        var lines = new List<string> { "  from /repo/Tests.dll (net10.0|x64)", "  big mtp error" };
+        lines.AddRange(frames);
+        lines.Add(string.Empty);
+        var log = "failed Tests.Big.Mtp (12ms)\n" + string.Join('\n', lines)
+            + "\n/repo/Tests.dll (net10.0|x64) failed with 1 error(s) (1s 2ms)\n";
+
+        var (_, omitted) = StrictPrefixSplit(lines);
+
+        var failure = Assert.Single((await FetchSingleLogAsync(log))!.Failures);
+
+        Assert.Equal("big mtp error", failure.Error);
+        Assert.EndsWith($" …[truncated: {omitted:N0} characters omitted]…", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("Frame0999", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 3, mixed sizes: after a long line is rejected, SHORT lines that would fit the remaining room
+    /// must not be admitted — the retained lines are a strict prefix and every later line is counted omitted.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_BlockLinesThatWouldFitAfterAnOmission_AreStillOmitted()
+    {
+        var lines = new List<string> { "  Error Message:", "    big error", "  Stack Trace:" };
+        for (var i = 0; i < 60; i++)
+            lines.Add("    at Long.Frame" + i.ToString("D2") + "(" + new string('p', 380) + ")");
+        lines.Add("    at Short.AfterOmission()"); // far shorter than the room a skipped long line left behind
+        lines.Add("    at Short.AfterOmission2()");
+        var log = "Failed Tests.Mixed.Block [1 ms]\n" + string.Join('\n', lines) + "\n";
+
+        var (retainedCount, omitted) = StrictPrefixSplit(lines);
+        Assert.True(retainedCount < lines.Count - 2, "A long line must have been rejected before the short lines.");
+
+        var failure = Assert.Single((await FetchSingleLogAsync(log))!.Failures);
+
+        Assert.DoesNotContain("Short.AfterOmission", failure.StackTrace, StringComparison.Ordinal);
+        Assert.EndsWith($" …[truncated: {omitted:N0} characters omitted]…", failure.StackTrace, StringComparison.Ordinal);
+        Assert.Contains($"Long.Frame{retainedCount - 4:D2}", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain($"Long.Frame{retainedCount - 3:D2}", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 3 (MTP), retained trailing blank: the cap binds right AFTER a blank line that fit, so the
+    /// retained lines END in a blank and the body trimming makes bodyEnd differ from the retained count.
+    /// Deriving truncation from that position suppressed the marker although later lines were omitted.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_MtpBlockWhoseRetainedLinesEndInBlank_StillReportsTruncation()
+    {
+        var lines = new List<string> { "  from /repo/Tests.dll (net10.0|x64)", "  big mtp error" };
+        long used = lines.Sum(l => l.Length + 1L);
+        var i = 0;
+        string Frame() => $"    at Blank.Edge.Frame{i:D4}()";
+        while (used + Frame().Length + 1 <= MaxFailureBlockChars - 1)
+        {
+            lines.Add(Frame());
+            used += Frame().Length + 1;
+            i++;
+        }
+
+        lines.Add(string.Empty);          // fits: it is the LAST retained line
+        lines.Add("    at Omitted.AfterBlank()");
+        lines.Add("    at Omitted.AfterBlank2()");
+        var (retainedCount, omitted) = StrictPrefixSplit(lines);
+        Assert.Equal(lines.Count - 2, retainedCount);
+        Assert.Equal(string.Empty, lines[retainedCount - 1]);
+
+        var log = "failed Tests.Blank.Edge (12ms)\n" + string.Join('\n', lines)
+            + "\n/repo/Tests.dll (net10.0|x64) failed with 1 error(s) (1s 2ms)\n";
+
+        var failure = Assert.Single((await FetchSingleLogAsync(log))!.Failures);
+
+        Assert.EndsWith($" …[truncated: {omitted:N0} characters omitted]…", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("Omitted.AfterBlank", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 3 / iteration-1 note: a VSTest stack that a blank line CLOSED inside the retained lines is a
+    /// complete failure; the many lines omitted after it are unrelated trailing output, so no marker.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_VstestStackClosedInsideRetainedLines_HasNoTruncationMarker()
+    {
+        var lines = new List<string> { "  Error Message:", "    err", "  Stack Trace:", "    at Done.Early()", string.Empty };
+        lines.AddRange(Enumerable.Range(0, 1_000).Select(n => $"    unrelated trailing output line {n:D4} {new string('u', 40)}"));
+        var log = "Failed Tests.Closed.Early [1 ms]\n" + string.Join('\n', lines) + "\n";
+        Assert.True(StrictPrefixSplit(lines).OmittedChars > 0, "Lines must have been omitted after the closing blank.");
+
+        var failure = Assert.Single((await FetchSingleLogAsync(log))!.Failures);
+
+        Assert.Equal("at Done.Early()", failure.StackTrace);
+        Assert.DoesNotContain("truncated", failure.StackTrace + failure.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The documented accounting rule: lines are retained in order until one does not fit the block cap;
+    /// that line and EVERY later line are omitted. A line costs its characters plus one separator.
+    /// </summary>
+    private static (int RetainedCount, long OmittedChars) StrictPrefixSplit(List<string> lines)
+    {
+        long used = 0;
+        var retained = 0;
+        long omitted = 0;
+        var truncated = false;
+        foreach (var line in lines)
+        {
+            var cost = line.Length + 1;
+            if (!truncated && used + cost <= MaxFailureBlockChars)
+            {
+                used += cost;
+                retained++;
+                continue;
+            }
+
+            truncated = true;
+            omitted += cost;
+        }
+
+        return (retained, omitted);
+    }
+
+    /// <summary>
+    /// Finding 4: a job whose download breaks after its blocks were already offered to the shared retention
+    /// contributes NOTHING — it cannot displace the next job's failures — and the occurrence accounting
+    /// stays exact (no overflow summary invented by a broken download).
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_FailedDownloadDoesNotPoisonSharedRetention()
+    {
+        var broken = Utf8(string.Concat(Enumerable.Range(0, MaxRetainedFailureCount + 1)
+            .Select(i => FailureBlockText($"Tests.BrokenDownload.Case{i:D4}", "boom"))));
+        var good = FailureBlockText("Tests.GoodDownload", "good boom");
+
+        var handler = new JobsAndLogsHandler(JobsJson(2, (111, "failure"), (222, "failure")), uri =>
+            uri.AbsolutePath.Contains("/111/", StringComparison.Ordinal)
+                ? LogResponse(new SegmentedStream(failAtEnd: true, (broken, 1)))
+                : LogResponse(good));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal("Tests.GoodDownload", failure.TestName);
+        Assert.Equal("good boom", failure.Error);
+        Assert.Null(result.Overflow);
+
+        // The cache keeps exactly this result: same object, no extra HTTP.
+        var requests = handler.Captured.Count;
+        var again = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+        Assert.Same(result, again);
+        Assert.Equal(requests, handler.Captured.Count);
+    }
+
+    /// <summary>
+    /// Finding 4, ordering and accounting: a good job BEFORE the broken one keeps its failures, the broken
+    /// job's partial failures are rolled back, and a later overflow summary counts only completed jobs.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_FailedDownloadAfterGoodJob_RollsBackOnlyTheBrokenJob()
+    {
+        var good = string.Concat(Enumerable.Range(0, MaxRetainedFailureCount - 1)
+            .Select(i => FailureBlockText($"Tests.Good.Case{i:D4}", "ok")));
+        var broken = Utf8(string.Concat(Enumerable.Range(0, 5).Select(i => FailureBlockText($"Tests.Broken.Case{i}", "boom"))));
+        var tailJob = string.Concat(Enumerable.Range(0, 3).Select(i => FailureBlockText($"Tests.Tail.Case{i}", "tail")));
+
+        var handler = new JobsAndLogsHandler(JobsJson(3, (111, "failure"), (222, "failure"), (333, "failure")), uri =>
+            uri.AbsolutePath.Contains("/222/", StringComparison.Ordinal)
+                ? LogResponse(new SegmentedStream(failAtEnd: true, (broken, 1)))
+                : uri.AbsolutePath.Contains("/111/", StringComparison.Ordinal) ? LogResponse(good) : LogResponse(tailJob));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        // 199 good + 1 of the 3 tail failures fit; the broken job's 5 are gone and not counted.
+        Assert.Equal(MaxRetainedFailureCount, result!.Failures.Count);
+        Assert.DoesNotContain(result.Failures, f => f.TestName.StartsWith("Tests.Broken", StringComparison.Ordinal));
+        Assert.Equal("Tests.Tail.Case0", result.Failures[^1].TestName);
+        Assert.Contains($"2 of {MaxRetainedFailureCount - 1 + 3}", result.Overflow, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Finding 5: a newline-free stream of exactly 2^31 decoded characters (131,072 x one 16,384-character
+    /// chunk) wrapped the narrow line counter negative, skipped the final-line flush, and lost the excerpt.
+    /// The log is never materialised: one chunk's bytes are repeated.
+    /// </summary>
+    [Theory]
+    [InlineData(131_072L)]
+    [InlineData(131_073L)]
+    public async Task FetchJobLogsAsync_NewlineFreeStreamOfTwoPow31Chars_IsFlushedWithExactGapSize(long repeats)
+    {
+        // Keep the exact original 2^31 vector and cross the marker's own int boundary too.
+        var Repeats = repeats;
+        var chunk = Utf8(new string('.', 16_384));
+        var total = Repeats * chunk.Length;
+        Assert.Equal((1L << 31) + (repeats - 131_072) * chunk.Length, total);
+
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ => LogResponse(new SegmentedStream(false, (chunk, Repeats))));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures);
+        Assert.NotNull(result.FallbackSnippet); // the narrow counter skipped the flush: null
+        var gap = total - CiLogStreamParser.FallbackHeadChars - CiLogStreamParser.FallbackTailChars;
+        Assert.Contains($"…[truncated: {gap:N0} characters omitted between the head and the tail of the log]…", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.True(result.FallbackSnippet!.Length < 4_200);
+    }
+
+    /// <summary>
+    /// Finding 5, line-marker variant: the same 2^31-character line sits inside a failure's error text, so
+    /// its capped form carries the per-line omission marker, whose DECODED-character count is exact.
+    /// </summary>
+    [Theory]
+    [InlineData(131_072L)]
+    [InlineData(131_073L)]
+    public async Task FetchJobLogsAsync_TwoPow31CharLineInsideFailure_MarkerCountsDecodedCharsExactly(long repeats)
+    {
+        // At exactly 2^31 chars, unchecked int subtraction wraps BACK to the expected positive
+        // omission count. The extra chunk makes the omission itself exceed int.MaxValue.
+        var Repeats = repeats;
+        var chunk = Utf8(new string('.', 16_384));
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ => LogResponse(new SegmentedStream(false,
+            (Utf8("Failed Tests.Wide.Counter [1 ms]\n  Error Message:\n"), 1),
+            (chunk, Repeats),
+            (Utf8("\n  Stack Trace:\n    at Wide.Counter()\n\n"), 1))));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        var failure = Assert.Single(result!.Failures);
+        var omitted = Repeats * chunk.Length - MaxLogLineChars;
+        Assert.EndsWith($" …[truncated: {omitted:N0} characters omitted]…", failure.Error, StringComparison.Ordinal);
+        Assert.Equal("at Wide.Counter()", failure.StackTrace);
+    }
+
+    /// <summary>Block omission is visible on the error field when there are no retained stack frames.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FetchJobLogsAsync_ErrorOnlyBlockBeyondCap_ReportsTruncationInError(bool mtp)
+    {
+        var lines = new List<string> { mtp ? "  from /repo/Tests.dll (net10.0|x64)" : "  Error Message:" };
+        lines.AddRange(Enumerable.Range(0, 4).Select(i => $"ERROR{i}:" + new string('e', 7_900)));
+        lines.Add(string.Empty);
+        var (retained, omitted) = StrictPrefixSplit(lines);
+        Assert.True(retained > 1 && retained < lines.Count - 1);
+        var log = BlockLinesLog(mtp ? "failed Tests.ErrorOnly.Case (1ms)" : "Failed Tests.ErrorOnly.Case [1 ms]",
+            lines, mtp ? "Test run summary: Failed!\n" : string.Empty);
+
+        var result = await FetchSingleLogAsync(log);
+
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal(string.Empty, failure.StackTrace);
+        Assert.Equal(string.Join('\n', lines.Skip(1).Take(retained - 1))
+            + $" …[truncated: {omitted:N0} characters omitted]…", failure.Error);
+        Assert.DoesNotContain("ERROR3:", failure.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Block-omitted characters can exceed int.MaxValue even though each individual line is small.
+    /// A huge single line does not test this counter, since it is capped before block accounting.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_BlockOmissionBeyondIntMax_ReportsExactPositiveCount()
+    {
+        const long repeats = 262_146;
+        var line = new string('E', 8_191) + "\n";
+        // Header plus one line fits; the second line exceeds the block cap and closes retention.
+        Assert.True("  Error Message:".Length + 1 + line.Length <= MaxFailureBlockChars);
+        Assert.True("  Error Message:".Length + 1 + line.Length * 2 > MaxFailureBlockChars);
+        var omitted = (repeats - 1) * line.Length + 1; // includes the closing blank line
+        Assert.True(omitted > int.MaxValue);
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ =>
+            LogResponse(new SegmentedStream(false,
+                (Utf8("Failed Tests.Wide.Block [1 ms]\n  Error Message:\n"), 1),
+                (Utf8(line), repeats), (Utf8("\n"), 1))));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal(new string('E', 8_191) + $" …[truncated: {omitted:N0} characters omitted]…", failure.Error);
+        Assert.Equal(string.Empty, failure.StackTrace);
+    }
+
+    /// <summary>
+    /// A complete token begins within the leading token-character run of the raw tail. Removing
+    /// exactly 40 leading characters must not bisect that token and expose its suffix.
+    /// </summary>
+    [Theory]
+    [InlineData("ghp_")]
+    [InlineData("gho_")]
+    [InlineData("ghs_")]
+    public async Task FetchJobLogsAsync_OversizedTailTrimMustNotBisectACompleteToken(string prefix)
+    {
+        var token = prefix + new string('a', 36);
+        const string tailMarker = "SAFE_TAIL_MARKER";
+        var safeSuffix = new string('.', CiLogStreamParser.FallbackTailChars - 70 - tailMarker.Length) + tailMarker;
+        var rawTail = new string('q', 30) + token + safeSuffix;
+        Assert.Equal(CiLogStreamParser.FallbackTailChars, rawTail.Length);
+        Assert.Equal(token, rawTail.Substring(30, token.Length));
+        // The current leading-run limit (40) falls SIX chars into the token's secret suffix.
+        Assert.True(30 < 40 && 40 < 30 + token.Length);
+        var log = new string('.', 12_000) + rawTail;
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result);
+        Assert.Empty(result.Failures);
+        Assert.NotNull(result.FallbackSnippet);
+        Assert.DoesNotContain(new string('a', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(prefix, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.EndsWith(safeSuffix, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.True(result.FallbackSnippet.Length < 4_200);
+    }
+
+    /// <summary>
+    /// The same single complete token must not leak a suffix into either a created issue or a
+    /// dedup append. No multiple-partial-trigger case is involved.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MonitorMergeAsync_OversizedTailTrimTokenSuffixNeverReachesIssue(bool dedup)
+    {
+        const string tailMarker = "SAFE_TAIL_MARKER";
+        var log = new string('.', 12_000) + new string('q', 30)
+            + "ghp_" + new string('a', 36) + new string('.', 1_930 - tailMarker.Length) + tailMarker;
+        var store = new FakeIssueStore();
+        var clock = new ControlledTimeProvider();
+        if (dedup)
+            SeedExistingIssue(store, "CI failure: build", "Original safe description.");
+        var handler = new CiFailureRoutingHandler(CheckRunsJsonWithDetailsUrl("123", summary: null),
+            _ => JobsJsonOneFailedJob(111), _ => log);
+        var service = CreateService(handler, issueStore: store, eventBus: new RecordingEventBus(), clock: clock);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(store.Issues.Values);
+        if (dedup)
+        {
+            Assert.Equal("issue-existing", issue.Id);
+            Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n", issue.Description, StringComparison.Ordinal);
+        }
+        Assert.DoesNotContain(new string('a', 8), issue.Description, StringComparison.Ordinal);
+        Assert.Contains(tailMarker, issue.Description, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The capped raw prefix may stop exactly at the assignment delimiter. An env value that
+    /// begins just past the cap is still secret and cannot be shown in the fallback tail.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FetchJobLogsAsync_SecretEnvValueStartsAfterLineCap_TailIsSuppressed(bool timestamped)
+    {
+        var stamp = timestamped ? StampPrefix : string.Empty;
+        const string keyStart = "MY_API_TOKEN";
+        var key = keyStart + new string('_', MaxLogLineChars - stamp.Length - keyStart.Length - 1);
+        var assignment = stamp + key + "=";
+        Assert.Equal(MaxLogLineChars, assignment.Length);
+        var log = assignment + new string('S', 3_000) + "TAILSECRET";
+        // Positive control: this complete line is accepted by the supported secret-env pattern.
+        Assert.Equal(assignment + "***REDACTED***", CiMonitorService.SanitizeLogContent(log));
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("TAILSECRET", result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.True(result.FallbackSnippet!.Length < 4_200);
+    }
+
+    /// <summary>
+    /// Defect-2 sibling: the capped prefix is a secret-env KEY that runs exactly to the cap, so even the
+    /// <c>=</c> lies past the cut. The unseen remainder may be the delimiter and the value, so the tail is
+    /// suppressed (fail closed) — a classifier that needs the <c>=</c> inside the prefix would publish it.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FetchJobLogsAsync_SecretEnvKeyEndsAtLineCap_EqualsAndValuePastCap_TailIsSuppressed(bool timestamped)
+    {
+        var stamp = timestamped ? StampPrefix : string.Empty;
+        const string keyStart = "MY_API_TOKEN";
+        var key = keyStart + new string('_', MaxLogLineChars - stamp.Length - keyStart.Length);
+        Assert.Equal(MaxLogLineChars, (stamp + key).Length);
+        var log = stamp + key + "=" + new string('S', 3_000) + "TAILSECRET";
+        // Positive control: the complete line is a supported secret assignment.
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(log), StringComparison.Ordinal);
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("TAILSECRET", result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A cut prefix ending at '=' is not automatically a secret assignment: safe prose, including
+    /// prose mentioning TOKEN, must still show its actual tail. Both the prefix and the full line
+    /// end with '=', so recognizing a pending secret value must remain key/assignment-specific.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FetchJobLogsAsync_ProsePrefixEndingAtEquals_DoesNotSuppressSafeTail(bool timestamped)
+    {
+        var start = (timestamped ? StampPrefix : string.Empty)
+            + "Build progress: TOKEN names a documentation label, not a credential. ";
+        var prefix = start + new string('x', MaxLogLineChars - start.Length - 1) + "=";
+        Assert.Equal(MaxLogLineChars, prefix.Length);
+        Assert.EndsWith("=", prefix, StringComparison.Ordinal);
+        var log = prefix + new string('.', 3_000) + "ACTUAL_SAFE_TAIL_MARKER=";
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log));
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result);
+        Assert.Empty(result.Failures);
+        var gap = log.Length - CiLogStreamParser.FallbackHeadChars - CiLogStreamParser.FallbackTailChars;
+        Assert.Equal(log[..CiLogStreamParser.FallbackHeadChars]
+            + $"\n…[truncated: {gap:N0} characters omitted between the head and the tail of the log]…\n"
+            + log[^CiLogStreamParser.FallbackTailChars..], result.FallbackSnippet);
+        Assert.EndsWith("ACTUAL_SAFE_TAIL_MARKER=", result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The secret-env KEYWORD itself is cut by, or lies wholly beyond, the line cap. The retained prefix is
+    /// only a run of key characters (it may end in "TOK", or not contain the keyword at all), yet the FULL
+    /// line is a supported secret assignment, so its tail — which starts inside the value — must never be shown.
+    /// <paramref name="keywordCut"/> is how many characters of TOKEN lie inside the prefix: 3 = "TOK" ends the
+    /// prefix, 0 = the keyword begins exactly at the cut, 6 = the whole of "TOKEN=" is dropped (the prefix is
+    /// pure padding), and so on across the boundary.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 1)]
+    [InlineData(false, 4)]
+    [InlineData(true, 5)]
+    [InlineData(false, -10)]
+    [InlineData(true, -500)]
+    public async Task FetchJobLogsAsync_SecretEnvKeywordCutOrBeyondLineCap_TailIsSuppressed(bool timestamped, int keywordCut)
+    {
+        var stamp = timestamped ? StampPrefix : string.Empty;
+        var padding = new string('A', MaxLogLineChars - stamp.Length - keywordCut);
+        var log = stamp + padding + "TOKEN=" + new string('S', 3_000) + "TAILSECRET";
+        Assert.True(log.Length > MaxLogLineChars);
+        // Positive control: the COMPLETE line is a supported secret assignment.
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(log), StringComparison.Ordinal);
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("TAILSECRET", result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.True(result.FallbackSnippet!.Length < 4_200);
+    }
+
+    /// <summary>
+    /// Completes the TOKEN= boundary sweep without duplicating coder rows: T|OKEN for timestamped
+    /// input, TO|KEN in both forms, TOKE|N timestamped, and TOKEN|= untimestamped. The last row is
+    /// a continuity control for a position the old prefix classifier already recognized. The
+    /// between-'='-and-value position is already pinned by SecretEnvValueStartsAfterLineCap.
+    /// </summary>
+    [Theory]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 2)]
+    [InlineData(true, 4)]
+    [InlineData(false, 5)]
+    public async Task FetchJobLogsAsync_SecretEnvKeywordCutBoundarySweep_MissingPositionsSuppressTail(bool timestamped, int keywordCut)
+    {
+        var start = (timestamped ? StampPrefix : string.Empty)
+            + new string('A', MaxLogLineChars - (timestamped ? StampPrefix.Length : 0) - keywordCut);
+        const string assignment = "TOKEN=";
+        Assert.Equal(MaxLogLineChars, start.Length + keywordCut);
+        var completeLine = start + assignment + new string('S', 3_000) + "TAILSECRET";
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(completeLine), StringComparison.Ordinal);
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ =>
+            LogResponse(new SegmentedStream(false, (Utf8(start), 1), (Utf8(assignment), 1),
+                (Utf8(new string('S', 1_000)), 3), (Utf8("TAILSECRET"), 1))));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync(
+            "run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.Empty(result!.Failures);
+        Assert.DoesNotContain("TAILSECRET", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        var omitted = completeLine.Length - CiLogStreamParser.FallbackHeadChars;
+        Assert.Equal(completeLine[..CiLogStreamParser.FallbackHeadChars]
+            + $"\n…[truncated: {omitted:N0} characters omitted between the head and the tail of the log]…\n",
+            result.FallbackSnippet);
+    }
+
+    /// <summary>
+    /// The new tracker handles all supported keywords, not only TOKEN. In particular PASSWOR|D
+    /// requires the full seven-character seed carry; the bounded stream never holds a whole log.
+    /// </summary>
+    [Theory]
+    [InlineData(false, "KEY", 2)]
+    [InlineData(true, "KEY", 2)]
+    [InlineData(false, "SECRET", 5)]
+    [InlineData(true, "SECRET", 5)]
+    [InlineData(false, "PASSWORD", 7)]
+    [InlineData(true, "PASSWORD", 7)]
+    public async Task FetchJobLogsAsync_SecretEnvOtherKeywordCrossesLineCap_SuppressesTail(bool timestamped, string keyword, int keywordCut)
+    {
+        var start = (timestamped ? StampPrefix : string.Empty)
+            + new string('A', MaxLogLineChars - (timestamped ? StampPrefix.Length : 0) - keywordCut);
+        var assignment = keyword + "=";
+        Assert.Equal(MaxLogLineChars, start.Length + keywordCut);
+        var completeLine = start + assignment + new string('S', 3_000) + "TAILSECRET";
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(completeLine), StringComparison.Ordinal);
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ =>
+            LogResponse(new SegmentedStream(false, (Utf8(start), 1), (Utf8(assignment), 1),
+                (Utf8(new string('S', 1_000)), 3), (Utf8("TAILSECRET"), 1))));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync(
+            "run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.Empty(result!.Failures);
+        Assert.DoesNotContain("TAILSECRET", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        var omitted = completeLine.Length - CiLogStreamParser.FallbackHeadChars;
+        Assert.Equal(completeLine[..CiLogStreamParser.FallbackHeadChars]
+            + $"\n…[truncated: {omitted:N0} characters omitted between the head and the tail of the log]…\n",
+            result.FallbackSnippet);
+    }
+
+    /// <summary>The keyword split lands exactly across a stream-chunk boundary in the dropped middle.</summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_SecretEnvKeywordSplitAcrossChunkInDroppedMiddle_TailIsSuppressed()
+    {
+        var log = new string('A', StreamChunkBytes - 3) + "TOKEN=" + new string('S', 3_000) + "TAILSECRET";
+        Assert.Equal("TOK", log.Substring(StreamChunkBytes - 3, 3));
+        Assert.True(StreamChunkBytes - 3 > MaxLogLineChars);
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(log), StringComparison.Ordinal);
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("TAILSECRET", result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// End to end for the reviewer's exact vectors (cut inside the keyword; keyword and '=' wholly beyond the
+    /// cap), timestamped and not: the secret reaches neither a CREATED issue nor a DEDUP append.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 3, false)]
+    [InlineData(false, 3, true)]
+    [InlineData(false, 0, false)]
+    [InlineData(false, 0, true)]
+    [InlineData(true, 3, false)]
+    [InlineData(true, 3, true)]
+    [InlineData(true, 0, false)]
+    [InlineData(true, 0, true)]
+    public async Task MonitorMergeAsync_SecretEnvKeywordCutByLineCap_NeverReachesIssueOrDedupAppend(
+        bool timestamped, int keywordCut, bool dedup)
+    {
+        var stamp = timestamped ? StampPrefix : string.Empty;
+        var log = stamp + new string('A', MaxLogLineChars - stamp.Length - keywordCut)
+            + "TOKEN=" + new string('S', 3_000) + "TAILSECRET";
+        var store = new FakeIssueStore();
+        var clock = new ControlledTimeProvider();
+        if (dedup)
+            SeedExistingIssue(store, "CI failure: build", "Original safe description.");
+        var handler = new CiFailureRoutingHandler(CheckRunsJsonWithDetailsUrl("123", summary: null),
+            _ => JobsJsonOneFailedJob(111), _ => log);
+        var service = CreateService(handler, issueStore: store, eventBus: new RecordingEventBus(), clock: clock);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(store.Issues.Values);
+        if (dedup)
+            Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n", issue.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("TAILSECRET", issue.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('S', 8), issue.Description, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Opposite direction (blanket suppression is NOT acceptable): oversized lines that are not secret
+    /// assignments keep their actual tail — a key run that holds NO secret keyword, a keyword separated from
+    /// the '=' by a space, and a keyword-free run followed by '='.
+    /// </summary>
+    [Theory]
+    [InlineData("no-keyword", false)]
+    [InlineData("no-keyword", true)]
+    [InlineData("space-breaks-key", false)]
+    [InlineData("space-breaks-key", true)]
+    [InlineData("lowercase-keyword", false)]
+    public async Task FetchJobLogsAsync_OversizedNonSecretLineStartingWithKeyRun_KeepsActualTail(string shape, bool timestamped)
+    {
+        var stamp = timestamped ? StampPrefix : string.Empty;
+        var middle = shape switch
+        {
+            "no-keyword" => new string('A', MaxLogLineChars - stamp.Length) + "NAME=",
+            "space-breaks-key" => new string('A', MaxLogLineChars - stamp.Length - 3) + "TOKEN =",
+            _ => new string('A', MaxLogLineChars - stamp.Length - 3) + "token=",
+        };
+        var log = stamp + middle + new string('.', 3_000) + "ACTUAL_SAFE_TAIL_MARKER";
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log)); // not a secret assignment at all
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.EndsWith("ACTUAL_SAFE_TAIL_MARKER", result!.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    private const string DistinctiveSecret = "DISTINCTIVE_TAIL_SECRET_9XZ";
+    private const string StampCore = "2026-08-22T09:47:38.1197374Z"; // a complete Actions timestamp, no separator
+
+    /// <summary>
+    /// A supported secret assignment whose Actions-timestamp separator ends <paramref name="separatorEndsPastCap"/>
+    /// characters past the line cap (so the separator CROSSES the cap), followed by the key, '=' and a long value.
+    /// </summary>
+    private static string SeparatorCrossingAssignment(char separator, string keyword, int separatorEndsPastCap) =>
+        StampCore + new string(separator, MaxLogLineChars - StampCore.Length + separatorEndsPastCap)
+        + keyword + "=" + new string('s', 5_000) + DistinctiveSecret;
+
+    /// <summary>
+    /// A supported secret assignment whose TIMESTAMP crosses the cap: the 'Z' ends up <paramref name="zPastCap"/>
+    /// characters past the cap boundary (negative = before it), because the fraction is that long.
+    /// </summary>
+    private static string TimestampCrossingAssignment(char separator, string keyword, int zPastCap)
+    {
+        const string DateHead = "2026-08-22T09:47:38.";
+        var fractionDigits = MaxLogLineChars + zPastCap - DateHead.Length;
+        return DateHead + new string('1', fractionDigits) + "Z" + separator + keyword + "=" + new string('s', 5_000) + DistinctiveSecret;
+    }
+
+    /// <summary>
+    /// The shared security assertions: the input really IS a supported assignment (the complete-line sanitizer
+    /// redacts it), the fallback shows no part of the secret value, and the gap is exact — the head window, one
+    /// gap marker accounting for EVERY other decoded character, and no tail at all.
+    /// </summary>
+    private async Task AssertEnvAssignmentTailSuppressedAsync(string log)
+    {
+        Assert.True(log.Length > MaxLogLineChars);
+        var sanitized = CiMonitorService.SanitizeLogContent(log);
+        Assert.DoesNotContain(DistinctiveSecret, sanitized, StringComparison.Ordinal);
+        Assert.EndsWith("=***REDACTED***", sanitized, StringComparison.Ordinal);
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        var snippet = result!.FallbackSnippet!;
+        Assert.DoesNotContain(DistinctiveSecret, snippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('s', 8), snippet, StringComparison.Ordinal);
+        Assert.Equal(
+            log[..CiLogStreamParser.FallbackHeadChars]
+            + $"\n…[truncated: {log.Length - CiLogStreamParser.FallbackHeadChars:N0} characters omitted between the head and the tail of the log]…\n",
+            snippet);
+    }
+
+    /// <summary>
+    /// The reviewer's separator-crossing leak: the whitespace between the timestamp and the key straddles the
+    /// cap. The sanitizer's separator is <c>[ \t]+</c>, so the line is a supported assignment however long the
+    /// separator is; the tracker used to mistake the next dropped whitespace for the end of an empty key and
+    /// stop tracking. Separator endings 0, 1, 3, 4096 and 8192 characters past the cap, spaces and tabs, all four
+    /// keywords.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(SeparatorSweepRows))]
+    public async Task FetchJobLogsAsync_SecretEnvSeparatorCrossesLineCap_TailIsSuppressed(char separator, string keyword, int separatorEndsPastCap) =>
+        await AssertEnvAssignmentTailSuppressedAsync(SeparatorCrossingAssignment(separator, keyword, separatorEndsPastCap));
+
+    public static IEnumerable<object[]> SeparatorSweepRows()
+    {
+        foreach (var separator in new[] { ' ', '\t' })
+        foreach (var keyword in new[] { "TOKEN", "KEY", "SECRET", "PASSWORD" })
+        foreach (var past in new[] { 0, 1, 3, 4_096, MaxLogLineChars })
+            yield return [separator, keyword, past];
+    }
+
+    /// <summary>
+    /// The reviewer's timestamp-crossing leak: a long fraction puts the 'Z' (and so the separator and key) at,
+    /// just before, or beyond the cap, so the retained prefix holds only an INCOMPLETE timestamp. The tracker
+    /// must follow the timestamp itself across the cut.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TimestampCrossingRows))]
+    public async Task FetchJobLogsAsync_SecretEnvTimestampCrossesLineCap_TailIsSuppressed(char separator, string keyword, int zPastCap) =>
+        await AssertEnvAssignmentTailSuppressedAsync(TimestampCrossingAssignment(separator, keyword, zPastCap));
+
+    public static IEnumerable<object[]> TimestampCrossingRows()
+    {
+        foreach (var separator in new[] { ' ', '\t' })
+        foreach (var keyword in new[] { "TOKEN", "PASSWORD" })
+        foreach (var zPastCap in new[] { -1, 0, 1, 2, 500 })
+            yield return [separator, keyword, zPastCap];
+    }
+
+    /// <summary>
+    /// Timestamp CUT positions inside the fixed template itself, which a streaming reader sees split across
+    /// stream chunks: the cap is shrunk to nothing by feeding the line in 1-character fragments, so every
+    /// position of the timestamp, separator, key and '=' is a fragment boundary.
+    /// </summary>
+    [Fact]
+    public void ParserFedOneCharacterAtATime_SecretEnvAssignmentTailIsStillSuppressed()
+    {
+        var log = SeparatorCrossingAssignment('\t', "SECRET", 3);
+        var retention = CiFailureRetention.CreateProduction();
+        var parser = CiLogStreamParser.CreateProduction(retention);
+
+        foreach (var ch in log)
+            parser.Feed(ch.ToString());
+        parser.Complete();
+
+        Assert.NotNull(parser.FallbackDiagnostics);
+        Assert.DoesNotContain(DistinctiveSecret, parser.FallbackDiagnostics!, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('s', 8), parser.FallbackDiagnostics!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// End to end for the reviewer's vectors: separator-crossing (all four keywords, space and tab) and
+    /// timestamp-crossing, through BOTH a created issue and a dedup append.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IssuePathRows))]
+    public async Task MonitorMergeAsync_SecretEnvSeparatorOrTimestampCrossesCap_NeverReachesIssueOrDedupAppend(
+        string shape, char separator, string keyword, bool dedup)
+    {
+        var log = shape == "separator"
+            ? SeparatorCrossingAssignment(separator, keyword, 1)
+            : TimestampCrossingAssignment(separator, keyword, 0);
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(log), StringComparison.Ordinal);
+        var store = new FakeIssueStore();
+        var clock = new ControlledTimeProvider();
+        if (dedup)
+            SeedExistingIssue(store, "CI failure: build", "Original safe description.");
+        var handler = new CiFailureRoutingHandler(CheckRunsJsonWithDetailsUrl("123", summary: null),
+            _ => JobsJsonOneFailedJob(111), _ => log);
+        var service = CreateService(handler, issueStore: store, eventBus: new RecordingEventBus(), clock: clock);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(store.Issues.Values);
+        if (dedup)
+            Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n", issue.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain(DistinctiveSecret, issue.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('s', 8), issue.Description, StringComparison.Ordinal);
+    }
+
+    public static IEnumerable<object[]> IssuePathRows()
+    {
+        foreach (var dedup in new[] { false, true })
+        {
+            foreach (var separator in new[] { ' ', '\t' })
+            {
+                foreach (var keyword in new[] { "TOKEN", "KEY", "SECRET", "PASSWORD" })
+                    yield return ["separator", separator, keyword, dedup];
+                yield return ["timestamp", separator, "TOKEN", dedup];
+            }
+        }
+    }
+
+    /// <summary>
+    /// The sanitizer's fraction is OPTIONAL (<c>(\.\d+)?</c>): a whole-second timestamp (<c>...:38Z</c>) followed
+    /// by a separator that crosses the cap is a supported assignment too, and must be tracked through the
+    /// no-fraction path of the grammar.
+    /// </summary>
+    [Theory]
+    [InlineData(' ', 0)]
+    [InlineData('\t', 1)]
+    [InlineData(' ', 4_096)]
+    public async Task FetchJobLogsAsync_WholeSecondTimestampSeparatorCrossesLineCap_TailIsSuppressed(char separator, int separatorEndsPastCap)
+    {
+        const string stamp = "2026-08-22T09:47:38Z";
+        var log = stamp + new string(separator, MaxLogLineChars - stamp.Length + separatorEndsPastCap)
+            + "SECRET=" + new string('s', 5_000) + DistinctiveSecret;
+
+        await AssertEnvAssignmentTailSuppressedAsync(log);
+    }
+
+    /// <summary>
+    /// Whole-second timestamp with NO separator is not a supported assignment (the sanitizer requires
+    /// <c>[ \t]+</c> after the 'Z'), so it must stay unsuppressed on the no-fraction path as well.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_WholeSecondTimestampWithoutSeparator_IsNotSuppressed()
+    {
+        var log = "2026-08-22T09:47:38Z" + new string('A', MaxLogLineChars) + "TOKEN=" + new string('s', 3_000) + "ACTUAL_SAFE_TAIL_MARKER";
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log));
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.EndsWith("ACTUAL_SAFE_TAIL_MARKER", result!.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Opposite direction: timestamp + a separator that crosses the cap + SAFE prose. The line never forms an
+    /// assignment (the sanitizer leaves it untouched), so its actual tail must still be shown — pending state
+    /// after whitespace must not suppress.
+    /// </summary>
+    [Theory]
+    [InlineData(' ', "Build progress: TOKEN names a documentation label.")]
+    [InlineData('\t', "Build progress: TOKEN names a documentation label.")]
+    [InlineData(' ', "TOKEN = not an assignment because a space breaks the key")]
+    [InlineData('\t', "lowercase_token=not an assignment")]
+    [InlineData(' ', "NAME=a key run with no secret keyword")]
+    public async Task FetchJobLogsAsync_TimestampAndLongSeparatorThenSafeProse_KeepsActualTail(char separator, string prose)
+    {
+        var log = StampCore + new string(separator, MaxLogLineChars - StampCore.Length + 7) + prose
+            + new string('.', 3_000) + "ACTUAL_SAFE_TAIL_MARKER";
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log)); // not a supported assignment at all
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.EndsWith("ACTUAL_SAFE_TAIL_MARKER", result!.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Opposite direction, per what the sanitizer actually ACCEPTS: an UNTIMESTAMPED key preceded by whitespace
+    /// is not a supported assignment (the pattern anchors the key, or a timestamp, at the line start), nor is a
+    /// timestamp with no separator or with a non-space/tab separator. The sanitizer leaves each line untouched,
+    /// so the suppression must not be broader than that: the tail is shown.
+    /// </summary>
+    [Theory]
+    [InlineData("untimestamped-leading-space")]
+    [InlineData("untimestamped-leading-tab")]
+    [InlineData("timestamp-no-separator")]
+    [InlineData("timestamp-nbsp-separator")]
+    [InlineData("timestamp-trailing-dot-no-fraction")]
+    public async Task FetchJobLogsAsync_UnsupportedWhitespaceOrTimestampShape_IsNotSuppressed(string shape)
+    {
+        var assignment = "TOKEN=" + new string('s', 3_000) + "ACTUAL_SAFE_TAIL_MARKER";
+        var log = shape switch
+        {
+            "untimestamped-leading-space" => new string(' ', MaxLogLineChars + 10) + assignment,
+            "untimestamped-leading-tab" => new string('\t', MaxLogLineChars + 10) + assignment,
+            "timestamp-no-separator" => StampCore + new string('A', MaxLogLineChars) + assignment,
+            "timestamp-nbsp-separator" => StampCore + new string('\u00a0', MaxLogLineChars) + assignment,
+            _ => "2026-08-22T09:47:38." + new string(' ', MaxLogLineChars) + assignment,
+        };
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log)); // the sanitizer does NOT accept this shape
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.EndsWith("ACTUAL_SAFE_TAIL_MARKER", result!.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Adds only separator shapes missing from SeparatorSweepRows: literal short/mid lengths are
+    /// continuity controls, as is a separator ending exactly at the cap. Separators extending
+    /// PAST the cap are security rows. Every keyword is covered without duplicating pure runs.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AdditionalEnvSeparatorRows))]
+    public async Task FetchJobLogsAsync_AdditionalEnvSeparatorBoundaries_SuppressOnlySupportedSecretTail(
+        string shape, int separatorLength, string keyword, bool security)
+    {
+        var separator = EnvSeparatorText(shape, separatorLength);
+        Assert.Equal(security, StampCore.Length + separator.Length > MaxLogLineChars);
+        const string valueUnit = "ssssssssss";
+        var value = string.Concat(Enumerable.Repeat(valueUnit, 2_000));
+        var assignment = keyword + "=";
+        var log = StampCore + separator + assignment + value + DistinctiveSecret;
+        Assert.Equal(StampCore + separator + assignment + "***REDACTED***", CiMonitorService.SanitizeLogContent(log));
+
+        var result = await FetchEnvSegmentsAsync(StampCore, separator, assignment,
+            valueUnit, 2_000, DistinctiveSecret);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.Empty(result!.Failures);
+        Assert.DoesNotContain(DistinctiveSecret, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('s', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        // If the value already starts before the cap, that retained prefix redacts to a short
+        // known string. Otherwise the retained prefix is just timestamp/separator text.
+        var prefix = StampCore.Length + separator.Length + assignment.Length < MaxLogLineChars
+            ? StampCore + separator + assignment + "***REDACTED***"
+            : log[..MaxLogLineChars];
+        var head = prefix[..Math.Min(prefix.Length, CiLogStreamParser.FallbackHeadChars)];
+        var excerptChars = (long)prefix.Length + log.Length - MaxLogLineChars;
+        Assert.Equal(head + $"\n…[truncated: {excerptChars - head.Length:N0} characters omitted between the head and the tail of the log]…\n",
+            result.FallbackSnippet);
+    }
+
+    public static IEnumerable<object[]> AdditionalEnvSeparatorRows()
+    {
+        foreach (var keyword in new[] { "TOKEN", "KEY", "SECRET", "PASSWORD" })
+        {
+            foreach (var shape in new[] { "space", "tab" })
+            {
+                foreach (var length in new[] { 1, 3, 4_096 })
+                    yield return [shape, length, keyword, false];
+                // The old sweep used an END offset of 8192, not this literal separator length.
+                yield return [shape, MaxLogLineChars, keyword, true];
+            }
+            foreach (var length in new[] { 3, 4_096 })
+                yield return ["mixed", length, keyword, false];
+            foreach (var length in new[] { MaxLogLineChars - StampCore.Length,
+                MaxLogLineChars - StampCore.Length + 1, MaxLogLineChars, 2 * MaxLogLineChars + 3 })
+                yield return ["mixed", length, keyword, StampCore.Length + length > MaxLogLineChars];
+        }
+    }
+
+    private static string EnvSeparatorText(string shape, int length) => shape switch
+    {
+        "space" => new string(' ', length),
+        "tab" => new string('\t', length),
+        "mixed" => new string(Enumerable.Range(0, length).Select(i => i % 2 == 0 ? ' ' : '\t').ToArray()),
+        _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unknown separator shape."),
+    };
+
+    /// <summary>Segments bound the fixture's buffers and force grammar state to survive real stream reads.</summary>
+    private async Task<LogFetchResult?> FetchEnvSegmentsAsync(string stamp, string separator, string assignment,
+        string valueUnit, long repeats, string tail)
+    {
+        var segments = new List<(byte[] Bytes, long Repeat)>();
+        foreach (var text in new[] { stamp, separator, assignment })
+        {
+            if (text.Length > 0)
+                segments.Add((Utf8(text), 1));
+        }
+        if (valueUnit.Length > 0 && repeats > 0)
+            segments.Add((Utf8(valueUnit), repeats));
+        if (tail.Length > 0)
+            segments.Add((Utf8(tail), 1));
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ =>
+            LogResponse(new SegmentedStream(false, segments.ToArray())));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        return await CreateServiceForLogFetch().FetchJobLogsAsync(
+            "run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>The timestamp sweep previously covered TOKEN/PASSWORD only; fill KEY/SECRET at the same offsets.</summary>
+    [Theory]
+    [MemberData(nameof(AdditionalTimestampKeywordRows))]
+    public async Task FetchJobLogsAsync_TimestampCrossesCap_KeyAndSecretTailIsSuppressed(char separator, string keyword, int zPastCap)
+    {
+        const string dateHead = "2026-08-22T09:47:38.";
+        var fraction = new string('1', MaxLogLineChars + zPastCap - dateHead.Length);
+        var log = dateHead + fraction + "Z" + separator + keyword + "=" + new string('s', 5_000) + DistinctiveSecret;
+        Assert.EndsWith("=***REDACTED***", CiMonitorService.SanitizeLogContent(log), StringComparison.Ordinal);
+        var handler = new JobsAndLogsHandler(JobsJson(1, (111, "failure")), _ =>
+            LogResponse(new SegmentedStream(false, (Utf8(dateHead), 1), (Utf8("1"), fraction.Length),
+                (Utf8("Z" + separator), 1), (Utf8(keyword + "="), 1), (Utf8("s"), 5_000), (Utf8(DistinctiveSecret), 1))));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync(
+            "run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain(DistinctiveSecret, result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('s', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.Equal(log[..CiLogStreamParser.FallbackHeadChars]
+            + $"\n…[truncated: {log.Length - CiLogStreamParser.FallbackHeadChars:N0} characters omitted between the head and the tail of the log]…\n",
+            result.FallbackSnippet);
+    }
+
+    public static IEnumerable<object[]> AdditionalTimestampKeywordRows()
+    {
+        foreach (var separator in new[] { ' ', '\t' })
+        foreach (var keyword in new[] { "KEY", "SECRET" })
+        foreach (var offset in new[] { -1, 0, 1, 2, 500 })
+            yield return [separator, keyword, offset];
+    }
+
+    /// <summary>Pending grammar state or an '=' alone must not suppress a supported key with an EMPTY value.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FetchJobLogsAsync_TimestampLongMixedSeparator_EmptyValueKeepsActualTail(bool wholeSeconds)
+    {
+        var stamp = wholeSeconds ? "2026-08-22T09:47:38Z" : StampCore;
+        // Force a real dropped-middle gap: if the ring held the whole dropped suffix, complete-line
+        // redaction would mask a broken suppression decision and make this control vacuous.
+        var separator = EnvSeparatorText("mixed", 2 * MaxLogLineChars + 3);
+        var log = stamp + separator + "TOKEN=";
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log)); // .+ requires at least one value character
+
+        var result = await FetchEnvSegmentsAsync(stamp, separator, "TOKEN=", string.Empty, 0, string.Empty);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.Equal(log[..CiLogStreamParser.FallbackHeadChars]
+            + $"\n…[truncated: {log.Length - CiLogStreamParser.FallbackHeadChars - CiLogStreamParser.FallbackTailChars:N0} characters omitted between the head and the tail of the log]…\n"
+            + log[^CiLogStreamParser.FallbackTailChars..], result!.FallbackSnippet);
+        Assert.EndsWith("TOKEN=", result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>Mixed pending separators may lead to safe prose rather than an assignment.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FetchJobLogsAsync_TimestampLongMixedSeparator_SafeProseKeepsActualTail(bool wholeSeconds)
+    {
+        var stamp = wholeSeconds ? "2026-08-22T09:47:38Z" : StampCore;
+        var separator = EnvSeparatorText("mixed", MaxLogLineChars + 3);
+        const string prose = "Build progress: TOKEN refers to a documentation label, not an assignment. ";
+        const string tail = "ACTUAL_SAFE_TAIL_MARKER";
+        var log = stamp + separator + prose + new string('.', 3_000) + tail;
+        Assert.Equal(log, CiMonitorService.SanitizeLogContent(log));
+
+        var result = await FetchEnvSegmentsAsync(stamp, separator, prose, ".", 3_000, tail);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.EndsWith(tail, result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.True(result.FallbackSnippet!.Length < 4_200);
+    }
+
+    /// <summary>The trigger itself, not just its value, straddles a stream-chunk boundary in the dropped middle.</summary>
+    [Theory]
+    [InlineData("Password=", 4)]
+    [InlineData("Bearer ", 3)]
+    public async Task FetchJobLogsAsync_OversizedSecretTriggerSplitInDroppedMiddle_SuppressesTail(string trigger, int split)
+    {
+        var log = new string('.', StreamChunkBytes - split) + trigger + new string('p', 3_000) + "TAILSECRET";
+        Assert.Equal(trigger[..split], log.Substring(StreamChunkBytes - split, split));
+        Assert.True(StreamChunkBytes - split > MaxLogLineChars);
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        var expectedGap = log.Length - CiLogStreamParser.FallbackHeadChars;
+        Assert.Equal(new string('.', CiLogStreamParser.FallbackHeadChars)
+            + $"\n…[truncated: {expectedGap:N0} characters omitted between the head and the tail of the log]…\n",
+            result!.FallbackSnippet);
+        Assert.DoesNotContain("TAILSECRET", result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_OversizedSecretThenOversizedSafeLine_DoesNotCarrySuppression()
+    {
+        var log = "Bearer " + new string('p', 20_000) + "TAILSECRET\n"
+            + new string('.', 12_000) + "ACTUAL_TAIL_MARKER";
+
+        var result = await FetchSingleLogAsync(log);
+
+        Assert.NotNull(result?.FallbackSnippet);
+        Assert.DoesNotContain("TAILSECRET", result!.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('p', 8), result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.EndsWith("ACTUAL_TAIL_MARKER", result.FallbackSnippet, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Rollback must restore character charges exactly, not leave the broken job's usage in place
+    /// or zero the successful prefix's usage. The count cap is not binding in either row.
+    /// </summary>
+    [Theory]
+    [InlineData(10, 20, 20)]
+    [InlineData(25, 2, 20)]
+    public async Task FetchJobLogsAsync_FailedDownload_RestoresCharacterBudgetExactly(int beforeCount, int brokenCount, int afterCount)
+    {
+        const int errorLength = 6_000;
+        var error = new string('e', errorLength);
+        string Name(string job, int i) => $"Tests.{job}.Case{i:D4}";
+        string JobLog(string job, int count) => string.Concat(Enumerable.Range(0, count)
+            .Select(i => FailureBlockText(Name(job, i), error)));
+        var successful = Enumerable.Range(0, beforeCount).Select(i => Name("BeforeBudget", i))
+            .Concat(Enumerable.Range(0, afterCount).Select(i => Name("AfterBudget", i))).ToList();
+        var expected = new List<(string TestName, string Error, string StackTrace)>();
+        long used = 0;
+        foreach (var name in successful)
+        {
+            var frame = $"at {name}()";
+            var cost = name.Length + error.Length + frame.Length;
+            if (used + cost > MaxRetainedFailureChars)
+                break;
+            expected.Add((name, error, frame));
+            used += cost;
+        }
+        Assert.True(successful.Count < MaxRetainedFailureCount);
+        Assert.True(expected.Count >= beforeCount && expected.Count < MaxRetainedFailureCount);
+
+        var handler = new JobsAndLogsHandler(JobsJson(3, (111, "failure"), (222, "failure"), (333, "failure")), uri =>
+            uri.AbsolutePath.Contains("/222/", StringComparison.Ordinal)
+                ? LogResponse(new SegmentedStream(true, (Utf8(JobLog("BrokenBudget", brokenCount)), 1)))
+                : LogResponse(uri.AbsolutePath.Contains("/111/", StringComparison.Ordinal)
+                    ? JobLog("BeforeBudget", beforeCount) : JobLog("AfterBudget", afterCount)));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Equal(expected, result.Failures);
+        Assert.DoesNotContain(result.Failures, f => f.TestName.Contains("BrokenBudget", StringComparison.Ordinal));
+        if (expected.Count == successful.Count)
+            Assert.Null(result.Overflow);
+        else
+            Assert.Contains($"Omitted failures: {successful.Count - expected.Count} of {successful.Count} parsed test failure occurrence(s)", result.Overflow, StringComparison.Ordinal);
+        var requests = handler.Captured.Count;
+        var again = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+        Assert.Same(result, again);
+        Assert.Equal(requests, handler.Captured.Count);
+    }
+
+    /// <summary>A previously exhausted successful budget remains closed after a later job fails.</summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_FailedDownload_PreservesAlreadyExhaustedCharacterBudget()
+    {
+        var good = string.Concat(Enumerable.Range(0, 26).Select(i =>
+            FailureBlockText($"Tests.InitialBudget.Case{i:D3}", new string('e', 8_000))));
+        var broken = FailureBlockText("Tests.BrokenBudget.Bad", "broken")
+            + "Failed Tests.BrokenBudget.Final [1 ms]\n";
+        var tail = FailureBlockText("Tests.Tiny.End", "x");
+        var handler = new JobsAndLogsHandler(JobsJson(3, (111, "failure"), (222, "failure"), (333, "failure")), uri =>
+            uri.AbsolutePath.Contains("/222/", StringComparison.Ordinal)
+                ? LogResponse(new SegmentedStream(true, (Utf8(broken), 1)))
+                : LogResponse(uri.AbsolutePath.Contains("/111/", StringComparison.Ordinal) ? good : tail));
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var result = await CreateServiceForLogFetch().FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Equal(25, result.Failures.Count);
+        Assert.Equal(Enumerable.Range(0, 25).Select(i => $"Tests.InitialBudget.Case{i:D3}"), result.Failures.Select(f => f.TestName));
+        Assert.Contains("Omitted failures: 2 of 27 parsed test failure occurrence(s)", result.Overflow, StringComparison.Ordinal);
+        var retainedCost = result.Failures.Sum(f => f.TestName.Length + f.Error.Length + f.StackTrace.Length);
+        var tinyCost = "Tests.Tiny.End".Length + "x".Length + "at Tests.Tiny.End()".Length;
+        Assert.True(retainedCost + tinyCost < MaxRetainedFailureChars,
+            "The tiny failure would fit in the remaining characters, but retention is a strict prefix already closed by rejection.");
+    }
+
+    // ── Streaming contract: bounds, chunk boundaries, and redaction ─────────
+
+    /// <summary>
+    /// A secret-bearing log line: the text that precedes the secret on the line, the raw secret,
+    /// the redacted form the parser must produce, and the fragments that must never survive into
+    /// ANY output (retained failures, fallback excerpt, or overflow summary).
+    /// </summary>
+    /// <param name="Line">The text that precedes the secret on the same line.</param>
+    /// <param name="Secret">The raw secret.</param>
+    /// <param name="SplitIntoSecret">
+    /// How many characters of the secret are before the boundary that cuts it.
+    /// </param>
+    /// <param name="ExpectedRedacted">The redacted form that must be present in the output.</param>
+    /// <param name="Forbidden">Fragments that must never appear in the output.</param>
+    private sealed record SecretVector(
+        string Line,
+        string Secret,
+        int SplitIntoSecret,
+        string ExpectedRedacted,
+        string[] Forbidden);
+
+    /// <summary>
+    /// Builds the secret-bearing line of a category so that the CHUNK boundary (the 16 KiB read
+    /// boundary) falls a fixed number of characters INSIDE the secret.
+    /// </summary>
+    /// <remarks>
+    /// The line prefix is the text that precedes the secret on the same line; for the environment
+    /// variable category it is empty because the pattern only matches a key that starts the line.
+    /// </remarks>
+    private static SecretVector ChunkSplitSecretVector(string category) => category switch
+    {
+        "ghp" => new SecretVector(
+            "    ", "ghp_" + new string('a', 36), 20,
+            "***REDACTED***", ["ghp_", new string('a', 36)]),
+        "gho" => new SecretVector(
+            "    ", "gho_" + new string('b', 36), 20,
+            "***REDACTED***", ["gho_", new string('b', 36)]),
+        "ghs" => new SecretVector(
+            "    ", "ghs_" + new string('c', 36), 20,
+            "***REDACTED***", ["ghs_", new string('c', 36)]),
+        "bearer" => new SecretVector(
+            "    Authorization: ", "Bearer Ab3CdEf.9-x_y", 12,
+            "Bearer ***REDACTED***", ["Ab3CdEf.9-x_y", "Bearer Ab3"]),
+        "envvar" => new SecretVector(
+            "", "MY_API_TOKEN=SuperSecretValue123", 20,
+            "MY_API_TOKEN=***REDACTED***", ["SuperSecretValue123", "SuperSecret"]),
+        "password" => new SecretVector(
+            "    ", "Password=s3cr3tValueAndMore", 12,
+            "Password=***REDACTED***", ["s3cr3tValue", "s3cr3t"]),
+        _ => throw new ArgumentOutOfRangeException(nameof(category), category, "Unknown secret category."),
+    };
+
+    /// <summary>
+    /// Builds the secret-bearing line of a category so that the per-LINE cap cuts it: the line is
+    /// longer than <see cref="MaxLogLineChars"/> and the secret straddles the cap boundary.
+    /// </summary>
+    private static SecretVector TruncationSecretVector(string category) => category switch
+    {
+        // The trigger survives in the retained prefix but the token does not: the unredactable-tail
+        // trim replaces everything from the trigger to the end of the retained line.
+        "ghp" => new SecretVector(
+            new string('x', MaxLogLineChars - 10), "ghp_" + new string('a', 36), 0,
+            "***REDACTED***", ["ghp_", new string('a', 36)]),
+        "gho" => new SecretVector(
+            new string('x', MaxLogLineChars - 10), "gho_" + new string('b', 36), 0,
+            "***REDACTED***", ["gho_", new string('b', 36)]),
+        "ghs" => new SecretVector(
+            new string('x', MaxLogLineChars - 10), "ghs_" + new string('c', 36), 0,
+            "***REDACTED***", ["ghs_", new string('c', 36)]),
+        // The value is cut INSIDE the value: the retained prefix ends with "Bearer Ab3", so the
+        // value-bounded pattern matches the retained fragment and redacts it.
+        "bearer" => new SecretVector(
+            new string('x', MaxLogLineChars - 24), "Authorization: Bearer Ab3CdEf.9-x_y", 0,
+            "Bearer ***REDACTED***", ["Ab3CdEf.9-x_y", "Bearer Ab3"]),
+        // The key must start the line for the environment-variable pattern to match.
+        "envvar" => new SecretVector(
+            "", "MY_API_TOKEN=SuperSecretValue" + new string('s', 9_000), 0,
+            "MY_API_TOKEN=***REDACTED***", ["SuperSecretValue"]),
+        "password" => new SecretVector(
+            new string('x', MaxLogLineChars - 20), "Password=s3cr3tValueAndMore", 0,
+            "Password=***REDACTED***", ["s3cr3tValue", "s3cr3t"]),
+        _ => throw new ArgumentOutOfRangeException(nameof(category), category, "Unknown secret category."),
+    };
+
+    /// <summary>
+    /// Asserts that neither the secret nor any of its fragments survives in a piece of output.
+    /// </summary>
+    private static void AssertNoSecretFragment(string output, SecretVector vector)
+    {
+        Assert.DoesNotContain(vector.Secret, output, StringComparison.Ordinal);
+        foreach (var forbidden in vector.Forbidden)
+            Assert.DoesNotContain(forbidden, output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Asserts that neither the secret nor any of its fragments survives in a piece of output, and
+    /// that the redacted form is present instead.
+    /// </summary>
+    private static void AssertSecretRedacted(string output, SecretVector vector)
+    {
+        AssertNoSecretFragment(output, vector);
+        Assert.Contains(vector.ExpectedRedacted, output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A secret split across a stream-chunk boundary must not leak: the parser carries the partial
+    /// line across the boundary and redacts the COMPLETE line, so neither the secret nor any
+    /// fragment of it reaches the retained failure or the fallback excerpt.
+    /// </summary>
+    /// <remarks>
+    /// Every supported secret category is covered: the three fixed-length GitHub token prefixes,
+    /// the HTTP <c>Bearer</c> header, a secret environment variable, and a <c>Password=</c>
+    /// connection-string fragment.
+    /// </remarks>
+    [Theory]
+    [InlineData("ghp")]
+    [InlineData("gho")]
+    [InlineData("ghs")]
+    [InlineData("bearer")]
+    [InlineData("envvar")]
+    [InlineData("password")]
+    public async Task FetchJobLogsAsync_SecretSplitAcrossChunkBoundary_IsRedacted(string category)
+    {
+        var vector = ChunkSplitSecretVector(category);
+        const string header = "Failed Tests.Secret.Case [1 ms]\n  Error Message:\n";
+
+        // ── Variant 1: the secret sits inside a parsed failure's error text ──
+        // The chunk boundary must fall SplitIntoSecret characters inside the secret.
+        var blockStart = StreamChunkBytes - header.Length - vector.Line.Length - vector.SplitIntoSecret;
+        Assert.True(blockStart > 0, "The failure block must start inside the first chunk.");
+
+        var blockLog = new StringBuilder();
+        AppendFillerTo(blockLog, blockStart);
+        blockLog.Append(header).Append(vector.Line).Append(vector.Secret)
+            .Append("\n  Stack Trace:\n    at Secret.Case()\n\n");
+        var blockText = blockLog.ToString();
+
+        // The boundary really falls inside the secret (sanity check on the geometry).
+        var secretStart = blockStart + header.Length + vector.Line.Length;
+        Assert.True(secretStart < StreamChunkBytes && StreamChunkBytes < secretStart + vector.Secret.Length,
+            "The chunk boundary must fall inside the secret.");
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(blockText));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var blockResult = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(blockResult);
+        var failure = Assert.Single(blockResult!.Failures);
+        AssertSecretRedacted(failure.Error, vector);
+        AssertNoSecretFragment(failure.StackTrace, vector);
+        AssertNoSecretFragment(failure.TestName, vector);
+
+        // ── Variant 2: the same secret in plain log text (no failure) → fallback excerpt ──
+        // The secret must land inside the retained TAIL window, otherwise the excerpt would drop
+        // it and the assertion would be vacuous.
+        var plainTotal = CiLogStreamParser.FallbackHeadChars + CiLogStreamParser.FallbackTailChars + 1_000;
+        var plainStart = plainTotal - vector.Line.Length - vector.Secret.Length - "end of log\n".Length;
+        Assert.True(plainStart > 0, "The secret line must start inside the log.");
+        var plainLog = new StringBuilder();
+        AppendFillerTo(plainLog, plainStart);
+        plainLog.Append(vector.Line).Append(vector.Secret).Append("\nend of log\n");
+        var plainText = plainLog.ToString();
+
+        // The secret really is inside the retained tail window.
+        var secretOffset = plainStart + vector.Line.Length;
+        Assert.True(secretOffset >= plainTotal - CiLogStreamParser.FallbackTailChars,
+            "The secret must lie inside the retained tail window of the fallback excerpt.");
+
+        var plainHandler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(plainText));
+        using var plainClient = new HttpClient(plainHandler, disposeHandler: false);
+        var plainService = CreateServiceForLogFetch();
+
+        var plainResult = await plainService.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", plainClient, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(plainResult);
+        Assert.Empty(plainResult!.Failures);
+        Assert.NotNull(plainResult.FallbackSnippet);
+        AssertSecretRedacted(plainResult.FallbackSnippet!, vector);
+    }
+
+    /// <summary>
+    /// A secret cut by the per-line cap must not leak: the retained prefix is redacted first and
+    /// truncated afterwards, so neither the secret nor any fragment of it reaches the retained
+    /// failure or the fallback excerpt.
+    /// </summary>
+    /// <remarks>
+    /// Every supported secret category is covered: the three fixed-length GitHub token prefixes
+    /// (whose unredactable tail must be trimmed), the HTTP <c>Bearer</c> header, a secret
+    /// environment variable, and a <c>Password=</c> connection-string fragment (whose values are
+    /// bounded by the end of the line, so a cut value is still fully redacted).
+    /// </remarks>
+    [Theory]
+    [InlineData("ghp")]
+    [InlineData("gho")]
+    [InlineData("ghs")]
+    [InlineData("bearer")]
+    [InlineData("envvar")]
+    [InlineData("password")]
+    public async Task FetchJobLogsAsync_SecretCutByLineCap_EveryCategoryIsRedacted(string category)
+    {
+        var vector = TruncationSecretVector(category);
+        var line = vector.Line + vector.Secret;
+
+        Assert.True(line.Length > MaxLogLineChars, "The line must exceed the per-line cap.");
+
+        // ── Variant 1: the secret sits inside a parsed failure's error text ──
+        const string header = "Failed Tests.Secret.Case [1 ms]\n  Error Message:\n";
+        var blockLog = new StringBuilder();
+        AppendFillerTo(blockLog, 101);
+        blockLog.Append(header).Append(line).Append("\n  Stack Trace:\n    at Secret.Case()\n\n");
+        var blockText = blockLog.ToString();
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(blockText));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var blockResult = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(blockResult);
+        var failure = Assert.Single(blockResult!.Failures);
+        AssertSecretRedacted(failure.Error, vector);
+        AssertNoSecretFragment(failure.StackTrace, vector);
+
+        // ── Variant 2: the same secret in plain log text (no failure) → fallback excerpt ──
+        var plainText = line + "\nend of log\n";
+        var plainHandler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(plainText));
+        using var plainClient = new HttpClient(plainHandler, disposeHandler: false);
+        var plainService = CreateServiceForLogFetch();
+
+        var plainResult = await plainService.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", plainClient, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(plainResult);
+        Assert.Empty(plainResult!.Failures);
+        Assert.NotNull(plainResult.FallbackSnippet);
+        AssertSecretRedacted(plainResult.FallbackSnippet!, vector);
+    }
+
+    /// <summary>
+    /// Failure blocks that straddle stream-chunk boundaries are still parsed as ONE failure each:
+    /// the VSTest header and the MTP header are themselves split by the boundary.
+    /// </summary>
+    /// <remarks>
+    /// Removal-proof: without incremental parsing across the boundary, the split header line would
+    /// never match and the corresponding failure would be lost entirely.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_LargeLog_VstestAndMtpBlocksSplitAtChunkBoundaries_AreParsed()
+    {
+        const string vstestBlock =
+            "Failed Tests.Chunk.Vstest [1 ms]\n"
+            + "  Error Message:\n"
+            + "    vstest chunk error\n"
+            + "  Stack Trace:\n"
+            + "    at Chunk.Vstest()\n"
+            + "\n";
+
+        const string mtpBlock =
+            "failed Tests.Chunk.Mtp (12ms)\n"
+            + "  from /repo/bin/Release/net10.0/Tests.dll (net10.0|x64)\n"
+            + "  mtp chunk error\n"
+            + "    at Chunk.Mtp()\n";
+
+        // The first block's HEADER line is split by the first chunk boundary (12 characters in), and
+        // the second block's header by the second boundary (20 characters in).
+        var (log, starts) = BuildLogWithBlocksSplitAtChunkBoundaries(
+        [
+            (vstestBlock, 12),
+            (mtpBlock, 20),
+        ]);
+
+        // The geometry is what makes this discriminating: each block's header really is cut by a
+        // chunk boundary — the last character of chunk N and the first character of chunk N+1 fall
+        // inside the header line, so a reader that never joined the two halves could never match
+        // the header.
+        var vstestBoundary = StreamChunkBytes;
+        Assert.Equal(starts[0] + 12, vstestBoundary);
+        Assert.Equal(vstestBlock[11], log[vstestBoundary - 1]);
+        Assert.Equal(vstestBlock[12], log[vstestBoundary]);
+        var mtpBoundary = StreamChunkBytes * 2;
+        Assert.Equal(starts[1] + 20, mtpBoundary);
+        Assert.Equal(mtpBlock[19], log[mtpBoundary - 1]);
+        Assert.Equal(mtpBlock[20], log[mtpBoundary]);
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result!.Failures.Count);
+
+        Assert.Equal("Tests.Chunk.Vstest", result.Failures[0].TestName);
+        Assert.Equal("vstest chunk error", result.Failures[0].Error);
+        Assert.Equal("at Chunk.Vstest()", result.Failures[0].StackTrace);
+
+        Assert.Equal("Tests.Chunk.Mtp", result.Failures[1].TestName);
+        Assert.Equal("mtp chunk error", result.Failures[1].Error);
+        Assert.Equal("at Chunk.Mtp()", result.Failures[1].StackTrace);
+
+        Assert.Null(result.Overflow);
+    }
+
+    /// <summary>
+    /// A single huge line is capped with an explicit truncation marker that counts DECODED
+    /// characters — not bytes.
+    /// </summary>
+    /// <remarks>
+    /// The error line is made of multi-byte characters (U+20AC, three UTF-8 bytes each), so a
+    /// byte-based count would report a completely different number than the decoded-character count
+    /// the contract specifies.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_HugeSingleLine_CappedWithDecodedCharacterCount()
+    {
+        const string euro = "€";
+        const string indent = "    ";
+        var errorLine = indent + string.Concat(Enumerable.Repeat(euro, 9_000));
+        var log = "Failed Tests.Huge.Line [1 ms]\n  Error Message:\n"
+            + errorLine
+            + "\n  Stack Trace:\n    at Huge.Line()\n\n";
+
+        // The line is 9,004 DECODED characters but 27,004 UTF-8 bytes — the two counts differ.
+        Assert.Equal(9_004, errorLine.Length);
+        Assert.True(Encoding.UTF8.GetByteCount(errorLine) > 27_000);
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal("Tests.Huge.Line", failure.TestName);
+
+        // The retained prefix is exactly the line cap in decoded characters, and the marker reports
+        // the DECODED characters that were dropped (9,004 - 8,192 = 812), not the bytes.
+        var expected = new string(euro[0], MaxLogLineChars - indent.Length)
+            + " …[truncated: 812 characters omitted]…";
+        Assert.Equal(expected, failure.Error);
+        Assert.DoesNotContain("truncated: 18,812 characters omitted", failure.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A failure block whose body grows past the per-block cap is truncated with an explicit marker
+    /// counting the omitted characters, and its retained fields stay inside the cap.
+    /// </summary>
+    /// <remarks>
+    /// The expected omitted count follows the documented accounting rule: a block line costs its
+    /// character count plus one for the line separator.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_FailureBlockBeyondBlockCap_IsTruncatedWithOmittedCount()
+    {
+        const string testName = "Tests.Big.Block";
+        var frames = new List<string>();
+        for (var i = 0; i < 1_000; i++)
+            frames.Add($"    at Big.Block.Frame{i:D4}()");
+
+        // The block runs to the end of the log (no blank line after the stack trace) so the
+        // truncation of the block body is reported on the extracted stack trace.
+        var log = $"Failed {testName} [1 ms]\n  Error Message:\n    big error\n  Stack Trace:\n"
+            + string.Join('\n', frames) + "\n";
+
+        // The retained/omitted split, following the documented per-line accounting.
+        var blockLines = new List<string> { "  Error Message:", "    big error", "  Stack Trace:" };
+        blockLines.AddRange(frames);
+        var used = 0;
+        var omitted = 0;
+        foreach (var line in blockLines)
+        {
+            var cost = line.Length + 1;
+            if (used + cost > MaxFailureBlockChars)
+            {
+                omitted += cost;
+                continue;
+            }
+
+            used += cost;
+        }
+
+        Assert.True(omitted > 0, "The block must exceed the per-block cap.");
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal(testName, failure.TestName);
+        Assert.Equal("big error", failure.Error);
+
+        var marker = $" …[truncated: {omitted:N0} characters omitted]…";
+        Assert.EndsWith(marker, failure.StackTrace, StringComparison.Ordinal);
+        var retained = failure.StackTrace[..^marker.Length];
+        Assert.True(retained.Length <= MaxFailureBlockChars,
+            $"The retained stack trace is {retained.Length} characters, past the {MaxFailureBlockChars}-character cap.");
+
+        // The dropped frames are really gone, and the retained ones are still there.
+        Assert.Contains("Frame0000", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("Frame0999", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The aggregate retained-character cap bounds the SUM of the retained failure fields, and the
+    /// overflow summary reports the omitted occurrences.
+    /// </summary>
+    /// <remarks>
+    /// The failure count is deliberately BELOW the retained-count cap, so only the aggregate
+    /// character cap can be the binding constraint.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_RetainedBytesCap_BoundsAggregateAndSummarisesOccurrences()
+    {
+        const int failureCount = 100;
+        const int errorChars = 3_000;
+        var failureLog = string.Concat(Enumerable.Range(0, failureCount).Select(i =>
+            $"Failed Tests.Agg.Case{i:D3} [1 ms]\n  Error Message:\n    {new string('e', errorChars)}\n  Stack Trace:\n    at Agg.Case{i:D3}()\n\n"));
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(failureLog));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result!.Overflow);
+
+        // The aggregate of the retained fields stays inside the cap...
+        var retainedChars = result.Failures.Sum(f => f.TestName.Length + f.Error.Length + f.StackTrace.Length);
+        Assert.True(retainedChars <= MaxRetainedFailureChars,
+            $"The retained fields total {retainedChars} characters, past the {MaxRetainedFailureChars}-character cap.");
+
+        // ...and the COUNT cap did not bind (fewer failures are retained than it allows).
+        Assert.True(result.Failures.Count > 0);
+        Assert.True(result.Failures.Count < MaxRetainedFailureCount,
+            $"The count cap bound instead of the aggregate character cap ({result.Failures.Count} retained).");
+
+        // The summary reports the omitted occurrences.
+        Assert.Contains($"{failureCount - result.Failures.Count} of {failureCount}", result.Overflow, StringComparison.Ordinal);
+        Assert.Contains("occurrence(s) were not retained", result.Overflow, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The retention bounds apply to the AGGREGATE of every failed job's log, not per job: a run
+    /// with several failing jobs cannot multiply them.
+    /// </summary>
+    /// <remarks>
+    /// Each job's log alone fits inside the count cap, but their SUM does not — so the aggregate
+    /// bound is the only thing that can bind here.
+    /// </remarks>
+    [Fact]
+    public async Task FetchJobLogsAsync_MultipleJobs_AggregateOverflowCountsAllJobsOccurrences()
+    {
+        const int jobCount = 4;
+        const int failuresPerJob = 60; // 4 x 60 = 240 > the 200 retained-failure cap
+
+        var jobsBody = JobsJson(jobCount, (111, "failure"), (222, "failure"), (333, "failure"), (444, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, uri =>
+        {
+            // Every job's log carries the same number of failures, but distinguishable names.
+            var jobId = uri.AbsolutePath.Contains("/111/", StringComparison.Ordinal) ? 1
+                : uri.AbsolutePath.Contains("/222/", StringComparison.Ordinal) ? 2
+                : uri.AbsolutePath.Contains("/333/", StringComparison.Ordinal) ? 3
+                : 4;
+            var log = string.Concat(Enumerable.Range(0, failuresPerJob).Select(i =>
+                $"Failed Tests.Job{jobId}.Case{i:D3} [1 ms]\n  Error Message:\n    boom {i}\n  Stack Trace:\n    at Job{jobId}.Case{i:D3}()\n\n"));
+            return LogResponse(log);
+        });
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result!.Overflow);
+
+        var totalParsed = jobCount * failuresPerJob;
+        Assert.Equal(MaxRetainedFailureCount, result.Failures.Count);
+        Assert.Contains($"{totalParsed - MaxRetainedFailureCount} of {totalParsed}", result.Overflow, StringComparison.Ordinal);
+        Assert.Contains("occurrence(s) were not retained", result.Overflow, StringComparison.Ordinal);
+
+        // The retained set spans the JOBS: the aggregate bound did not stop at the first job.
+        Assert.Contains(result.Failures, f => f.TestName.StartsWith("Tests.Job1.", StringComparison.Ordinal));
+        Assert.Contains(result.Failures, f => f.TestName.StartsWith("Tests.Job2.", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The overflow summary counts parsed failure OCCURRENCES, not distinct tests: a log that
+    /// repeats the SAME failing test is still counted once per occurrence.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_OverflowSummaryCountsOccurrencesNotDistinctTests()
+    {
+        const int extra = 5;
+        var retainedCap = MaxRetainedFailureCount;
+        var failureCount = retainedCap + extra;
+        var oneFailure = "Failed Tests.Same.Case [1 ms]\n  Error Message:\n    boom\n  Stack Trace:\n    at Same.Case()\n\n";
+        var failureLog = string.Concat(Enumerable.Repeat(oneFailure, failureCount));
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(failureLog));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Equal(MaxRetainedFailureCount, result!.Failures.Count);
+        Assert.NotNull(result.Overflow);
+
+        // One DISTINCT test, but 205 parsed occurrences: the summary must count occurrences.
+        Assert.Contains($"{extra} of {failureCount}", result.Overflow, StringComparison.Ordinal);
+        Assert.DoesNotContain($"of 1 ", result.Overflow, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An empty or blank job log yields an empty result with no fallback excerpt and no overflow
+    /// summary — the log-derived path must never invent content.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   \n  \n")]
+    public async Task FetchJobLogsAsync_EmptyOrBlankLog_ReturnsEmptyResultWithoutSnippet(string body)
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(body));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures);
+        Assert.Null(result.FallbackSnippet);
+        Assert.Null(result.Overflow);
+    }
+
+    /// <summary>
+    /// A log that ends in the MIDDLE of a line still delivers that line: the parser flushes the
+    /// final newline-less line when the stream ends.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_LogEndingMidLine_FlushesTrailingLine()
+    {
+        // The last line has no terminating newline and is cut mid-text.
+        var log = "Failed Tests.Tail.Case [1 ms]\n  Error Message:\n    tail err";
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal("Tests.Tail.Case", failure.TestName);
+        Assert.Equal("tail err", failure.Error);
+    }
+
+    /// <summary>
+    /// A log that ends INSIDE an open failure block still yields the failure parsed so far.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_LogEndingInsideFailureBlock_RetainsPartialFailure()
+    {
+        var log = "Failed Tests.Partial.Case [1 ms]\n  Error Message:\n    partial error\n  Stack Trace:\n    at Partial.Case()";
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal("Tests.Partial.Case", failure.TestName);
+        Assert.Equal("partial error", failure.Error);
+        Assert.Equal("at Partial.Case()", failure.StackTrace);
+    }
+
+    /// <summary>
+    /// A cancellation that lands in the MIDDLE of the streaming read propagates to the caller — the
+    /// log fetch must not swallow it and report a partial result.
+    /// </summary>
+    [Fact]
+    public async Task FetchJobLogsAsync_CancellationDuringStreamRead_Propagates()
+    {
+        using var cts = new CancellationTokenSource();
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var stream = new CancellingStream(
+            cts,
+            Encoding.UTF8.GetBytes("Failed Tests.A [1 ms]\n  Error Message:\n    x\n"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(stream));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, cts.Token));
     }
 
     // ── HandleCiFailureAsync integration (via MonitorMergeAsync / StartupScanAsync) ──
@@ -5065,6 +7580,159 @@ public sealed class CiMonitorServiceTests : IDisposable
     /// <summary>An empty log body (whitespace only), yielding an empty snippet.</summary>
     private static string EmptyLog() => "   ";
 
+    /// <summary>
+    /// Retention overflow visibility at the issue level: when more failures parse than the retention
+    /// bound allows, the created issues must SHOW the overflow summary next to the retained failure —
+    /// it must never be hidden in an unused snippet.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_RetentionOverflow_SurfacesSummaryInIssues()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var retainedCap = CiLogStreamParser.MaxRetainedFailureCount;
+        var failureCount = retainedCap + 1;
+        var failureLog = string.Concat(Enumerable.Range(0, failureCount).Select(i =>
+            $"Failed Tests.Overflow.Case{i:D4} [1 ms]\n  Error Message:\n    boom {i}\n  Stack Trace:\n    at Case{i:D4}()\n\n"));
+
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => failureLog);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // One issue per RETAINED failure, and every issue carries the overflow summary.
+        Assert.Equal(CiLogStreamParser.MaxRetainedFailureCount, issueStore.Issues.Count);
+        Assert.All(issueStore.Issues.Values, issue =>
+        {
+            Assert.Contains("Test: Tests.Overflow.Case", issue.Description, StringComparison.Ordinal);
+            Assert.Contains("1 of 201", issue.Description, StringComparison.Ordinal);
+            Assert.Contains("occurrence(s) were not retained", issue.Description, StringComparison.Ordinal);
+            // The summary sits inside the description the reader sees, not in a snippet.
+            Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description, StringComparison.Ordinal);
+        });
+    }
+
+    /// <summary>
+    /// The AGGREGATE retained-character cap is visible in the produced issues: when the retained
+    /// failures' fields hit the character budget, the created issues must SHOW the overflow summary
+    /// next to the retained failure.
+    /// </summary>
+    /// <remarks>
+    /// The failure count is deliberately BELOW the retained-count cap, so only the aggregate
+    /// character cap can be the binding constraint.
+    /// </remarks>
+    [Fact]
+    public async Task MonitorMergeAsync_AggregateBytesOverflow_SurfacesSummaryInIssues()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        const int failureCount = 100;
+        const int errorChars = 3_000;
+        var failureLog = string.Concat(Enumerable.Range(0, failureCount).Select(i =>
+            $"Failed Tests.Agg.Issue{i:D3} [1 ms]\n  Error Message:\n    {new string('e', errorChars)}\n  Stack Trace:\n    at Agg.Issue{i:D3}()\n\n"));
+
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => failureLog);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        Assert.NotEmpty(issueStore.Issues);
+        Assert.All(issueStore.Issues.Values, issue =>
+        {
+            Assert.Contains("Test: Tests.Agg.Issue", issue.Description, StringComparison.Ordinal);
+            Assert.Contains("occurrence(s) were not retained", issue.Description, StringComparison.Ordinal);
+            // The summary names the aggregate character bound that actually bound.
+            Assert.Contains($"{MaxRetainedFailureChars:N0} characters per run", issue.Description, StringComparison.Ordinal);
+        });
+    }
+
+    /// <summary>
+    /// The aggregate bound applies to the WHOLE RUN across every failed job, and the overflow
+    /// summary visible in the issues counts the occurrences of ALL jobs.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_MultipleJobs_AggregateOverflowSummaryCountsEveryJob()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        const int jobCount = 4;
+        const int failuresPerJob = 60; // 4 x 60 = 240 > the 200 retained-failure cap
+        const int totalParsed = jobCount * failuresPerJob;
+
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JsonSerializer.Serialize(new
+            {
+                total_count = jobCount,
+                jobs = new[] { 111, 222, 333, 444 }.Select(id => new { id, conclusion = "failure" }).ToArray(),
+            }),
+            jobId =>
+            {
+                var log = string.Concat(Enumerable.Range(0, failuresPerJob).Select(i =>
+                    $"Failed Tests.Job{jobId}.Case{i:D3} [1 ms]\n  Error Message:\n    boom {i}\n  Stack Trace:\n    at Job{jobId}.Case{i:D3}()\n\n"));
+                return log;
+            });
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        Assert.NotEmpty(issueStore.Issues);
+        Assert.All(issueStore.Issues.Values, issue =>
+        {
+            // The summary counts EVERY job's occurrences, not just the first job's.
+            Assert.Contains($"{totalParsed - MaxRetainedFailureCount} of {totalParsed}", issue.Description, StringComparison.Ordinal);
+            Assert.Contains("occurrence(s) were not retained", issue.Description, StringComparison.Ordinal);
+        });
+    }
+
+    /// <summary>
+    /// The per-line cap is visible in the produced issue: an oversized failure line is truncated with
+    /// an explicit marker inside the issue's error text, so the reader can see that it was cut.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_OversizedFailureLine_TruncationMarkerVisibleInIssue()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var hugeLine = "    " + new string('E', 9_000);
+        var failureLog = "Failed Tests.Huge.Issue [1 ms]\n  Error Message:\n" + hugeLine
+            + "\n  Stack Trace:\n    at Huge.Issue()\n\n";
+
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => failureLog);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: Tests.Huge.Issue", issue.Title);
+        // The truncation marker and its decoded-character count are visible in the issue.
+        var omittedChars = hugeLine.Length - MaxLogLineChars;
+        Assert.Contains($"truncated: {omittedChars:N0} characters omitted", issue.Description, StringComparison.Ordinal);
+        // The truncated tail really is gone from the issue text. The run of 'E's that survives is
+        // bounded by the line cap (the line's own indent is part of the cap), so the cap itself is
+        // the discriminator — a removed cap would leave the whole 9,000-character run in the issue.
+        var longestRun = 0;
+        var currentRun = 0;
+        foreach (var ch in issue.Description)
+        {
+            currentRun = ch == 'E' ? currentRun + 1 : 0;
+            if (currentRun > longestRun)
+                longestRun = currentRun;
+        }
+
+        Assert.Equal(MaxLogLineChars - "    ".Length, longestRun);
+        Assert.True(longestRun < hugeLine.Length, "The oversized line must have been truncated.");
+    }
+
     [Fact]
     public async Task MonitorMergeAsync_NoOutputLogWithTestFailures_CreatesLogDerivedIssues()
     {
@@ -5091,6 +7759,10 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Equal(EventType.CiFailed, evt.Type);
     }
 
+    /// <summary>
+    /// The log-fallback issue carries the bounded head+tail excerpt under the NEW label — the old
+    /// "Log output (last 500 chars)" label is gone.
+    /// </summary>
     [Fact]
     public async Task MonitorMergeAsync_NoOutputLogNoTestsWithSnippet_CreatesFallbackIssue()
     {
@@ -5107,7 +7779,11 @@ public sealed class CiMonitorServiceTests : IDisposable
         // One fallback issue: no tests parsed but the log yielded a snippet.
         var issue = Assert.Single(issueStore.Issues.Values);
         Assert.Equal("CI failure: build", issue.Title);
-        Assert.Contains("Log output (last 500 chars):", issue.Description);
+        // The literal label is pinned here (not the production constant) so the rendered format
+        // cannot drift silently.
+        Assert.Contains("Log output (first 2000 and last 2000 chars):", issue.Description, StringComparison.Ordinal);
+        // The obsolete last-500 label is gone.
+        Assert.DoesNotContain("last 500", issue.Description, StringComparison.Ordinal);
         Assert.Contains("Passed!", issue.Description);
         Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
         Assert.Equal("goal-1", issue.SourceGoalId);
@@ -5240,6 +7916,50 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     /// <summary>
+    /// Overflow survives the DEDUP path too: when a matching open issue already exists, the
+    /// log-derived dedup-append block carries BOTH the retained failure and the overflow summary,
+    /// stamped with exactly the service clock's time.
+    /// </summary>
+    /// <remarks>
+    /// Removal-proof: if the summary were only rendered into the issue DESCRIPTION and not into the
+    /// dedup append, the updated issue (which keeps its original description) would lose the
+    /// omitted-occurrence count entirely — the reader would see a retained failure with no hint that
+    /// others were dropped.
+    /// </remarks>
+    [Fact]
+    public async Task MonitorMergeAsync_LogDerivedDedup_OverflowSummaryAppendedWithExactClockStamp()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var failureCount = MaxRetainedFailureCount + 1;
+        var failureLog = string.Concat(Enumerable.Range(0, failureCount).Select(i =>
+            $"Failed Tests.Dedup.Overflow{i:D4} [1 ms]\n  Error Message:\n    boom {i}\n  Stack Trace:\n    at Dedup.Overflow{i:D4}()\n\n"));
+
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => failureLog);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+
+        // The FIRST retained failure gets an existing open issue to append to; the others are new.
+        SeedExistingIssue(issueStore, "CI failure: Tests.Dedup.Overflow0000", "Original dedup description.");
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var existing = issueStore.Issues["issue-existing"];
+        Assert.StartsWith("Original dedup description.", existing.Description);
+        // The exact clock stamp, then the retained failure, then the overflow summary.
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\nTest: Tests.Dedup.Overflow0000\n", existing.Description);
+        Assert.Contains("Error: boom 0", existing.Description);
+        Assert.Contains("1 of 201", existing.Description, StringComparison.Ordinal);
+        Assert.Contains("occurrence(s) were not retained", existing.Description, StringComparison.Ordinal);
+        // The summary is really part of the APPENDED block, and the CI run link closes it.
+        Assert.EndsWith("CI run: https://github.com/org/test-repo/actions/runs/123", existing.Description);
+        Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", existing.Description);
+    }
+
+    /// <summary>
     /// Log-fallback dedup (<c>BuildLogFallbackDedupAppend</c>): same routing shape as
     /// <see cref="MonitorMergeAsync_NoOutputLogNoTestsWithSnippet_CreatesFallbackIssue"/>, but a
     /// matching open issue already exists, so no issue is created and the existing one gains a
@@ -5264,7 +7984,10 @@ public sealed class CiMonitorServiceTests : IDisposable
         var issue = Assert.Single(issueStore.Issues.Values);
         Assert.Equal("issue-existing", issue.Id);
         Assert.StartsWith("Original fallback description.", issue.Description);
-        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\nLog output (last 500 chars):\n", issue.Description);
+        // The exact clock stamp, then the NEW head+tail excerpt label (the old "last 500" label
+        // would be a different string, so this assertion is discriminating).
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\nLog output (first 2000 and last 2000 chars):\n", issue.Description);
+        Assert.DoesNotContain("last 500", issue.Description, StringComparison.Ordinal);
         Assert.Contains("Passed!", issue.Description);
         Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
         Assert.Single(handler.JobLogHits);
