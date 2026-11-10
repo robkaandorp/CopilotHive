@@ -55,7 +55,8 @@ internal sealed class ComposerAgentService(
     IReadOnlyList<ModelEntry> subAgentModels,
     string? additionalImagesRoot = null,
     ComposerUserState? userState = null,
-    ComposerToolAuthorizationGate? toolAuthorizationGate = null) : IAsyncDisposable
+    ComposerToolAuthorizationGate? toolAuthorizationGate = null,
+    ProviderGate? providerGate = null) : IAsyncDisposable
 {
     private string? _model = string.IsNullOrWhiteSpace(model) ? null : model;
     private int _maxContextTokens = maxContextTokens;
@@ -82,6 +83,89 @@ internal sealed class ComposerAgentService(
     private readonly bool _subAgentsEnabled = subAgentsEnabled;
     private readonly string? _additionalImagesRoot = additionalImagesRoot;
     private readonly ComposerUserState? _userState = userState;
+
+    /// <summary>
+    /// The identity-bound provider gate (<c>null</c> for the legacy singleton and for direct test construction:
+    /// unchanged behaviour). It is consulted at TWO levels, always BEFORE any teardown, token probe, client creation or
+    /// network call, and each consultation re-reads the CURRENT stored account (never a construction-time principal):
+    /// <list type="bullet">
+    /// <item><b>Selection level</b> (<see cref="EnforceProviderGateAsync"/>): the primary model together with the
+    /// explicit compaction model, at the very start of connect, first-selection and primary switch — so a denied
+    /// operation touches nothing (no teardown, no scalar mutation, no publication).</item>
+    /// <item><b>Per-client level</b> (<see cref="CreateClientAsync"/> / <see cref="CreateClient"/>): EVERY chat client this
+    /// service creates — primary, compaction and every sub-agent model client — is gated for ITS OWN model at creation
+    /// time. This is the single choke point: <see cref="CreateRawClient"/> (the only call into the chat-client factory)
+    /// is reachable only through those two methods, so a denied identity can never obtain a Copilot-backed client even if
+    /// its standing changed after the selection-level check.</item>
+    /// </list>
+    /// A denial surfaces as <see cref="ProviderNotEligibleException"/>.
+    /// </summary>
+    private readonly ProviderGate? _providerGate = providerGate;
+
+    /// <summary>Selection-level gate: throws <see cref="ProviderNotEligibleException"/> when <paramref name="model"/> (plus the explicit compaction model) is not eligible.</summary>
+    private async Task EnforceProviderGateAsync(string model, CancellationToken ct)
+    {
+        if (_providerGate is null) return;
+
+        var eligibility = await _providerGate(model, _compactionModel, ct);
+        if (!eligibility.IsAllowed)
+            throw new ProviderNotEligibleException(eligibility.Reason);
+    }
+
+    /// <summary>
+    /// OPERATION-LEVEL freshness gate for operations that invoke the model through the CACHED clients (a send / stream
+    /// turn, a manual full or partial compaction). It re-reads the CURRENT stored account through the same
+    /// <see cref="ProviderGate"/> (credential-free projection) and evaluates the runtime's ACTUAL primary together
+    /// with its explicit compaction model, so a disabled or deleted account — or an identity that is no longer eligible
+    /// — is denied BEFORE the cached client is invoked, with no client creation and no token probe. It is a no-op
+    /// (no directory read, no denial) for an ungated service (legacy singleton / open mode / direct construction) and
+    /// for a model-less shell. Deliberately NOT called on the "not connected" pre-admission refusals: only operations
+    /// that would really invoke a model revalidate.
+    /// </summary>
+    /// <exception cref="ProviderNotEligibleException">The current account is not eligible to use this runtime's models.</exception>
+    internal async Task EnforceOperationGateAsync(CancellationToken ct)
+    {
+        if (_providerGate is null || _model is not { } model) return;
+
+        await EnforceProviderGateAsync(model, ct);
+    }
+
+    /// <summary>
+    /// Per-client gate + creation. The gate is evaluated for exactly <paramref name="modelId"/> (as the client's primary
+    /// model, no compaction) BEFORE the chat-client factory — and therefore any token probe or network call — runs.
+    /// </summary>
+    private async Task<IChatClient> CreateClientAsync(string modelId, CancellationToken ct)
+    {
+        if (_providerGate is not null)
+        {
+            var eligibility = await _providerGate(modelId, null, ct);
+            if (!eligibility.IsAllowed)
+                throw new ProviderNotEligibleException(eligibility.Reason);
+        }
+
+        return CreateRawClient(modelId);
+    }
+
+    /// <summary>
+    /// Synchronous per-client gate + creation, for the sub-agent <c>ClientFactory</c> whose contract is synchronous.
+    /// The (async) fresh account read is run on the thread pool and joined, so it can never deadlock on a captured
+    /// synchronization context; an ungated service (legacy / direct construction) takes no extra work at all.
+    /// </summary>
+    private IChatClient CreateClient(string modelId)
+    {
+        if (_providerGate is not null)
+        {
+            var gate = _providerGate;
+            var eligibility = Task.Run(() => gate(modelId, null, CancellationToken.None)).GetAwaiter().GetResult();
+            if (!eligibility.IsAllowed)
+                throw new ProviderNotEligibleException(eligibility.Reason);
+        }
+
+        return CreateRawClient(modelId);
+    }
+
+    /// <summary>The ONLY call into the chat-client factory. Never call it directly: use <see cref="CreateClientAsync"/> / <see cref="CreateClient"/>.</summary>
+    private IChatClient CreateRawClient(string modelId) => (_chatClientFactory ?? ChatClientFactory.Create)(modelId);
 
     /// <summary>
     /// THIS runtime's tool-authorization boundary (the central
@@ -347,8 +431,6 @@ internal sealed class ComposerAgentService(
         }
     }
 
-    private IChatClient CreateClient(string modelId) => (_chatClientFactory ?? ChatClientFactory.Create)(modelId);
-
     private string GetSessionFilePath() => ComposerUserState.SessionFilePath(_stateDir, _userState);
 
     private string RegistryId => ComposerUserState.RegistryId(_userState);
@@ -522,6 +604,10 @@ internal sealed class ComposerAgentService(
         // non-null DTO.
         var model = _model;
 
+        // Identity-bound provider gate: BEFORE the log, the teardown and any client creation, so a denial
+        // leaves the prior connection (if any) and every scalar untouched.
+        await EnforceProviderGateAsync(model, ct);
+
         // PRE-TEARDOWN failure boundary: this log is the last fallible operation before the
         // old connection is torn down. If it throws, ConnectAsync exits with the prior
         // connection AND its registry entry PRESERVED — no rollback runs.
@@ -534,9 +620,9 @@ internal sealed class ComposerAgentService(
             // so the registry matches the now-disconnected state.
             await DisposeClientsAndClearStateAsync();
 
-            _chatClient = CreateClient(model);
+            _chatClient = await CreateClientAsync(model, ct);
             if (!string.IsNullOrEmpty(_compactionModel))
-                _compactionChatClient = CreateClient(_compactionModel);
+                _compactionChatClient = await CreateClientAsync(_compactionModel, ct);
 
             // Original-admin legacy claim (no-op for legacy construction and for every identity that
             // cannot claim). A failure propagates OUT of ConnectAsync via the rollback below — it is
@@ -673,6 +759,9 @@ internal sealed class ComposerAgentService(
     {
         ct.ThrowIfCancellationRequested();
 
+        // Identity-bound provider gate: BEFORE the snapshot, the log and the teardown — a denied switch touches nothing.
+        await EnforceProviderGateAsync(selection.Model, ct);
+
         // PRE-CALL SCALAR SNAPSHOT: the four scalars the switch mutates, captured BEFORE the
         // opening log and the teardown so a PRE-COMMIT failure (apply or client/agent creation)
         // can restore them exactly. _session is deliberately NOT captured — a failed switch
@@ -700,9 +789,9 @@ internal sealed class ComposerAgentService(
             // scalars, which the catch below reverts wholesale.
             ApplyModelScalars(selection);
 
-            _chatClient = CreateClient(selection.Model);
+            _chatClient = await CreateClientAsync(selection.Model, ct);
             if (!string.IsNullOrEmpty(_compactionModel))
-                _compactionChatClient = CreateClient(_compactionModel);
+                _compactionChatClient = await CreateClientAsync(_compactionModel, ct);
 
             // Session is preserved — do NOT reload from file.
             await RecreateAgentAsync();
@@ -791,6 +880,11 @@ internal sealed class ComposerAgentService(
     {
         // 1. Validate ONCE (one snapshot) → a ValidatedModelSelection.
         var selection = ValidateAvailableModel(newModel, reasoningEffort);
+
+        // 1b. Identity-bound provider gate: a denied first selection mutates nothing and publishes nothing
+        //     (it fails BEFORE the publication boundary), so the shell stays disconnected and no stale
+        //     connected/loaded state is cached.
+        await EnforceProviderGateAsync(selection.Model, ct);
 
         // 2. Cancellation checkpoint AFTER validation and BEFORE any scalar mutation/callback.
         ct.ThrowIfCancellationRequested();

@@ -162,7 +162,7 @@ public sealed class ComposerUserRuntime
 /// <para>
 /// NO GLOBAL COORDINATOR: this class never touches <see cref="LlmConnectionCoordinator"/> instances nor
 /// <see cref="UserService.TokenAvailable"/>; it only evaluates the coordinator's pure deferral predicate
-/// through <see cref="ComposerFactory.ShouldDeferConnect"/> over each runtime's CONSTRUCTION-CAPTURED
+/// through <see cref="ComposerFactory.DecideConnectAsync"/> (identity-bound eligibility first, then <see cref="ComposerFactory.ShouldDeferConnect"/>) over each runtime's CONSTRUCTION-CAPTURED
 /// configuration (<see cref="ComposerUserRuntime.Configuration"/>), so a configuration reload can never
 /// change the deferral decision of an already-constructed runtime. A deferred runtime is connected by an
 /// explicit, awaitable <see cref="ConnectAsync"/>.
@@ -356,8 +356,19 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
                 : null;
         }
 
-        // ── 2. Token probe OUTSIDE the lock: a blocking probe must not stall unrelated users ──
-        if (deferred is not null && !_factory.ShouldDeferConnect(deferred.Configuration))
+        // A Deferred runtime that ALREADY connected through the actor's first-selection path (an eligible
+        // selection) is not a connect candidate: starting a second connect would tear down the live connection.
+        // JoinAsync reports its ACTUAL state (Connected), see ReconcileStatus.
+        if (deferred is { Composer.IsConnected: true })
+            deferred = null;
+
+        // ── 2. Eligibility + token probe OUTSIDE the lock: a blocking probe must not stall unrelated users ──
+        // The identity-bound eligibility is re-read FIRST (current account, the runtime's ACTUAL committed primary
+        // selection and its construction-captured explicit compaction model — never mutable global config); a
+        // denied non-original runtime never reaches the token probe and can never recover merely because the
+        // original admin's token became available.
+        if (deferred is not null
+            && !(await _factory.DecideConnectAsync(deferred.Configuration, userId, deferred.Composer.CurrentModel, ct)).Defer)
         {
             // ── 3. Revalidate under the lock: only the SAME entry, still cached, not Removing, not shut
             //      down, and still settled on the SAME Deferred runtime may start the shared connect. ──
@@ -517,8 +528,18 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
 
         return settled.Status == ComposerRuntimeStatus.Failed
             ? ComposerRuntimeResult.Faulted(settled.Failure!)
-            : ComposerRuntimeResult.Granted(settled.Status, settled.Runtime!);
+            : ComposerRuntimeResult.Granted(ReconcileStatus(settled), settled.Runtime!);
     }
+
+    /// <summary>
+    /// The status a caller observes for a settled operation. A runtime settled as Deferred (or as a model-less shell) can later connect through
+    /// the actor's first-selection path (an eligible model selection); its status is then DERIVED from the actual
+    /// connection so a cached Deferred is never reported for a live runtime. Every other status is returned as is.
+    /// </summary>
+    private static ComposerRuntimeStatus ReconcileStatus(Settled settled) =>
+        settled is { Status: ComposerRuntimeStatus.Deferred or ComposerRuntimeStatus.DisconnectedShell, Runtime.Composer.IsConnected: true }
+            ? ComposerRuntimeStatus.Connected
+            : settled.Status;
 
     /// <summary>Re-reads the stored account; <c>null</c> when it is still activated, enabled and role-valid.</summary>
     private async Task<ComposerRuntimeRefusal?> RecheckAsync(int userId, CancellationToken ct)
@@ -554,6 +575,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         // from, so the two can never drift apart: every later deferral decision for this runtime reads
         // these captured values, never a live configuration lookup.
         ComposerBuildResult? build = null;
+        ComposerUserRuntime? constructed = null;
         try
         {
             state = principal.IsOriginal
@@ -567,6 +589,7 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
             build = _factory.CreateForUser(state, attachments, subscriber, principal);
             var composer = build.Composer;
             var runtime = new ComposerUserRuntime(state, composer, attachments, subscriber, build.Configuration);
+            constructed = runtime;
 
             // A Composer without a resolved model is an explicit disconnected shell: nothing to connect.
             if (composer.StartupDefaultModel is null)
@@ -574,13 +597,22 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
 
             // Deferred: the gate says no usable token yet. An explicit state — not a failure and not a
             // started connect; the manager's awaitable ConnectAsync completes it later.
-            if (_factory.ShouldDeferConnect(build.Configuration))
+            // The identity-bound eligibility is decided FIRST (fresh account read, BEFORE any token probe, client
+            // creation or network call): a denied non-original runtime settles Deferred without a throw.
+            if ((await _factory.DecideConnectAsync(build.Configuration, principal.UserId, composer.StartupDefaultModel, entry.Cts.Token)).Defer)
                 return new Settled(ComposerRuntimeStatus.Deferred, runtime, null);
 
             // Migration / session load run inside ConnectAsync and fail closed (never delete history).
             // The token is the ENTRY's, not any caller's: only removal cancels this connect.
             await _connect(composer, entry.Cts.Token);
             return new Settled(ComposerRuntimeStatus.Connected, runtime, null);
+        }
+        catch (ProviderNotEligibleException) when (constructed is not null && !entry.Cts.IsCancellationRequested)
+        {
+            // The identity-bound gate inside the connect denied the selection or a client (e.g. the account was
+            // disabled since the eligibility probe). It fires before any provider client is created: settle as the
+            // typed Deferred outcome instead of failing and destroying the runtime.
+            return new Settled(ComposerRuntimeStatus.Deferred, constructed, null);
         }
         catch (Exception ex)
         {
@@ -600,6 +632,12 @@ public sealed class ComposerRuntimeManager : IAsyncDisposable
         {
             await _connect(runtime.Composer, entry.Cts.Token);
             return new Settled(ComposerRuntimeStatus.Connected, runtime, null);
+        }
+        catch (ProviderNotEligibleException) when (!entry.Cts.IsCancellationRequested)
+        {
+            // Denied by the identity-bound gate before any provider client was created: the runtime stays intact and
+            // Deferred (a typed, safe outcome); a later ConnectAsync re-evaluates the CURRENT account.
+            return new Settled(ComposerRuntimeStatus.Deferred, runtime, null);
         }
         catch (Exception ex)
         {

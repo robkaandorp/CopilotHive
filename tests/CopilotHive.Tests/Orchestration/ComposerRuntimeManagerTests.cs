@@ -116,18 +116,25 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     {
         private readonly SqliteConnection _keeper;
         private readonly DbContextOptions<CopilotHiveDbContext> _options;
+        public CredentialReadObserver CredentialReads { get; } = new();
 
         public MemoryDbFactory()
         {
             var connectionString = $"Data Source=runtime-{Guid.NewGuid():N};Mode=Memory;Cache=Shared;Pooling=False";
             _keeper = new SqliteConnection(connectionString);
             _keeper.Open();
-            _options = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connectionString).Options;
+            _options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(connectionString).AddInterceptors(CredentialReadObserver.Interceptor).Options;
             using var ctx = CreateDbContext();
             ctx.Database.EnsureCreated();
         }
 
-        public CopilotHiveDbContext CreateDbContext() => new(_options);
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var context = new CopilotHiveDbContext(_options);
+            CredentialReadObserver.Bind(context, CredentialReads);
+            return context;
+        }
         public void Dispose() => _keeper.Dispose();
     }
 
@@ -218,6 +225,17 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
         var invited = await _users.ActivateInvitationAsync("second", "200", null, null, null, Ct);
         return (ActingUserPrincipal.ForActivatedAccount(original.Id, "100", UserRole.Admin, true, isOriginal: true),
                 ActingUserPrincipal.ForActivatedAccount(invited.Id, "200", secondRole, true, isOriginal: false));
+    }
+
+    /// <summary>
+    /// Same two accounts as <see cref="TwoUsersAsync"/> but returned as (ORIGINAL admin, invited Member). Tests whose
+    /// subject is the legacy Copilot token-deferral/recovery behaviour use the ORIGINAL identity as the runtime
+    /// under test: the non-original identity is, by the fail-closed gate, never allowed to use the original token.
+    /// </summary>
+    private async Task<(ActingUserPrincipal Original, ActingUserPrincipal Invited)> OriginalAsSecondAsync(UserRole invitedRole = UserRole.Member)
+    {
+        var (original, invited) = await TwoUsersAsync(invitedRole);
+        return (original, invited);
     }
 
     private Task<ComposerRuntimeResult> Request(ComposerRuntimeManager manager, ActingUserPrincipal principal, CancellationToken? cancellationToken = null)
@@ -469,6 +487,8 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     [InlineData(true)]
     public async Task DisabledPrincipal_IsRefusedWithoutCreatingAnything(bool authEnabled)
     {
+        _provider = "copilot";
+        CountTokenProbes();
         await TwoUsersAsync();
         var sp = BuildProvider(authEnabled);
         Assert.Equal(authEnabled, sp.GetRequiredService<HiveAuthMode>().AuthEnabled);
@@ -479,8 +499,10 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 
         Assert.False(result.IsGranted);
         Assert.Null(result.Runtime);
+        Assert.Equal(ComposerRuntimeStatus.Refused, result.Status);
         Assert.Equal(ComposerRuntimeRefusal.DisabledAccount, result.Refusal);
         Assert.Equal(0, _clientCreations);
+        Assert.Equal(0, Volatile.Read(ref _tokenProbes));
         Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll());
         Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
     }
@@ -490,6 +512,8 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     [InlineData(true)]
     public async Task UndefinedRolePrincipal_IsRefusedWithoutCreatingAnything(bool authEnabled)
     {
+        _provider = "copilot";
+        CountTokenProbes();
         var (first, _) = await TwoUsersAsync();
         var sp = BuildProvider(authEnabled);
         Assert.Equal(authEnabled, sp.GetRequiredService<HiveAuthMode>().AuthEnabled);
@@ -505,8 +529,10 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 
         Assert.False(result.IsGranted);
         Assert.Null(result.Runtime);
+        Assert.Equal(ComposerRuntimeStatus.Refused, result.Status);
         Assert.Equal(ComposerRuntimeRefusal.UndefinedRole, result.Refusal);
         Assert.Equal(0, _clientCreations);
+        Assert.Equal(0, Volatile.Read(ref _tokenProbes));
         Assert.Empty(sp.GetRequiredService<LlmSessionRegistry>().GetAll());
         Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
     }
@@ -516,6 +542,8 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
     [InlineData(true)]
     public async Task SyntheticLocalOperator_IsRefusedRegardlessOfAuthMode_AndNeverCreatesARuntime(bool authEnabled)
     {
+        _provider = "copilot";
+        CountTokenProbes();
         await TwoUsersAsync();
         var sp = BuildProvider(authEnabled);
         Assert.Equal(authEnabled, sp.GetRequiredService<HiveAuthMode>().AuthEnabled);
@@ -526,15 +554,19 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
         var result = await Request(manager, ActingUserPrincipal.LocalOperator());
 
         Assert.False(result.IsGranted);
+        Assert.Equal(ComposerRuntimeStatus.Refused, result.Status);
         Assert.Equal(ComposerRuntimeRefusal.LocalOperator, result.Refusal);
         Assert.Null(result.Runtime);
         Assert.Equal(0, _clientCreations);
+        Assert.Equal(0, Volatile.Read(ref _tokenProbes));
         Assert.False(Directory.Exists(Path.Combine(StateDir, "composer")));
     }
 
     [Fact]
     public async Task PrincipalWithoutActivatedAccount_IsRefused()
     {
+        _provider = "copilot";
+        CountTokenProbes();
         await TwoUsersAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
@@ -542,8 +574,11 @@ public sealed partial class ComposerRuntimeManagerTests : IAsyncLifetime
 
         var result = await Request(manager, ghost);
 
+        Assert.Equal(ComposerRuntimeStatus.Refused, result.Status);
         Assert.Equal(ComposerRuntimeRefusal.UnknownAccount, result.Refusal);
+        Assert.Null(result.Runtime);
         Assert.Equal(0, _clientCreations);
+        Assert.Equal(0, Volatile.Read(ref _tokenProbes));
     }
 
     // ── Re-check on every call ──

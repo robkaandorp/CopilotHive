@@ -501,7 +501,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         ComposerEventSubscriber? eventSubscriber = null,
         IEventBus? eventBus = null,
         ComposerUserState? userState = null,
-        ActingUserPrincipal? principal = null)
+        ActingUserPrincipal? principal = null,
+        ProviderGate? providerGate = null)
     {
         // Constructor normalization: null/whitespace model ⇒ null (no model configured).
         // The Composer then registers as a disconnected shell — no client, IsConnected false.
@@ -608,7 +609,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             subAgentModels,
             attachmentService?.AttachmentsRootPath,
             _userState,
-            _toolAuthorizationGate);
+            _toolAuthorizationGate,
+            providerGate);
 
         _handleSubAgentChanged = info => OnSubAgentChanged?.Invoke(info);
         _agentService.OnSubAgentChanged += _handleSubAgentChanged;
@@ -693,6 +695,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             _manualCompactionUsage.Add);
         _actor.Start();
     }
+
+    /// <summary>
+    /// The model this Composer is CURRENTLY selected on, committed in runtime state (<c>null</c> for a model-less
+    /// shell). It follows every committed selection (first-selection connect or switch) and is never re-read from
+    /// mutable global configuration, so identity-bound provider decisions evaluate what the runtime really uses.
+    /// </summary>
+    internal string? CurrentModel => _agentService.Model;
 
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
     public bool IsConnected => _agentService.IsConnected;

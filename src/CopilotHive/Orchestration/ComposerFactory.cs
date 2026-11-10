@@ -48,6 +48,14 @@ internal sealed record ComposerConstructionSnapshot
     public string? CompactionModel { get; }
 }
 
+/// <summary>
+/// The settled connect decision for one per-user runtime: whether its connect must stay DEFERRED, and the typed
+/// <see cref="ProviderEligibility"/> that decided it. A denied identity is always deferred.
+/// </summary>
+/// <param name="Defer">Whether the runtime's connect must not start now.</param>
+/// <param name="Eligibility">The identity-bound provider verdict this decision was built on.</param>
+internal readonly record struct ConnectDecision(bool Defer, ProviderEligibility Eligibility);
+
 /// <summary>One built <see cref="Composer"/> together with the construction inputs it was built from.</summary>
 /// <param name="Composer">The constructed Composer.</param>
 /// <param name="Configuration">The construction-captured configuration (the same values the Composer was built with).</param>
@@ -110,6 +118,86 @@ public sealed class ComposerFactory
             _isTokenAvailable,
             _providerOf,
             _sp.GetService<ILogger<ComposerRuntimeManager>>());
+    }
+
+    private bool AuthEnabled => _sp.GetService<HiveAuthMode>()?.AuthEnabled ?? false;
+
+    /// <summary>
+    /// The identity-bound provider gate for <paramref name="userId"/>: re-reads the CURRENT stored account (never a
+    /// principal captured at construction) and evaluates <see cref="ProviderEligibility.Evaluate"/> over the given
+    /// ACTUAL primary and explicit compaction models. It reads no token, builds no client and makes no network call,
+    /// so callers run it BEFORE any of them. Open mode short-circuits to <see cref="ProviderEligibility.Allowed"/>
+    /// without a directory read (byte-unchanged). A directory fault, a missing <see cref="UserService"/> or any other
+    /// failure to establish the identity fails CLOSED (<see cref="ProviderDenyReason.IdentityUnavailable"/>);
+    /// cancellation propagates.
+    /// </summary>
+    /// <param name="userId">The internal account id the runtime belongs to.</param>
+    /// <param name="primaryModel">The runtime's actual primary model.</param>
+    /// <param name="compactionModel">The runtime's explicit compaction model (verbatim), or <c>null</c>.</param>
+    /// <param name="ct">Cancellation token.</param>
+    internal async Task<ProviderEligibility> EvaluateEligibilityAsync(
+        int userId, string? primaryModel, string? compactionModel, CancellationToken ct)
+    {
+        var (eligibility, _) = await EvaluateWithIdentityAsync(userId, primaryModel, compactionModel, ct);
+        return eligibility;
+    }
+
+    private async Task<(ProviderEligibility Eligibility, ProviderIdentity? Identity)> EvaluateWithIdentityAsync(
+        int userId, string? primaryModel, string? compactionModel, CancellationToken ct)
+    {
+        var authEnabled = AuthEnabled;
+        if (!authEnabled)
+            return (ProviderEligibility.Allowed, null);
+
+        ProviderIdentity identity;
+        try
+        {
+            var users = _sp.GetService<UserService>();
+            identity = users is null ? ProviderIdentity.Unknown : await ProviderIdentity.ReadAsync(users, userId, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try { _sp.GetService<ILogger<ComposerRuntimeManager>>()?.LogWarning(ex, "Could not read the account of user {UserId}; denying the provider selection", userId); }
+            catch { /* diagnostics never throw */ }
+            return (ProviderEligibility.Denied(ProviderDenyReason.IdentityUnavailable), null);
+        }
+
+        return (ProviderEligibility.Evaluate(authEnabled, identity, primaryModel, compactionModel, _providerOf,
+            _sp.GetService<ILogger<ComposerRuntimeManager>>()), identity);
+    }
+
+    /// <summary>
+    /// The ONE connect decision for a per-user runtime, evaluated in a fixed order:
+    /// <list type="number">
+    /// <item>Identity-bound eligibility over the runtime's ACTUAL primary and its construction-captured explicit
+    /// compaction model — BEFORE any token probe. A denial defers and never reaches the probe.</item>
+    /// <item>An eligible NON-original identity never needs (and never touches) the original admin's Copilot token:
+    /// eligibility already proved no Copilot-backed model is involved, so it is not deferred and the token signal is
+    /// NOT consulted.</item>
+    /// <item>The ORIGINAL identity (and open mode) keeps the unchanged legacy token deferral over the construction
+    /// snapshot (<see cref="ShouldDeferConnect"/>), so original recovery on token availability is untouched.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="configuration">The runtime's construction-captured inputs.</param>
+    /// <param name="userId">The internal account id.</param>
+    /// <param name="actualPrimaryModel">The runtime's CURRENT primary selection (committed runtime state, not global config).</param>
+    /// <param name="ct">Cancellation token.</param>
+    internal async Task<ConnectDecision> DecideConnectAsync(
+        ComposerConstructionSnapshot configuration, int userId, string? actualPrimaryModel, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var (eligibility, identity) = await EvaluateWithIdentityAsync(userId, actualPrimaryModel, configuration.CompactionModel, ct);
+        if (!eligibility.IsAllowed)
+            return new ConnectDecision(Defer: true, eligibility);
+        if (identity is { IsOriginal: false })
+            return new ConnectDecision(Defer: false, eligibility);
+
+        return new ConnectDecision(ShouldDeferConnect(configuration), eligibility);
     }
 
     /// <summary>
@@ -210,7 +298,12 @@ public sealed class ComposerFactory
             eventSubscriber: eventSubscriber,
             eventBus: _sp.GetService<IEventBus>(),
             userState: userState,
-            principal: principal);
+            principal: principal,
+            // Identity-bound runtimes carry the provider gate: every client creation re-reads the CURRENT account.
+            // The legacy singleton (no userState) carries none and is unchanged.
+            providerGate: userState is null
+                ? null
+                : (primary, compaction, ct) => EvaluateEligibilityAsync(userState.UserId, primary, compaction, ct));
 
         return new ComposerBuildResult(composer, constructionConfiguration);
     }

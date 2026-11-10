@@ -70,7 +70,7 @@ public sealed partial class ComposerRuntimeManagerTests
     public async Task RuntimeDeferral_AfterLiveConfigReload_StillUsesTheConstructionCapturedModels(
         string primary, string? compaction, string? reloadedCompaction)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         _providerResolver = model => model.StartsWith("copilot/", StringComparison.Ordinal) ? "copilot" : "ollama-local";
         // No usable token for the whole construction phase: only the captured models can defer.
         _tokenAvailable = false;
@@ -138,7 +138,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task FactoryVerdict_ForARuntime_FollowsTheCapture_NotTheReload_AndMatchesTheManager()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         _providerResolver = model => model.StartsWith("copilot/", StringComparison.Ordinal) ? "copilot" : "ollama-local";
         _tokenAvailable = false;
         var config = new HiveConfigFile
@@ -403,9 +403,12 @@ public sealed partial class ComposerRuntimeManagerTests
         // runtime's or the build result's CAPTURE.
         var managerSource = File.ReadAllText(Path.Combine(
             TestRepoRoot.Find(), "src", "CopilotHive", "Orchestration", "ComposerRuntimeManager.cs")).ReplaceLineEndings("\n");
-        Assert.Equal(2, CountOccurrences(managerSource, "_factory.ShouldDeferConnect("));
-        Assert.Contains("_factory.ShouldDeferConnect(deferred.Configuration)", managerSource);
-        Assert.Contains("_factory.ShouldDeferConnect(build.Configuration)", managerSource);
+        // The manager reaches the predicate ONLY through the identity-bound decision (eligibility first), and both
+        // call sites still pass a CAPTURE.
+        Assert.Equal(0, CountOccurrences(managerSource, "_factory.ShouldDeferConnect("));
+        Assert.Equal(2, CountOccurrences(managerSource, "_factory.DecideConnectAsync("));
+        Assert.Contains("_factory.DecideConnectAsync(deferred.Configuration,", managerSource);
+        Assert.Contains("_factory.DecideConnectAsync(build.Configuration,", managerSource);
     }
 
     private static bool IsCopilotBacked(string? model) =>

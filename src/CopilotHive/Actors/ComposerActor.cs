@@ -177,7 +177,20 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                     break;
                 }
 
-                StartStream(m.WrappedMessage);
+                // FRESHNESS: the admitted send is about to invoke the CACHED model client, so the CURRENT account is
+                // re-validated first. A denial is the typed refusal on the caller's reply; nothing streams, nothing
+                // is claimed and the runtime stays intact. (No gate on the pre-admission "not connected" refusal.)
+                try
+                {
+                    await _agentService.EnforceOperationGateAsync(LoopToken);
+                }
+                catch (Exception ex)
+                {
+                    m.Reply.TrySetException(ex);
+                    break;
+                }
+
+                StartStream(m.WrappedMessage, freshnessChecked: true);
                 // The reply completes AFTER StartStream, so by the time the caller observes
                 // `true`, _onStreamingStarted has fired (the facade's _isStreaming is set).
                 m.Reply.TrySetResult(true);
@@ -399,6 +412,14 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 // The finished callback runs BEFORE the reply completes (in the finally, which
                 // always runs) so the facade's OnCompacted/IsCompacting/WasCompacted updates
                 // are observable in actor order by the time the caller sees the outcome.
+                // FRESHNESS: the compactor would invoke the cached (explicit or primary) client, so the CURRENT account
+                // is re-validated BEFORE compaction starts: a denial replies with the typed refusal and fires no
+                // started/finished callbacks (nothing began), leaving the runtime and session untouched.
+                if (await TryDenyCompactionAsync(m.Ct, m.Reply) is { } fullDenied)
+                {
+                    fullDenied(); break;
+                }
+
                 var compactResult = false;
                 try
                 {
@@ -427,6 +448,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 {
                     m.Reply.TrySetException(new InvalidOperationException("Cannot compact while streaming."));
                     break;
+                }
+
+                if (await TryDenyCompactionAsync(m.Ct, m.Reply) is { } partialDenied)
+                {
+                    partialDenied(); break;
                 }
 
                 var partialResult = false;
@@ -522,11 +548,33 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     }
 
     /// <summary>
+    /// Operation-level freshness check for a manual compaction. Returns <c>null</c> when the operation may proceed, or
+    /// the action that settles <paramref name="reply"/>: the typed refusal on denial, or the existing
+    /// "cancel → false" contract when the caller's token was cancelled during the check.
+    /// </summary>
+    private async Task<Action?> TryDenyCompactionAsync(CancellationToken ct, TaskCompletionSource<bool> reply)
+    {
+        try
+        {
+            await _agentService.EnforceOperationGateAsync(ct);
+            return null;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return () => reply.TrySetResult(false);
+        }
+        catch (Exception ex)
+        {
+            return () => reply.TrySetException(ex);
+        }
+    }
+
+    /// <summary>
     /// Starts a streaming response for the given wrapped message. Resets the terminal latches,
     /// publishes the streaming-started callback, registers the streaming status and launches
     /// the background streaming task.
     /// </summary>
-    private void StartStream(string wrappedMessage)
+    private void StartStream(string wrappedMessage, bool freshnessChecked = false)
     {
         // Reset the terminal latches so the actor is reusable: without this a second
         // stream could never complete (its terminal message would be swallowed).
@@ -539,7 +587,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         // and cleared content before any reply completes.
         TryInvoke(_onStreamingStarted, nameof(_onStreamingStarted));
         _refreshRegistry("streaming");
-        _streamingTask = Task.Run(() => RunStreamingAsync(wrappedMessage, _streamingCts.Token), LoopToken);
+        _streamingTask = Task.Run(() => RunStreamingAsync(wrappedMessage, _streamingCts.Token, freshnessChecked), LoopToken);
     }
 
     /// <summary>
@@ -639,7 +687,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     /// is reported as a real error.
     /// </para>
     /// </summary>
-    private async Task RunStreamingAsync(string userMessage, CancellationToken ct)
+    private async Task RunStreamingAsync(string userMessage, CancellationToken ct, bool freshnessChecked = false)
     {
         // The terminal message that was attempted, or null when none was ever issued. Held so
         // a rejected Tell can be replayed through the shared handler with full semantics.
@@ -661,6 +709,12 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         try
         {
             var cancelled = false;
+
+            // FRESHNESS for streams that were NOT admitted through a caller send (active notifications and the queued
+            // notification chain): the cached client is about to be invoked, so re-validate the CURRENT account first.
+            // A denial ends the stream through the existing error terminal with the typed, secret-free message.
+            if (!freshnessChecked)
+                await _agentService.EnforceOperationGateAsync(ct);
 
             await foreach (var update in _agentService.Agent!.ExecuteStreamingAsync(_agentService.Session, userMessage, ct))
             {

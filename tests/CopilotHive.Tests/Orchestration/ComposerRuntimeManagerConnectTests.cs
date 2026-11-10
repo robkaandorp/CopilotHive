@@ -144,7 +144,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task ParkedTokenProbe_DoesNotHoldTheManagerGate_WhileAnotherUserCreatesAndTheOwnerStaysDeferred()
     {
-        var (first, second) = await TwoUsersAsync();
+        var (second, first) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -198,7 +198,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task ParkedTokenProbe_DoesNotBlockAnotherUsersConnectAsync()
     {
-        var (first, second) = await TwoUsersAsync();
+        var (second, first) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -237,12 +237,13 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Equal(0, _clientCreations);
         probe.AssertHealthy();
 
-        // Control: with a token both users connect normally.
+        // Control: with a token the ORIGINAL user connects normally.
         _tokenAvailable = true;
         gate.Release();
         Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, second)).Status);
-        Assert.Equal(ComposerRuntimeStatus.Connected, (await Retry(manager, first)).Status);
-        Assert.Equal(2, gate.Calls);
+        // The other user is a non-original identity on a Copilot model: the original token never recovers it.
+        Assert.Equal(ComposerRuntimeStatus.Deferred, (await Retry(manager, first)).Status);
+        Assert.Equal(1, gate.Calls);
     }
 
     [Theory]
@@ -250,7 +251,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task RemovalStartedDuringTheParkedTokenProbe_KeepsOwnership_RemovedAndNoRuntimeHandedOut(bool shutdown)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -293,7 +294,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task StaleTokenProbe_AfterRemoveAndRecreate_StartsNoConnectAndHandsOutNoRuntime()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -335,7 +336,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task RemovalInProgressDuringTheParkedTokenProbe_RevalidationStartsNoConnectOnTheOwnedRuntime()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -399,7 +400,7 @@ public sealed partial class ComposerRuntimeManagerTests
     public async Task ConcurrentSameUserConnects_ProbedSimultaneouslyOutsideTheGate_StartExactlyOneConnect()
     {
         const int callers = 6;
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -531,7 +532,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task CopilotModelWithoutToken_UnderAuth_CompletesAsDeferred_ThenConnectAsyncRetriesAwaitably()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider(authEnabled: true));
         _provider = "copilot";
         _tokenAvailable = false;
@@ -637,7 +638,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task FailedDeferredConnect_DisposesAndRemovesRuntimeBeforeAnyRecreationCanStart()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
         _provider = "copilot";
@@ -760,7 +761,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task CancelledDeferredConnectCaller_DoesNotCancelTheSharedDeferredConnect()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider());
         _provider = "copilot";
         _tokenAvailable = false;
@@ -802,7 +803,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task Removal_CancelsTheSharedOperation_AdmitsNoNewWaiters_AndTearsTheRuntimeDown(bool deferred)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
         if (deferred)
@@ -886,7 +887,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [Fact]
     public async Task ManagedPaths_NeverReachTheLegacyCoordinatorOrTokenAvailable()
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var sp = BuildProvider(authEnabled: true);
         var manager = NewManager(sp);
         _provider = "copilot";

@@ -212,7 +212,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true, true)]
     public async Task Lifecycle_DeferredRuntime_PreservesUploadedAttachmentsAndSessions(bool shutdown, bool connecting)
     {
-        var (first, second) = await TwoUsersAsync();
+        var (second, first) = await OriginalAsSecondAsync();
         var provider = BuildProvider();
         var manager = NewManager(provider);
         var other = (await Request(manager, first)).Runtime!;
@@ -276,7 +276,7 @@ public sealed partial class ComposerRuntimeManagerTests
             {
                 Assert.Same(other, (await Request(manager, first)).Runtime);
                 Assert.True(other.Composer.IsConnected);
-                Assert.Equal(["composer:1"], provider.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
+                Assert.Equal([$"composer:{first.UserId}"], provider.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
             }
             else Assert.True(other.Composer.TeardownCompletion.IsCompletedSuccessfully);
             var fileSurvived = File.Exists(file);

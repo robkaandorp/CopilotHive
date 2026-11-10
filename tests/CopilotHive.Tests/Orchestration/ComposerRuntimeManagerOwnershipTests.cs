@@ -107,7 +107,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task RealFactory_CompactionProviderControlsDeferredOutcome(bool copilotCompaction)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         const string primary = "ollama-local/main";
         var compaction = copilotCompaction ? "copilot/compact" : "ollama-local/compact";
         var config = new HiveConfigFile
@@ -147,7 +147,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task InFlightConnection_WithoutRemoval_AdmitsCreateAndConnectWaiters(bool deferred)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var manager = NewManager(BuildProvider());
         ComposerUserRuntime? before = null;
         if (deferred)
@@ -186,7 +186,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task Cancellation_InsideRealComposerConnect_CancelsOnlyCallerWaitAndKeepsCache(bool deferred)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
         ComposerUserRuntime? before = null;
@@ -255,7 +255,7 @@ public sealed partial class ComposerRuntimeManagerTests
             await runtime.Composer.SaveSessionAsync(Ct);
             Assert.True(File.Exists(ComposerUserState.SessionFilePath(StateDir, runtime.State)));
             Assert.Equal(1, _clientCreations);
-            Assert.Equal(["composer:2"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
+            Assert.Equal([$"composer:{second.UserId}"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
         }
         catch (Exception ex) { primary = ExceptionDispatchInfo.Capture(ex); }
         finally
@@ -283,7 +283,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task DeferredConnect_RechecksStaleAccountOnEveryJoinedWait_WithoutPoisoningCache(bool invalidateRole)
     {
-        var (_, second) = await TwoUsersAsync();
+        var (second, _) = await OriginalAsSecondAsync(UserRole.Admin);
         var manager = NewManager(BuildProvider());
         _provider = "copilot";
         _tokenAvailable = false;
@@ -301,7 +301,7 @@ public sealed partial class ComposerRuntimeManagerTests
             if (invalidateRole) await SetStoredRoleAsync(second, "retired-role");
             else await _users.SetUserEnabledAsync(second.UserId, false, Ct);
             Assert.True(second.Enabled);
-            Assert.Equal(UserRole.Member, second.Role);
+            Assert.Equal(UserRole.Admin, second.Role);
             gate.Release();
             foreach (var call in new[] { connector, connectWaiter, createWaiter })
             {
@@ -321,7 +321,7 @@ public sealed partial class ComposerRuntimeManagerTests
         {
             gate.Release();
             foreach (var call in new[] { connector, connectWaiter, createWaiter }) await JoinRequestAsync(call);
-            if (invalidateRole) await SetStoredRoleAsync(second, "member");
+            if (invalidateRole) await SetStoredRoleAsync(second, "admin");
             else
             {
                 var fresh = await _users.GetActivatedUserByIdAsync(second.UserId, CancellationToken.None);
@@ -333,7 +333,9 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Same(deferred, repaired.Runtime);
         Assert.Same(deferred, (await Request(manager, second)).Runtime);
         Assert.Same(deferred.Attachments, repaired.Runtime!.Attachments);
-        Assert.Equal(1, gate.Calls);
+        // The stale in-flight connect reached its identity-bound provider gate AFTER the account mutation and was
+        // denied there (before any client creation); the repaired retry is the one that really connected.
+        Assert.Equal(2, gate.Calls);
         Assert.Equal(1, _clientCreations);
     }
 
@@ -342,7 +344,7 @@ public sealed partial class ComposerRuntimeManagerTests
     [InlineData(true)]
     public async Task ConnectFailure_CleansMatchingPendingAttachments_PreservesHistoryAndOtherUser(bool deferred)
     {
-        var (first, second) = await TwoUsersAsync();
+        var (second, first) = await OriginalAsSecondAsync();
         var sp = BuildProvider();
         var manager = NewManager(sp);
         var survivor = (await Request(manager, first)).Runtime!;
@@ -351,7 +353,7 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.True(otherAttachment.Success, otherAttachment.Error);
         var otherPath = Path.Combine(survivor.Attachments.AttachmentsRootPath, otherAttachment.Attachment!.SavedRelativePath);
         var otherBefore = await File.ReadAllBytesAsync(otherPath, Ct);
-        var sessionPath = Path.Combine(StateDir, "composer", "users", "2", "session.json");
+        var sessionPath = Path.Combine(StateDir, "composer", "users", second.UserId.ToString(), "session.json");
         await WriteSessionAsync(sessionPath, "failure-preserved-session-marker");
         var sessionBefore = await File.ReadAllBytesAsync(sessionPath, Ct);
         ComposerUserRuntime? deferredRuntime = null;
@@ -375,7 +377,7 @@ public sealed partial class ComposerRuntimeManagerTests
             failedComposer = composer;
             matchingAttachments = Field<ComposerAttachmentService>(composer, "_attachmentService");
             if (deferredRuntime is not null) Assert.Same(deferredRuntime.Attachments, matchingAttachments);
-            Assert.Equal(Path.GetFullPath(Path.Combine(StateDir, "composer", "users", "2", "attachments")), matchingAttachments.AttachmentsRootPath);
+            Assert.Equal(Path.GetFullPath(Path.Combine(StateDir, "composer", "users", second.UserId.ToString(), "attachments")), matchingAttachments.AttachmentsRootPath);
             using var content = new MemoryStream([1, 4, 1, 4]);
             var saved = await matchingAttachments.SaveAsync("pending.png", content, token);
             Assert.True(saved.Success, saved.Error);
@@ -414,7 +416,7 @@ public sealed partial class ComposerRuntimeManagerTests
         Assert.Same(survivor, (await Request(manager, first)).Runtime);
         Assert.Same(survivor.Attachments, (await Request(manager, first)).Runtime!.Attachments);
         Assert.True(survivor.Composer.IsConnected);
-        Assert.Equal(["composer:1"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
+        Assert.Equal([$"composer:{first.UserId}"], sp.GetRequiredService<LlmSessionRegistry>().GetAll().Select(row => row.SessionId));
         Assert.Equal(ComposerRuntimeRefusal.NoRuntime, (await Retry(manager, second)).Refusal);
 
         _connectHook = null;
