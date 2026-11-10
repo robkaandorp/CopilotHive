@@ -1,5 +1,8 @@
+using System.Security.Claims;
+
 using CopilotHive.Configuration;
 using CopilotHive.Git;
+using CopilotHive.Security;
 
 namespace CopilotHive.Services;
 
@@ -221,15 +224,27 @@ public interface IConfigFacade
     /// <summary>
     /// Persists Composer setting changes (validate → mutate → write → commit).
     /// </summary>
+    /// <remarks>
+    /// The GLOBAL Composer write is an administration operation: EVERY shape of the update — an
+    /// empty update, a MaxSteps-only update and a notification-only update alike — requires
+    /// <see cref="HiveCapability.GlobalAdmin"/> for the caller re-resolved FRESH from current stored
+    /// state. A non-admin (including a plain Member) is refused with
+    /// <see cref="FacadeErrorKind.Forbidden"/> before any persistence work runs. Open mode resolves
+    /// the local operator and therefore succeeds exactly as before.
+    /// </remarks>
     /// <param name="update">The Composer settings to apply.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <param name="ct">Cancellation token forwarded to the persistence layer.</param>
     /// <returns>
-    /// Success with the saved result, <see cref="FacadeErrorKind.BadRequest"/> when the update
-    /// is invalid (e.g. an unknown notification mode or event name), or
-    /// <see cref="FacadeErrorKind.NotConfigured"/> when no <see cref="ConfigModelService"/> is
-    /// registered. Cancellation and any other exception propagate to the caller.
+    /// Success with the saved result, <see cref="FacadeErrorKind.Forbidden"/> when the caller does
+    /// not currently hold <see cref="HiveCapability.GlobalAdmin"/>,
+    /// <see cref="FacadeErrorKind.BadRequest"/> when the update is invalid (e.g. an unknown
+    /// notification mode or event name), or <see cref="FacadeErrorKind.NotConfigured"/> when no
+    /// <see cref="ConfigModelService"/> is registered. Cancellation and any other exception
+    /// propagate to the caller.
     /// </returns>
-    Task<FacadeResult<SavedResult>> SaveComposerAsync(ComposerSettingsUpdate update, CancellationToken ct);
+    Task<FacadeResult<SavedResult>> SaveComposerAsync(
+        ComposerSettingsUpdate update, ClaimsPrincipal? actingUser, CancellationToken ct);
 }
 
 /// <summary>
@@ -245,6 +260,8 @@ public sealed class ConfigFacade : IConfigFacade
     private readonly ConfigModelService? _configModel;
     private readonly ModelDiscoveryService? _discovery;
     private readonly IBrainRepoManager? _repoManager;
+    private readonly HivePrincipalResolver _resolver;
+    private readonly HivePolicy _policy;
     private readonly ILogger<ConfigFacade> _log;
 
     /// <summary>
@@ -254,18 +271,29 @@ public sealed class ConfigFacade : IConfigFacade
     /// <param name="configModel">The <see cref="ConfigModelService"/> (may be <c>null</c> when no config repo is configured).</param>
     /// <param name="discovery">The <see cref="ModelDiscoveryService"/> (may be <c>null</c> when no config repo is configured).</param>
     /// <param name="log">Logger instance.</param>
+    /// <param name="resolver">
+    /// The stateless principal resolver the GLOBAL Composer write re-resolves through. It is a
+    /// REQUIRED dependency so there is no unauthenticated construction: the resolver and the policy
+    /// are stateless singletons, and this facade never captures the scoped circuit accessor.
+    /// </param>
+    /// <param name="policy">The pure capability evaluator (required together with <paramref name="resolver"/>).</param>
     /// <param name="repoManager">The <see cref="IBrainRepoManager"/> (may be <c>null</c> when not registered).</param>
+    /// <exception cref="ArgumentNullException">A required dependency is null.</exception>
     public ConfigFacade(
         HiveConfigFile? hiveConfig,
         ConfigModelService? configModel,
         ModelDiscoveryService? discovery,
         ILogger<ConfigFacade> log,
+        HivePrincipalResolver resolver,
+        HivePolicy policy,
         IBrainRepoManager? repoManager = null)
     {
         _hiveConfig = hiveConfig;
         _configModel = configModel;
         _discovery = discovery;
-        _log = log;
+        _log = log ?? throw new ArgumentNullException(nameof(log));
+        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _repoManager = repoManager;
     }
 
@@ -729,8 +757,25 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> SaveComposerAsync(ComposerSettingsUpdate update, CancellationToken ct)
+    public async Task<FacadeResult<SavedResult>> SaveComposerAsync(
+        ComposerSettingsUpdate update, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        // AUTHORIZATION FIRST, and for EVERY update shape — empty, MaxSteps-only or
+        // notification-only. The GLOBAL Composer write is an administration operation, so the
+        // caller is re-resolved FRESH from current stored state on every call: a demoted or
+        // disabled account is refused on the very next call, and no principal is retained here.
+        var authorized = await FacadeAuthorization.IsAllowedAsync(
+            _resolver,
+            _policy,
+            actingUser,
+            HiveCapability.GlobalAdmin,
+            _log,
+            nameof(SaveComposerAsync),
+            ct).ConfigureAwait(false);
+
+        if (!authorized)
+            return new(false, null, FacadeAuthorization.ForbiddenMessage, FacadeErrorKind.Forbidden);
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -740,7 +785,7 @@ public sealed class ConfigFacade : IConfigFacade
 
         try
         {
-            await svc.UpdateComposerSettingsAsync(update, ct);
+            await svc.UpdateComposerSettingsAsync(update, ct).ConfigureAwait(false);
             return new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
         }
         catch (ArgumentException ex)

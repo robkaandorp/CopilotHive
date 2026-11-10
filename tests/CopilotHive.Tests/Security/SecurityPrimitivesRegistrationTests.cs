@@ -131,38 +131,35 @@ public sealed class SecurityPrimitivesRegistrationTests
     }
 
     /// <summary>
-    /// ENFORCEMENT STOPS AT THE COMPOSER TOOL SURFACE: the authorization primitives are consumed ONLY by
-    /// the Composer tool surface this goal wires (the Composer, its tool partials and its agent service) and
-    /// by the new central Composer tool-authorization helper. Every OTHER boundary — endpoints, hubs,
-    /// facades, routes, the user directory and the credential entity — still references none of them, so
-    /// nothing outside the Composer tools gained enforcement.
+    /// ENFORCEMENT IS CONFINED TO THE BOUNDARIES THE AUTHORIZATION SLICES WIRE: the Composer tool
+    /// surface and — as of the server-side authorization slice — the two facades, the two hubs, the
+    /// circuit-side identity acquisition helper and the two component call sites.
     /// <para>
-    /// The Composer files are deliberately NOT in the pinned list: wiring them is exactly what the goal
-    /// requires. <see cref="UserService"/> and
-    /// <see cref="CopilotHive.Persistence.Entities.UserEntity"/> remain untouched contracts the primitives
-    /// consume rather than modify, and <c>Program.cs</c> remains the DI registration site.
+    /// Every OTHER boundary (the general API endpoints, the goal/release/issue/backup facades, the
+    /// router, the nav menu, the Composer actor, the user directory and the credential entity) still
+    /// references none of the primitives, so no boundary OUTSIDE this slice's declared surface
+    /// gained enforcement. <see cref="UserService"/> and
+    /// <see cref="CopilotHive.Persistence.Entities.UserEntity"/> remain untouched contracts the
+    /// primitives consume rather than modify, and <c>Program.cs</c> remains the DI registration site.
     /// </para>
     /// </summary>
     [Fact]
-    public void BoundariesOutsideTheComposerToolSurface_ReferenceNoneOfTheNewPrimitives()
+    public void BoundariesOutsideTheAuthorizedSurface_ReferenceNoneOfTheNewPrimitives()
     {
         var repoRoot = TestRepoRoot.Find();
         var src = Path.Combine(repoRoot, "src", "CopilotHive");
 
+        // The boundaries this iteration's slices deliberately LEFT unchanged. Wiring any of them is a
+        // new enforcement decision that must come with its own contract tests, so it fails here first.
         var boundaries = new[]
         {
             "ApiEndpoints.cs",
-            "Orchestration/ConfigHub.cs",
-            "Orchestration/ComposerHub.cs",
-            "Services/ConfigFacade.cs",
             "Services/GoalFacade.cs",
             "Services/ReleaseFacade.cs",
             "Services/IssueFacade.cs",
             "Services/BackupFacade.cs",
-            "Services/ComposerFacade.cs",
             "Services/UserService.cs",
             "Components/Routes.razor",
-            "Components/Pages/ComposerChat.razor",
             "Components/Layout/NavMenu.razor",
             "Actors/ComposerActor.cs",
             "Persistence/Entities/UserEntity.cs",
@@ -192,6 +189,191 @@ public sealed class SecurityPrimitivesRegistrationTests
             {
                 Assert.DoesNotContain(primitive, body, StringComparison.Ordinal);
             }
+        }
+    }
+
+    /// <summary>
+    /// THE DECLARED SERVER-SIDE SURFACE REALLY ENFORCES: the two facades resolve the acting principal
+    /// through <see cref="HivePrincipalResolver"/> and consult <see cref="HivePolicy"/> on every
+    /// operation, and both hubs carry the request's identity to them. A facade or hub that dropped the
+    /// enforcement — or a re-introduced identity-free overload — fails this test.
+    /// </summary>
+    [Fact]
+    public void TheAuthorizedFacadesAndHubs_ReferenceTheResolverAndPolicy()
+    {
+        var repoRoot = TestRepoRoot.Find();
+        var src = Path.Combine(repoRoot, "src", "CopilotHive");
+
+        foreach (var relativePath in new[]
+        {
+            "Services/ComposerFacade.cs",
+            "Services/ConfigFacade.cs",
+        })
+        {
+            var body = TestSourceScanner.StripNonCode(
+                File.ReadAllText(Path.Combine(src, relativePath.Replace('/', Path.DirectorySeparatorChar)))
+                    .ReplaceLineEndings("\n"));
+
+            Assert.Contains("HivePrincipalResolver", body, StringComparison.Ordinal);
+            Assert.Contains("HivePolicy", body, StringComparison.Ordinal);
+            Assert.Contains("FacadeAuthorization", body, StringComparison.Ordinal);
+            // The SCOPED circuit accessor must never be captured by a facade.
+            Assert.DoesNotContain("CircuitUserPrincipalAccessor", body, StringComparison.Ordinal);
+        }
+
+        foreach (var relativePath in new[]
+        {
+            "Orchestration/ComposerHub.cs",
+            "Orchestration/ConfigHub.cs",
+        })
+        {
+            // Line endings are normalised to "\n" (never removed): the scanner needs line starts to
+            // recognise line comments, otherwise everything after the first "//" would be masked.
+            var body = TestSourceScanner.StripNonCode(
+                File.ReadAllText(Path.Combine(src, relativePath.Replace('/', Path.DirectorySeparatorChar)))
+                    .ReplaceLineEndings("\n"));
+
+            // Identity is taken PER REQUEST from the HttpContext and forwarded to the facade.
+            // ALL whitespace is removed so a reformatted parameter list can neither hide nor fake the
+            // wiring (the fragments below are written whitespace-free for the same reason).
+            var collapsed = new string(body.Where(c => !char.IsWhiteSpace(c)).ToArray());
+            Assert.Contains("HttpContextcontext", collapsed, StringComparison.Ordinal);
+            Assert.Contains("context.User", collapsed, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// THE CIRCUIT CALLERS ARE MIGRATED (goal scope 6 — MINIMAL circuit identity acquisition): both
+    /// pages obtain the circuit identity and initialise the SCOPED accessor through the single
+    /// <c>ComponentActingUser</c> helper, forward that identity to EVERY identity-aware facade call,
+    /// and use the accessor ONLY for a capability question. The pages never reach into the resolver,
+    /// the policy or the principal type directly, and nothing registers the scoped accessor with a
+    /// singleton.
+    /// </summary>
+    [Fact]
+    public void TheCircuitCallers_AcquireIdentityThroughTheSingleHelper()
+    {
+        var repoRoot = TestRepoRoot.Find();
+        var src = Path.Combine(repoRoot, "src", "CopilotHive");
+
+        foreach (var relativePath in new[]
+        {
+            "Components/Pages/ComposerChat.razor",
+            "Components/Pages/Configuration.razor",
+        })
+        {
+            var raw = File.ReadAllText(
+                Path.Combine(src, relativePath.Replace('/', Path.DirectorySeparatorChar)))
+                .ReplaceLineEndings("\n");
+            var body = TestSourceScanner.StripNonCode(raw);
+
+            // The scoped accessor is INJECTED per circuit and initialised through the helper.
+            Assert.Contains("CircuitUserPrincipalAccessor", raw, StringComparison.Ordinal);
+            Assert.Contains("ComponentActingUser", body, StringComparison.Ordinal);
+
+            // The identity is acquired through that ONE helper — never a second resolution path and
+            // never the principal/policy types directly.
+            Assert.DoesNotContain("HivePrincipalResolver", body, StringComparison.Ordinal);
+            Assert.DoesNotContain("HivePolicy", body, StringComparison.Ordinal);
+            Assert.DoesNotContain("ActingUserPrincipal ", body, StringComparison.Ordinal);
+            Assert.DoesNotContain(".ResolveAsync(", body, StringComparison.Ordinal);
+        }
+
+        // The pages hand an identity + cancellation token to every migrated facade call: no
+        // identity-free call site survives anywhere in the component tree.
+        foreach (var page in new[] { "Components/Pages/ComposerChat.razor", "Components/Pages/Configuration.razor" })
+        {
+            var body = TestSourceScanner.StripNonCode(
+                File.ReadAllText(Path.Combine(src, page.Replace('/', Path.DirectorySeparatorChar)))
+                    .ReplaceLineEndings("\n"));
+
+            foreach (var operation in new[]
+            {
+                "ComposerFacade.GetModelsAsync(", "ComposerFacade.GetCurrentModelAsync(",
+                "ComposerFacade.SwitchModelAsync(", "ComposerFacade.CompactAsync(",
+                "ComposerFacade.CompactPartialAsync(", "ConfigFacade.SaveComposerAsync(",
+            })
+            {
+                foreach (var statement in StatementsContaining(body, operation))
+                {
+                    Assert.True(
+                        statement.Contains("ActingUserAsync", StringComparison.Ordinal)
+                        || statement.Contains("AcquireAsync", StringComparison.Ordinal),
+                        $"'{operation}' in {page} must pass the circuit identity acquired through ComponentActingUser. "
+                        + $"Offending statement: {statement}");
+                }
+            }
+        }
+
+        // ADMIN GATING IS DERIVED FROM THE CIRCUIT IDENTITY, not assumed: each page asks the
+        // accessor for GlobalAdmin through the helper, and the GLOBAL notification UI is rendered from
+        // the resulting flag. Deleting the question (or hardcoding the flag true) fails here.
+        foreach (var page in new[] { "Components/Pages/ComposerChat.razor", "Components/Pages/Configuration.razor" })
+        {
+            var body = TestSourceScanner.StripNonCode(
+                File.ReadAllText(Path.Combine(src, page.Replace('/', Path.DirectorySeparatorChar)))
+                    .ReplaceLineEndings("\n"));
+
+            var question = Assert.Single(
+                StatementsContaining(body, "ComponentActingUser.IsAllowedAsync(").ToList(),
+                statement => true);
+            Assert.Contains("GlobalAdmin", question, StringComparison.Ordinal);
+            Assert.Contains("CircuitPrincipal", question, StringComparison.Ordinal);
+
+        }
+
+        // The Configuration page renders the notification controls behind the flag and offers the
+        // non-admin a GLOBAL/system label instead of the personal control. Markup assertions read the
+        // RAW source (the same way the existing UI markup tests do): the C#-oriented scanner treats a
+        // prose apostrophe as a char literal, so it cannot be used to look for razor markup.
+        var configurationRaw = File.ReadAllText(
+            Path.Combine(src, "Components", "Pages", "Configuration.razor"))
+            .ReplaceLineEndings("\n");
+        Assert.Contains("@if (_composerAdminAllowed)", configurationRaw, StringComparison.Ordinal);
+        Assert.Contains("Global / system-wide setting", configurationRaw, StringComparison.Ordinal);
+        Assert.Contains("Only an administrator can change", configurationRaw, StringComparison.Ordinal);
+
+        // The ComposerChat toggle is gated the same way, and its non-admin rendering is labelled as a
+        // global setting rather than a personal preference.
+        var composerChatRaw = File.ReadAllText(
+            Path.Combine(src, "Components", "Pages", "ComposerChat.razor"))
+            .ReplaceLineEndings("\n");
+        Assert.Contains("@if (_notifToggleAdminAllowed)", composerChatRaw, StringComparison.Ordinal);
+        Assert.Contains("Notifications (global setting)", composerChatRaw, StringComparison.Ordinal);
+
+        // SINGLETON SAFETY: no SINGLETON registration statement closes over the scoped accessor.
+        // Statements are semicolon-delimited so the assertion is scoped to one registration and
+        // cannot be satisfied (or broken) by neighbouring text.
+        var program = TestSourceScanner.StripNonCode(
+            File.ReadAllText(Path.Combine(src, "Program.cs")).ReplaceLineEndings("\n"));
+        foreach (var statement in StatementsContaining(program, "AddSingleton"))
+        {
+            Assert.DoesNotContain("CircuitUserPrincipalAccessor", statement, StringComparison.Ordinal);
+        }
+
+        // ...and the accessor's own registration is SCOPED, one instance per circuit.
+        var accessorRegistration = Assert.Single(StatementsContaining(program, "CircuitUserPrincipalAccessor("));
+        Assert.Contains("AddScoped", accessorRegistration, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Every semicolon-delimited STATEMENT containing <paramref name="fragment"/>. Blanked non-code
+    /// characters (spaces) keep the split honest: a ';' inside a string literal or comment was already
+    /// replaced, so it can never end a statement early.
+    /// </summary>
+    private static IEnumerable<string> StatementsContaining(string source, string fragment)
+    {
+        var start = 0;
+        for (var i = 0; i < source.Length; i++)
+        {
+            if (source[i] != ';')
+                continue;
+
+            var statement = source.Substring(start, i - start + 1);
+            if (statement.Contains(fragment, StringComparison.Ordinal))
+                yield return statement.Length > 400 ? statement[^400..] : statement;
+
+            start = i + 1;
         }
     }
 

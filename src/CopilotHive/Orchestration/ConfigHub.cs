@@ -205,11 +205,15 @@ public static class ConfigHub
         });
 
         // Update composer settings
+        // IDENTITY IS PER REQUEST: this GLOBAL write forwards the request's authenticated principal
+        // (HttpContext.User) to the facade, which re-resolves the caller's CURRENT role/enabled state
+        // and requires GlobalAdmin. Every other endpoint in this hub is unchanged by this slice.
         app.MapMethods("/api/config/composer", ["PATCH"], async (
+            HttpContext context,
             ComposerSettingsUpdate update,
             CancellationToken ct) =>
         {
-            var result = await facade.SaveComposerAsync(update, ct);
+            var result = await facade.SaveComposerAsync(update, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -219,9 +223,10 @@ public static class ConfigHub
     /// <summary>
     /// Maps a <see cref="FacadeErrorKind"/> from the model-catalog facade to the exact HTTP
     /// response the pre-facade handlers produced: <c>NotFound</c>/<c>Conflict</c>/<c>BadRequest</c>
-    /// return a JSON <c>{error}</c> body; <c>NotConfigured</c>, <c>ServiceUnavailable</c> and
-    /// <c>Internal</c> return a problem-details body. <see cref="FacadeErrorKind.None"/> is a
-    /// programming error and throws.
+    /// return a JSON <c>{error}</c> body; <c>Forbidden</c> returns HTTP 403 with the same body shape
+    /// (the AUTHORIZATION answer of the global Composer write); <c>NotConfigured</c>,
+    /// <c>ServiceUnavailable</c> and <c>Internal</c> return a problem-details body.
+    /// <see cref="FacadeErrorKind.None"/> is a programming error and throws.
     /// </summary>
     /// <param name="kind">The failure category reported by the facade.</param>
     /// <param name="error">The human-readable error message.</param>
@@ -233,6 +238,7 @@ public static class ConfigHub
             FacadeErrorKind.NotFound => Results.NotFound(new { error }),
             FacadeErrorKind.Conflict => Results.Conflict(new { error }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
+            FacadeErrorKind.Forbidden => Results.Json(new { error }, statusCode: StatusCodes.Status403Forbidden),
             FacadeErrorKind.NotConfigured => Results.Problem(error),
             FacadeErrorKind.ServiceUnavailable => Results.Problem(error, statusCode: 503),
             FacadeErrorKind.Internal => Results.Problem(error, statusCode: 500),

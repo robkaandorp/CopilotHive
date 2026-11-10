@@ -142,6 +142,106 @@ public sealed class AuthenticatedModeTests : IDisposable
         Assert.NotEqual("/login", response.Headers.Location?.OriginalString);
     }
 
+    // ── API challenge: 401 with NO redirect; browser challenge unchanged ────
+    //
+    // An unauthenticated API caller is a PROGRAMMATIC client: challenging it with the GitHub OAuth
+    // redirect would hand it an HTML login page and a 302. /api/* therefore gets a bare 401 with no
+    // Location header, while every browser/page request keeps the very same GitHub redirect the
+    // pre-slice host produced (which the correlation-cookie test below pins).
+
+    [Theory]
+    [InlineData("/api/goals")]
+    [InlineData("/api/config/composer")]
+    [InlineData("/api/composer/models")]
+    public async Task ApiEndpoints_Unauthenticated_Return401_WithNoRedirect(string path)
+    {
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+        });
+
+        var response = await client.GetAsync(path, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Null(response.Headers.Location);
+
+        // No OAuth interstitial was started for a programmatic caller: no correlation cookie
+        // (in fact no Set-Cookie header at all).
+        Assert.False(
+            response.Headers.TryGetValues("Set-Cookie", out var cookies)
+            && cookies.Any(cookie => cookie.StartsWith(".AspNetCore.Correlation.", StringComparison.Ordinal)),
+            "an API challenge must not start an OAuth handshake");
+    }
+
+    /// <summary>
+    /// A PATCH is challenged the same way: the authorization layer answers before the model binding
+    /// runs, so the API client sees 401 rather than a 400 for an unparsable body.
+    /// </summary>
+    [Fact]
+    public async Task ConfigComposerPatch_Unauthenticated_Returns401_WithNoRedirect()
+    {
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+        });
+
+        var content = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+        var response = await client.PatchAsync("/api/config/composer", content, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Null(response.Headers.Location);
+    }
+
+    /// <summary>
+    /// The BROWSER challenge is preserved: an unauthenticated PAGE request still redirects to the
+    /// GitHub OAuth handshake (302 + correlation cookie) exactly as before this slice, and /login
+    /// still renders 200 so the user can sign in.
+    /// </summary>
+    [Fact]
+    public async Task BrowserPage_Unauthenticated_StillRedirectsToGitHubOAuth()
+    {
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+        });
+
+        var response = await client.GetAsync("/goals", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.NotNull(response.Headers.Location);
+        Assert.StartsWith("https://github.com/login/oauth/authorize", response.Headers.Location!.OriginalString,
+            StringComparison.Ordinal);
+
+        // The OAuth handshake really started (correlation cookie present) — this is the pre-slice
+        // browser behaviour, unchanged.
+        Assert.Contains(
+            response.Headers.NonValidated["Set-Cookie"],
+            cookie => cookie.StartsWith(".AspNetCore.Correlation.", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The challenge handler itself is path-aware, but the AUTHENTICATION scheme is still the cookie:
+    /// a signed-in caller is never challenged. This pins that the new default challenge scheme did
+    /// not displace the cookie authentication scheme.
+    /// </summary>
+    [Fact]
+    public void AuthenticationOptions_KeepTheCookieAsTheDefaultScheme()
+    {
+        using var client = _factory.CreateClient();
+
+        var options = _factory.Services
+            .GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<
+                Microsoft.AspNetCore.Authentication.AuthenticationOptions>>()
+            .Get(Microsoft.Extensions.Options.Options.DefaultName);
+
+        Assert.Equal(
+            Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationDefaults.AuthenticationScheme,
+            options.DefaultScheme);
+        Assert.Equal(
+            CopilotHive.Security.HiveChallengeHandler.SchemeName,
+            options.DefaultChallengeScheme);
+    }
+
     [Fact]
     public void CorrelationCookie_IsNotSecure_WhenAllowInsecureOAuthIsTrue()
     {
@@ -162,7 +262,8 @@ public sealed class AuthenticatedModeTests : IDisposable
             AllowAutoRedirect = false,
         });
 
-        var response = await client.GetAsync("/api/goals", TestContext.Current.CancellationToken);
+        // A PAGE request (not /api/*) is what still starts the OAuth handshake.
+        var response = await client.GetAsync("/goals", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.Found, response.StatusCode);
         var setCookie = Assert.Single(response.Headers.NonValidated["Set-Cookie"]);

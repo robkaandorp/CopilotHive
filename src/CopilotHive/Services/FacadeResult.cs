@@ -18,6 +18,13 @@ public enum FacadeErrorKind
     /// <summary>The request was malformed or failed validation (HTTP 400).</summary>
     BadRequest,
 
+    /// <summary>
+    /// The acting account is not authorized to perform the operation (HTTP 403). This is an
+    /// AUTHORIZATION answer, decided BEFORE any of the operation's own work runs, so it is never a
+    /// disguised validation or execution failure.
+    /// </summary>
+    Forbidden,
+
     /// <summary>The operation requires configuration that is not present.</summary>
     NotConfigured,
 

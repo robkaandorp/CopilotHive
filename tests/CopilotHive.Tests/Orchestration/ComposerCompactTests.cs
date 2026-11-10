@@ -17,6 +17,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using SharpCoder;
 
+using CopilotHive.Tests.Security;
+
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
@@ -547,7 +549,7 @@ public sealed class ComposerCompactTests
         var app = builder.Build();
         app.MapComposerEndpoints(
             composer,
-            new ComposerFacade(composer, NullLogger<ComposerFacade>.Instance),
+            new ComposerFacade(composer, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy, NullLogger<ComposerFacade>.Instance),
             null);
         await app.StartAsync(TestContext.Current.CancellationToken);
 

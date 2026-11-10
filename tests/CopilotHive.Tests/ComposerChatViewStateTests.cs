@@ -329,7 +329,10 @@ public sealed class ComposerChatViewStateTests
 
         // The host binding is what connects the seam to the facade — removal-proof.
         var host = ExtractMethodSource(source, "private sealed class ComponentCurrentModelHost(ComposerChat owner)");
-        Assert.Contains("ComposerFacade.GetCurrentModelAsync()", host);
+        // The call carries the CIRCUIT IDENTITY (re-resolved by the facade) and a cancellation
+        // token — an identity-free facade call is exactly what the authorization contract removed.
+        Assert.Contains("owner.ComposerFacade.GetCurrentModelAsync(", host);
+        Assert.Contains("await owner.ActingUserAsync()", host);
         Assert.Contains("owner.ComposerFacade", host);
         Assert.DoesNotContain("/api/composer/", host);
     }

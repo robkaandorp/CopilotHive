@@ -815,6 +815,8 @@ public sealed class ConfigurationModelEditorTests
             service,
             discovery: null,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<ConfigFacade>.Instance,
+            CopilotHive.Tests.Security.OpenModeFacadeAuth.Resolver,
+            CopilotHive.Tests.Security.OpenModeFacadeAuth.Policy,
             repoManager: null);
     }
 }

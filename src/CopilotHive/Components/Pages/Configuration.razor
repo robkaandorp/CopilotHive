@@ -8,6 +8,7 @@
 @inject ConfigRepoManager ConfigRepo
 @inject PageHeaderState PageHeader
 @inject IConfigFacade ConfigFacade
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject IBackupFacade BackupFacade
 @inject IJSRuntime JS
 
@@ -998,8 +999,13 @@ else
                                style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
                     </div>
 
+                    @if (_composerAdminAllowed)
+                    {
                     <div style="margin-top:1.5rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:600px">
-                        <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">Event Notifications</h3>
+                        <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.25rem">Event Notifications</h3>
+                        <p style="color:var(--text-muted);font-size:0.8rem;margin-bottom:0.75rem">
+                            Global / system-wide setting — applies to the whole installation, not to your personal session.
+                        </p>
                         <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center">
                             <label style="color:var(--text-muted);font-size:0.9rem">Mode</label>
                             <select @bind="_composerNotifMode"
@@ -1077,11 +1083,35 @@ else
                             </div>
                         </div>
                     </div>
+                    }
+                    else
+                    {
+                        <div style="margin-top:1.5rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:600px">
+                            <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.25rem">Event Notifications</h3>
+                            <p style="color:var(--text-muted);font-size:0.8rem;margin-bottom:0.5rem">
+                                Global / system-wide setting — applies to the whole installation, not to your personal session.
+                            </p>
+                            <p style="color:var(--text-muted);font-size:0.9rem">
+                                🔒 Only an administrator can change the installation-wide notification mode.
+                                Ask an administrator to change it for you.
+                            </p>
+                        </div>
+                    }
 
                     <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1rem">
-                        <button class="approve-btn" disabled="@_composerSaving" @onclick="SaveComposerAsync">
+                        @* The whole Composer section (max steps AND the global notification mode) is a
+                           GLOBAL write, so a non-admin is not offered a Save that could only be refused.
+                           For an admin the expression reduces to the previous disabled="@_composerSaving",
+                           so admin rendering and behaviour are unchanged. *@
+                        <button class="approve-btn" disabled="@(_composerSaving || !_composerAdminAllowed)" @onclick="SaveComposerAsync">
                             @(_composerSaving ? "Saving…" : "💾 Save")
                         </button>
+                        @if (!_composerAdminAllowed)
+                        {
+                            <span style="color:var(--text-muted);font-size:0.85rem">
+                                🔒 Administrator permission required to change global Composer settings.
+                            </span>
+                        }
                         @if (_composerSaveSuccess is not null)
                         {
                             <span style="color:var(--accent);font-size:0.9rem">@_composerSaveSuccess</span>
@@ -1286,9 +1316,63 @@ else
     private int _composerNotifThrottle = 30;
     private readonly HashSet<string> _composerNotifActiveEvents = [];
 
+    /// <summary>
+    /// The circuit's authenticated identity for the GLOBAL Composer write. Absent in open mode (no
+    /// cascading AuthenticationState), where the helper yields null and the resolver answers with
+    /// the open-mode local operator — so backward compatibility is unchanged. The facade
+    /// re-resolves current role/enabled state on every call and requires GlobalAdmin.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// Whether the CURRENT circuit user holds <see cref="CopilotHive.Security.HiveCapability.GlobalAdmin"/>,
+    /// i.e. whether the GLOBAL Composer settings (including the system-wide event-notification mode)
+    /// may be edited. Derived from the circuit identity through the scoped
+    /// <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/>, which re-resolves current
+    /// stored state on every evaluation. In open mode there is no cascade and no circuit principal, so
+    /// the answer is the explicit open-mode local operator (full authority) — byte-identical to the
+    /// pre-multi-user single-operator installation.
+    /// </summary>
+    private bool _composerAdminAllowed;
+
+    /// <summary>
+    /// Re-evaluates the caller's admin capability from CURRENT stored state. Called once per
+    /// initialisation; the value only gates RENDERING, never authorization — the facade re-resolves
+    /// and refuses independently, so a stale flag can only under-render, never over-grant.
+    /// </summary>
+    private async Task RefreshComposerAdminAllowedAsync()
+    {
+        try
+        {
+            _composerAdminAllowed = await ComponentActingUser.IsAllowedAsync(
+                AuthenticationState,
+                CircuitPrincipal,
+                CopilotHive.Security.HiveCapability.GlobalAdmin,
+                CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // A failure to answer is a DENIAL for rendering purposes: the section stays hidden and
+            // the facade would refuse the write anyway.
+            _composerAdminAllowed = false;
+            _composerSaveError = $"Could not verify administrator permissions: {ex.Message}";
+        }
+    }
+
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("⚙️ Configuration");
+
+        // MINIMAL circuit identity acquisition: this initialises the scoped accessor from the circuit's
+        // AuthenticationState (no-op in open mode, where no cascade exists) and derives the admin gate
+        // for the GLOBAL Composer settings below. It never throws when auth services are absent.
+        await RefreshComposerAdminAllowedAsync();
+
         try
         {
             await LoadFilesAsync();
@@ -1931,7 +2015,9 @@ else
                 MaxSteps: _composerMaxSteps,
                 EventNotificationsMode: _composerNotifMode,
                 EventNotificationsActiveEvents: _composerNotifActiveEvents.ToList(),
-                EventNotificationsThrottleSeconds: _composerNotifThrottle), CancellationToken.None);
+                EventNotificationsThrottleSeconds: _composerNotifThrottle),
+                await ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal),
+                CancellationToken.None);
             if (result.Success)
             {
                 await LoadComposerAsync();

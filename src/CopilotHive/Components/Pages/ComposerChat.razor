@@ -9,6 +9,7 @@
 @using System.IO
 @using System.Text.Json
 @using Microsoft.Extensions.AI
+@using System.Security.Claims
 @implements IAsyncDisposable
 @inject Composer Composer
 @inject ComposerAttachmentService AttachmentService
@@ -16,6 +17,7 @@
 @inject PageHeaderState PageHeader
 @inject IComposerFacade ComposerFacade
 @inject IConfigFacade ConfigFacade
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 
 @if (ViewState.ShowNotConfiguredNotice)
 {
@@ -286,11 +288,20 @@
                         <text>📦 Compact 50%</text>
                     }
                 </button>
-                <button @onclick="ToggleActiveNotifications"
-                        disabled="@(!CanToggleActiveNotifications(_activeNotifMode, Composer.IsStreaming, _notifTogglePending))"
-                        class="chat-action-btn">
-                    @ActiveNotificationsButtonText
-                </button>
+                @if (_notifToggleAdminAllowed)
+                {
+                    <button @onclick="ToggleActiveNotifications"
+                            disabled="@(!CanToggleActiveNotifications(_activeNotifMode, Composer.IsStreaming, _notifTogglePending))"
+                            class="chat-action-btn">
+                        @ActiveNotificationsButtonText
+                    </button>
+                }
+                else
+                {
+                    <span class="chat-hint" title="Global / system-wide setting — only an administrator can change it">
+                        🔒 Notifications (global setting)
+                    </span>
+                }
                 @if (_restartRequiredForNotifications)
                 {
                     <span class="chat-hint">⚠️ Restart required</span>
@@ -476,6 +487,31 @@
         public string Content { get; set; } = "";
     }
 
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation.
+    /// <para>
+    /// This is also the page's MINIMAL circuit identity acquisition: the scoped
+    /// <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/> is initialised from the same
+    /// cascading state exactly once per circuit. In open mode there is no cascade, so the accessor is
+    /// left uninitialised (open mode needs none) and the identity is null — the facades then resolve
+    /// the local operator exactly as before. Nothing here throws when auth services are absent.
+    /// </para>
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
     private readonly List<ChatMessage> _messages = [];
     private string _inputText = "";
     private HashSet<string> _selectedOptions = [];
@@ -500,6 +536,17 @@
     private bool _notifTogglePending;
     private bool _restartRequiredForNotifications;
     private string? _notifToggleError;
+    /// <summary>
+    /// Whether the CURRENT circuit user may change the INSTALLATION-WIDE event-notification mode.
+    /// The toggle persists the global Composer setting through
+    /// <see cref="IConfigFacade.SaveComposerAsync"/>, which requires
+    /// <see cref="CopilotHive.Security.HiveCapability.GlobalAdmin"/> — so a non-admin must not be
+    /// offered a control that could only fail. Derived from the circuit identity through the scoped
+    /// <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/> (which re-resolves current
+    /// stored state); in open mode it is the local operator, so the pre-multi-user behaviour is
+    /// unchanged. This gates RENDERING only: the facade independently re-resolves and refuses.
+    /// </summary>
+    private bool _notifToggleAdminAllowed;
 
     protected override async Task OnInitializedAsync()
     {
@@ -514,6 +561,26 @@
         {
             LoadHistory();
             await LoadCurrentModelAsync();
+        }
+
+        // The notification toggle persists a GLOBAL (installation-wide) setting, so its rendering is
+        // gated on the caller's CURRENT GlobalAdmin capability. This is also the page's explicit
+        // circuit identity acquisition: the scoped accessor is initialised from the cascading
+        // AuthenticationState here (no-op in open mode, where no cascade exists and the local
+        // operator holds every capability). A failure to answer renders the toggle HIDDEN — the
+        // facade would refuse the write anyway, so a stale flag can only under-render.
+        try
+        {
+            _notifToggleAdminAllowed = await ComponentActingUser.IsAllowedAsync(
+                AuthenticationState,
+                CircuitPrincipal,
+                CopilotHive.Security.HiveCapability.GlobalAdmin,
+                CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _notifToggleAdminAllowed = false;
+            _notifToggleError = $"Could not verify administrator permissions: {ex.Message}";
         }
 
         // The config endpoint is independent of the Composer agent connection, so the
@@ -1064,7 +1131,8 @@
         if (Composer.IsStreaming || Composer.IsCompacting) return;
         try
         {
-            var result = await ComposerFacade.CompactAsync();
+            var result = await ComposerFacade.CompactAsync(
+                await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 LoadHistory();
@@ -1084,7 +1152,8 @@
         if (Composer.IsStreaming || Composer.IsCompacting) return;
         try
         {
-            var result = await ComposerFacade.CompactPartialAsync(50);
+            var result = await ComposerFacade.CompactPartialAsync(
+                await ActingUserAsync(), 50, CancellationToken.None);
             if (result.Success)
             {
                 LoadHistory();
@@ -1216,9 +1285,11 @@
         public bool IsStreaming => owner.Composer.IsStreaming;
 
         /// <inheritdoc />
-        public Task<FacadeResult<SavedResult>> SaveModeAsync(string mode)
-            => owner.ConfigFacade.SaveComposerAsync(
-                new ComposerSettingsUpdate(EventNotificationsMode: mode), CancellationToken.None);
+        public async Task<FacadeResult<SavedResult>> SaveModeAsync(string mode)
+            => await owner.ConfigFacade.SaveComposerAsync(
+                new ComposerSettingsUpdate(EventNotificationsMode: mode),
+                await owner.ActingUserAsync(),
+                CancellationToken.None);
 
         /// <inheritdoc />
         public void Notify() => owner.StateHasChanged();
@@ -1318,15 +1389,17 @@
     /// <summary>Runs the shared toggle body against this component's own state.</summary>
     private Task ToggleActiveNotifications() => ToggleActiveNotificationsCoreAsync(NotificationToggleHost);
 
-    private Task LoadAvailableModelsAsync()
+    private async Task LoadAvailableModelsAsync()
     {
         try
         {
-            var result = ComposerFacade.GetModels();
+            var result = await ComposerFacade.GetModelsAsync(
+                await ActingUserAsync(),
+                CancellationToken.None);
             if (!result.Success)
             {
                 Console.Error.WriteLine($"[ComposerChat] Failed to load available models: {result.Error}");
-                return Task.CompletedTask;
+                return;
             }
 
             if (result.Value?.Models is { Count: > 0 } models)
@@ -1341,8 +1414,6 @@
         {
             Console.Error.WriteLine($"[ComposerChat] Failed to load available models: {ex.Message}");
         }
-
-        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -1396,8 +1467,9 @@
             => Console.Error.WriteLine($"[ComposerChat] Failed to load current model: {error}");
 
         /// <inheritdoc />
-        public Task<FacadeResult<CurrentModelDto>> GetCurrentModelAsync()
-            => owner.ComposerFacade.GetCurrentModelAsync();
+        public async Task<FacadeResult<CurrentModelDto>> GetCurrentModelAsync()
+            => await owner.ComposerFacade.GetCurrentModelAsync(
+                await owner.ActingUserAsync(), CancellationToken.None);
     }
 
     private ICurrentModelHost? _currentModelHost;
@@ -1524,8 +1596,9 @@
         public bool IsConnected => owner.Composer.IsConnected;
 
         /// <inheritdoc />
-        public Task<FacadeResult<SwitchResultDto>> SwitchAsync(string model, ReasoningEffort reasoning)
-            => owner.ComposerFacade.SwitchModelAsync(model, SwitchReasoningWireValue(reasoning));
+        public async Task<FacadeResult<SwitchResultDto>> SwitchAsync(string model, ReasoningEffort reasoning)
+            => await owner.ComposerFacade.SwitchModelAsync(
+                await owner.ActingUserAsync(), model, SwitchReasoningWireValue(reasoning), CancellationToken.None);
 
         /// <inheritdoc />
         public void LoadHistory() => owner.LoadHistory();
@@ -1623,7 +1696,10 @@
         try
         {
             var result = await ComposerFacade.SwitchModelAsync(
-                _selectedModel, SwitchReasoningWireValue(newReasoning));
+                await ActingUserAsync(),
+                _selectedModel,
+                SwitchReasoningWireValue(newReasoning),
+                CancellationToken.None);
             _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, result.Success);
 
             if (!result.Success)

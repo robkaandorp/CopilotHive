@@ -1,7 +1,11 @@
+using System.Security.Claims;
+
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Security;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -59,8 +63,19 @@ public sealed class ComposerFacadeTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
     }
 
+    /// <summary>
+    /// Builds the production facade in OPEN mode over a real directory. Open mode is what the
+    /// pre-existing behavioural tests exercised (the legacy single local operator), so their
+    /// assertions about NotConfigured / BadRequest / success semantics stay exactly as they were.
+    /// </summary>
     private static ComposerFacade CreateFacade(Composer? composer)
-        => new(composer, NullLogger<ComposerFacade>.Instance);
+        => new(composer, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy, NullLogger<ComposerFacade>.Instance);
+
+    /// <summary>The open-mode identity: no cascade exists, so the caller passes <c>null</c>.</summary>
+    private static readonly ClaimsPrincipal? OpenModeUser = null;
+
+    /// <summary>The caller's cancellation token for facade calls.</summary>
+    private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
     /// <summary>Returns the Composer's <see cref="SharpCoder.AgentSession"/> via reflection.</summary>
     private static SharpCoder.AgentSession GetSessionOf(Composer composer)
@@ -144,7 +159,7 @@ public sealed class ComposerFacadeTests : IDisposable
     [Fact]
     public async Task NullComposer_GetCurrentModel_ReportsNotConfigured()
     {
-        var result = await CreateFacade(null).GetCurrentModelAsync();
+        var result = await CreateFacade(null).GetCurrentModelAsync(OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Null(result.Value);
@@ -153,9 +168,9 @@ public sealed class ComposerFacadeTests : IDisposable
     }
 
     [Fact]
-    public void NullComposer_GetModels_ReportsNotConfigured()
+    public async Task NullComposer_GetModels_ReportsNotConfigured()
     {
-        var result = CreateFacade(null).GetModels();
+        var result = await CreateFacade(null).GetModelsAsync(OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Null(result.Value);
@@ -180,7 +195,7 @@ public sealed class ComposerFacadeTests : IDisposable
     [InlineData(null, null)]
     public async Task NullComposer_SwitchModel_ChecksComposerBeforeValidatingArguments(string? model, string? reasoning)
     {
-        var result = await CreateFacade(null).SwitchModelAsync(model, reasoning);
+        var result = await CreateFacade(null).SwitchModelAsync(OpenModeUser, model, reasoning, Ct);
 
         Assert.False(result.Success);
         Assert.Equal("Composer is not available.", result.Error);
@@ -191,7 +206,7 @@ public sealed class ComposerFacadeTests : IDisposable
     [Fact]
     public async Task NullComposer_Compact_ReportsNotConfigured()
     {
-        var result = await CreateFacade(null).CompactAsync();
+        var result = await CreateFacade(null).CompactAsync(OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal("Composer is not available.", result.Error);
@@ -201,7 +216,7 @@ public sealed class ComposerFacadeTests : IDisposable
     [Fact]
     public async Task NullComposer_CompactPartial_ReportsNotConfigured()
     {
-        var result = await CreateFacade(null).CompactPartialAsync(50);
+        var result = await CreateFacade(null).CompactPartialAsync(OpenModeUser, 50, Ct);
 
         Assert.False(result.Success);
         Assert.Equal("Composer is not available.", result.Error);
@@ -220,7 +235,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer());
 
-        var result = await facade.GetCurrentModelAsync();
+        var result = await facade.GetCurrentModelAsync(OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.NotNull(result.Value);
@@ -241,7 +256,7 @@ public sealed class ComposerFacadeTests : IDisposable
         {
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
 
-            var result = await CreateFacade(composer).GetCurrentModelAsync();
+            var result = await CreateFacade(composer).GetCurrentModelAsync(OpenModeUser, Ct);
 
             Assert.True(result.Success);
             Assert.NotNull(result.Value);
@@ -254,12 +269,12 @@ public sealed class ComposerFacadeTests : IDisposable
     // ── Models: the Composer catalog is the sole authority ──────────────────
 
     [Fact]
-    public void GetModels_ReturnsComposerCatalogVerbatim()
+    public async Task GetModels_ReturnsComposerCatalogVerbatim()
     {
         var composer = CreateComposer(["claude-sonnet-4", "claude-opus"]);
         var facade = CreateFacade(composer);
 
-        var result = facade.GetModels();
+        var result = await facade.GetModelsAsync(OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(composer.AvailableModels, result.Value!.Models);
@@ -277,7 +292,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer());
 
-        var result = await facade.SwitchModelAsync(model, "medium");
+        var result = await facade.SwitchModelAsync(OpenModeUser, model, "medium", Ct);
 
         Assert.False(result.Success);
         Assert.Equal("The 'model' query parameter is required.", result.Error);
@@ -292,7 +307,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer());
 
-        var result = await facade.SwitchModelAsync("claude-opus", reasoning);
+        var result = await facade.SwitchModelAsync(OpenModeUser, "claude-opus", reasoning, Ct);
 
         Assert.False(result.Success);
         Assert.Equal("The 'reasoning' query parameter is required.", result.Error);
@@ -304,7 +319,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer());
 
-        var result = await facade.SwitchModelAsync("claude-opus", "turbo");
+        var result = await facade.SwitchModelAsync(OpenModeUser, "claude-opus", "turbo", Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -313,7 +328,7 @@ public sealed class ComposerFacadeTests : IDisposable
 
     /// <summary>
     /// Validation is against the Composer's normalised catalog — the same list
-    /// <see cref="IComposerFacade.GetModels"/> reports — and the rejection message names the
+    /// <see cref="IComposerFacade.GetModelsAsync"/> reports — and the rejection message names the
     /// available models.
     /// </summary>
     [Fact]
@@ -321,7 +336,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer(["claude-sonnet-4", "claude-opus"]));
 
-        var result = await facade.SwitchModelAsync("gpt-5", "medium");
+        var result = await facade.SwitchModelAsync(OpenModeUser, "gpt-5", "medium", Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -341,7 +356,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer());
 
-        var result = await facade.CompactAsync();
+        var result = await facade.CompactAsync(OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Null(result.Value);
@@ -354,7 +369,7 @@ public sealed class ComposerFacadeTests : IDisposable
     {
         var facade = CreateFacade(CreateComposer());
 
-        var result = await facade.CompactPartialAsync(50);
+        var result = await facade.CompactPartialAsync(OpenModeUser, 50, Ct);
 
         Assert.False(result.Success);
         Assert.Null(result.Value);
@@ -376,7 +391,7 @@ public sealed class ComposerFacadeTests : IDisposable
         {
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
 
-            var result = await CreateFacade(composer).SwitchModelAsync("claude-opus", "medium");
+            var result = await CreateFacade(composer).SwitchModelAsync(OpenModeUser, "claude-opus", "medium", Ct);
 
             Assert.True(result.Success);
             Assert.NotNull(result.Value);
@@ -403,7 +418,7 @@ public sealed class ComposerFacadeTests : IDisposable
         {
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
 
-            var result = await CreateFacade(composer).SwitchModelAsync("CLAUDE-OPUS", "high");
+            var result = await CreateFacade(composer).SwitchModelAsync(OpenModeUser, "CLAUDE-OPUS", "high", Ct);
 
             Assert.True(result.Success, result.Error ?? "switch failed");
             Assert.NotNull(result.Value);
@@ -428,7 +443,7 @@ public sealed class ComposerFacadeTests : IDisposable
         var composer = await CreateComposerWithConnectedAgent();
         await using (composer)
         {
-            var result = await CreateFacade(composer).CompactAsync();
+            var result = await CreateFacade(composer).CompactAsync(OpenModeUser, Ct);
 
             Assert.True(result.Success);
             Assert.NotNull(result.Value);
@@ -450,7 +465,7 @@ public sealed class ComposerFacadeTests : IDisposable
         var composer = await CreateComposerWithConnectedAgent(populateMessages: false);
         await using (composer)
         {
-            var result = await CreateFacade(composer).CompactPartialAsync(50);
+            var result = await CreateFacade(composer).CompactPartialAsync(OpenModeUser, 50, Ct);
 
             Assert.True(result.Success);
             Assert.NotNull(result.Value);
@@ -477,7 +492,7 @@ public sealed class ComposerFacadeTests : IDisposable
             // commit boundary, not an ArgumentException.
             var facade = CreateFacade(composer);
             var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => facade.SwitchModelAsync("claude-opus", "medium"));
+                () => facade.SwitchModelAsync(OpenModeUser, "claude-opus", "medium", Ct));
 
             Assert.Contains("factory exploded", exception.Message, StringComparison.Ordinal);
         }
@@ -507,26 +522,42 @@ public sealed class ComposerFacadeTests : IDisposable
 
             var facade = CreateFacade(composer);
             var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => facade.GetCurrentModelAsync());
+                () => facade.GetCurrentModelAsync(OpenModeUser, Ct));
 
             Assert.Contains("without a model", exception.Message, StringComparison.Ordinal);
         }
     }
 
-    // ── No CancellationToken anywhere on the facade surface ─────────────────
+    // ── The AUTHORIZATION surface: identity + cancellation on EVERY operation ──
 
     /// <summary>
-    /// None of the pre-facade endpoints accepted a cancellation token, so no facade method may
-    /// declare one — the adapters pass <see cref="CancellationToken.None"/> internally.
+    /// EVERY operation takes the caller's identity and a cancellation token — there is no
+    /// identity-free overload anywhere on the interface (that removal IS the no-bypass contract: a
+    /// caller cannot reach a Composer operation without an identity the facade can re-resolve).
+    /// Only ONE overload per name may exist, so a re-added identity-free overload fails this test.
     /// </summary>
     [Fact]
-    public void FacadeSurface_DeclaresNoCancellationTokenParameters()
+    public void FacadeSurface_EveryOperationRequiresAnIdentityAndACancellationToken()
     {
-        foreach (var method in typeof(IComposerFacade).GetMethods())
+        var methods = typeof(IComposerFacade).GetMethods();
+
+        Assert.Equal(5, methods.Length);
+        Assert.Equal(5, methods.Select(m => m.Name).Distinct(StringComparer.Ordinal).Count());
+
+        foreach (var method in methods)
         {
-            Assert.DoesNotContain(
-                method.GetParameters(),
-                p => p.ParameterType == typeof(CancellationToken));
+            var parameters = method.GetParameters();
+
+            // The acting identity is the FIRST parameter: an implicit/optional identity would be an
+            // unauthenticated bypass, so it is required and typed as the claims principal.
+            Assert.True(
+                parameters.Length > 0 && parameters[0].ParameterType == typeof(ClaimsPrincipal),
+                $"{method.Name} must take the acting ClaimsPrincipal as its first parameter.");
+            Assert.False(parameters[0].IsOptional, $"{method.Name}'s identity parameter must not be optional.");
+
+            // The cancellation token is required too — never a silently defaulted one.
+            var ct = Assert.Single(parameters, p => p.ParameterType == typeof(CancellationToken));
+            Assert.False(ct.IsOptional, $"{method.Name}'s CancellationToken must not be optional.");
         }
     }
 
@@ -537,11 +568,65 @@ public sealed class ComposerFacadeTests : IDisposable
     [Fact]
     public void FacadeSurface_ExposesExactlyTheFiveRuntimeOperations()
     {
-        var names = typeof(IComposerFacade).GetMethods().Select(m => m.Name).OrderBy(n => n).ToArray();
+        var names = typeof(IComposerFacade).GetMethods().Select(m => m.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
 
         Assert.Equal(
-            ["CompactAsync", "CompactPartialAsync", "GetCurrentModelAsync", "GetModels", "SwitchModelAsync"],
+            ["CompactAsync", "CompactPartialAsync", "GetCurrentModelAsync", "GetModelsAsync", "SwitchModelAsync"],
             names);
+    }
+
+    /// <summary>
+    /// THE NO-BYPASS CONTRACT ON THE CONCRETE CLASS TOO: a caller holding the concrete
+    /// <see cref="ComposerFacade"/> (rather than the interface) must not find an identity-free
+    /// overload there either.
+    /// <para>
+    /// The interface-level check above is not sufficient on its own: an implementation that kept
+    /// an identity-free PUBLIC method on the concrete class would still be reachable by any
+    /// caller that resolved the concrete type. Every PUBLIC instance method of the concrete facade
+    /// must therefore carry the acting identity and the cancellation token.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void ConcreteFacadeSurface_HasNoPublicIdentityFreeOperation()
+    {
+        var publicOperations = typeof(ComposerFacade)
+            .GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)
+            .Where(m => !m.IsSpecialName && m.DeclaringType == typeof(ComposerFacade))
+            .ToArray();
+
+        Assert.NotEmpty(publicOperations);
+
+        foreach (var method in publicOperations)
+        {
+            var parameters = method.GetParameters();
+
+            Assert.True(
+                parameters.Length > 0 && parameters[0].ParameterType == typeof(ClaimsPrincipal),
+                $"{method.Name} must take the acting ClaimsPrincipal as its first parameter.");
+            Assert.False(parameters[0].IsOptional, $"{method.Name}'s identity parameter must not be optional.");
+
+            var ct = Assert.Single(parameters, p => p.ParameterType == typeof(CancellationToken));
+            Assert.False(ct.IsOptional, $"{method.Name}'s CancellationToken must not be optional.");
+        }
+    }
+
+    /// <summary>
+    /// THE SAME NO-BYPASS CONTRACT ON THE CONCRETE <see cref="ConfigFacade"/>: the global Composer
+    /// write must not be reachable through an identity-free PUBLIC method on the concrete class.
+    /// </summary>
+    [Fact]
+    public void ConcreteConfigFacadeSurface_HasNoPublicIdentityFreeComposerWrite()
+    {
+        var saveComposer = Assert.Single(
+            typeof(ConfigFacade)
+                .GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public),
+            m => m.Name == nameof(IConfigFacade.SaveComposerAsync));
+
+        var parameters = saveComposer.GetParameters();
+        Assert.Equal(typeof(ComposerSettingsUpdate), parameters[0].ParameterType);
+        Assert.Equal(typeof(ClaimsPrincipal), parameters[1].ParameterType);
+        Assert.Equal(typeof(CancellationToken), parameters[2].ParameterType);
+        Assert.All(parameters, p => Assert.False(p.IsOptional, $"{p.Name} must be required."));
     }
 
     public void Dispose()

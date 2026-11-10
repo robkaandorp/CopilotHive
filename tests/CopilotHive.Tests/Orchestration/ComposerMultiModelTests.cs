@@ -15,6 +15,8 @@ using System.Net;
 using System.Text.Json;
 using System.Net.Http.Json;
 
+using CopilotHive.Tests.Security;
+
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
@@ -895,7 +897,7 @@ public sealed class ComposerHubTests : IAsyncLifetime
         _app = builder.Build();
         _app.MapComposerEndpoints(
             _composer,
-            new ComposerFacade(_composer, NullLogger<ComposerFacade>.Instance),
+            new ComposerFacade(_composer, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy, NullLogger<ComposerFacade>.Instance),
             config: null);
         await _app.StartAsync(TestContext.Current.CancellationToken);
         _client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };
@@ -1482,7 +1484,7 @@ public sealed class ComposerHubNullTests : IAsyncLifetime
         // Map endpoints with null composer - should not throw
         _app.MapComposerEndpoints(
             null!,
-            new ComposerFacade(null, NullLogger<ComposerFacade>.Instance),
+            new ComposerFacade(null, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy, NullLogger<ComposerFacade>.Instance),
             config: null);
         await _app.StartAsync(TestContext.Current.CancellationToken);
         _client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };
@@ -1882,14 +1884,28 @@ public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
     private readonly CopilotHiveDbContext _dbContext;
     private readonly GoalStore _store;
     private readonly Composer _composer;
+    private readonly IComposerFacade? _facade;
     private WebApplication _app = null!;
     private HttpClient _client = null!;
 
     public HttpClient Client => _client;
 
     public ComposerHubWithConfigFixture(HiveConfigFile? config)
+        : this(config, facade: null)
+    {
+    }
+
+    /// <summary>
+    /// Builds the fixture with a SUPPLIED facade so an authorization test can substitute one whose
+    /// identity decisions are the subject of the test (the default wiring is the open-mode facade,
+    /// which resolves the legacy local operator for every request).
+    /// </summary>
+    /// <param name="config">Optional global configuration.</param>
+    /// <param name="facade">The facade to map, or <c>null</c> to build the default open-mode one.</param>
+    public ComposerHubWithConfigFixture(HiveConfigFile? config, IComposerFacade? facade)
     {
         Config = config;
+        _facade = facade;
         _dbContext = CopilotHiveDbContext.CreateInMemory();
         _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
@@ -1916,7 +1932,9 @@ public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
         _app = builder.Build();
         _app.MapComposerEndpoints(
             _composer,
-            new ComposerFacade(_composer, NullLogger<ComposerFacade>.Instance),
+            _facade ?? new ComposerFacade(
+                _composer, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy,
+                NullLogger<ComposerFacade>.Instance),
             Config);
         await _app.StartAsync(TestContext.Current.CancellationToken);
         _client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };

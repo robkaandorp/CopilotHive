@@ -656,6 +656,11 @@ public sealed class Program
                 sp.GetService<ConfigModelService>(),
                 sp.GetService<ModelDiscoveryService>(),
                 sp.GetRequiredService<ILogger<ConfigFacade>>(),
+                // Authorization is part of the global Composer write: the stateless resolver and
+                // policy are singletons, so nothing per-user (and never the scoped circuit
+                // accessor) is captured by this singleton facade.
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
                 sp.GetService<IBrainRepoManager>()));
 
             // Brain: direct LLM connection via SharpCoder. Registered UNCONDITIONALLY — CopilotHive
@@ -708,8 +713,12 @@ public sealed class Program
                 builder.Services.AddAuthentication(options =>
                     {
                         options.DefaultScheme = Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationDefaults.AuthenticationScheme;
-                        options.DefaultChallengeScheme = "GitHub";
+                        // Path-aware challenge: an unauthenticated /api/* request gets a bare 401 with
+                        // NO redirect, while a browser/page challenge keeps the GitHub OAuth redirect
+                        // (and therefore the /login and /signin-github flows) exactly as before.
+                        options.DefaultChallengeScheme = HiveChallengeHandler.SchemeName;
                     })
+                    .AddScheme<AuthenticationSchemeOptions, HiveChallengeHandler>(HiveChallengeHandler.SchemeName, _ => { })
                     .AddCookie(options =>
                     {
                         options.LoginPath = "/login";
@@ -826,9 +835,14 @@ public sealed class Program
             // Composer runtime facade: ALWAYS registered so the Composer endpoints and the
             // ComposerChat component resolve it unconditionally. The Composer itself may be
             // absent — it is passed through as-is and the facade reports NotConfigured on every
-            // operation in that case (it never throws on a null Composer).
+            // authorized operation in that case (it never throws on a null Composer).
+            // AUTHORIZATION is part of the contract now: the singleton facade holds the stateless
+            // resolver + policy (never the scoped circuit accessor) and re-resolves current
+            // role/enabled state on EVERY operation.
             builder.Services.AddSingleton<IComposerFacade>(sp => new ComposerFacade(
                 sp.GetService<Composer>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
                 sp.GetRequiredService<ILogger<ComposerFacade>>()));
 
             // Composer LLM connection coordinator: owns the startup connect (gating, deferral

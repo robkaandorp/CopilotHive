@@ -5,7 +5,9 @@ using System.Text;
 
 using CopilotHive.Configuration;
 using CopilotHive.Git;
+using CopilotHive.Security;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -93,11 +95,17 @@ public class ConfigFacadeTests
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<IConfigFacade>();
+                // The production wiring: the SINGLETON facade takes the stateless resolver + policy
+                // (never the scoped circuit accessor). The test host runs in OPEN mode (no OAuth env
+                // vars), so the resolver yields the legacy local operator and every operation
+                // behaves exactly as before.
                 services.AddSingleton<IConfigFacade>(sp => new ConfigFacade(
                     _hiveConfig,
                     _configModel,
                     _discovery,
                     sp.GetRequiredService<ILogger<ConfigFacade>>(),
+                    sp.GetRequiredService<HivePrincipalResolver>(),
+                    sp.GetRequiredService<HivePolicy>(),
                     _repoManager));
 
                 if (_configModel is not null)
@@ -661,7 +669,8 @@ public class ConfigFacadeTests
     /// reads only the config, so the read path needs no services.
     /// </summary>
     private static ConfigFacade CreateReadFacade(HiveConfigFile config) =>
-        new(config, null, null, NullLogger<ConfigFacade>.Instance);
+        new(config, null, null, NullLogger<ConfigFacade>.Instance,
+            OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy);
 
     /// <summary>
     /// Missing <c>Models</c> and null/empty catalogs preserve the exact null-versus-empty

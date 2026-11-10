@@ -1,5 +1,7 @@
 using CopilotHive.Configuration;
+using CopilotHive.Security;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -41,6 +43,13 @@ public class ConfigFacadeSettingsTests
     // ── Exact messages the pre-facade handlers produced ────────────────────
 
     private const string ConfigNotConfiguredMessage = "Config repo not configured.";
+
+    /// <summary>
+    /// The OPEN-MODE identity: these tests exercise the pre-existing failure table against a host
+    /// with no OAuth configured, where the resolver yields the legacy local operator for a null
+    /// identity. Authorization therefore never changes any assertion here.
+    /// </summary>
+    private static readonly System.Security.Claims.ClaimsPrincipal? OpenModeUser = null;
     private const string CrudNotConfiguredMessage = "Config service is not configured.";
 
     /// <summary>
@@ -137,7 +146,7 @@ public class ConfigFacadeSettingsTests
         Assert.Equal(CrudNotConfiguredMessage, workers.Error);
 
         var composer = await facade.SaveComposerAsync(
-            new ComposerSettingsUpdate(MaxSteps: 75), TestContext.Current.CancellationToken);
+            new ComposerSettingsUpdate(MaxSteps: 75), OpenModeUser, TestContext.Current.CancellationToken);
         Assert.False(composer.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, composer.Kind);
         Assert.Equal(CrudNotConfiguredMessage, composer.Error);
@@ -161,6 +170,7 @@ public class ConfigFacadeSettingsTests
 
             var result = await facade.SaveComposerAsync(
                 new ComposerSettingsUpdate(EventNotificationsMode: "bogus"),
+                OpenModeUser,
                 TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
@@ -192,6 +202,7 @@ public class ConfigFacadeSettingsTests
 
             var result = await facade.SaveComposerAsync(
                 new ComposerSettingsUpdate(EventNotificationsActiveEvents: ["not_an_event"]),
+                OpenModeUser,
                 TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
@@ -290,7 +301,8 @@ public class ConfigFacadeSettingsTests
 
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => facade.SaveComposerAsync(
-                    new ComposerSettingsUpdate(MaxSteps: 75), TestContext.Current.CancellationToken));
+                    new ComposerSettingsUpdate(MaxSteps: 75), OpenModeUser,
+                    TestContext.Current.CancellationToken));
             Assert.Equal("unexpected storage outage", ex.Message);
         }
         finally
@@ -708,6 +720,7 @@ public class ConfigFacadeSettingsTests
                     EventNotificationsMode: "active",
                     EventNotificationsActiveEvents: ["goal_completed", "ci_failed"],
                     EventNotificationsThrottleSeconds: 45),
+                OpenModeUser,
                 TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
@@ -753,7 +766,7 @@ public class ConfigFacadeSettingsTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var saveCall = facade.SaveComposerAsync(
-                new ComposerSettingsUpdate(MaxSteps: 75), cts.Token);
+                new ComposerSettingsUpdate(MaxSteps: 75), OpenModeUser, cts.Token);
 
             // Deterministically unwind the gated write via cancellation (never a timing wait).
             cts.Cancel();
@@ -791,6 +804,8 @@ public class ConfigFacadeSettingsTests
                 service,
                 discovery: null,
                 NullLogger<ConfigFacade>.Instance,
+                OpenModeFacadeAuth.Resolver,
+                OpenModeFacadeAuth.Policy,
                 repoManager: null);
 
             var page = new ConfigurationPage();
