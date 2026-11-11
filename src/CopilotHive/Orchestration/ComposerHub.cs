@@ -17,7 +17,14 @@ public static class ComposerHub
     /// The handlers are thin adapters over <see cref="IComposerFacade"/>: all Composer work
     /// (authorization, validation, switching, compaction) lives in the facade, and the mapping from
     /// <see cref="FacadeErrorKind"/> to an HTTP status happens in <see cref="MapComposerFacadeError"/>.
-    /// The facade is passed EXPLICITLY rather than resolved from DI so tests can substitute one.
+    /// </para>
+    /// <para>
+    /// THE FACADE IS RESOLVED PER REQUEST, from <see cref="HttpContext.RequestServices"/>, so the
+    /// request's OWN scope supplies it. That is what lets the registration be scoped (the gate-selected
+    /// facade may hold the scoped circuit accessor) without any host startup closure capturing a scoped
+    /// service — the reason this hub no longer receives an <c>app.Services</c>-resolved instance.
+    /// A NON-NULL <paramref name="composerFacade"/> is still honoured as an explicit OVERRIDE so a test
+    /// can substitute one; it is never resolved from the root provider here.
     /// </para>
     /// <para>
     /// IDENTITY IS PER REQUEST: each handler takes the request's <see cref="HttpContext"/> and
@@ -32,10 +39,13 @@ public static class ComposerHub
     /// The Composer instance to expose. When <c>null</c>, NO routes are mapped at all — the
     /// endpoints 404, exactly as before.
     /// </param>
-    /// <param name="composerFacade">The facade the handlers delegate to.</param>
+    /// <param name="composerFacade">
+    /// An explicit facade override for tests, or <c>null</c> to resolve the scoped
+    /// <see cref="IComposerFacade"/> from the request's own service provider.
+    /// </param>
     /// <param name="config">Optional global configuration; retained for existing call sites.</param>
     public static void MapComposerEndpoints(
-        this WebApplication routes, Composer? composer, IComposerFacade composerFacade, HiveConfigFile? config = null)
+        this WebApplication routes, Composer? composer, IComposerFacade? composerFacade = null, HiveConfigFile? config = null)
     {
         if (composer is null) return;
 
@@ -44,7 +54,7 @@ public static class ComposerHub
         // the catalog (no FirstOrDefault fallback). A null model is a SUCCESSFUL read.
         routes.MapGet("/api/composer/current-model", async (HttpContext context) =>
         {
-            var result = await composerFacade.GetCurrentModelAsync(
+            var result = await FacadeFor(context, composerFacade).GetCurrentModelAsync(
                 context.User, context.RequestAborted);
             if (!result.Success)
                 return MapComposerFacadeError(result.Kind, result.Error);
@@ -53,7 +63,7 @@ public static class ComposerHub
 
         routes.MapGet("/api/composer/models", async (HttpContext context) =>
         {
-            var result = await composerFacade.GetModelsAsync(context.User, context.RequestAborted);
+            var result = await FacadeFor(context, composerFacade).GetModelsAsync(context.User, context.RequestAborted);
             if (!result.Success)
                 return MapComposerFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -62,7 +72,7 @@ public static class ComposerHub
         routes.MapPost("/api/composer/models/switch", async (
             HttpContext context, string? model, string? reasoning) =>
         {
-            var result = await composerFacade.SwitchModelAsync(
+            var result = await FacadeFor(context, composerFacade).SwitchModelAsync(
                 context.User, model, reasoning, context.RequestAborted);
             if (!result.Success)
                 return MapComposerFacadeError(result.Kind, result.Error);
@@ -71,7 +81,7 @@ public static class ComposerHub
 
         routes.MapPost("/api/composer/compact", async (HttpContext context) =>
         {
-            var result = await composerFacade.CompactAsync(context.User, context.RequestAborted);
+            var result = await FacadeFor(context, composerFacade).CompactAsync(context.User, context.RequestAborted);
             if (!result.Success)
                 return MapComposerFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -79,12 +89,27 @@ public static class ComposerHub
 
         routes.MapPost("/api/composer/compact-partial", async (HttpContext context, int percent) =>
         {
-            var result = await composerFacade.CompactPartialAsync(
+            var result = await FacadeFor(context, composerFacade).CompactPartialAsync(
                 context.User, percent, context.RequestAborted);
             if (!result.Success)
                 return MapComposerFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
         });
+    }
+
+    /// <summary>
+    /// The facade for ONE request: the explicit test override when one was supplied, otherwise the
+    /// request's OWN scoped <see cref="IComposerFacade"/>.
+    /// </summary>
+    /// <param name="context">The request being handled.</param>
+    /// <param name="override">The explicit override passed to <see cref="MapComposerEndpoints"/>, or <c>null</c>.</param>
+    /// <returns>The facade the handler must use.</returns>
+    private static IComposerFacade FacadeFor(HttpContext context, IComposerFacade? @override)
+    {
+        if (@override is not null)
+            return @override;
+
+        return context.RequestServices.GetRequiredService<IComposerFacade>();
     }
 
     /// <summary>
@@ -95,8 +120,14 @@ public static class ComposerHub
     /// reported as a 400). <c>NotConfigured</c> returns a 503 problem-details body — through the
     /// real endpoints it is unreachable (a null Composer maps no routes at all), but a substituted
     /// facade can report it, so the case is handled explicitly instead of falling through.
-    /// Every other kind is a programming error and throws.
     /// </summary>
+    /// <remarks>
+    /// The two ADDITIVE recovery kinds are mapped explicitly and nothing else moves:
+    /// <c>ServiceUnavailable</c> (the runtime is failed, or its connect is still deferred after the
+    /// operation's own retry) is a 503 problem-details body, and <c>Conflict</c> (a runtime removed
+    /// while the request was in flight) is a 409 <c>{error}</c> body carrying the safe retry message.
+    /// Every existing mapping above is byte-unchanged.
+    /// </remarks>
     /// <param name="kind">The failure category reported by the facade.</param>
     /// <param name="error">The human-readable error message.</param>
     /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
@@ -107,6 +138,10 @@ public static class ComposerHub
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
             FacadeErrorKind.Forbidden => Results.Json(new { error }, statusCode: StatusCodes.Status403Forbidden),
             FacadeErrorKind.NotConfigured => Results.Problem(error, statusCode: 503),
+            // Additive recovery kinds (the per-user runtime path): explicitly handled, never a
+            // fall-through, and never a silent remap of an existing kind.
+            FacadeErrorKind.ServiceUnavailable => Results.Problem(error, statusCode: StatusCodes.Status503ServiceUnavailable),
+            FacadeErrorKind.Conflict => Results.Json(new { error }, statusCode: StatusCodes.Status409Conflict),
             _ => throw new InvalidOperationException($"Unexpected facade error kind: {kind}."),
         };
     }

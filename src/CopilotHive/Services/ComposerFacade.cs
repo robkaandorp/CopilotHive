@@ -189,14 +189,11 @@ public sealed class ComposerFacade : IComposerFacade
         if (!await IsAuthorizedAsync(actingUser, nameof(GetCurrentModelAsync), ct).ConfigureAwait(false))
             return Forbidden<CurrentModelDto>();
 
-        if (_composer is null)
-            return NotAvailable<CurrentModelDto>(nameof(GetCurrentModelAsync));
-
-        // Frozen contract: a Composer that is not connected / has no active model reports a NULL
-        // model on a SUCCESSFUL result — a value is never fabricated from the catalog.
-        // Nothing is caught here: the pre-facade read handler caught nothing either.
-        var model = _composer.GetStats()?.Model;
-        return new(true, new CurrentModelDto(model), null, FacadeErrorKind.None);
+        // The authorization answer and the "no Composer" answer are produced BEFORE the operation
+        // helper runs, so a substituted runtime can never observe an unauthorized caller.
+        return _composer is null
+            ? NotAvailable<CurrentModelDto>(nameof(GetCurrentModelAsync))
+            : ReadCurrentModel(_composer);
     }
 
     /// <inheritdoc />
@@ -206,16 +203,9 @@ public sealed class ComposerFacade : IComposerFacade
         if (!await IsAuthorizedAsync(actingUser, nameof(GetModelsAsync), ct).ConfigureAwait(false))
             return Forbidden<ComposerModelsDto>();
 
-        if (_composer is null)
-            return NotAvailable<ComposerModelsDto>(nameof(GetModelsAsync));
-
-        // The Composer's normalised catalog is the sole authority for listing, so listed models
-        // are IDENTICAL to what SwitchModelAsync validates. Nothing is caught (read handler).
-        return new(
-            true,
-            new ComposerModelsDto(_composer.AvailableModels, _composer.ReasoningEffort),
-            null,
-            FacadeErrorKind.None);
+        return _composer is null
+            ? NotAvailable<ComposerModelsDto>(nameof(GetModelsAsync))
+            : ReadModels(_composer);
     }
 
     /// <inheritdoc />
@@ -225,11 +215,84 @@ public sealed class ComposerFacade : IComposerFacade
         if (!await IsAuthorizedAsync(actingUser, nameof(SwitchModelAsync), ct).ConfigureAwait(false))
             return Forbidden<SwitchResultDto>();
 
-        if (_composer is null)
-            return NotAvailable<SwitchResultDto>(nameof(SwitchModelAsync));
+        return _composer is null
+            ? NotAvailable<SwitchResultDto>(nameof(SwitchModelAsync))
+            : await SwitchModelAsync(_composer, model, reasoning, ct).ConfigureAwait(false);
+    }
 
-        // Both values are required: a model switch always carries an explicit reasoning effort so
-        // the running Composer can never inherit a stale one.
+    /// <inheritdoc />
+    public async Task<FacadeResult<CompactResultDto>> CompactAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST, OUTSIDE the operational catch-all inside the helper: a denial can
+        // therefore never surface as a BadRequest, and caller cancellation can never be converted
+        // into a result by the catch-all.
+        if (!await IsAuthorizedAsync(actingUser, nameof(CompactAsync), ct).ConfigureAwait(false))
+            return Forbidden<CompactResultDto>();
+
+        return _composer is null
+            ? NotAvailable<CompactResultDto>(nameof(CompactAsync))
+            : await CompactAsync(_composer, ct).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<CompactResultDto>> CompactPartialAsync(
+        ClaimsPrincipal? actingUser, int percent, CancellationToken ct)
+    {
+        // See CompactAsync: authorization runs first and outside the catch-all.
+        if (!await IsAuthorizedAsync(actingUser, nameof(CompactPartialAsync), ct).ConfigureAwait(false))
+            return Forbidden<CompactResultDto>();
+
+        return _composer is null
+            ? NotAvailable<CompactResultDto>(nameof(CompactPartialAsync))
+            : await CompactPartialAsync(_composer, percent, ct).ConfigureAwait(false);
+    }
+
+    // ── The per-Composer operation shaping, WITHOUT authorization ──────────────────────────────
+    //
+    // These helpers are the ONE implementation of each operation's validation, exception mapping and
+    // result shaping. Both facade implementations use them: the legacy facade over its injected
+    // Composer, and the per-user recovery facade over the Composer of the runtime it selected. Sharing
+    // them is what keeps the two paths from drifting into different validation, different messages or a
+    // second compaction catch-all. They are INTERNAL (never public) because reaching one without the
+    // authorization check above would be an identity-free bypass.
+
+    /// <summary>
+    /// Frozen contract: a Composer that is not connected / has no active model reports a NULL model on
+    /// a SUCCESSFUL result — a value is never fabricated from the catalog. Nothing is caught here: the
+    /// pre-facade read handler caught nothing either.
+    /// </summary>
+    internal FacadeResult<CurrentModelDto> ReadCurrentModel(Composer composer)
+    {
+        ArgumentNullException.ThrowIfNull(composer);
+        return new(true, new CurrentModelDto(composer.GetStats()?.Model), null, FacadeErrorKind.None);
+    }
+
+    /// <summary>
+    /// The Composer's normalised catalog is the sole authority for listing, so listed models are
+    /// IDENTICAL to what <see cref="SwitchModelAsync(Composer, string?, string?, CancellationToken)"/>
+    /// validates. Nothing is caught (read handler).
+    /// </summary>
+    internal FacadeResult<ComposerModelsDto> ReadModels(Composer composer)
+    {
+        ArgumentNullException.ThrowIfNull(composer);
+        return new(
+            true,
+            new ComposerModelsDto(composer.AvailableModels, composer.ReasoningEffort),
+            null,
+            FacadeErrorKind.None);
+    }
+
+    /// <summary>
+    /// Switches <paramref name="composer"/> to another model without losing the session. Both values are
+    /// required: a switch always carries an explicit reasoning effort so the running Composer can never
+    /// inherit a stale one.
+    /// </summary>
+    internal async Task<FacadeResult<SwitchResultDto>> SwitchModelAsync(
+        Composer composer, string? model, string? reasoning, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(composer);
+
         if (string.IsNullOrWhiteSpace(model))
             return new(false, null, "The 'model' query parameter is required.", FacadeErrorKind.BadRequest);
         if (string.IsNullOrWhiteSpace(reasoning))
@@ -251,7 +314,7 @@ public sealed class ComposerFacade : IComposerFacade
         {
             // The Composer's normalised catalog is the sole authority for switch validation —
             // identical to what the backend SwitchModelAsync validates.
-            var validModels = _composer.AvailableModels.ToList();
+            var validModels = composer.AvailableModels.ToList();
             if (!validModels.Contains(model, StringComparer.OrdinalIgnoreCase))
             {
                 throw new ArgumentException(
@@ -259,11 +322,11 @@ public sealed class ComposerFacade : IComposerFacade
                     nameof(model));
             }
 
-            await _composer.SwitchModelAsync(model, parsedReasoning, ct).ConfigureAwait(false);
+            await composer.SwitchModelAsync(model, parsedReasoning, ct).ConfigureAwait(false);
             _log.LogInformation("Composer switched to model {Model}.", model);
             return new(
                 true,
-                new SwitchResultDto(_composer.GetStats()?.Model ?? model, _composer.ReasoningEffort),
+                new SwitchResultDto(composer.GetStats()?.Model ?? model, composer.ReasoningEffort),
                 null,
                 FacadeErrorKind.None);
         }
@@ -276,25 +339,21 @@ public sealed class ComposerFacade : IComposerFacade
         }
     }
 
-    /// <inheritdoc />
-    public async Task<FacadeResult<CompactResultDto>> CompactAsync(
-        ClaimsPrincipal? actingUser, CancellationToken ct)
+    /// <summary>
+    /// Compacts the whole session of <paramref name="composer"/>. The catch-all maps OPERATIONAL
+    /// failures to <see cref="FacadeErrorKind.BadRequest"/> (the pre-facade handler's 400) and caller
+    /// cancellation propagates unchanged.
+    /// </summary>
+    internal async Task<FacadeResult<CompactResultDto>> CompactAsync(Composer composer, CancellationToken ct)
     {
-        // AUTHORIZATION FIRST, OUTSIDE the operational catch-all below: a denial can therefore
-        // never surface as a BadRequest, and caller cancellation can never be converted into a
-        // result by the catch-all.
-        if (!await IsAuthorizedAsync(actingUser, nameof(CompactAsync), ct).ConfigureAwait(false))
-            return Forbidden<CompactResultDto>();
-
-        if (_composer is null)
-            return NotAvailable<CompactResultDto>(nameof(CompactAsync));
+        ArgumentNullException.ThrowIfNull(composer);
 
         try
         {
-            var compacted = await _composer.CompactSessionAsync(ct).ConfigureAwait(false);
+            var compacted = await composer.CompactSessionAsync(ct).ConfigureAwait(false);
             return new(
                 true,
-                new CompactResultDto(compacted, _composer.GetStats()?.MessageCount ?? 0),
+                new CompactResultDto(compacted, composer.GetStats()?.MessageCount ?? 0),
                 null,
                 FacadeErrorKind.None);
         }
@@ -312,23 +371,21 @@ public sealed class ComposerFacade : IComposerFacade
         }
     }
 
-    /// <inheritdoc />
-    public async Task<FacadeResult<CompactResultDto>> CompactPartialAsync(
-        ClaimsPrincipal? actingUser, int percent, CancellationToken ct)
+    /// <summary>
+    /// Partially compacts the oldest <paramref name="percent"/> percent of <paramref name="composer"/>'s
+    /// session. Same mapping as <see cref="CompactAsync(Composer, CancellationToken)"/>.
+    /// </summary>
+    internal async Task<FacadeResult<CompactResultDto>> CompactPartialAsync(
+        Composer composer, int percent, CancellationToken ct)
     {
-        // See CompactAsync: authorization runs first and outside the catch-all.
-        if (!await IsAuthorizedAsync(actingUser, nameof(CompactPartialAsync), ct).ConfigureAwait(false))
-            return Forbidden<CompactResultDto>();
-
-        if (_composer is null)
-            return NotAvailable<CompactResultDto>(nameof(CompactPartialAsync));
+        ArgumentNullException.ThrowIfNull(composer);
 
         try
         {
-            var compacted = await _composer.CompactOldestPercentAsync(percent, ct).ConfigureAwait(false);
+            var compacted = await composer.CompactOldestPercentAsync(percent, ct).ConfigureAwait(false);
             return new(
                 true,
-                new CompactResultDto(compacted, _composer.GetStats()?.MessageCount ?? 0),
+                new CompactResultDto(compacted, composer.GetStats()?.MessageCount ?? 0),
                 null,
                 FacadeErrorKind.None);
         }

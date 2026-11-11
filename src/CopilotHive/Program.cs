@@ -832,18 +832,26 @@ public sealed class Program
                 sp.GetRequiredService<ILogger<ComposerRuntimeManager>>()));
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
-            // Composer runtime facade: ALWAYS registered so the Composer endpoints and the
-            // ComposerChat component resolve it unconditionally. The Composer itself may be
-            // absent — it is passed through as-is and the facade reports NotConfigured on every
+            // Composer runtime facade plumbing. ALWAYS registered so the Composer endpoints and the
+            // ComposerChat component resolve IComposerFacade unconditionally. The Composer itself may
+            // be absent — it is passed through as-is and the facade reports NotConfigured on every
             // authorized operation in that case (it never throws on a null Composer).
-            // AUTHORIZATION is part of the contract now: the singleton facade holds the stateless
-            // resolver + policy (never the scoped circuit accessor) and re-resolves current
-            // role/enabled state on EVERY operation.
-            builder.Services.AddSingleton<IComposerFacade>(sp => new ComposerFacade(
-                sp.GetService<Composer>(),
-                sp.GetRequiredService<HivePrincipalResolver>(),
-                sp.GetRequiredService<HivePolicy>(),
-                sp.GetRequiredService<ILogger<ComposerFacade>>()));
+            // AUTHORIZATION is part of the contract: the facade holds the stateless resolver + policy
+            // (never the scoped circuit accessor) and re-resolves current role/enabled state on EVERY
+            // operation.
+            //
+            // LIFETIMES are the security contract: the Composer and the per-user ComposerRuntimeManager
+            // are SINGLETONS (the manager is the sole disposer of runtimes), the CIRCUIT accessor and the
+            // runtime accessor are SCOPED, and IComposerFacade is SCOPED so a request can receive the
+            // recovery facade without any singleton — or startup closure — capturing a scoped service.
+            // NO STARTUP CAPTURE: nothing here reads a scoped service out of app.Services.
+            //
+            // STAGING SAFETY: the deployment gate DEFAULTS TO LEGACY, so the live facade path stays on
+            // the legacy singleton Composer in this slice (ComposerChat keeps using that same legacy
+            // Composer for messages/history/streaming). The per-user recovery facade is registered behind
+            // the gate and stays dormant until a later, separately reviewed circuit goal turns it on, so
+            // no split-runtime behaviour is observable.
+            builder.Services.AddComposerRuntimeFacades(ComposerRuntimeFacadeDeployment.FromEnvironment());
 
             // Composer LLM connection coordinator: owns the startup connect (gating, deferral
             // until a GitHub Copilot token exists, wake-up on token commit, dedup, shutdown).
@@ -1243,10 +1251,13 @@ public sealed class Program
                 }, appLifetime.ApplicationStopping);
             }
 
-            // Composer model-management REST API
+            // Composer model-management REST API. The facade is NOT resolved here: each request
+            // resolves its OWN scoped IComposerFacade from HttpContext.RequestServices, so no startup
+            // closure captures a scoped service (the runtime accessor and the gate-selected facade are
+            // both scoped).
             app.MapComposerEndpoints(
                 composer,
-                app.Services.GetRequiredService<IComposerFacade>(),
+                composerFacade: null,
                 app.Services.GetService<HiveConfigFile>());
 
             // Model configuration REST API
