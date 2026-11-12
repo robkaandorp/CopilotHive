@@ -259,11 +259,73 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
+    /// THE ZERO-STORE-WORK CONTRACT FOR THE GOAL READS: a caller who does NOT hold shared read
+    /// (a DISABLED account, an anonymous caller and an unknown identity) is refused by every goal
+    /// read, and every one of those refusals performs NO store work at all — including the SEARCH
+    /// lookup and the ITERATION read, which no per-operation counter would otherwise see.
+    /// <para>
+    /// This is the refusal row that a lookup moved AHEAD of the gate would fail, so it is the
+    /// read-side counterpart of the mutation refusal row.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task GoalReads_ARefusedCaller_PerformsNoStoreWorkOnAnyRead()
+    {
+        await SeedAllRolesAsync();
+
+        var reads = new (string Operation, Func<GoalFacade, ClaimsPrincipal?, Task<FacadeErrorKind>> Call)[]
+        {
+            ("list", async (f, u) => (await f.GetGoalsAsync(u, Ct)).Kind),
+            ("detail", async (f, u) => (await f.GetGoalAsync("goal-1", u, Ct)).Kind),
+            ("search", async (f, u) => (await f.SearchGoalsAsync("goal", null, u, Ct)).Kind),
+            ("iterations", async (f, u) => (await f.GetIterationsAsync("goal-1", u, Ct)).Kind),
+            ("dependency-statuses", async (f, u) => (await f.GetDependencyStatusesAsync("goal-1", u, Ct)).Kind),
+            ("live-detail", async (f, u) => (await f.GetLiveGoalDetailAsync("goal-1", u, Ct)).Kind),
+            ("progress", async (f, u) => (await f.GetProgressAsync("goal-1", u, Ct)).Kind),
+            ("linked-issues", async (f, u) => (await f.GetLinkedIssuesAsync("goal-1", u, Ct)).Kind),
+        };
+
+        // THE REFUSED CALLERS: a DISABLED account (which holds nothing), an anonymous caller and
+        // an authenticated identity with no activated account.
+        await _auth.SetEnabledAsync(ViewerId, enabled: false);
+
+        var callers = new (string Caller, ClaimsPrincipal? Principal)[]
+        {
+            ("disabled", Principal(ViewerId)),
+            ("anonymous", null),
+            ("unknown", Principal("never-invited")),
+        };
+
+        foreach (var (caller, principal) in callers)
+        {
+            foreach (var (operation, call) in reads)
+            {
+                using var store = new RecordingGoalStore();
+                var facade = GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()]);
+
+                var kind = await call(facade, principal);
+
+                Assert.Equal(FacadeErrorKind.Forbidden, kind);
+                Assert.Empty(store.AllCalls);
+            }
+        }
+    }
+
+    /// <summary>
     /// GOAL MUTATION MATRIX — EVERY GOAL MUTATION REFUSES THE VIEWER AND THE MEMBER WITH
     /// <see cref="FacadeErrorKind.Forbidden"/> AND PERFORMS NO STORE WORK.
     /// <para>
     /// Each row uses an input shape that would otherwise answer BadRequest/NotFound, so the
     /// refusal provably precedes the operation's own validation and store reads.
+    /// </para>
+    /// <para>
+    /// THE ZERO-STORE-WORK ASSERTION IS WRITTEN AGAINST
+    /// <see cref="RecordingGoalStore.AllCalls"/> — the COMPLETE observation surface — not against
+    /// the per-operation counters. A counter can only observe the method it happens to count, so
+    /// an implementation that moved the attach-release RELEASE lookup (<c>GetReleaseAsync</c>)
+    /// ahead of the gate would still answer Forbidden and still leave every per-operation counter
+    /// at zero. The observation-control row below proves this recorder DOES see that lookup for
+    /// an authorized caller.
     /// </para>
     /// </summary>
     [Fact]
@@ -294,15 +356,82 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
                 Assert.Equal(FacadeErrorKind.Forbidden, kind);
                 Assert.Equal(ForbiddenMessage, error);
 
-                // NO store work whatsoever for a refused caller.
+                // NO store work whatsoever for a refused caller — not ONE IGoalStore method of
+                // ANY kind, including the release lookup, the search and the iteration reads
+                // that no per-operation counter would otherwise see.
+                Assert.Empty(store.AllCalls);
+
+                // The per-operation counters agree with the complete observation surface.
                 Assert.Empty(store.ReadCalls);
                 Assert.Empty(store.DeleteCalls);
                 Assert.Empty(store.StatusUpdates);
                 Assert.Empty(store.ResetCalls);
                 Assert.Empty(store.GoalUpdates);
+                Assert.Empty(store.ReleaseLookupCalls);
+                Assert.Empty(store.SearchCalls);
+                Assert.Empty(store.IterationReads);
                 Assert.Equal(0, store.ReleaseReads);
                 Assert.Equal(0, store.GetAllCalls);
             }
+        }
+    }
+
+    /// <summary>
+    /// THE OBSERVATION CONTROL for the zero-store-work assertion above: the SAME recorder DOES
+    /// observe the attach-release RELEASE lookup (<c>GetReleaseAsync</c>), the goal SEARCH lookup
+    /// (<c>SearchGoalsAsync</c>) and the ITERATION read (<c>GetIterationsAsync</c>) when the
+    /// caller is AUTHORIZED.
+    /// <para>
+    /// So the refusal test's <c>Assert.Empty(store.AllCalls)</c> cannot pass merely because the
+    /// recorder is blind to those methods: an implementation that moved a lookup ahead of the
+    /// gate (while still answering Forbidden) would leave that method in <c>AllCalls</c> and
+    /// fail <see cref="GoalMutations_ExecutionOperator_ViewerAndMemberRefusedOnEveryOperation"/>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task GoalStoreObservationControls_TheRecorderSeesTheReleaseSearchAndIterationLookups()
+    {
+        await SeedAllRolesAsync();
+        var operatorUser = Principal(OperatorId);
+
+        // THE ATTACH-RELEASE RELEASE LOOKUP: an authorized caller performs it, and a MISSING
+        // release performs it ALONE (the release is checked before the goal).
+        using (var store = new RecordingGoalStore())
+        {
+            var facade = GoalFacadeFor(
+                HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()], withRelease: true);
+            var result = await facade.AttachReleaseAsync("goal-1", "rel-1", operatorUser);
+            Assert.True(result.Success, result.Error ?? "an Operator must be allowed to attach a release");
+            Assert.Equal(["GetReleaseAsync", "GetGoalAsync", "UpdateGoalAsync"], store.AllCalls);
+            Assert.Equal(["rel-1"], store.ReleaseLookupCalls);
+        }
+
+        using (var store = new RecordingGoalStore())
+        {
+            var facade = GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()]);
+            var result = await facade.AttachReleaseAsync("goal-1", "missing-release", operatorUser);
+            Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
+            Assert.Equal(["GetReleaseAsync"], store.AllCalls);
+        }
+
+        // THE SEARCH LOOKUP: an authorized caller performs it.
+        using (var store = new RecordingGoalStore())
+        {
+            var facade = GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()]);
+            var result = await facade.SearchGoalsAsync("goal", null, operatorUser, Ct);
+            Assert.True(result.Success, result.Error ?? "an Operator must be allowed to search");
+            Assert.Equal(["SearchGoalsAsync"], store.AllCalls);
+            Assert.Equal(["goal"], store.SearchCalls);
+        }
+
+        // THE ITERATION READ: an authorized caller performs it.
+        using (var store = new RecordingGoalStore())
+        {
+            var facade = GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()]);
+            var result = await facade.GetIterationsAsync("goal-1", operatorUser, Ct);
+            Assert.True(result.Success, result.Error ?? "an Operator must be allowed to read the iterations");
+            Assert.Equal(["GetIterationsAsync"], store.AllCalls);
+            Assert.Equal(["goal-1"], store.IterationReads);
         }
     }
 
@@ -343,6 +472,13 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
             Assert.True(result.Success, result.Error ?? "an Operator must be allowed to set the review status");
             Assert.Equal(ReviewStatus.Approved, Assert.Single(store.GoalUpdates).ReviewStatus);
         }
+
+        // REVIEW, CANCEL and EXTEND-ITERATIONS have their OWN viable success controls in
+        // GoalIssueViableSuccessControlTests (a real verdict, a real cancellation and a real
+        // extended iteration budget, for BOTH the Operator and the Admin). The rows below are
+        // therefore the GATE-PASSAGE rows for this matrix: they prove the operation reached its
+        // own validation/store work — which is what this file is about — and NOT that the role
+        // can perform the operation, which the viable-control file proves with a real outcome.
 
         // REVIEW reaches the goal lookup (so the gate passed) and then reports NotFound.
         using (var store = new RecordingGoalStore())
@@ -388,6 +524,12 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
     /// <summary>
     /// GOAL MUTATION MATRIX — THE ADMIN IS GRANTED EVERY GOAL MUTATION TOO: the Admin row proves
     /// the gate is a MINIMUM role, not an exclusion of the top role.
+    /// <para>
+    /// REVIEW, CANCEL and EXTEND-ITERATIONS are covered for the Admin by the VIABLE success
+    /// controls in <see cref="GoalIssueViableSuccessControlTests"/> (a real verdict, a real
+    /// cancellation and a real extended iteration budget). The rows here are the GATE-PASSAGE
+    /// rows: they prove the operation reached its own validation/store work.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task GoalMutations_ExecutionOperator_AdminGrantedOnEveryOperation()
@@ -416,6 +558,29 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
             Assert.True(result.Success, result.Error ?? "an Admin must be allowed to set the review status");
         }
 
+        // REVIEW reaches the goal lookup (so the gate passed) and then reports NotFound. The
+        // Admin's viable review success is in GoalIssueViableSuccessControlTests.
+        using (var store = new RecordingGoalStore())
+        {
+            var result = await GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [])
+                .RequestReviewAsync("missing", admin, Ct);
+            Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
+        }
+
+        // CANCEL reaches the goal lookup (so the gate passed) and then reports NotFound. The
+        // Admin's viable cancellation success is in GoalIssueViableSuccessControlTests.
+        using (var store = new RecordingGoalStore())
+        {
+            var result = await GoalFacadeFor(
+                HiveAuthMode.AuthenticationEnabled, store, [], withDispatcher: true)
+                .CancelGoalAsync("missing", admin);
+            Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
+            Assert.Equal("Goal 'missing' not found.", result.Error);
+        }
+
+        // EXTEND-ITERATIONS reaches the range check (so the gate passed) and reports BadRequest.
+        // The dispatcher is present, so the frozen "dispatcher availability FIRST" order does
+        // not pre-empt the range check with a 503.
         using (var store = new RecordingGoalStore())
         {
             var result = await GoalFacadeFor(
@@ -530,7 +695,39 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
             (await anonymousFacade.GetIssuesAsync(new IssueFilter(), null, Ct)).Kind);
         Assert.Equal(FacadeErrorKind.Forbidden,
             (await anonymousFacade.GetIssueAsync("issue-1", null, Ct)).Kind);
+        Assert.Empty(anonymousStore.AllCalls);
         Assert.Empty(anonymousStore.Tokens);
+    }
+
+    /// <summary>
+    /// THE ISSUE-STORE OBSERVATION CONTROL: the SAME recorder DOES observe the issue list query
+    /// and the issue existence read for an AUTHORIZED caller, so the refusal rows' empty
+    /// <see cref="RecordingIssueStore.AllCalls"/> cannot pass merely because the recorder is blind
+    /// to those methods.
+    /// </summary>
+    [Fact]
+    public async Task IssueStoreObservationControls_TheRecorderSeesTheListQueryAndTheExistenceRead()
+    {
+        await SeedAllRolesAsync();
+        var operatorUser = Principal(OperatorId);
+
+        using (var store = new RecordingIssueStore())
+        {
+            store.AddIssue(MakeIssue("issue-1"));
+            var facade = IssueFacadeFor(HiveAuthMode.AuthenticationEnabled, store);
+            var result = await facade.GetIssuesAsync(new IssueFilter(), operatorUser, Ct);
+            Assert.True(result.Success, result.Error ?? "an Operator must be allowed to list the issues");
+            Assert.Equal(["GetIssuesAsync"], store.AllCalls);
+        }
+
+        using (var store = new RecordingIssueStore())
+        {
+            store.AddIssue(MakeIssue("issue-1"));
+            var facade = IssueFacadeFor(HiveAuthMode.AuthenticationEnabled, store);
+            var result = await facade.GetIssueAsync("issue-1", operatorUser, Ct);
+            Assert.True(result.Success, result.Error ?? "an Operator must be allowed to read an issue");
+            Assert.Equal(["GetIssueAsync"], store.AllCalls);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -555,6 +752,8 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
                     Principal(ViewerId), Ct);
             Assert.Equal(FacadeErrorKind.Forbidden, result.Kind);
             Assert.Equal(ForbiddenMessage, result.Error);
+            // NO store work whatsoever — the COMPLETE observation surface is empty.
+            Assert.Empty(store.AllCalls);
             Assert.Empty(store.Tokens);
         }
 
@@ -705,6 +904,8 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
 
             Assert.Equal(FacadeErrorKind.Forbidden, result.Kind);
             Assert.Equal(ForbiddenMessage, result.Error);
+            // NO store work whatsoever — the COMPLETE observation surface is empty.
+            Assert.Empty(store.AllCalls);
             Assert.Empty(store.Tokens);
         }
 
@@ -848,6 +1049,7 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
             Assert.Equal(FacadeErrorKind.Forbidden, result.Kind);
             Assert.Empty(bus.Published);
             // The refused update performed NO store call at all — not even the existence read.
+            Assert.Empty(store.AllCalls);
             Assert.Empty(store.Tokens);
         }
 
@@ -885,6 +1087,7 @@ public sealed class GoalIssueAuthorizationMatrixTests : IDisposable
 
             Assert.Equal(FacadeErrorKind.Forbidden, result.Kind);
             Assert.Empty(bus.Published);
+            Assert.Empty(store.AllCalls);
             Assert.Empty(store.Tokens);
         }
 

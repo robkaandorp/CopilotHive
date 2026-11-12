@@ -28,19 +28,21 @@ namespace CopilotHive.Tests.Services;
 /// <see cref="UserService"/> directory.
 /// <para>
 /// THE CONTRACT: when a refresh is DENIED, the page presents NO stale data. Every previously
-/// loaded goal / stored goal / live detail / progress / dependency / iteration / issue value is
-/// cleared, the denial is surfaced, and NO direct store read happens as a fallback.
+/// loaded goal / stored goal / live detail / progress / dependency / iteration / release /
+/// expanded-issue value is cleared, the denial is surfaced, and NO direct store read happens as a
+/// fallback.
+/// </para>
+/// <para>
+/// <b>EVERY ADVERTISED STATE IS POPULATED THROUGH THE PRODUCTION PATH BEFORE THE DENIAL</b>, and
+/// the baseline is PROVEN nonempty (or present) by an explicit assertion BEFORE the denial is
+/// triggered. A state that was never populated would make its later "was cleared" assertion
+/// vacuous, so every row asserts BOTH halves: the baseline was really there, and it is really
+/// gone afterwards.
 /// </para>
 /// <para>
 /// THE SCENARIO IS DETERMINISTIC: the account is authorized for the FIRST load (so the page
-/// really holds data — the non-vacuity control), the directory is then changed, and the page's
-/// OWN production refresh path is triggered. No sleeps, no polling, no scheduling assumptions.
-/// </para>
-/// <para>
-/// EACH ROW ASSERTS BOTH SIDES OF THE CONTRACT: the RENDERED MARKUP carries no stale value (the
-/// user-visible half) AND the page's own loaded state is EMPTY (the internal half). The markup
-/// assertion alone could be satisfied by a page that never loaded anything, so the
-/// non-vacuity control proves the first load really did present the data.
+/// really holds data), the directory is then changed, and the page's OWN production refresh path
+/// is triggered. No sleeps, no polling, no scheduling assumptions.
 /// </para>
 /// </summary>
 public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
@@ -53,11 +55,15 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
     private const string ForbiddenMessage = "The acting account is not authorized to perform this operation.";
 
     /// <summary>The markers the assertions look for in the rendered markup.</summary>
-    private const string GoalIdMarker = "stale-goal-marker";
     private const string GoalDescriptionMarker = "STALE-GOAL-DESCRIPTION";
     private const string DependencyMarker = "stale-dependency-marker";
     private const string IssueTitleMarker = "STALE-ISSUE-TITLE";
     private const string IssueIdMarker = "stale-issue-marker";
+    private const string PlanningReleaseTag = "v9.9.9-planning";
+    private const string ReleasedReleaseTag = "v9.9.9-released";
+    private const string PlanningReleaseId = "rel-planning-marker";
+    private const string ReleasedReleaseId = "rel-released-marker";
+    private const string ProgressDetailsMarker = "STALE-PROGRESS-DETAILS";
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
@@ -78,12 +84,16 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
             ServiceProvider provider,
             DashboardNotifier notifier,
             DashboardStateService dashboardState,
+            ProgressLog progressLog,
+            GoalPipelineManager pipelineManager,
             RecordingGoalStore goalStore,
             RecordingIssueStore issueStore)
         {
             _provider = provider;
             Notifier = notifier;
             DashboardState = dashboardState;
+            ProgressLog = progressLog;
+            PipelineManager = pipelineManager;
             GoalStore = goalStore;
             IssueStore = issueStore;
         }
@@ -93,6 +103,12 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         internal DashboardNotifier Notifier { get; }
 
         internal DashboardStateService DashboardState { get; }
+
+        /// <summary>The REAL progress log the dashboard and the progress service share.</summary>
+        internal ProgressLog ProgressLog { get; }
+
+        /// <summary>The REAL pipeline manager the dashboard reads live detail from.</summary>
+        internal GoalPipelineManager PipelineManager { get; }
 
         internal RecordingGoalStore GoalStore { get; }
 
@@ -139,6 +155,8 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         services.AddLogging();
         services.AddSingleton(notifier);
         services.AddSingleton(dashboardState);
+        services.AddSingleton(progressLog);
+        services.AddSingleton(pipelineManager);
         services.AddSingleton(goalStore);
         services.AddSingleton<IGoalStore>(goalStore);
         services.AddSingleton(issueStore);
@@ -181,8 +199,11 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
             goalReadyNotifier: null,
             dispatcher: null,
             dashboardState: sp.GetRequiredService<DashboardStateService>(),
+            // THE REAL progress service over the SAME progress log the dashboard holds, so a
+            // progress entry recorded through the production log really reaches the page.
             progressReports: new ProgressReportService(
-                new GoalPipelineManager(), new ProgressLog())));
+                sp.GetRequiredService<GoalPipelineManager>(),
+                sp.GetRequiredService<ProgressLog>())));
 
         services.AddSingleton<IIssueFacade>(sp => new IssueFacade(
             sp.GetRequiredService<IIssueStore>(),
@@ -197,7 +218,7 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
             ValidateOnBuild = true,
         });
 
-        return new Host(provider, notifier, dashboardState, goalStore, issueStore);
+        return new Host(provider, notifier, dashboardState, progressLog, pipelineManager, goalStore, issueStore);
     }
 
     // ── Rendering helpers ───────────────────────────────────────────────────
@@ -239,15 +260,30 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
                 .GetValue(_page);
 
         /// <summary>Invokes a private method of the rendered page on the renderer's dispatcher.</summary>
-        internal async Task InvokePrivateAsync(string methodName)
+        internal async Task InvokePrivateAsync(string methodName, params object?[] args)
         {
             var method = _page.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic)!;
             await _renderer.Dispatcher.InvokeAsync(async () =>
             {
-                if (method.Invoke(_page, null) is Task task)
+                if (method.Invoke(_page, args) is Task task)
                     await task;
             });
         }
+
+        /// <summary>
+        /// Asks the page to re-render, exactly as the framework does after an event handler —
+        /// the private page methods the rows invoke directly do not re-render on their own.
+        /// <c>StateHasChanged</c> is protected, so it is invoked the way the framework does.
+        /// </summary>
+        internal Task RequestRenderAsync() => _renderer.Dispatcher.InvokeAsync(() =>
+        {
+            var stateHasChanged = _page.GetType().GetMethod(
+                "StateHasChanged",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            Assert.NotNull(stateHasChanged);
+            stateHasChanged!.Invoke(_page, null);
+            return Task.CompletedTask;
+        });
 
         public async ValueTask DisposeAsync()
         {
@@ -283,10 +319,12 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
                     builder.OpenComponent<TComponent>(0);
                     if (parameters is not null)
                     {
-                        // The sequence number is the SOURCE ORDER of the attribute. Only ONE
-                        // parameter is ever passed, so the literal 0 is that source order.
                         foreach (var (key, value) in parameters)
+                        {
+                            // The sequence number is the SOURCE ORDER of the attribute. Only ONE
+                            // parameter is ever passed, so the literal 0 is that source order.
                             builder.AddAttribute(0, key, value);
+                        }
                     }
 
                     builder.AddComponentReferenceCapture(1, captured => page = captured);
@@ -307,33 +345,57 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
     // ── 1. Goals.razor ──────────────────────────────────────────────────────
 
     /// <summary>
-    /// <c>Goals.razor</c>: the page loads the goal list through the authorized facade (the
-    /// non-vacuity control — the goal IS presented), and after the account is disabled the page's
-    /// OWN refresh path clears the list, presents NO stale goal and performs NO direct store
-    /// read as a fallback.
+    /// <c>Goals.razor</c>: the page loads the goal list AND the release dropdown through the
+    /// authorized facade (the non-vacuity control — both really are presented), and after the
+    /// account is disabled the page's OWN refresh path clears the list, the release options and
+    /// the release status map, presents NO stale goal and performs NO direct store read as a
+    /// fallback.
+    /// <para>
+    /// The release options are DISTINCTIVE (a Planning and a Released release with unique tags),
+    /// so their removal is observable in the rendered markup — the goal id alone would not prove
+    /// the release state was cleared.
+    /// </para>
     /// </summary>
     [Fact]
-    public async Task GoalsPage_DeniedRefresh_ClearsTheLoadedGoalList_AndDoesNotFallBackToTheStore()
+    public async Task GoalsPage_DeniedRefresh_ClearsTheLoadedGoalListAndReleaseOptions_AndDoesNotFallBackToTheStore()
     {
         await _auth.SeedAsync(ViewerId, UserRole.Viewer);
         await using var host = NewHost(HiveAuthMode.AuthenticationEnabled);
 
         host.GoalStore.AddGoal(new Goal
         {
-            Id = GoalIdMarker,
+            Id = "goals-page-goal",
             Description = GoalDescriptionMarker,
             Status = GoalStatus.Draft,
             CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
         });
+        host.GoalStore.AddRelease(new Release
+        {
+            Id = PlanningReleaseId,
+            Tag = PlanningReleaseTag,
+            Status = ReleaseStatus.Planning,
+            CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
+        });
+        host.GoalStore.AddRelease(new Release
+        {
+            Id = ReleasedReleaseId,
+            Tag = ReleasedReleaseTag,
+            Status = ReleaseStatus.Released,
+            CreatedAt = new DateTime(2024, 5, 7, 7, 8, 9, DateTimeKind.Utc),
+        });
 
         await using var rendered = await RenderAsync<CopilotHive.Components.Pages.Goals>(host, ViewerId);
 
-        // THE NON-VACUITY CONTROL: the authorized load really presented the goal.
+        // THE NON-VACUITY CONTROL: the authorized load really presented the goal AND both
+        // release options.
         var before = await rendered.HtmlAsync();
-        Assert.Contains(GoalIdMarker, before, StringComparison.Ordinal);
         Assert.Contains(GoalDescriptionMarker, before, StringComparison.Ordinal);
+        Assert.Contains(PlanningReleaseTag, before, StringComparison.Ordinal);
+        Assert.Contains(ReleasedReleaseTag, before, StringComparison.Ordinal);
         Assert.NotEmpty(Assert.IsAssignableFrom<List<Goal>>(rendered.Field("_allGoals")));
         Assert.NotEmpty(Assert.IsAssignableFrom<List<Goal>>(rendered.Field("_filtered")));
+        Assert.NotEmpty(Assert.IsAssignableFrom<List<Release>>(rendered.Field("_allReleases")));
+        Assert.NotEmpty(Assert.IsAssignableFrom<Dictionary<string, ReleaseStatus>>(rendered.Field("_releaseStatusById")));
 
         var readsBefore = host.GoalStore.GetAllCalls;
         var releaseReadsBefore = host.GoalStore.ReleaseReads;
@@ -348,13 +410,18 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         var after = await rendered.HtmlAsync();
 
         // NO stale goal data is presented.
-        Assert.DoesNotContain(GoalIdMarker, after, StringComparison.Ordinal);
         Assert.DoesNotContain(GoalDescriptionMarker, after, StringComparison.Ordinal);
+
+        // NO stale RELEASE data is presented either — the release selector's options are gone.
+        Assert.DoesNotContain(PlanningReleaseTag, after, StringComparison.Ordinal);
+        Assert.DoesNotContain(ReleasedReleaseTag, after, StringComparison.Ordinal);
 
         // The page's own loaded state is EMPTY.
         Assert.Empty(Assert.IsAssignableFrom<List<Goal>>(rendered.Field("_allGoals")));
         Assert.Empty(Assert.IsAssignableFrom<List<Goal>>(rendered.Field("_filtered")));
         Assert.Empty(Assert.IsAssignableFrom<Dictionary<string, GoalStatus>>(rendered.Field("_goalStatusById")));
+        Assert.Empty(Assert.IsAssignableFrom<List<Release>>(rendered.Field("_allReleases")));
+        Assert.Empty(Assert.IsAssignableFrom<Dictionary<string, ReleaseStatus>>(rendered.Field("_releaseStatusById")));
         Assert.False(Assert.IsAssignableFrom<bool>(rendered.Field("_loaded")));
 
         // The denial IS surfaced (the page shows the facade's error text).
@@ -365,14 +432,15 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         Assert.Equal(releaseReadsBefore, host.GoalStore.ReleaseReads);
     }
 
-    // ── 2. GoalDetail.razor ────────────────────────────────────────────────
+    // ── 2. GoalDetail.razor — the stored path ───────────────────────────────
 
     /// <summary>
-    /// <c>GoalDetail.razor</c>: the page loads the stored goal, its iterations, its dependency
-    /// statuses and its linked issues through the authorized facade (the non-vacuity control), and
-    /// after the account is DISABLED the page's OWN refresh path clears EVERY one of those
-    /// values — no stale stored goal, no stale iteration, no stale dependency status, no stale
-    /// linked issue — and performs NO direct store read as a fallback.
+    /// <c>GoalDetail.razor</c> — THE STORED PATH: the page loads the stored goal, its iterations,
+    /// its progress feed, its dependency statuses, its linked issues AND the planning-release
+    /// dropdown through the authorized facade (the non-vacuity control), and after the account is
+    /// DISABLED the page's OWN refresh path clears EVERY one of those values — no stale stored
+    /// goal, no stale iteration, no stale progress entry, no stale dependency status, no stale
+    /// linked issue, no stale release option — and performs NO direct store read as a fallback.
     /// </summary>
     [Fact]
     public async Task GoalDetailPage_DeniedRefresh_ClearsEveryLoadedValue_AndDoesNotFallBackToTheStore()
@@ -380,11 +448,13 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         await _auth.SeedAsync(ViewerId, UserRole.Viewer);
         await using var host = NewHost(HiveAuthMode.AuthenticationEnabled);
 
+        // A COMPLETED, UNASSIGNED goal: that is the only state in which the page loads the
+        // PLANNING-RELEASE dropdown, so the dropdown baseline is really populated.
         host.GoalStore.AddGoal(new Goal
         {
-            Id = GoalIdMarker,
+            Id = "detail-page-goal",
             Description = GoalDescriptionMarker,
-            Status = GoalStatus.Draft,
+            Status = GoalStatus.Completed,
             DependsOn = [DependencyMarker],
             IterationSummaries = [new IterationSummary { Iteration = 7 }],
             CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
@@ -398,6 +468,15 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
             Status = GoalStatus.Completed,
             CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
         });
+        // A PLANNING release with a distinctive tag: the dropdown is populated from the store's
+        // release read, so its tag in the markup proves the dropdown really was loaded.
+        host.GoalStore.AddRelease(new Release
+        {
+            Id = PlanningReleaseId,
+            Tag = PlanningReleaseTag,
+            Status = ReleaseStatus.Planning,
+            CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
+        });
         host.IssueStore.AddIssue(new Issue
         {
             Id = IssueIdMarker,
@@ -406,25 +485,33 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
             Type = IssueType.Bug,
             Severity = IssueSeverity.Medium,
             Status = IssueStatus.Open,
-            SourceGoalId = GoalIdMarker,
+            SourceGoalId = "detail-page-goal",
         });
 
+        // A REAL progress entry for the goal, recorded through the production progress log the
+        // dashboard and the progress service share — so the progress baseline is really
+        // populated (the iteration-1 fixture used an empty log, which made the progress
+        // assertion vacuous).
+        host.ProgressLog.Add("worker-1", "detail-page-goal", "working", ProgressDetailsMarker);
+
         await using var rendered = await RenderAsync<CopilotHive.Components.Pages.GoalDetail>(
-            host, ViewerId, new Dictionary<string, object?> { ["GoalId"] = GoalIdMarker });
+            host, ViewerId, new Dictionary<string, object?> { ["GoalId"] = "detail-page-goal" });
 
         // THE NON-VACUITY CONTROL: the authorized load really presented every value.
-        // (The page renders the goal's DESCRIPTION, its dependencies, its iterations and its
-        // linked issues; the goal ID itself is not part of the rendered body, so the goal's
-        // unique description is the marker for "the stored goal really was presented".)
         var before = await rendered.HtmlAsync();
         Assert.Contains(GoalDescriptionMarker, before, StringComparison.Ordinal);
         Assert.Contains(DependencyMarker, before, StringComparison.Ordinal);
         Assert.Contains(IssueTitleMarker, before, StringComparison.Ordinal);
+        Assert.Contains(PlanningReleaseTag, before, StringComparison.Ordinal);
         Assert.Contains("Iteration 7", before, StringComparison.Ordinal);
+
+        // …and every advertised state really was POPULATED.
         Assert.NotNull(rendered.Field("_storedGoal"));
         Assert.NotEmpty(Assert.IsAssignableFrom<IReadOnlyList<IterationSummary>>(rendered.Field("_storedIterations")));
+        Assert.NotEmpty(Assert.IsAssignableFrom<IReadOnlyList<ProgressEntry>>(rendered.Field("_progress")));
         Assert.NotEmpty(Assert.IsAssignableFrom<Dictionary<string, GoalStatus>>(rendered.Field("_dependencyStatuses")));
         Assert.NotEmpty(Assert.IsAssignableFrom<List<LinkedIssueDto>>(rendered.Field("_linkedIssues")));
+        Assert.NotEmpty(Assert.IsAssignableFrom<List<Release>>(rendered.Field("_planningReleases")));
 
         var readsBefore = host.GoalStore.ReadCalls.Count;
 
@@ -439,10 +526,12 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
 
         var after = await rendered.HtmlAsync();
 
-        // NO stale goal / live detail / iteration / dependency / linked-issue data is presented.
+        // NO stale goal / iteration / progress / dependency / linked-issue / release data is
+        // presented.
         Assert.DoesNotContain(GoalDescriptionMarker, after, StringComparison.Ordinal);
         Assert.DoesNotContain(DependencyMarker, after, StringComparison.Ordinal);
         Assert.DoesNotContain(IssueTitleMarker, after, StringComparison.Ordinal);
+        Assert.DoesNotContain(PlanningReleaseTag, after, StringComparison.Ordinal);
         Assert.DoesNotContain("Iteration 7", after, StringComparison.Ordinal);
 
         // The dependency-status icon for a COMPLETED dependency is gone too.
@@ -465,27 +554,31 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         Assert.Equal(readsBefore, host.GoalStore.ReadCalls.Count);
     }
 
+    // ── 3. GoalDetail.razor — the LIVE branch ───────────────────────────────
+
     /// <summary>
-    /// <c>GoalDetail.razor</c> — THE LIVE BRANCH: with the dashboard wired to the goal store the
-    /// page's LIVE detail read resolves a real <see cref="GoalDetailInfo"/>, so the page holds
-    /// LIVE data (and its dependency statuses and linked issues) rather than the stored path. A
-    /// denied refresh must clear the LIVE detail too — a page that kept the live detail would
-    /// present a stale live dashboard to a caller that may no longer read it.
+    /// <c>GoalDetail.razor</c> — THE LIVE BRANCH: with the dashboard wired to the goal store AND a
+    /// real live pipeline, the page's LIVE detail read resolves a real
+    /// <see cref="GoalDetailInfo"/> with a real TIMELINE (the pipeline's progress reports become
+    /// the timeline entries), so the page holds LIVE data rather than the stored path. A denied
+    /// refresh must clear the LIVE detail and the TIMELINE too — a page that kept the live
+    /// detail would present a stale live dashboard to a caller that may no longer read it.
     /// </summary>
     [Fact]
-    public async Task GoalDetailPage_DeniedRefresh_ClearsTheLiveDetailToo()
+    public async Task GoalDetailPage_DeniedRefresh_ClearsTheLiveDetailAndTheTimeline()
     {
         await _auth.SeedAsync(ViewerId, UserRole.Viewer);
         await using var host = NewHost(HiveAuthMode.AuthenticationEnabled, liveGoalStore: true);
 
-        host.GoalStore.AddGoal(new Goal
+        var goal = new Goal
         {
-            Id = GoalIdMarker,
+            Id = "live-detail-goal",
             Description = GoalDescriptionMarker,
-            Status = GoalStatus.Draft,
+            Status = GoalStatus.InProgress,
             DependsOn = [DependencyMarker],
             CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
-        });
+        };
+        host.GoalStore.AddGoal(goal);
         host.GoalStore.AddGoal(new Goal
         {
             Id = DependencyMarker,
@@ -494,14 +587,24 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
             CreatedAt = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc),
         });
 
+        // A REAL live pipeline for the goal, so the dashboard's live detail really resolves and
+        // really carries the phase log and the progress reports the TIMELINE is built from.
+        var pipeline = host.PipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, 1, 1));
+        pipeline.AddProgressReport("worker-1", "working", ProgressDetailsMarker);
+
         await using var rendered = await RenderAsync<CopilotHive.Components.Pages.GoalDetail>(
-            host, ViewerId, new Dictionary<string, object?> { ["GoalId"] = GoalIdMarker });
+            host, ViewerId, new Dictionary<string, object?> { ["GoalId"] = "live-detail-goal" });
 
         // THE NON-VACUITY CONTROL: the authorized load really presented the LIVE detail.
         var before = await rendered.HtmlAsync();
         Assert.Contains(GoalDescriptionMarker, before, StringComparison.Ordinal);
         Assert.Contains(DependencyMarker, before, StringComparison.Ordinal);
         Assert.NotNull(rendered.Field("_detail"));
+
+        // …and the TIMELINE really was populated (the iteration-1 fixture could not populate it
+        // from the stored path, so its timeline assertion was vacuous).
+        Assert.NotEmpty(Assert.IsAssignableFrom<System.Collections.ICollection>(rendered.Field("_timeline")));
 
         // The account is DISABLED in the directory.
         await _auth.SetEnabledAsync(ViewerId, enabled: false);
@@ -512,22 +615,24 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
 
         var after = await rendered.HtmlAsync();
 
-        // The LIVE detail and everything derived from it is gone.
+        // The LIVE detail and the TIMELINE are gone.
         Assert.Null(rendered.Field("_detail"));
+        Assert.Empty(Assert.IsAssignableFrom<System.Collections.ICollection>(rendered.Field("_timeline")));
         Assert.DoesNotContain(GoalDescriptionMarker, after, StringComparison.Ordinal);
         Assert.DoesNotContain(DependencyMarker, after, StringComparison.Ordinal);
         Assert.Contains(ForbiddenMessage, after, StringComparison.Ordinal);
     }
 
-    // ── 3. Issues.razor ────────────────────────────────────────────────────
+    // ── 4. Issues.razor ────────────────────────────────────────────────────
+
     /// <summary>
-    /// <c>Issues.razor</c>: the page loads the issue list through the authorized facade (the
-    /// non-vacuity control), and after the account is disabled the page's OWN load path clears
-    /// the list and the expanded detail, presents NO stale issue and performs NO direct store
-    /// read as a fallback.
+    /// <c>Issues.razor</c>: the page loads the issue list through the authorized facade and the
+    /// issue is ACTUALLY EXPANDED (the non-vacuity control for the expanded-detail state), and
+    /// after the account is disabled the page's OWN load path clears the list AND the expanded
+    /// detail, presents NO stale issue and performs NO direct store read as a fallback.
     /// </summary>
     [Fact]
-    public async Task IssuesPage_DeniedRefresh_ClearsTheLoadedIssueList_AndDoesNotFallBackToTheStore()
+    public async Task IssuesPage_DeniedRefresh_ClearsTheLoadedIssueListAndTheExpandedDetail_AndDoesNotFallBackToTheStore()
     {
         await _auth.SeedAsync(ViewerId, UserRole.Viewer);
         await using var host = NewHost(HiveAuthMode.AuthenticationEnabled);
@@ -536,7 +641,7 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         {
             Id = IssueIdMarker,
             Title = IssueTitleMarker,
-            Description = "desc",
+            Description = "STALE-ISSUE-DESCRIPTION-MARKER",
             Type = IssueType.Bug,
             Severity = IssueSeverity.Medium,
             Status = IssueStatus.Open,
@@ -548,6 +653,19 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         var before = await rendered.HtmlAsync();
         Assert.Contains(IssueTitleMarker, before, StringComparison.Ordinal);
         Assert.NotEmpty(Assert.IsAssignableFrom<List<LinkedIssueDto>>(rendered.Field("_issues")));
+
+        // THE ISSUE IS REALLY EXPANDED, so the expanded-detail baseline is populated (the
+        // iteration-1 fixture never expanded an issue, so its _expandedIssueId assertion was
+        // vacuous). The page's OWN loaded DTO is handed to the toggle, exactly as the row
+        // click does.
+        var loadedIssue = Assert.Single(Assert.IsAssignableFrom<List<LinkedIssueDto>>(rendered.Field("_issues")));
+        await rendered.InvokePrivateAsync("ToggleDetail", IssueIdMarker, loadedIssue);
+        await rendered.RequestRenderAsync();
+        await rendered.DrainAsync();
+
+        var expanded = await rendered.HtmlAsync();
+        Assert.Equal(IssueIdMarker, rendered.Field("_expandedIssueId"));
+        Assert.Contains("STALE-ISSUE-DESCRIPTION-MARKER", expanded, StringComparison.Ordinal);
 
         var queriesBefore = host.IssueStore.Queries.Count;
 
@@ -564,7 +682,7 @@ public sealed class GoalIssuePagesStaleDataRegressionTests : IDisposable
         Assert.DoesNotContain(IssueTitleMarker, after, StringComparison.Ordinal);
         Assert.DoesNotContain(IssueIdMarker, after, StringComparison.Ordinal);
 
-        // The page's own loaded state is EMPTY.
+        // The page's own loaded state is EMPTY — including the EXPANDED DETAIL.
         Assert.Empty(Assert.IsAssignableFrom<List<LinkedIssueDto>>(rendered.Field("_issues")));
         Assert.Null(rendered.Field("_expandedIssueId"));
         Assert.False(Assert.IsAssignableFrom<bool>(rendered.Field("_loaded")));
