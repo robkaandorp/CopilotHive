@@ -701,6 +701,13 @@ public static class ApiEndpoints
     /// requires <see cref="HiveCapability.GlobalAdmin"/>, re-resolved FRESH on every call. The
     /// archive-name validation and the two validation messages live in the facade (the download and
     /// restore paths), so a handler can never serve or restore a file without it.
+    /// <para>
+    /// RESTORE binds a TYPED BODY, so it additionally carries
+    /// <see cref="PreBindingAuthorization"/> metadata: an authenticated but insufficient caller is
+    /// refused with 403 BEFORE the body is deserialized (a malformed body therefore never answers 400
+    /// to a caller who may not restore), while an authorized caller keeps the unchanged binding
+    /// behaviour. The facade gate still re-checks in the handler (defence in depth).
+    /// </para>
     /// <see cref="BackupService"/> stays a trusted internal service with its public API unchanged.
     /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
@@ -752,7 +759,8 @@ public static class ApiEndpoints
                 restored.KeysCount,
                 restored.SafetyBackupPath,
             });
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.GlobalAdmin, "backup.restore"));
     }
 
     /// <summary>
@@ -783,19 +791,60 @@ public static class ApiEndpoints
     /// Registers the LLM sessions REST API endpoint under <c>/api/sessions</c>.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// THE ROUTE IS A SHARED-READ SURFACE: it resolves the caller FRESH through the SAME
+    /// <see cref="FacadeAuthorization"/> seam every facade uses (one
+    /// <see cref="HivePrincipalResolver"/> resolution + one <see cref="HivePolicy"/> evaluation per
+    /// request, nothing cached between requests) and requires
+    /// <see cref="HiveCapability.SharedRead"/>. A refusal — signed out while authentication is
+    /// enabled, unknown account, disabled account, unreadable directory — answers 403 with the single
+    /// sanitized <c>{ error }</c> body, so a disabled or unknown identity can never read the shared
+    /// execution-session list. Cancellation propagates and is never turned into a denial. This is the
+    /// same seam, the same resolver/policy singletons and the same denial text as the facades and the
+    /// pre-binding middleware — deliberately no parallel authorization code.
+    /// </para>
+    /// <para>
     /// The route reports SHARED EXECUTION sessions only: <see cref="Dashboard.LlmSessionType.Composer"/>
     /// entries are excluded, because a Composer session is per-user private metadata. The filter lives
     /// HERE, at the endpoint, and <see cref="Dashboard.LlmSessionRegistry.GetAll"/> keeps its
     /// unchanged semantics (the dashboard renders Composer entries).
+    /// </para>
     /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapSessionEndpoints(this WebApplication app)
     {
         // ── LLM Sessions REST API ────────────────────────────────────────────────
-        app.MapGet("/api/sessions", (LlmSessionRegistry registry) =>
-            Results.Ok(registry.GetAll()
+        // IDENTITY IS PER REQUEST: the handler forwards the request's authenticated principal
+        // (HttpContext.User) to the shared authorization seam, which re-resolves the caller's CURRENT
+        // role/enabled state and requires shared read.
+        app.MapGet("/api/sessions", async (
+            HttpContext context,
+            LlmSessionRegistry registry,
+            HivePrincipalResolver resolver,
+            HivePolicy policy,
+            ILoggerFactory loggerFactory,
+            CancellationToken ct) =>
+        {
+            var allowed = await FacadeAuthorization.IsAllowedAsync(
+                resolver,
+                policy,
+                context.User,
+                HiveCapability.SharedRead,
+                loggerFactory.CreateLogger(nameof(ApiEndpoints)),
+                "sessions.list",
+                ct);
+
+            if (!allowed)
+            {
+                return Results.Json(
+                    new { error = FacadeAuthorization.ForbiddenMessage },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            return Results.Ok(registry.GetAll()
                 .Where(session => session.SessionType != LlmSessionType.Composer)
-                .ToList()));
+                .ToList());
+        });
     }
 
     /// <summary>

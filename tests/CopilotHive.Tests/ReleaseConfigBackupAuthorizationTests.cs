@@ -995,7 +995,20 @@ public sealed class ReleaseConfigBackupAuthorizationTests : IDisposable
         var builder = WebApplication.CreateBuilder();
         Program.AddHiveJsonOptions(builder.Services);
         builder.Services.AddSingleton(registry);
+
+        // The route is a SharedRead surface: it resolves the caller through the shared authorization
+        // seam, so this minimal host registers the same resolver/policy singletons a production host
+        // does and identifies an ELIGIBLE Viewer (shared read is held from Viewer upwards).
+        await _auth.SeedAsync(ViewerId, UserRole.Viewer);
+        builder.Services.AddSingleton(_auth.Resolver(HiveAuthMode.AuthenticationEnabled));
+        builder.Services.AddSingleton(_auth.Policy);
+
         var app = builder.Build();
+        app.Use(async (context, next) =>
+        {
+            context.User = FacadeAuthorizationHarness.Principal(ViewerId);
+            await next();
+        });
         app.MapSessionEndpoints();
         await app.StartAsync(Ct);
         try

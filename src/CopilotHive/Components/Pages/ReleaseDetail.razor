@@ -353,17 +353,36 @@ else if (_loaded)
     protected override async Task OnInitializedAsync()
     {
         var decoded = Uri.UnescapeDataString(ReleaseId);
-        var release = await GoalStore.GetReleaseAsync(decoded);
-        if (release is not null)
+
+        // AUTHORIZED READS: both the release and its goals go through IReleaseFacade, which
+        // re-resolves this circuit user's CURRENT role/enabled state on every call and requires
+        // shared read. A direct GoalStore read here would be an identity-free bypass of the covered
+        // release-read surface. A refused or not-found release read leaves _release null and renders
+        // the existing "Release not found." surface; a refused GOALS read keeps _goals empty and
+        // reports through the page's existing _releaseError card. Nothing throws out of the renderer.
+        var releaseResult = await ReleaseFacade.GetReleaseAsync(
+            decoded, await ActingUserAsync(), CancellationToken.None);
+
+        if (releaseResult.Success && releaseResult.Value is not null)
         {
-            _release = ReleaseDto.From(release);
+            _release = releaseResult.Value;
             PageHeader.SetTitle($"📦 {_release.Tag}");
             PageHeader.SetBack("/releases");
             _editNotes = _release.Notes ?? "";
             _editTag = _release.Tag;
             _selectedRepos = new HashSet<string>(_release.RepositoryNames, StringComparer.OrdinalIgnoreCase);
-            _goals = (await GoalStore.GetGoalsByReleaseAsync(decoded)).ToList();
+
+            var goalsResult = await ReleaseFacade.GetGoalsByReleaseAsync(
+                decoded, await ActingUserAsync(), CancellationToken.None);
+            if (goalsResult.Success && goalsResult.Value is not null)
+                _goals = goalsResult.Value.ToList();
+            else
+                _releaseError = goalsResult.Error;
         }
+        // A denied or not-found RELEASE read leaves _release null, so the page renders its EXISTING
+        // "Release not found." surface rather than throwing out of the renderer. Deliberately no new
+        // error UI and no denial-state machinery here: denial handling/redesign is a separate phase.
+
         if (_release is null)
         {
             PageHeader.SetTitle("Release Not Found");
