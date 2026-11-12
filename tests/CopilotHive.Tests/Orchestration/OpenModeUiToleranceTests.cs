@@ -3,8 +3,10 @@ using System.Net;
 using System.Text.Json;
 
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
 using CopilotHive.Security;
 using CopilotHive.Services;
+using CopilotHive.Tests.Services;
 
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -223,6 +225,17 @@ public sealed class OpenModeUiToleranceTests : IDisposable
             null, resolver, policy, NullLogger<ComposerFacade>.Instance));
         services.AddSingleton<IConfigFacade>(_ => new ConfigFacade(
             null, null, null, NullLogger<ConfigFacade>.Instance, resolver, policy));
+
+        // THE OPEN-MODE CIRCUIT RUNTIME SEAM: the page injects the scoped accessor, and in open mode the
+        // resolver yields the synthetic local operator, which the manager refuses
+        // (ComposerRuntimeRefusal.LocalOperator) — the ONE refusal the page serves from the legacy singleton.
+        // Substituting that production answer keeps this row about page ACTIVATION with no cascade at all.
+        services.AddScoped<IComposerRuntimeAccessor>(_ =>
+            new ComposerCircuitTesting.ScriptedCircuitRuntimeAccessor(
+                (_, _) => Task.FromResult(ComposerRuntimeAccess.Granted(
+                    ComposerRuntimeResult.Refused(
+                        ComposerRuntimeRefusal.LocalOperator))),
+                authEnabled: false));
 
         await using var provider = services.BuildServiceProvider();
         await using var renderer = new Microsoft.AspNetCore.Components.Web.HtmlRenderer(

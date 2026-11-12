@@ -73,7 +73,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     [Fact]
     public async Task TheManagerIsASingleton_TheAccessorIsScoped()
     {
-        await using var fixture = new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly);
+        await using var fixture = new WiringFixture(authEnabled: true, users: _auth.Directory.Service);
         using var first = fixture.Provider.CreateScope();
         using var second = fixture.Provider.CreateScope();
 
@@ -92,32 +92,31 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// THE FACADE'S LIFETIME FOLLOWS THE GATE: with the gate OFF every scope resolves the LEGACY
-    /// SINGLETON facade (the pre-slice behaviour, byte-identical), and with the gate ON each scope
-    /// resolves its OWN recovery facade — the scoped lifetime that lets it hold the scoped
+    /// THE FACADE'S LIFETIME FOLLOWS THE AUTHENTICATION MODE: in open mode every scope resolves the
+    /// LEGACY SINGLETON facade (the pre-slice behaviour, byte-identical), and in authenticated mode each
+    /// scope resolves its OWN recovery facade — the scoped lifetime that lets it hold the scoped
     /// accessor.
     /// </summary>
     [Fact]
-    public async Task TheFacadesLifetimeFollowsTheGate()
+    public async Task TheFacadesLifetimeFollowsTheAuthenticationMode()
     {
-        await using var off = new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly);
-        using var offFirst = off.Provider.CreateScope();
-        using var offSecond = off.Provider.CreateScope();
+        await using var open = new WiringFixture(authEnabled: false, users: _auth.Directory.Service);
+        using var openFirst = open.Provider.CreateScope();
+        using var openSecond = open.Provider.CreateScope();
 
-        // The gate OFF: the legacy singleton facade in every scope.
-        var legacyFromFirst = offFirst.ServiceProvider.GetRequiredService<IComposerFacade>();
-        var legacyFromSecond = offSecond.ServiceProvider.GetRequiredService<IComposerFacade>();
+        // OPEN MODE: the legacy singleton facade in every scope.
+        var legacyFromFirst = openFirst.ServiceProvider.GetRequiredService<IComposerFacade>();
+        var legacyFromSecond = openSecond.ServiceProvider.GetRequiredService<IComposerFacade>();
         Assert.IsType<ComposerFacade>(legacyFromFirst);
         Assert.Same(legacyFromFirst, legacyFromSecond);
 
-        await using var on = new WiringFixture(
-            new ComposerRuntimeFacadeDeployment(PerUserRuntimeEnabled: true), users: _auth.Directory.Service);
-        using var onFirst = on.Provider.CreateScope();
-        using var onSecond = on.Provider.CreateScope();
+        await using var authenticated = new WiringFixture(authEnabled: true, users: _auth.Directory.Service);
+        using var authFirst = authenticated.Provider.CreateScope();
+        using var authSecond = authenticated.Provider.CreateScope();
 
-        // The gate ON: a per-scope recovery facade, each holding its OWN scoped accessor.
-        var recoveryFromFirst = onFirst.ServiceProvider.GetRequiredService<IComposerFacade>();
-        var recoveryFromSecond = onSecond.ServiceProvider.GetRequiredService<IComposerFacade>();
+        // AUTHENTICATED MODE: a per-scope recovery facade, each holding its OWN scoped accessor.
+        var recoveryFromFirst = authFirst.ServiceProvider.GetRequiredService<IComposerFacade>();
+        var recoveryFromSecond = authSecond.ServiceProvider.GetRequiredService<IComposerFacade>();
         Assert.IsType<ComposerRuntimeFacade>(recoveryFromFirst);
         Assert.NotSame(recoveryFromFirst, recoveryFromSecond);
     }
@@ -129,7 +128,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     [Fact]
     public async Task TheLegacyComposerIsTheSingletonTheOpenModeFallbackServes()
     {
-        await using var fixture = new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly);
+        await using var fixture = new WiringFixture(authEnabled: false, users: _auth.Directory.Service);
 
         var legacyComposer = fixture.Provider.GetRequiredService<Composer>();
         var legacyFacade = fixture.Provider.GetRequiredService<ComposerFacade>();
@@ -148,7 +147,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     [Fact]
     public async Task OpenModeLocalOperator_FallsBackToTheLegacySingletonComposer()
     {
-        await using var fixture = new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly, authEnabled: false, users: _auth.Directory.Service);
+        await using var fixture = new WiringFixture(authEnabled: false, users: _auth.Directory.Service);
 
         using var scope = fixture.Provider.CreateScope();
         var facade = scope.ServiceProvider.GetRequiredService<IComposerFacade>();
@@ -188,7 +187,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     [Fact]
     public async Task AnAuthenticatedRefusal_NeverFallsBackToTheLegacyComposer()
     {
-        await using var fixture = new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly, authEnabled: true, users: _auth.Directory.Service);
+        await using var fixture = new WiringFixture(authEnabled: true, users: _auth.Directory.Service);
 
         using var scope = fixture.Provider.CreateScope();
         var accessor = scope.ServiceProvider.GetRequiredService<ComposerRuntimeAccessor>();
@@ -231,7 +230,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     public async Task TheLegacyMigration_IsKeyedOnTheIdentity_NeverOnTheRole()
     {
         await using var fixture = new WiringFixture(
-            ComposerRuntimeFacadeDeployment.LegacyOnly, authEnabled: true, users: _auth.Directory.Service, stateDir: _dir);
+            authEnabled: true, users: _auth.Directory.Service, stateDir: _dir);
 
         // The legacy session exists: only the original account may claim it.
         var legacyPath = Path.Combine(_dir, "composer-session.json");
@@ -285,7 +284,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
 
         // A Copilot-backed primary for the NON-original account: the gate defers it.
         await using var copilot = new WiringFixture(
-            ComposerRuntimeFacadeDeployment.LegacyOnly, authEnabled: true, users: _auth.Directory.Service);
+            authEnabled: true, users: _auth.Directory.Service);
         copilot.SetPrimaryModel("copilot/primary");
         var deferred = await copilot.Manager.GetOrCreateAsync(
             await ResolveAsync(_secondId), Ct);
@@ -294,7 +293,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
 
         // An Ollama-backed primary for the SAME non-original account: it connects.
         await using var ollama = new WiringFixture(
-            ComposerRuntimeFacadeDeployment.LegacyOnly, authEnabled: true, users: _auth.Directory.Service);
+            authEnabled: true, users: _auth.Directory.Service);
         ollama.SetPrimaryModel("ollama-local/other");
         var connected = await ollama.Manager.GetOrCreateAsync(
             await ResolveAsync(_secondId), Ct);
@@ -302,26 +301,26 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
         Assert.True(connected.Runtime!.Composer.IsConnected);
     }
 
-    // ── 4. The default gate ────────────────────────────────────────────────────────────────────
+    // ── 4. The deployment contract: the auth mode, and ONLY the auth mode ──────────────────────
 
     /// <summary>
-    /// WITH THE GATE AT ITS DEFAULT NOTHING SPLIT IS OBSERVABLE: the host's live facade path
-    /// resolves the LEGACY singleton facade, the legacy Composer is the one the endpoints serve,
-    /// and the per-user manager's cache stays EMPTY after a real request — so no per-user runtime
-    /// can be observed anywhere on the default path.
+    /// OPEN MODE IS THE LEGACY SINGLETON, BEHAVIOURALLY: the scope resolves the LEGACY facade, the
+    /// operation runs on the legacy Composer, and the per-user manager's cache stays EMPTY — so no
+    /// per-user runtime can be observed anywhere in an open installation. The retired variable is set
+    /// to <c>"true"</c> for this row, so the row also proves it can no longer move OPEN mode onto
+    /// per-user runtimes.
     /// </summary>
     [Fact]
-    public async Task WithTheDefaultGate_TheLivePathIsTheLegacySingleton_AndNoPerUserRuntimeIsCreated()
+    public async Task OpenMode_IsTheLegacySingleton_AndNoPerUserRuntimeIsCreated()
     {
-        // The SHIPPED default: an unset environment variable.
         var previous = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
         try
         {
-            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, null);
+            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, "true");
 
-            Assert.False(ComposerRuntimeFacadeDeployment.FromEnvironment().PerUserRuntimeEnabled);
+            Assert.False(ComposerRuntimeFacadeDeployment.ForAuthMode(HiveAuthMode.Open).PerUserRuntimeEnabled);
 
-            await using var fixture = new WiringFixture(ComposerRuntimeFacadeDeployment.FromEnvironment(), users: _auth.Directory.Service);
+            await using var fixture = new WiringFixture(authEnabled: false, users: _auth.Directory.Service);
             using var scope = fixture.Provider.CreateScope();
 
             var facade = scope.ServiceProvider.GetRequiredService<IComposerFacade>();
@@ -331,7 +330,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
             // The operation runs on the LEGACY Composer and creates NO per-user runtime.
             var read = await facade.GetModelsAsync(
                 FacadeAuthorizationHarness.Principal(SecondId), Ct);
-            Assert.True(read.Success, read.Error ?? "default-gate read failed");
+            Assert.True(read.Success, read.Error ?? "open-mode read failed");
             Assert.Empty(ManagerEntries(fixture.Manager));
         }
         finally
@@ -341,25 +340,98 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// THE GATE MUST BE EXPLICITLY ENABLED TO REACH THE PER-USER PATH: with the gate ON the scope
-    /// resolves the recovery facade, and the per-user manager is the one that owns the runtime — so
-    /// the gated path is genuinely reachable and genuinely different.
+    /// AUTHENTICATED MODE IS THE PER-USER PATH FOR EVERY VALUE OF THE RETIRED VARIABLE: with the variable
+    /// <c>null</c>, <c>"true"</c> AND <c>"false"</c> the scope resolves the recovery facade, the operation
+    /// really drives the per-user runtime, and the manager — not the facade — owns it.
+    /// <para>
+    /// The <c>"false"</c> row is the regression this goal exists to close: it used to keep the legacy
+    /// singleton live in an authenticated installation.
+    /// </para>
     /// </summary>
-    [Fact]
-    public async Task WithTheGateEnabled_TheScopeResolvesTheRecoveryFacade_AndTheManagerOwnsTheRuntime()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("true")]
+    [InlineData("false")]
+    public async Task AuthenticatedMode_IsThePerUserPath_ForEveryRetiredVariableValue(string? value)
     {
-        await using var fixture = new WiringFixture(new ComposerRuntimeFacadeDeployment(PerUserRuntimeEnabled: true), users: _auth.Directory.Service);
-        using var scope = fixture.Provider.CreateScope();
+        var previous = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, value);
 
-        var facade = scope.ServiceProvider.GetRequiredService<IComposerFacade>();
-        Assert.IsType<ComposerRuntimeFacade>(facade);
+            // The SAME production seam Program.cs uses: the deployment derived from the auth mode.
+            var deployment = ComposerRuntimeFacadeDeployment.ForAuthMode(HiveAuthMode.AuthenticationEnabled);
+            Assert.True(deployment.PerUserRuntimeEnabled,
+                $"'{value ?? "<unset>"}' must not remove the authenticated per-user path");
 
-        var read = await facade.GetModelsAsync(
-            FacadeAuthorizationHarness.Principal(SecondId), Ct);
+            await using var fixture = new WiringFixture(
+                authEnabled: true, users: _auth.Directory.Service, declaredDeployment: deployment);
+            using var scope = fixture.Provider.CreateScope();
 
-        Assert.True(read.Success, read.Error ?? "gated read failed");
-        // The per-user runtime was really created — by the manager, under the caller's identity.
-        Assert.Contains(_secondId, ManagerEntries(fixture.Manager));
+            var facade = scope.ServiceProvider.GetRequiredService<IComposerFacade>();
+            Assert.IsType<ComposerRuntimeFacade>(facade);
+
+            var read = await facade.GetModelsAsync(
+                FacadeAuthorizationHarness.Principal(SecondId), Ct);
+
+            Assert.True(read.Success, read.Error ?? "authenticated read failed");
+            // The per-user runtime was really created — by the manager, under the caller's identity.
+            Assert.Contains(_secondId, ManagerEntries(fixture.Manager));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, previous);
+        }
+    }
+
+    // ── 5. The accessor alias: ONE scoped instance behind both types ───────────────────────────
+
+    /// <summary>
+    /// THE PRODUCTION REGISTRATION MAKES <see cref="IComposerRuntimeAccessor"/> AN ALIAS OF THE VERY SAME
+    /// SCOPED <see cref="ComposerRuntimeAccessor"/> INSTANCE: the ComposerChat circuit (which injects the
+    /// interface) and the recovery facade (which is built from the concrete type) therefore share ONE
+    /// per-circuit identity — never two accessors with divergent circuit state.
+    /// <para>
+    /// The row is discriminating in both directions: it fails if the interface is registered with its own
+    /// factory (a second instance), with a different lifetime, or resolved from a different scope.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TheRuntimeAccessorInterface_IsAnAliasOfTheSameScopedInstance(bool authEnabled)
+    {
+        await using var fixture = new WiringFixture(authEnabled: authEnabled, users: _auth.Directory.Service);
+
+        using var first = fixture.Provider.CreateScope();
+        using var second = fixture.Provider.CreateScope();
+
+        // Within ONE scope: the interface and the concrete type are the SAME object.
+        Assert.Same(
+            first.ServiceProvider.GetRequiredService<ComposerRuntimeAccessor>(),
+            first.ServiceProvider.GetRequiredService<IComposerRuntimeAccessor>());
+        Assert.Same(
+            second.ServiceProvider.GetRequiredService<ComposerRuntimeAccessor>(),
+            second.ServiceProvider.GetRequiredService<IComposerRuntimeAccessor>());
+
+        // ACROSS scopes: a DIFFERENT accessor per scope — the interface is scoped, never a singleton.
+        Assert.NotSame(
+            first.ServiceProvider.GetRequiredService<IComposerRuntimeAccessor>(),
+            second.ServiceProvider.GetRequiredService<IComposerRuntimeAccessor>());
+
+        // ...and the ROOT provider refuses it, exactly like the concrete scoped type.
+        Assert.Throws<InvalidOperationException>(
+            () => fixture.Provider.GetRequiredService<IComposerRuntimeAccessor>());
+
+        // The recovery facade handed to a request really holds the SAME instance the circuit resolved.
+        if (authEnabled)
+        {
+            _ = first.ServiceProvider.GetRequiredService<IComposerFacade>();
+            var facadeAccessor = (IComposerRuntimeAccessor)typeof(ComposerRuntimeFacade)
+                .GetField("_accessor", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(first.ServiceProvider.GetRequiredService<IComposerFacade>())!;
+            Assert.Same(first.ServiceProvider.GetRequiredService<IComposerRuntimeAccessor>(), facadeAccessor);
+        }
     }
 
     [Theory]
@@ -369,7 +441,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     [InlineData(true, true)]
     public Task WiringFixture_AwaitsTeardownAndObservesFailures_OnEveryExit(bool bodyFails, bool disposalFails) =>
         RuntimeFacadeFixtureDisposalProof.VerifyAsync(
-            configure => new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly,
+            configure => new WiringFixture(
                 users: _auth.Directory.Service, configureServices: configure),
             fixture => fixture.Provider, fixture => fixture.Manager, bodyFails, disposalFails);
 
@@ -378,7 +450,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
     [InlineData(true)]
     public Task WiringFixture_JoinsActualRuntimeBeforeProviderAndBackingResources(bool bodyFails) =>
         RuntimeFacadeFixtureDisposalProof.VerifyManagerAsync(
-            (configure, client) => new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly,
+            (configure, client) => new WiringFixture(
                 configureServices: configure, chatClientFactory: client),
             fixture => fixture.Provider, fixture => fixture.Manager, bodyFails);
 
@@ -412,7 +484,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
                 directoryConnection = directoryDb.Database.GetDbConnection();
             }
             Assert.Equal(System.Data.ConnectionState.Open, directoryConnection.State);
-            owned = new WiringFixture(ComposerRuntimeFacadeDeployment.LegacyOnly,
+            owned = new WiringFixture(
                 users: subject._auth.Directory.Service, stateDir: subject._dir,
                 configureServices: services => services.AddSingleton(_ => providerDisposal),
                 chatClientFactory: _ => hold);
@@ -565,12 +637,12 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
         private readonly CopilotHiveDbContext _db;
 
         public WiringFixture(
-            ComposerRuntimeFacadeDeployment deployment,
             bool authEnabled = true,
             UserService? users = null,
             string? stateDir = null,
             Action<IServiceCollection>? configureServices = null,
-            Func<string, IChatClient>? chatClientFactory = null)
+            Func<string, IChatClient>? chatClientFactory = null,
+            ComposerRuntimeFacadeDeployment? declaredDeployment = null)
         {
             _db = CopilotHiveDbContext.CreateInMemory();
             var directory = users ?? new UserService(new NullDbFactory(_db), NullLogger<UserService>.Instance);
@@ -623,8 +695,11 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
                 sp.GetRequiredService<HivePrincipalResolver>(),
                 sp.GetRequiredService<HivePolicy>()));
 
-            // THE PRODUCTION SEAM.
-            services.AddComposerRuntimeFacades(deployment);
+            // THE PRODUCTION SEAM — the deployment is DERIVED FROM THE AUTH MODE, exactly as Program.cs does,
+            // unless a row deliberately declares something else.
+            services.AddComposerRuntimeFacades(
+                declaredDeployment ?? ComposerRuntimeFacadeDeployment.ForAuthMode(
+                    authEnabled ? HiveAuthMode.AuthenticationEnabled : HiveAuthMode.Open));
 
             configureServices?.Invoke(services);
             Provider = services.BuildServiceProvider(new ServiceProviderOptions

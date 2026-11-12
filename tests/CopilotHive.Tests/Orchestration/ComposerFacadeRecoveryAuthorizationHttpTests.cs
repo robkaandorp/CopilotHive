@@ -33,7 +33,7 @@ namespace CopilotHive.Tests.Orchestration;
 /// authorization answer and not a facade-produced one.
 /// </para>
 /// </summary>
-[Collection("HiveIntegration")]
+[Collection("EnvVarMutation")]
 public sealed class ComposerFacadeRecoveryAuthorizationHttpTests : IDisposable
 {
     private const string ViewerId = "recovery-http-viewer";
@@ -227,27 +227,47 @@ public sealed class ComposerFacadeRecoveryAuthorizationHttpTests : IDisposable
     }
 
     /// <summary>
-    /// THE DEFAULT GATE KEEPS THE LIVE PATH ON THE LEGACY SINGLETON: an authorized Member's read
-    /// succeeds with the real payload and the per-user runtime manager's cache stays EMPTY — so no
-    /// split-runtime behaviour is observable while the gate is at its default.
+    /// AN AUTHENTICATED MEMBER'S READ RUNS ON THEIR OWN PER-USER RUNTIME — FOR EVERY VALUE OF THE RETIRED
+    /// GATE VARIABLE: the read succeeds with the real payload, and the per-user runtime manager now really
+    /// owns a runtime for that account. In particular the <c>"false"</c> row proves the variable can no
+    /// longer keep an authenticated installation on the legacy singleton (the split runtime this goal
+    /// closes), and the unset/absent row proves the integrated path is the DEFAULT one.
     /// </summary>
-    [Fact]
-    public async Task WithTheDefaultGate_TheMemberReadSucceeds_AndNoPerUserRuntimeIsCreated()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("false")]
+    [InlineData("true")]
+    public async Task AnAuthenticatedMemberRead_RunsOnTheirOwnPerUserRuntime_ForEveryRetiredVariableValue(
+        string? retiredVariableValue)
     {
-        await SeedAsync(MemberId, UserRole.Member);
-        using var client = await SignInAsync(MemberId);
+        var previous = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
+        try
+        {
+            // Set BEFORE the first request so a host that (wrongly) read the variable would observe it.
+            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, retiredVariableValue);
 
-        var response = await client.GetAsync("/api/composer/models", Ct);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            await SeedAsync(MemberId, UserRole.Member);
+            using var client = await SignInAsync(MemberId);
 
-        var manager = _factory.Services.GetRequiredService<ComposerRuntimeManager>();
-        var entriesField = typeof(ComposerRuntimeManager)
-            .GetField("_entries", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        var entries = (System.Collections.IDictionary)entriesField.GetValue(manager)!;
+            var response = await client.GetAsync("/api/composer/models", Ct);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        Assert.True(
-            entries.Count == 0,
-            "the legacy singleton runtime must be used; no per-user runtime may be created");
+            // The per-user runtime really exists for THIS account: the integrated path is live.
+            var manager = _factory.Services.GetRequiredService<ComposerRuntimeManager>();
+            var entriesField = typeof(ComposerRuntimeManager)
+                .GetField("_entries", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+            var entries = (System.Collections.IDictionary)entriesField.GetValue(manager)!;
+
+            var users = _factory.Services.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>();
+            await using var db = await users.CreateDbContextAsync(Ct);
+            var memberInternalId = (await db.Users.SingleAsync(u => u.GitHubId == MemberId, Ct)).Id;
+
+            Assert.Contains(memberInternalId, entries.Keys.Cast<int>());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, previous);
+        }
     }
 
     public void Dispose() => _factory.Dispose();

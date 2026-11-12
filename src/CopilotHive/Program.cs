@@ -824,8 +824,9 @@ public sealed class Program
             // service and the legacy shared event subscriber.
             builder.Services.AddSingleton(sp => new ComposerFactory(sp, stateDir, ollamaApiKey));
             builder.Services.AddSingleton(sp => sp.GetRequiredService<ComposerFactory>().CreateLegacy());
-            // Per-user runtime manager (creation/cache/re-check only). Not yet wired to any UI,
-            // facade or routing: the legacy singleton above remains the sole live user-facing runtime.
+            // Per-user runtime manager: creation/cache/re-check and the SOLE OWNER/DISPOSER of every
+            // per-user runtime. In authenticated mode it is the live runtime authority (the legacy
+            // singleton above is then only the open-mode binding).
             builder.Services.AddSingleton(sp => new ComposerRuntimeManager(
                 sp.GetRequiredService<ComposerFactory>(),
                 sp.GetRequiredService<UserService>(),
@@ -844,14 +845,19 @@ public sealed class Program
             // are SINGLETONS (the manager is the sole disposer of runtimes), the CIRCUIT accessor and the
             // runtime accessor are SCOPED, and IComposerFacade is SCOPED so a request can receive the
             // recovery facade without any singleton — or startup closure — capturing a scoped service.
+            // IComposerRuntimeAccessor is an ALIAS of the SAME scoped ComposerRuntimeAccessor instance, so
+            // the ComposerChat circuit and the facade share ONE per-circuit accessor.
             // NO STARTUP CAPTURE: nothing here reads a scoped service out of app.Services.
             //
-            // STAGING SAFETY: the deployment gate DEFAULTS TO LEGACY, so the live facade path stays on
-            // the legacy singleton Composer in this slice (ComposerChat keeps using that same legacy
-            // Composer for messages/history/streaming). The per-user recovery facade is registered behind
-            // the gate and stays dormant until a later, separately reviewed circuit goal turns it on, so
-            // no split-runtime behaviour is observable.
-            builder.Services.AddComposerRuntimeFacades(ComposerRuntimeFacadeDeployment.FromEnvironment());
+            // THE DEPLOYMENT CONTRACT: AUTHENTICATION decides the path, and it is the only thing that does.
+            // In authenticated mode the integrated per-user path is ALWAYS selected (the recovery facade for
+            // IComposerFacade, the per-user runtime for the ComposerChat circuit) — there is no OFF path and
+            // no split runtime, whatever COMPOSER_PER_USER_RUNTIME says (the variable is retired and is
+            // never read). In open mode the legacy singleton facade/UI is selected, byte-identical to before,
+            // because the synthetic local operator has no persisted account and open mode IS the legacy
+            // single-operator installation. The mode is the SAME explicit HiveAuthMode singleton the resolver
+            // uses, so the facade selection can never drift away from the authorization answers.
+            builder.Services.AddComposerRuntimeFacades(ComposerRuntimeFacadeDeployment.ForAuthMode(authMode));
 
             // Composer LLM connection coordinator: owns the startup connect (gating, deferral
             // until a GitHub Copilot token exists, wake-up on token commit, dedup, shutdown).

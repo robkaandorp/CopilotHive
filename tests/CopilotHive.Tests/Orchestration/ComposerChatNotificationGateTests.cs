@@ -11,6 +11,7 @@ using CopilotHive.Persistence;
 using CopilotHive.Persistence.Entities;
 using CopilotHive.Security;
 using CopilotHive.Services;
+using CopilotHive.Tests.Services;
 
 using Microsoft.AspNetCore.Components;
 using Microsoft.AspNetCore.Components.Authorization;
@@ -161,13 +162,15 @@ public sealed class ComposerChatNotificationGateTests : IDisposable
             NullLogger<HivePrincipalResolver>.Instance);
         var policy = new HivePolicy();
 
+        var attachments = new ComposerAttachmentService(
+            stateDir, NullLogger<ComposerAttachmentService>.Instance);
+
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton(_store);
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton<Microsoft.JSInterop.IJSRuntime>(new NullJsRuntime());
-        services.AddSingleton(new ComposerAttachmentService(
-            stateDir, NullLogger<ComposerAttachmentService>.Instance));
+        services.AddSingleton(attachments);
         services.AddSingleton(composer);
         services.AddSingleton<IComposerFacade>(_ => new ComposerFacade(
             composer, resolver, policy, NullLogger<ComposerFacade>.Instance));
@@ -176,6 +179,22 @@ public sealed class ComposerChatNotificationGateTests : IDisposable
 
         // The SCOPED circuit accessor — one per circuit, exactly as the host registers it.
         services.AddScoped(_ => new CircuitUserPrincipalAccessor(resolver, policy));
+
+        // THE CIRCUIT RUNTIME SEAM the page injects. This row is about the GLOBAL notification gate, so the
+        // runtime SELECTION is substituted by the production-shaped answer for ONE circuit: the signed-in
+        // account's own runtime handle (wrapping the connected Composer above) for a signed-in identity, and the
+        // fail-closed DENIAL for a signed-out one — exactly the two answers the real accessor gives there.
+        var runtime = gitHubId is null
+            ? ComposerRuntimeAccess.Denied()
+            : ComposerCircuitTesting.GrantedAccessAsync(
+                composer,
+                attachments,
+                directory.Service,
+                (await directory.Service.GetByGitHubIdAsync(gitHubId!, Ct))!.Id,
+                ct: Ct).GetAwaiter().GetResult();
+        services.AddScoped<IComposerRuntimeAccessor>(_ =>
+            new ComposerCircuitTesting.ScriptedCircuitRuntimeAccessor(
+                (_, _) => Task.FromResult(runtime), authEnabled: true));
 
         await using var provider = services.BuildServiceProvider();
         await using var renderer = new HtmlRenderer(provider, NullLoggerFactory.Instance);

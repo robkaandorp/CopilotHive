@@ -756,6 +756,24 @@ internal sealed class RecordingPasteHost(ComposerAttachmentService service) : Co
         _syncedValues.Add(ComposerChat.ComputePasteAllowed(IsStreaming, Uploading, Pending));
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// THE COMPLETION GUARD's answer. Defaults to <c>true</c> (the ordinary case: the binding is still current and
+    /// the caller is still authorized), so the pre-existing rows keep asserting the same behaviour. A row that
+    /// models a demotion / disablement / runtime replacement landing WHILE the write was in flight sets it to
+    /// <c>false</c> and asserts that the completed write is NOT reflected in component state.
+    /// </summary>
+    public bool CompletionStillAuthorized { get; set; } = true;
+
+    /// <summary>How many times the completion guard was asked (proof it runs on the completion path).</summary>
+    public int CompletionGuardChecks { get; private set; }
+
+    /// <inheritdoc />
+    public Task<bool> IsCompletionStillAuthorizedAsync(CancellationToken ct)
+    {
+        CompletionGuardChecks++;
+        return Task.FromResult(CompletionStillAuthorized);
+    }
 }
 
 /// <summary>Host whose save always throws, proving the shared funnel's finally releases the claim.</summary>
@@ -784,6 +802,9 @@ internal sealed class ThrowingSavePasteHost : ComposerChat.IPasteHost
 
     /// <inheritdoc />
     public Task SyncPasteAllowedAsync() => Task.CompletedTask;
+
+    /// <inheritdoc />
+    public Task<bool> IsCompletionStillAuthorizedAsync(CancellationToken ct) => Task.FromResult(true);
 }
 
 /// <summary>

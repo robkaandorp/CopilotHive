@@ -15,102 +15,150 @@ using Xunit;
 namespace CopilotHive.Tests.Services;
 
 /// <summary>
-/// THE DEPLOYMENT GATE — THE STAGING-SAFETY CONTRACT: the live facade path stays on the LEGACY singleton
-/// <see cref="Composer"/> unless the gate is explicitly enabled, so this slice changes no live behaviour.
+/// THE DEPLOYMENT CONTRACT — THE FINAL ONE: the host AUTHENTICATION MODE alone decides the live Composer
+/// path, and in authenticated mode there is NO OFF PATH.
 /// <para>
-/// With the gate OFF (the default everywhere), resolving <see cref="IComposerFacade"/> from any scope answers
-/// the SAME legacy facade instance the host has always served — never a per-user recovery facade, so no
-/// split-runtime behaviour can be observed. With it ON, the scope resolves a
-/// <see cref="ComposerRuntimeFacade"/>; the per-user path therefore cannot become live by accident.
+/// The retired variable <c>COMPOSER_PER_USER_RUNTIME</c> is read by nothing: unset, <c>"true"</c>,
+/// <c>"false"</c> and every other value produce the SAME decision — the integrated per-user path when
+/// authentication is enabled, the legacy singleton when the host is in open mode. The regression this
+/// class exists to prevent is a split runtime: a live legacy singleton coexisting with per-user runtimes
+/// in an authenticated installation.
 /// </para>
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class ComposerRuntimeFacadeGateTests : IDisposable
 {
+    /// <summary>Every value the retired variable used to be read with — plus a few it never was.</summary>
+    public static TheoryData<string?> AllRetiredValues => new(
+        null, "", "true", "TRUE", "True", "false", "FALSE", "0", "1", "yes", "enabled", "per-user");
+
     private readonly string? _gateBeforeTest = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
 
     public void Dispose() => Assert.Equal(_gateBeforeTest,
         Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable));
 
-    /// <summary>Every value other than an explicit <c>true</c> keeps the legacy singleton.</summary>
+    // ── The decision function: the mode, and ONLY the mode ───────────────────────────────────────
+
+    /// <summary>
+    /// THE AUTHENTICATION MODE ALONE DECIDES: an authenticated host is ALWAYS the integrated per-user
+    /// path, an open host is ALWAYS the legacy singleton — independently of the retired variable.
+    /// </summary>
+    [Fact]
+    public void TheDecision_IsDerivedFromTheAuthMode_Only()
+    {
+        Assert.True(ComposerRuntimeFacadeDeployment.ForAuthMode(HiveAuthMode.AuthenticationEnabled).PerUserRuntimeEnabled,
+            "an authenticated installation has NO legacy-singleton path");
+        Assert.False(ComposerRuntimeFacadeDeployment.ForAuthMode(HiveAuthMode.Open).PerUserRuntimeEnabled,
+            "open mode is the legacy single-operator installation");
+
+        Assert.True(ComposerRuntimeFacadeDeployment.PerUserRuntime.PerUserRuntimeEnabled);
+        Assert.False(ComposerRuntimeFacadeDeployment.LegacyOnly.PerUserRuntimeEnabled);
+    }
+
+    /// <summary>
+    /// THE RETIRED VARIABLE SELECTS NOTHING — IN EITHER MODE: for every value it has ever been given, the
+    /// decision made from the environment equals the decision made from the OAuth predicate alone.
+    /// <para>
+    /// The rows are the WHOLE point of this slice: <c>"false"</c> in particular used to keep the legacy
+    /// singleton live while authentication was enabled. It no longer can.
+    /// </para>
+    /// </summary>
     [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("false")]
-    [InlineData("0")]
-    [InlineData("yes")]
-    [InlineData("enabled")]
-    [InlineData("per-user")]
-    public void TheGate_DefaultsToLegacy_ForEverythingExceptAnExplicitTrue(string? value)
+    [MemberData(nameof(AllRetiredValues))]
+    public void TheRetiredVariable_SelectsNothing_InEitherMode(string? value)
     {
         var previous = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
+        var previousId = Environment.GetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable);
+        var previousSecret = Environment.GetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable);
         try
         {
             Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, value);
 
-            var deployment = ComposerRuntimeFacadeDeployment.FromEnvironment();
+            // AUTHENTICATED: every value — including "false" — selects the integrated per-user path.
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable, "id");
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable, "secret");
+            Assert.True(
+                ComposerRuntimeFacadeDeployment.FromEnvironment().PerUserRuntimeEnabled,
+                $"'{value ?? "<unset>"}' must not create an OFF path while authentication is enabled");
 
-            Assert.False(deployment.PerUserRuntimeEnabled,
-                $"'{value}' must not enable the per-user live path");
+            // OPEN: every value keeps the legacy singleton (byte-identical to before).
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable, null);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable, null);
+            Assert.False(
+                ComposerRuntimeFacadeDeployment.FromEnvironment().PerUserRuntimeEnabled,
+                $"'{value ?? "<unset>"}' must not move open mode off the legacy singleton");
         }
         finally
         {
             Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, previous);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable, previousId);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable, previousSecret);
         }
     }
 
     /// <summary>
-    /// AN UNSET VARIABLE IS THE SHIPPED DEFAULT — read through the SAME seam <c>Program.cs</c> uses, so this row
-    /// fails if the production default ever flips.
+    /// AN UNSET VARIABLE IN OPEN MODE IS THE SHIPPED DEFAULT — read through the SAME seam
+    /// <c>Program.cs</c> uses, so this row fails if the open-mode default ever flips.
     /// </summary>
     [Fact]
-    public void TheGate_WithNoEnvironmentValue_IsTheLegacyDefault()
+    public void TheUnsetVariable_InOpenMode_IsTheLegacyDefault()
     {
         var previous = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
+        var previousId = Environment.GetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable);
+        var previousSecret = Environment.GetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable);
         try
         {
             Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, null);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable, null);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable, null);
 
             var deployment = ComposerRuntimeFacadeDeployment.FromEnvironment();
 
             Assert.False(deployment.PerUserRuntimeEnabled);
-            Assert.False(ComposerRuntimeFacadeDeployment.LegacyOnly.PerUserRuntimeEnabled);
+            Assert.Equal(ComposerRuntimeFacadeDeployment.LegacyOnly, deployment);
         }
         finally
         {
             Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, previous);
-        }
-    }
-
-    /// <summary>Only the exact value <c>true</c> (case-insensitive) opens the per-user live path.</summary>
-    [Theory]
-    [InlineData("true")]
-    [InlineData("TRUE")]
-    [InlineData("True")]
-    public void TheGate_OpensOnlyForAnExplicitTrue(string value)
-    {
-        var previous = Environment.GetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable);
-        try
-        {
-            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, value);
-
-            Assert.True(ComposerRuntimeFacadeDeployment.FromEnvironment().PerUserRuntimeEnabled);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable(ComposerRuntimeFacadeDeployment.EnvironmentVariable, previous);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientIdEnvironmentVariable, previousId);
+            Environment.SetEnvironmentVariable(HiveAuthMode.ClientSecretEnvironmentVariable, previousSecret);
         }
     }
 
     /// <summary>
-    /// THE GATE OFF MEANS THE LEGACY SINGLETON, BEHAVIOURALLY: every scope resolves the SAME
-    /// <see cref="ComposerFacade"/> instance, and it is the very object the singleton registration produced — so
-    /// the operation runs on the legacy singleton <see cref="Composer"/> exactly as before.
+    /// THE VARIABLE IS NOT EVEN READ: the production deployment source contains no
+    /// <c>GetEnvironmentVariable</c> call for it, so no future edit can quietly reintroduce the split
+    /// path through the environment. The name survives only as the retired identifier.
     /// </summary>
     [Fact]
-    public async Task GateOff_EveryScopeResolvesTheSameLegacyFacade()
+    public void TheRetiredVariable_IsNotReadAnywhere()
     {
-        await using var fixture = new RegistrationFixture(ComposerRuntimeFacadeDeployment.LegacyOnly);
+        var repoRoot = TestRepoRoot.Find();
+        var source = TestSourceScanner.StripNonCode(
+            File.ReadAllText(Path.Combine(repoRoot, "src", "CopilotHive", "Services", "ComposerRuntimeFacadeDeployment.cs"))
+                .ReplaceLineEndings("\n"));
+
+        Assert.DoesNotContain(
+            $"GetEnvironmentVariable({ComposerRuntimeFacadeDeployment.EnvironmentVariable})", source, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            $"GetEnvironmentVariable(EnvironmentVariable)", source, StringComparison.Ordinal);
+
+        // The decision really comes from the explicit mode.
+        Assert.Contains("HiveAuthMode.FromEnvironment()", source, StringComparison.Ordinal);
+        Assert.Contains("ForAuthMode(", source, StringComparison.Ordinal);
+    }
+
+    // ── The production registration seam: selection follows the mode ──────────────────────────────
+
+    /// <summary>
+    /// OPEN MODE: every scope resolves the SAME legacy <see cref="ComposerFacade"/> instance, and it is the
+    /// very object the singleton registration produced — so the operation runs on the legacy singleton
+    /// <see cref="Composer"/> exactly as before.
+    /// </summary>
+    [Fact]
+    public async Task OpenMode_EveryScopeResolvesTheSameLegacyFacade()
+    {
+        await using var fixture = new RegistrationFixture(HiveAuthMode.Open, ComposerRuntimeFacadeDeployment.LegacyOnly);
         using var first = fixture.Provider.CreateScope();
         using var second = fixture.Provider.CreateScope();
 
@@ -122,7 +170,7 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
         // registration is a pass-through and the behaviour is byte-identical to the pre-slice host.
         Assert.Same(fromFirst, fromSecond);
         Assert.False(fromFirst is ComposerRuntimeFacade,
-            "the per-user recovery facade must never be live while the gate is off");
+            "the per-user recovery facade must never be live in open mode");
 
         // ...and it really drives the LEGACY singleton Composer.
         var legacy = fixture.Provider.GetRequiredService<Composer>();
@@ -130,14 +178,14 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
     }
 
     /// <summary>
-    /// WHY PRODUCTION MUST RESOLVE PER REQUEST: the facade is SCOPED now, so resolving it from the ROOT provider
-    /// is REFUSED under scope validation. That is precisely the startup-closure capture the hub's per-request
-    /// resolution removes — and it is demonstrated here rather than assumed.
+    /// WHY PRODUCTION MUST RESOLVE PER REQUEST: the facade is SCOPED now, so resolving it from the ROOT
+    /// provider is REFUSED under scope validation. That is precisely the startup-closure capture the hub's
+    /// per-request resolution removes — and it is demonstrated here rather than assumed.
     /// </summary>
     [Fact]
     public async Task ResolvingTheFacadeFromTheRootProvider_IsRefused()
     {
-        await using var fixture = new RegistrationFixture(ComposerRuntimeFacadeDeployment.LegacyOnly);
+        await using var fixture = new RegistrationFixture(HiveAuthMode.Open, ComposerRuntimeFacadeDeployment.LegacyOnly);
 
         var error = Assert.Throws<InvalidOperationException>(
             () => fixture.Provider.GetRequiredService<IComposerFacade>());
@@ -145,14 +193,15 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
     }
 
     /// <summary>
-    /// THE GATE ON SELECTS THE RECOVERY FACADE, PER SCOPE: two scopes get DIFFERENT instances (each holding its
-    /// OWN scoped runtime accessor), which is exactly why the registration can never be a singleton.
+    /// AUTHENTICATED MODE SELECTS THE RECOVERY FACADE, PER SCOPE: two scopes get DIFFERENT instances (each
+    /// holding its OWN scoped runtime accessor), which is exactly why the registration can never be a
+    /// singleton.
     /// </summary>
     [Fact]
-    public async Task GateOn_EachScopeResolvesItsOwnRecoveryFacade()
+    public async Task AuthenticatedMode_EachScopeResolvesItsOwnRecoveryFacade()
     {
         await using var fixture = new RegistrationFixture(
-            new ComposerRuntimeFacadeDeployment(PerUserRuntimeEnabled: true));
+            HiveAuthMode.AuthenticationEnabled, ComposerRuntimeFacadeDeployment.PerUserRuntime);
 
         using var first = fixture.Provider.CreateScope();
         using var second = fixture.Provider.CreateScope();
@@ -166,13 +215,67 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
     }
 
     /// <summary>
-    /// NO SINGLETON CAPTURES THE SCOPED ACCESSOR IN EITHER MODE: the registration never closes a singleton over
-    /// it, so the per-circuit identity can never leak host-wide.
+    /// THE RETIRED GATE CANNOT REINSTATE THE SPLIT RUNTIME: declaring <see cref="ComposerRuntimeFacadeDeployment.LegacyOnly"/>
+    /// in an AUTHENTICATED fixture is a NO-OP — the scope still resolves the recovery facade, and the
+    /// declaration is recorded rather than honoured.
+    /// <para>
+    /// This is the row that fails if the deployment ever starts honouring a declared OFF path again.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ADefaultLegacyDeclaration_CannotKeepTheLegacySingletonLive_InAuthenticatedMode()
+    {
+        await using var fixture = new RegistrationFixture(
+            HiveAuthMode.AuthenticationEnabled, ComposerRuntimeFacadeDeployment.LegacyOnly);
+
+        using var scope = fixture.Provider.CreateScope();
+
+        var facade = scope.ServiceProvider.GetRequiredService<IComposerFacade>();
+
+        Assert.IsType<ComposerRuntimeFacade>(facade);
+        Assert.False(
+            facade is ComposerFacade,
+            "an authenticated installation must never fall back to the legacy singleton facade");
+        Assert.True(
+            scope.ServiceProvider.GetRequiredService<ComposerRuntimeFacadeDeployment>().PerUserRuntimeEnabled);
+    }
+
+    /// <summary>
+    /// THE MODE DECIDES, NOT THE DECLARATION — in BOTH directions, so a declaration can never add a legacy
+    /// path to an authenticated host either:
+    /// <list type="bullet">
+    /// <item>authenticated + declared legacy → per-user (the OFF path is a no-op);</item>
+    /// <item>authenticated + declared per-user → per-user;</item>
+    /// <item>open + declared legacy → legacy;</item>
+    /// <item>open + declared per-user → legacy (open mode has no per-user runtime to select).</item>
+    /// </list>
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    public async Task TheAuthModeDecides_TheDeclarationNeverDoes(bool authEnabled, bool declaredPerUser)
+    {
+        await using var fixture = new RegistrationFixture(
+            authEnabled ? HiveAuthMode.AuthenticationEnabled : HiveAuthMode.Open,
+            new ComposerRuntimeFacadeDeployment(declaredPerUser));
+
+        using var scope = fixture.Provider.CreateScope();
+
+        Assert.Equal(
+            authEnabled ? typeof(ComposerRuntimeFacade) : typeof(ComposerFacade),
+            scope.ServiceProvider.GetRequiredService<IComposerFacade>().GetType());
+    }
+
+    /// <summary>
+    /// NO SINGLETON CAPTURES THE SCOPED ACCESSOR IN EITHER MODE: the registration never closes a singleton
+    /// over it, so the per-circuit identity can never leak host-wide.
     /// </summary>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task NoRegistrationCapturesTheScopedAccessorInASingleton(bool gateEnabled)
+    public async Task NoRegistrationCapturesTheScopedAccessorInASingleton(bool authEnabled)
     {
         var repoRoot = TestRepoRoot.Find();
         var registration = TestSourceScanner.StripNonCode(
@@ -193,12 +296,13 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
             CountOccurrences(registration, "new ComposerRuntimeFacade(") == 1,
             "the recovery facade is constructed in exactly ONE registration");
 
-        // Sanity: the flag really reaches the fixture this row is named for.
+        // Sanity: the mode really reaches the fixture this row is named for.
         await using var fixture = new RegistrationFixture(
-            new ComposerRuntimeFacadeDeployment(PerUserRuntimeEnabled: gateEnabled));
+            authEnabled ? HiveAuthMode.AuthenticationEnabled : HiveAuthMode.Open,
+            ComposerRuntimeFacadeDeployment.ForAuthMode(authEnabled ? HiveAuthMode.AuthenticationEnabled : HiveAuthMode.Open));
         using var scope = fixture.Provider.CreateScope();
         Assert.Equal(
-            gateEnabled ? typeof(ComposerRuntimeFacade) : typeof(ComposerFacade),
+            authEnabled ? typeof(ComposerRuntimeFacade) : typeof(ComposerFacade),
             scope.ServiceProvider.GetRequiredService<IComposerFacade>().GetType());
     }
 
@@ -209,7 +313,8 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
     [InlineData(true, true)]
     public Task RegistrationFixture_AwaitsTeardownAndObservesFailures_OnEveryExit(bool bodyFails, bool disposalFails) =>
         RuntimeFacadeFixtureDisposalProof.VerifyAsync(
-            configure => new RegistrationFixture(ComposerRuntimeFacadeDeployment.LegacyOnly, configure),
+            configure => new RegistrationFixture(
+                HiveAuthMode.Open, ComposerRuntimeFacadeDeployment.LegacyOnly, configure),
             fixture => fixture.Provider, fixture => fixture.Manager, bodyFails, disposalFails);
 
     [Theory]
@@ -217,7 +322,8 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
     [InlineData(true)]
     public Task RegistrationFixture_JoinsActualRuntimeBeforeProviderAndBackingResources(bool bodyFails) =>
         RuntimeFacadeFixtureDisposalProof.VerifyManagerAsync(
-            (configure, client) => new RegistrationFixture(ComposerRuntimeFacadeDeployment.LegacyOnly, configure, client),
+            (configure, client) => new RegistrationFixture(
+                HiveAuthMode.Open, ComposerRuntimeFacadeDeployment.LegacyOnly, configure, client),
             fixture => fixture.Provider, fixture => fixture.Manager, bodyFails);
 
     /// <summary>The legacy Composer a legacy facade drives (it holds exactly that instance).</summary>
@@ -266,7 +372,9 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
         private readonly CopilotHiveDbContext _db;
         private readonly string _dir;
 
-        public RegistrationFixture(ComposerRuntimeFacadeDeployment deployment,
+        public RegistrationFixture(
+            HiveAuthMode mode,
+            ComposerRuntimeFacadeDeployment deployment,
             Action<IServiceCollection>? configureServices = null,
             Func<string, IChatClient>? chatClientFactory = null)
         {
@@ -283,7 +391,7 @@ public sealed class ComposerRuntimeFacadeGateTests : IDisposable
             });
             services.AddSingleton<IGoalStore>(new GoalStore(
                 _db, NullLogger<GoalStore>.Instance));
-            services.AddSingleton<HiveAuthMode>(HiveAuthMode.Open);
+            services.AddSingleton(mode);
             services.AddSingleton<HivePolicy>();
             services.AddSingleton(sp => new HivePrincipalResolver(
                 sp.GetRequiredService<UserService>(),

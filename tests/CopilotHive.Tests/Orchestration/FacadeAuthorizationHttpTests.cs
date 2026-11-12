@@ -423,27 +423,46 @@ public sealed class FacadeAuthorizationHttpTests : IDisposable
     }
 
     /// <summary>
-    /// THE LEGACY SINGLETON IS THE RUNTIME: exercising every Composer endpoint leaves the
-    /// per-user <see cref="ComposerRuntimeManager"/> cache EMPTY, so no private per-user runtime
-    /// was created or consulted on any path. This slice deliberately does not convert the runtime
-    /// selection.
+    /// EVERY COMPOSER ENDPOINT RUNS ON THE CALLER'S OWN PER-USER RUNTIME: exercising the endpoints creates
+    /// the per-user <see cref="ComposerRuntimeManager"/> entry for THAT account and for no other — the
+    /// integrated path is live, and it never serves one account's runtime to another.
     /// </summary>
     [Fact]
-    public async Task ComposerEndpoints_NeverInvolveTheRuntimeManager()
+    public async Task ComposerEndpoints_RunOnTheCallersOwnPerUserRuntime()
     {
         await SeedAsync(MemberId, UserRole.Member);
-        using var client = await SignInAsync(MemberId);
+        await SeedAsync(OperatorId, UserRole.Operator);
 
-        await client.GetAsync("/api/composer/current-model", Ct);
-        await client.GetAsync("/api/composer/models", Ct);
-        await client.PostAsync("/api/composer/compact", null, Ct);
+        using var memberClient = await SignInAsync(MemberId);
+        await memberClient.GetAsync("/api/composer/current-model", Ct);
+        await memberClient.GetAsync("/api/composer/models", Ct);
+        await memberClient.PostAsync("/api/composer/compact", null, Ct);
 
         var manager = _factory.Services.GetRequiredService<ComposerRuntimeManager>();
         var entriesField = typeof(ComposerRuntimeManager)
             .GetField("_entries", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         var entries = (System.Collections.IDictionary)entriesField.GetValue(manager)!;
 
-        Assert.True(entries.Count == 0, "the legacy singleton runtime must be used; no per-user runtime may be created");
+        var users = _factory.Services.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>();
+        int MemberInternalId;
+        int OperatorInternalId;
+        await using (var db = await users.CreateDbContextAsync(Ct))
+        {
+            MemberInternalId = (await db.Users.SingleAsync(u => u.GitHubId == MemberId, Ct)).Id;
+            OperatorInternalId = (await db.Users.SingleAsync(u => u.GitHubId == OperatorId, Ct)).Id;
+        }
+
+        // The member's runtime exists — created by the manager, under the member's own identity.
+        Assert.Contains(MemberInternalId, entries.Keys.Cast<int>());
+        // ...and the OTHER account's runtime was never created by the member's requests.
+        Assert.DoesNotContain(OperatorInternalId, entries.Keys.Cast<int>());
+
+        // The OPERATOR's own requests create THEIR runtime, isolated from the member's.
+        using var operatorClient = await SignInAsync(OperatorId);
+        await operatorClient.GetAsync("/api/composer/models", Ct);
+
+        Assert.Contains(OperatorInternalId, entries.Keys.Cast<int>());
+        Assert.Contains(MemberInternalId, entries.Keys.Cast<int>());
     }
 
     public void Dispose() => _factory.Dispose();

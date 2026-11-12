@@ -11,13 +11,45 @@
 @using Microsoft.Extensions.AI
 @using System.Security.Claims
 @implements IAsyncDisposable
-@inject Composer Composer
-@inject ComposerAttachmentService AttachmentService
+@* The LEGACY singleton Composer / attachment store: the OPEN-MODE binding only. In authenticated mode
+   the circuit binds the caller's OWN runtime (Composer/Atsachments resolve from the circuit binding),
+   so nothing here can serve one account's Composer to another. *@
+@inject Composer LegacyComposer
+@inject ComposerAttachmentService LegacyAttachments
+@* THE SCOPED PER-CIRCUIT RUNTIME SEAM: every operation re-queries it, so the CURRENT account's role and
+   enabled state are re-resolved on the very next call. It is never captured by a singleton. *@
+@inject IComposerRuntimeAccessor ComposerRuntimeAccessor
 @inject IJSRuntime JS
 @inject PageHeaderState PageHeader
 @inject IComposerFacade ComposerFacade
 @inject IConfigFacade ConfigFacade
 @inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
+
+@if (ViewState.ShowForbidden)
+{
+    @* A Viewer, a signed-out caller or an authenticated refusal: NO runtime, NO history, NO content and
+       deliberately NO login redirect (the identity is known — it simply may not use the Composer). *@
+    <div class="chat-status chat-status-error chat-forbidden">
+        You do not have access to the Composer.
+    </div>
+}
+
+@if (ViewState.ShowRuntimeError)
+{
+    <div class="chat-status chat-status-error">
+        @ViewState.RuntimeError
+    </div>
+}
+
+@if (ViewState.ShowDeferredNotice)
+{
+    @* DEFERRED: the runtime exists but its connect is deferred, so every read answers with shell
+       metadata and every mutation first drives ONE connect. The control keeps the page actionable. *@
+    <div class="chat-status chat-status-deferred">
+        This Composer is not connected yet.
+        <button @onclick="ConnectRuntimeAsync" class="chat-action-btn chat-connect-btn">Connect now</button>
+    </div>
+}
 
 @if (ViewState.ShowNotConfiguredNotice)
 {
@@ -29,7 +61,7 @@
 @if (ViewState.ShowModelPicker && !ViewState.ShowConnectedControls)
 {
     <div class="chat-actions">
-        <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
+        <select disabled="@IsBoundStreaming" class="chat-model-select" @onchange="HandleModelChange">
             @if (ViewState.Placeholder is { } placeholder)
             {
                 <option value="" selected="@(string.IsNullOrEmpty(_selectedModel))">@placeholder</option>
@@ -87,7 +119,7 @@
                 </div>
             }
             <div class="chat-messages" id="chat-messages">
-                @if (_messages.Count == 0 && !Composer.IsStreaming)
+                @if (_messages.Count == 0 && !IsBoundStreaming)
                 {
                     <div class="chat-empty">
                         <p><strong>Welcome to the Composer.</strong></p>
@@ -114,7 +146,7 @@
                     }
                 }
 
-                @if (Composer.IsStreaming)
+                @if (IsBoundStreaming)
                 {
                     <div class="chat-msg chat-msg-assistant">
                         <div class="chat-msg-role">Composer</div>
@@ -210,7 +242,7 @@
                 {
                     <div class="chat-attach-chip">
                         <span class="chat-attach-chip-name">@_pending.DisplayName</span>
-                        <button class="chat-attach-chip-remove" @onclick="RemoveAttachment" disabled="@Composer.IsStreaming" title="Remove attachment">×</button>
+                        <button class="chat-attach-chip-remove" @onclick="RemoveAttachment" disabled="@IsBoundStreaming" title="Remove attachment">×</button>
                     </div>
                 }
                 @if (!string.IsNullOrEmpty(_attachmentError))
@@ -225,19 +257,19 @@
                     📎
                     <InputFile OnChange="HandleFileSelected"
                                accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,image/*,application/pdf"
-                               disabled="@(_pending is not null || _uploading || Composer.IsStreaming)"
+                               disabled="@(_pending is not null || _uploading || IsBoundStreaming)"
                                class="chat-attach-input" />
                 </label>
                 <textarea id="composer-input"
                           @bind="_inputText" @bind:event="oninput"
                           @onkeydown="HandleKeyDown"
                           placeholder="Describe what you want to build…"
-                          disabled="@Composer.IsStreaming"
+                          disabled="@IsBoundStreaming"
                           rows="2"
                           class="chat-input"></textarea>
                 <button @onclick="SendMessage" disabled="@(!CanSend)"
                         class="chat-send">
-                    @if (Composer.IsStreaming)
+                    @if (IsBoundStreaming)
                     {
                         <span>Thinking…</span>
                     }
@@ -249,7 +281,7 @@
             </div>
 
             <div class="chat-actions">
-                <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
+                <select disabled="@IsBoundStreaming" class="chat-model-select" @onchange="HandleModelChange">
                     @if (ViewState.Placeholder is { } placeholder)
                     {
                         <option value="" selected="@(string.IsNullOrEmpty(_selectedModel))">@placeholder</option>
@@ -259,16 +291,16 @@
                         <option value="@model" selected="@(_selectedModel == model)">@model</option>
                     }
                 </select>
-                <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleReasoningChange">
+                <select disabled="@IsBoundStreaming" class="chat-model-select" @onchange="HandleReasoningChange">
                     @foreach (var option in ReasoningEffortOptions.Options)
                     {
                         <option value="@ReasoningEffortOptions.WireValue(option.Value)" selected="@(_selectedReasoning == option.Value)">@option.Label</option>
                     }
                 </select>
-                <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
+                <button @onclick="ResetSession" disabled="@IsBoundStreaming" class="chat-action-btn">
                     🔄 New Session
                 </button>
-                <button @onclick="CompactSession" disabled="@(Composer.IsStreaming || Composer.IsCompacting)" class="chat-action-btn">
+                <button @onclick="CompactSession" disabled="@(IsBoundStreaming || Composer.IsCompacting)" class="chat-action-btn">
                     @if (Composer.IsCompacting)
                     {
                         <span>Compacting…</span>
@@ -278,7 +310,7 @@
                         <text>📦 Compact</text>
                     }
                 </button>
-                <button @onclick="CompactPartial" disabled="@(Composer.IsStreaming || Composer.IsCompacting)" class="chat-action-btn">
+                <button @onclick="CompactPartial" disabled="@(IsBoundStreaming || Composer.IsCompacting)" class="chat-action-btn">
                     @if (Composer.IsCompacting)
                     {
                         <span>Compacting…</span>
@@ -355,18 +387,37 @@
     /// Internal immutable view-state record the Razor markup reads DIRECTLY. The page computes
     /// its render state from this record; tests construct it from mock Composer state and assert
     /// its flags — never markup tokens or an HTML string. This is the production seam.
+    /// <para>
+    /// It carries BOTH dimensions: the circuit's runtime selection (which fails closed — a denied or
+    /// faulted selection hides the whole Composer) and the bound Composer's own connection state.
+    /// </para>
     /// </summary>
     /// <param name="IsConnected">Whether the Composer is connected (has an active model).</param>
     /// <param name="ShowModelPicker">Whether the model picker is rendered (always true — reachable even while disconnected).</param>
     /// <param name="ShowConnectedControls">Whether the connected-only controls (thread, Send, Compact, Reset, reasoning select) are rendered.</param>
     /// <param name="ShowNotConfiguredNotice">Whether the "No model configured" notice is shown.</param>
     /// <param name="Placeholder">The no-selection placeholder label for the model select, or <c>null</c> when none.</param>
+    /// <param name="ShowForbidden">Whether the forbidden view is rendered INSTEAD of any Composer content.</param>
+    /// <param name="ShowRuntimeError">Whether a fixed, secret-free runtime error is rendered.</param>
+    /// <param name="RuntimeError">The error text for <paramref name="ShowRuntimeError"/>; otherwise <c>null</c>.</param>
+    /// <param name="ShowDeferredNotice">Whether the still-deferred notice (with its ONE connect control) is rendered.</param>
     internal sealed record ComposerChatViewState(
         bool IsConnected,
         bool ShowModelPicker,
         bool ShowConnectedControls,
         bool ShowNotConfiguredNotice,
-        string? Placeholder);
+        string? Placeholder,
+        bool ShowForbidden = false,
+        bool ShowRuntimeError = false,
+        string? RuntimeError = null,
+        bool ShowDeferredNotice = false)
+    {
+        /// <summary>
+        /// Whether this render may show Composer content at all. A forbidden or faulted runtime
+        /// selection shows none: no thread, no catalog, no controls.
+        /// </summary>
+        internal bool ShowsComposerContent => !ShowForbidden && !ShowRuntimeError;
+    }
 
     /// <summary>
     /// The placeholder label for the model select's no-selection option. A non-empty list with
@@ -387,7 +438,63 @@
         ShowNotConfiguredNotice: !isConnected,
         Placeholder: ModelSelectPlaceholder);
 
-    private ComposerChatViewState ViewState => ComputeViewState(Composer.IsConnected);
+    /// <summary>
+    /// Computes the page's render state from BOTH the circuit's runtime selection and the bound
+    /// Composer's connection state. The runtime status dominates: a forbidden, faulted or deferred
+    /// selection decides what may be shown regardless of what a previously bound Composer reported.
+    /// </summary>
+    /// <param name="status">The circuit's current runtime status.</param>
+    /// <param name="isConnected">Whether the BOUND Composer is connected (ignored when nothing is bound).</param>
+    /// <param name="runtimeError">The fixed runtime error text for the failed/removed statuses.</param>
+    internal static ComposerChatViewState ComputeViewState(
+        ComposerCircuitStatus status, bool isConnected, string? runtimeError)
+    {
+        switch (status)
+        {
+            case ComposerCircuitStatus.Forbidden:
+                // NOTHING renders: no picker, no thread, no controls, no "configure a model" hint — a
+                // caller who may not use the Composer learns nothing about its state.
+                return new ComposerChatViewState(
+                    IsConnected: false,
+                    ShowModelPicker: false,
+                    ShowConnectedControls: false,
+                    ShowNotConfiguredNotice: false,
+                    Placeholder: null,
+                    ShowForbidden: true);
+
+            case ComposerCircuitStatus.Failed:
+            case ComposerCircuitStatus.Removed:
+                // A fixed, secret-free error and NO content: the handle is unusable until the next operation.
+                return new ComposerChatViewState(
+                    IsConnected: false,
+                    ShowModelPicker: false,
+                    ShowConnectedControls: false,
+                    ShowNotConfiguredNotice: false,
+                    Placeholder: null,
+                    ShowRuntimeError: true,
+                    RuntimeError: runtimeError ?? ComposerRuntimeFacade.RuntimeUnavailableError);
+
+            case ComposerCircuitStatus.Deferred:
+                // Deferred: shell metadata only (no thread, no connected controls) plus the ONE connect
+                // control that keeps the page actionable.
+                return new ComposerChatViewState(
+                    IsConnected: false,
+                    ShowModelPicker: true,
+                    ShowConnectedControls: false,
+                    ShowNotConfiguredNotice: false,
+                    Placeholder: ModelSelectPlaceholder,
+                    ShowDeferredNotice: true);
+
+            case ComposerCircuitStatus.Ready:
+                return ComputeViewState(isConnected);
+
+            default:
+                // No silent fallback for an undefined status: an unhandled value is a bug.
+                throw new InvalidOperationException($"Unexpected Composer circuit status: {status}.");
+        }
+    }
+
+    private ComposerChatViewState ViewState => ComputeViewState(CircuitStatus, HasBoundComposer && Composer.IsConnected, _circuitError);
 
     /// <summary>
     /// Internal immutable usage view the Razor markup reads DIRECTLY: the SHORT text appended to the
@@ -526,9 +633,11 @@
     private string? _sendError;
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
-    // Whether the paste module has been installed on the composer-input textarea. Set exactly
-    // once, when the textarea first appears (post-connect on a disconnected-first page); never
-    // reset — the module is uninstalled/disposed only in DisposeAsync.
+    // Whether the paste module is installed on the CURRENT composer-input textarea. Set when the
+    // textarea appears (post-connect on a disconnected-first page) and RESET whenever the connected
+    // layout is removed (a refusal, a deferral, a failure): the listener is released with the textarea
+    // it was attached to and a fresh one is installed on the NEXT textarea. Managed component JS only —
+    // never a runtime.
     private bool _pasteInstalled;
     // Authoritative event-notification mode. Null until IConfigFacade.GetComposer() reports it —
     // a fabricated default would let the toggle persist a transition the server never implied.
@@ -552,15 +661,32 @@
     {
         PageHeader.SetTitle("💬 Composer");
 
-        // The available-models picker is ALWAYS loaded — even while disconnected the picker is
-        // reachable and enabled so the user can select a model to start. The current-model
-        // endpoint returns {"model":null} while disconnected (frozen contract), so loading it
-        // is harmless and keeps the select in its placeholder state.
-        await LoadAvailableModelsAsync();
-        if (Composer.IsConnected)
+        // THE CIRCUIT'S RUNTIME SELECTION, BEFORE ANY CONTENT IS READ: the accessor re-resolves this
+        // circuit's identity from CURRENT stored state and requires InteractiveMember. A Viewer, a
+        // signed-out caller or an authenticated refusal therefore never reaches the Composer at all.
+        // In open mode the same call selects the explicit legacy singleton.
+        try
         {
-            LoadHistory();
-            await LoadCurrentModelAsync();
+            _ = await AcquireCircuitRuntimeAsync(mutation: false, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _circuitError = ComposerRuntimeFacade.RuntimeUnavailableError;
+            Console.Error.WriteLine($"[ComposerChat] Composer runtime selection failed: {ex.Message}");
+        }
+
+        // The available-models picker is ALWAYS loaded for a bound Composer — even while disconnected the
+        // picker is reachable and enabled so the user can select a model to start. The current-model
+        // endpoint returns {"model":null} while disconnected (frozen contract), so loading it is harmless
+        // and keeps the select in its placeholder state.
+        if (HasBoundComposer)
+        {
+            await LoadAvailableModelsAsync();
+            if (Composer.IsConnected)
+            {
+                LoadHistory();
+                await LoadCurrentModelAsync();
+            }
         }
 
         // The notification toggle persists a GLOBAL (installation-wide) setting, so its rendering is
@@ -588,13 +714,6 @@
         // page would render the toggle from an unloaded state.
         await LoadActiveNotificationsModeAsync();
         StateHasChanged();
-
-        Composer.OnStreamingUpdate += HandleStreamingUpdate;
-        Composer.OnQuestionAsked += HandleQuestionAsked;
-        Composer.OnCompactingStarted += HandleCompactingStarted;
-        Composer.OnCompacted += HandleCompacted;
-        Composer.OnSubAgentChanged += HandleSubAgentChanged;
-        Composer.OnActiveInjection += HandleActiveInjection;
     }
 
     /// <summary>
@@ -614,18 +733,115 @@
         await JS.InvokeVoidAsync("eval",
             "document.getElementById('chat-anchor')?.scrollIntoView()");
 
-        // The paste module is installed when the composer-input textarea FIRST appears — on a
-        // connected-first page that is the first render; on a disconnected-first page it is the
-        // render after a successful first-connect. Installed EXACTLY ONCE (tracked by
-        // _pasteInstalled); never installed while disconnected (no textarea exists).
+        // THE LISTENER FOLLOWS THE TEXTAREA. When the connected layout is gone (a refusal, a deferral, a
+        // failure, a removed runtime) the textarea the listener was attached to is detached: release the
+        // listener NOW instead of at disposal, so the JS module never keeps a detached element and a paste can
+        // never be intercepted for a page that shows no composer.
+        if (_pasteInstalled && !ViewState.ShowConnectedControls)
+            await ReleasePasteListenerAsync();
+
+        // The paste module is installed when the composer-input textarea APPEARS — on a connected-first page
+        // that is the first render; on a disconnected-first page (or after a Deferred -> Connect -> Ready
+        // replacement, which creates a NEW textarea) it is the render after the connect. Installed once per
+        // textarea (tracked by _pasteInstalled); never installed while no textarea exists.
         if (ShouldInstallPasteModule(_pasteInstalled, ViewState.ShowConnectedControls))
         {
+            // LIFECYCLE OWNERSHIP: the flag is set before the import await (so a second render cannot start a second
+            // import), and the generation identifies THIS install attempt. Every release bumps the generation, so
+            // the continuation below can tell — when it resumes — whether it still owns the lifecycle.
             _pasteInstalled = true;
-            _pasteModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/composer-paste.js");
+            var generation = _pasteGeneration;
+
+            var module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/composer-paste.js");
+
+            // RE-VALIDATE AT RESUMPTION, BEFORE ANY INSTALL OR REFERENCE RETENTION: a refusal/removal that rendered
+            // while the import was outstanding released the lifecycle (new generation) or removed the textarea. The
+            // late module belongs to a textarea that is gone: dispose it, install nothing, retain nothing, and leave
+            // the flag clear (only if no newer attempt already owns it).
+            if (generation != _pasteGeneration || !ViewState.ShowConnectedControls)
+            {
+                if (generation == _pasteGeneration)
+                    _pasteInstalled = false;
+
+                try
+                {
+                    await module.DisposeAsync();
+                }
+                catch (JSDisconnectedException)
+                {
+                    // Circuit teardown: the module reference dies with the circuit.
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ComposerChat] Paste module disposal failed: {ex.Message}");
+                }
+
+                return;
+            }
+
+            _pasteModule = module;
             _pasteDotNetRef = DotNetObjectReference.Create(this);
             await _pasteModule.InvokeVoidAsync("install", "composer-input", _pasteDotNetRef);
             await SyncPasteAllowedAsync();
         }
+    }
+
+    // Identifies the current paste-listener lifecycle. Bumped by every release so an in-flight import (or any
+    // other continuation that captured it) can tell it no longer owns the lifecycle when it resumes.
+    private int _pasteGeneration;
+
+    /// <summary>
+    /// Uninstalls and disposes this component's paste JS (listener, module reference, .NET reference) and resets
+    /// the install flag so the NEXT connected textarea gets a fresh listener. Each step is independently attempted
+    /// and a fault is logged, never thrown. It manages component JS only — never a runtime.
+    /// </summary>
+    private async Task ReleasePasteListenerAsync()
+    {
+        // DETACH EVERY OWNED RESOURCE SYNCHRONOUSLY, BEFORE THE FIRST AWAIT: this release owns exactly the module AND
+        // the .NET reference that were installed when it started. A NEWER install that appears while the uninstall
+        // response is outstanding writes the shared fields afresh and is therefore never visible to — or cleaned
+        // up by — this release.
+        _pasteInstalled = false;
+        _pasteGeneration++;
+        var module = _pasteModule;
+        _pasteModule = null;
+        var dotNetRef = _pasteDotNetRef;
+        _pasteDotNetRef = null;
+
+        if (module is not null)
+        {
+            // Independently attempted: an uninstall fault must not skip the module disposal.
+            try
+            {
+                await module.InvokeVoidAsync("uninstall");
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit teardown / navigation: the browser is already gone — expected, not a fault.
+            }
+            catch (Exception ex)
+            {
+                // Never silently swallowed: re-throwing here would mask whatever triggered
+                // disposal, so an unexpected teardown fault is surfaced in the logs instead.
+                Console.Error.WriteLine($"[ComposerChat] Paste module uninstall failed: {ex.Message}");
+            }
+
+            try
+            {
+                await module.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit teardown / navigation: the module reference dies with the circuit.
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[ComposerChat] Paste module disposal failed: {ex.Message}");
+            }
+        }
+
+        // ONLY the reference this release detached: never the shared field, which may now hold a newer install's.
+        dotNetRef?.Dispose();
     }
 
     /// <summary>
@@ -635,8 +851,24 @@
     private async Task SyncPasteAllowedAsync()
     {
         if (_pasteModule is null) return;
-        await _pasteModule.InvokeVoidAsync("setAllowed", ComputePasteAllowed(Composer.IsStreaming, _uploading, _pending));
+        await _pasteModule.InvokeVoidAsync("setAllowed", PasteAllowedNow);
     }
+
+    /// <summary>
+    /// The paste-allowed state to mirror to JS RIGHT NOW. An UNBOUND page (forbidden / failed / removed / deferred)
+    /// is never allowed — an idle page with nothing bound is not "idle and ready", it is closed — and a bound one
+    /// follows <see cref="ComputePasteAllowed"/> exactly as before.
+    /// </summary>
+    private bool PasteAllowedNow =>
+        CircuitStatus == ComposerCircuitStatus.Ready
+        && HasBoundComposer
+        && ComputePasteAllowed(IsBoundStreaming, _uploading, _pending);
+
+    /// <summary>
+    /// Whether the CURRENTLY BOUND Composer is streaming. With nothing bound (forbidden / failed /
+    /// removed / before the first selection) the page is idle, never streaming.
+    /// </summary>
+    private bool IsBoundStreaming => HasBoundComposer && Composer.IsStreaming;
 
     /// <summary>
     /// Whether a clipboard paste may currently produce a pending attachment. A paste is refused
@@ -653,6 +885,12 @@
     private void LoadHistory()
     {
         _messages.Clear();
+
+        // NO CONTENT WITHOUT A BINDING: a forbidden/failed/removed selection (or the moment before the
+        // first selection) must never show another account's thread.
+        if (!HasBoundComposer)
+            return;
+
         foreach (var (role, content) in Composer.GetChatHistory())
         {
             if (role == "user")
@@ -674,12 +912,26 @@
         }
     }
 
+    /// <summary>
+    /// A streaming update from the Composer this circuit is subscribed to. The handler is QUEUE-able, so the
+    /// binding is captured when it fires and re-checked when the body finally runs: a callback queued before a
+    /// demotion or a runtime replacement must not re-render content from the runtime it no longer shows.
+    /// </summary>
     private void HandleStreamingUpdate()
     {
-        InvokeAsync(async () =>
+        // CAPTURED SYNCHRONOUSLY, on the raising thread: the token is the binding that raised this event.
+        var captured = CurrentCallbackBinding;
+
+        QueueCallback(async () =>
         {
+            // THE FRESHNESS GUARD: a queued callback for a replaced/fail-closed binding, or for a caller who has
+            // since been demoted or disabled, does nothing at all — it neither re-renders content nor re-syncs
+            // the paste mirror from the runtime it no longer shows.
+            if (await DropStaleCallbackAsync(captured, CancellationToken.None))
+                return;
+
             // When streaming finishes, reload history to get the final message
-            if (!Composer.IsStreaming)
+            if (!IsBoundStreaming)
             {
                 LoadHistory();
             }
@@ -697,11 +949,50 @@
 
         _sendError = null;
 
+        // FRESH SELECTION FOR THE SEND: the operation re-queries the accessor, so a demotion or
+        // disablement since the last render refuses the send instead of streaming into a runtime the
+        // caller no longer holds. A deferred/shell runtime is connected by the send itself.
+        Composer? composer;
+        try
+        {
+            composer = await AcquireComposerForMutationAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _sendError = ComposerRuntimeFacade.RuntimeUnavailableError;
+            Console.Error.WriteLine($"[ComposerChat] Composer runtime selection failed: {ex.Message}");
+            StateHasChanged();
+            return;
+        }
+
+        if (composer is null)
+        {
+            // Denied, still deferred, failed or removed: no content is produced and the failure is stated.
+            _sendError = _circuitError ?? ComposerRuntimeAccessError;
+            StateHasChanged();
+            return;
+        }
+
+        // The attachment path is resolved against the SAME selection the message is sent to, so a
+        // per-user attachment can never be addressed through another account's root.
+        ComposerAttachmentService attachments;
+        try
+        {
+            attachments = BoundAttachments ?? throw new InvalidOperationException(
+                "A bound Composer must carry its attachment service.");
+        }
+        catch (Exception ex)
+        {
+            _sendError = ex.Message;
+            StateHasChanged();
+            return;
+        }
+
         string text;
         if (_pending is not null)
         {
             var ext = Path.GetExtension(_pending.SavedRelativePath);
-            var absPath = Path.Combine(AttachmentService.AttachmentsRootPath, _pending.SavedRelativePath);
+            var absPath = Path.Combine(attachments.AttachmentsRootPath, _pending.SavedRelativePath);
             text = BuildAttachmentMessage(_inputText, _pending.DisplayName, ext, absPath);
         }
         else
@@ -712,7 +1003,7 @@
         string? eventBlock = null;
         try
         {
-            eventBlock = await Composer.SendMessageWithEventsAsync(text);
+            eventBlock = await composer.SendMessageWithEventsAsync(text);
         }
         catch (Exception ex)
         {
@@ -731,7 +1022,7 @@
         // This keeps _pending and _inputText intact for retry if the call fails.
         if (_pending is not null)
         {
-            AttachmentService.MarkAsSent(_pending);
+            attachments.MarkAsSent(_pending);
             _pending = null;
         }
 
@@ -740,6 +1031,14 @@
         StateHasChanged();
         await SyncPasteAllowedAsync();
     }
+
+    /// <summary>
+    /// The fixed, sanitized notice for a mutation that could not run because the runtime selection was
+    /// denied or is not (yet) usable. It names no account, model, provider or credential.
+    /// </summary>
+    internal const string ComposerRuntimeAccessError =
+        "The Composer is not available for this account right now. Retry the operation; if it persists, "
+        + "check that your account is enabled and has access to the selected model.";
 
     internal static string BuildAttachmentMessage(string? userText, string displayName, string extension, string savedAbsPath)
     {
@@ -757,7 +1056,7 @@
     internal static bool ComputeCanSend(bool isStreaming, bool uploading, string inputText, object? pending)
         => !isStreaming && !uploading && (!string.IsNullOrWhiteSpace(inputText) || pending is not null);
 
-    private bool CanSend => ComputeCanSend(Composer.IsStreaming, _uploading, _inputText, _pending);
+    private bool CanSend => ComputeCanSend(IsBoundStreaming, _uploading, _inputText, _pending);
 
     private async Task HandleFileSelected(InputFileChangeEventArgs e)
     {
@@ -766,6 +1065,15 @@
         if (file is null || file.Size == 0)
         {
             _attachmentError = "No file selected or file is empty.";
+            StateHasChanged();
+            return;
+        }
+
+        // NO ATTACHMENT WITHOUT A BINDING: the upload is written into the SELECTED runtime's own attachment
+        // store, so a forbidden/failed/removed selection must refuse the upload instead of writing anywhere.
+        if (BoundAttachments is null)
+        {
+            _attachmentError = ComposerRuntimeAccessError;
             StateHasChanged();
             return;
         }
@@ -829,6 +1137,17 @@
         /// <param name="content">Content stream; never fully buffered.</param>
         Task<AttachmentSaveResult> SaveAsync(string originalName, Stream content);
 
+        /// <summary>
+        /// THE COMPLETION GUARD: whether the asynchronous write that just finished may still be reflected in this
+        /// circuit's state — i.e. the binding that started it is still current AND the caller still holds
+        /// <see cref="CopilotHive.Security.HiveCapability.InteractiveMember"/>. The component re-queries its
+        /// scoped runtime accessor here, so a demotion, a disablement or a runtime replacement that landed while
+        /// the upload was in flight is observed at completion time.
+        /// </summary>
+        /// <param name="ct">Caller cancellation; cancellation propagates.</param>
+        /// <returns><c>true</c> only when the outcome may be applied.</returns>
+        Task<bool> IsCompletionStillAuthorizedAsync(CancellationToken ct);
+
         /// <summary>Requests a re-render (the component's <c>StateHasChanged</c>).</summary>
         void Notify();
 
@@ -839,6 +1158,14 @@
     /// <summary>Binds <see cref="IPasteHost"/> to this component's own fields and services.</summary>
     private sealed class ComponentPasteHost(ComposerChat owner) : IPasteHost
     {
+        /// <summary>
+        /// THE FRESHNESS TOKEN for this host's IN-FLIGHT asynchronous write: the binding that was current when the
+        /// write STARTED. It is refreshed by every <see cref="SaveAsync"/>, so it always describes the write being
+        /// observed — and a save that completes after the runtime was replaced (or after the selection became
+        /// fail-closed) is dropped rather than attached to a runtime this circuit no longer shows.
+        /// </summary>
+        private ComposerCircuitBinding? _capturedBinding;
+
         /// <inheritdoc />
         public ComposerAttachment? Pending
         {
@@ -861,17 +1188,39 @@
         }
 
         /// <inheritdoc />
-        public bool IsStreaming => owner.Composer.IsStreaming;
+        public bool IsStreaming => owner.IsBoundStreaming;
 
         /// <inheritdoc />
-        public Task<AttachmentSaveResult> SaveAsync(string originalName, Stream content)
-            => owner.AttachmentService.SaveAsync(originalName, content);
+        public async Task<AttachmentSaveResult> SaveAsync(string originalName, Stream content)
+        {
+            // THE START GATE: one FRESH selection through the accessor BEFORE any byte reaches a store. A write
+            // begun after access was revoked (or after the runtime was removed/replaced) must never start; the
+            // completion guard below is a separate, additional requirement for a write that did start.
+            var attachments = await owner.AuthorizeAttachmentWriteAsync();
+
+            // CAPTURED AT THE START OF THE WRITE: this is the binding whose freshness the completion must prove —
+            // the one the start gate just selected, so it is the binding the write is actually going into.
+            _capturedBinding = owner.CurrentCallbackBinding;
+
+            if (attachments is null)
+                return new AttachmentSaveResult(false, null, ComposerRuntimeAccessError);
+
+            return await attachments.SaveAsync(originalName, content);
+        }
 
         /// <inheritdoc />
         public void Notify() => owner.StateHasChanged();
 
         /// <inheritdoc />
         public Task SyncPasteAllowedAsync() => owner.SyncPasteAllowedAsync();
+
+        /// <summary>
+        /// THE COMPLETION GUARD for this component: the binding the write started under, re-checked through the
+        /// component's own freshness seam (the O(1) binding check plus ONE fresh authorization re-check).
+        /// </summary>
+        /// <param name="ct">Caller cancellation; cancellation propagates.</param>
+        public Task<bool> IsCompletionStillAuthorizedAsync(CancellationToken ct) =>
+            owner.IsCompletionStillAuthorizedAsync(_capturedBinding, ct);
     }
 
     private IPasteHost? _pasteHost;
@@ -884,15 +1233,32 @@
     /// attachment / error state. The caller owns the stream, its size guard and its exception
     /// handling (the picker's <see cref="IOException"/> oversize contract is picker-specific).
     /// </summary>
+    /// <remarks>
+    /// THE COMPLETION IS RE-AUTHORIZED BEFORE ITS OUTCOME IS APPLIED: the write runs, then the host re-checks
+    /// that the binding which started it is still the current one AND that the caller still holds
+    /// <see cref="CopilotHive.Security.HiveCapability.InteractiveMember"/>. A write that completes after a
+    /// demotion, a disablement or a
+    /// runtime replacement is NOT attached to this circuit — it becomes an orphaned file in the store that
+    /// accepted it, which is strictly safer than re-attaching a stale upload to a runtime the user may no
+    /// longer use.
+    /// </remarks>
     /// <param name="host">State seam the outcome is written to.</param>
     /// <param name="originalName">Display name recorded for the attachment.</param>
     /// <param name="stream">Content stream; never fully buffered.</param>
     internal static async Task SaveAttachmentAsync(IPasteHost host, string originalName, Stream stream)
     {
+        ArgumentNullException.ThrowIfNull(host);
+        ArgumentNullException.ThrowIfNull(stream);
+
         host.Uploading = true;
         try
         {
             var result = await host.SaveAsync(originalName, stream);
+
+            // THE COMPLETION GUARD, on EVERY path that would reflect the write in component state.
+            if (!await host.IsCompletionStillAuthorizedAsync(CancellationToken.None))
+                return;
+
             if (result.Success && result.Attachment is not null)
             {
                 host.Pending = result.Attachment;
@@ -1100,7 +1466,33 @@
     private async Task RemoveAttachment()
     {
         if (_pending is null) return;
-        var result = AttachmentService.Remove(_pending);
+
+        // AUTHORIZE BEFORE THE MUTATION: removal deletes a file, so it needs the same fresh selection as any other
+        // storage write. A demoted/refused caller's file is left exactly where it is, and the page leaves Ready.
+        // The pending attachment belongs to the SELECTION that saved it, so it is removed through that
+        // selection's own attachment store — never through a global one.
+        ComposerAttachmentService? attachments;
+        try
+        {
+            attachments = await AuthorizeAttachmentWriteAsync();
+        }
+        catch (Exception ex)
+        {
+            attachments = null;
+            Console.Error.WriteLine($"[ComposerChat] Composer runtime selection failed: {ex.Message}");
+        }
+
+        // A different runtime (or a refusal) forgot the staged record while the selection ran: nothing to remove.
+        if (attachments is null || _pending is null)
+        {
+            if (attachments is null)
+                _attachmentError = ComposerRuntimeAccessError;
+            StateHasChanged();
+            await SyncPasteAllowedAsync();
+            return;
+        }
+
+        var result = attachments.Remove(_pending);
         if (result.Success)
         {
             _pending = null;
@@ -1117,8 +1509,31 @@
 
     private async Task ResetSession()
     {
-        if (Composer.IsStreaming) return;
-        await Composer.ResetSessionAsync();
+        if (IsBoundStreaming) return;
+
+        // FRESH SELECTION: the reset mutates the session, so it re-queries the accessor first and drives
+        // the ONE deferred connect when the runtime is not connected yet.
+        Composer? composer;
+        try
+        {
+            composer = await AcquireComposerForMutationAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _sendError = ComposerRuntimeFacade.RuntimeUnavailableError;
+            Console.Error.WriteLine($"[ComposerChat] Composer runtime selection failed: {ex.Message}");
+            StateHasChanged();
+            return;
+        }
+
+        if (composer is null)
+        {
+            _sendError = _circuitError ?? ComposerRuntimeAccessError;
+            StateHasChanged();
+            return;
+        }
+
+        await composer.ResetSessionAsync();
         _messages.Clear();
         _pending = null;        // Composer's reset calls ClearAllAsync which may delete the file
         _attachmentError = null; // clear any pending-related error note
@@ -1128,14 +1543,26 @@
 
     private async Task CompactSession()
     {
-        if (Composer.IsStreaming || Composer.IsCompacting) return;
+        if (IsBoundStreaming || (HasBoundComposer && Composer.IsCompacting)) return;
         try
         {
+            // The facade re-selects the runtime for THIS operation itself (fresh identity + capability,
+            // one deferred connect on a mutation), then maps every manager outcome to the recovery answer.
             var result = await ComposerFacade.CompactAsync(
                 await ActingUserAsync(), CancellationToken.None);
+
+            // ADOPT WHAT THE FACADE JUST DECIDED: a refusal hides the content and unsubscribes, a replacement
+            // unifies the binding/reads/subscriptions with the runtime the facade acted on.
+            await AdoptCurrentSelectionAsync();
             if (result.Success)
             {
                 LoadHistory();
+            }
+            else
+            {
+                // The recovery answer (deferred 503 / failed 503 / removed 409 / refused 403) is surfaced next
+                // to the controls; it never hides the thread, because the bound Composer is still usable.
+                _sendError = result.Error;
             }
             // A failed compaction leaves the thread exactly as it was — the history is NOT
             // reloaded — but the view is still refreshed so the compacting indicator clears.
@@ -1149,14 +1576,19 @@
 
     private async Task CompactPartial()
     {
-        if (Composer.IsStreaming || Composer.IsCompacting) return;
+        if (IsBoundStreaming || (HasBoundComposer && Composer.IsCompacting)) return;
         try
         {
             var result = await ComposerFacade.CompactPartialAsync(
                 await ActingUserAsync(), 50, CancellationToken.None);
+            await AdoptCurrentSelectionAsync();
             if (result.Success)
             {
                 LoadHistory();
+            }
+            else
+            {
+                _sendError = result.Error;
             }
             StateHasChanged();
         }
@@ -1282,7 +1714,7 @@
         }
 
         /// <inheritdoc />
-        public bool IsStreaming => owner.Composer.IsStreaming;
+        public bool IsStreaming => owner.IsBoundStreaming;
 
         /// <inheritdoc />
         public async Task<FacadeResult<SavedResult>> SaveModeAsync(string mode)
@@ -1593,12 +2025,18 @@
     private sealed class ComponentModelSwitchHost(ComposerChat owner) : IModelSwitchHost
     {
         /// <inheritdoc />
-        public bool IsConnected => owner.Composer.IsConnected;
+        public bool IsConnected => owner.HasBoundComposer && owner.Composer.IsConnected;
 
         /// <inheritdoc />
         public async Task<FacadeResult<SwitchResultDto>> SwitchAsync(string model, ReasoningEffort reasoning)
-            => await owner.ComposerFacade.SwitchModelAsync(
+        {
+            var result = await owner.ComposerFacade.SwitchModelAsync(
                 await owner.ActingUserAsync(), model, SwitchReasoningWireValue(reasoning), CancellationToken.None);
+
+            // ADOPT WHAT THE FACADE JUST DECIDED (refusal => hidden + unsubscribed; replacement => unified).
+            await owner.AdoptCurrentSelectionAsync();
+            return result;
+        }
 
         /// <inheritdoc />
         public void LoadHistory() => owner.LoadHistory();
@@ -1700,6 +2138,7 @@
                 _selectedModel,
                 SwitchReasoningWireValue(newReasoning),
                 CancellationToken.None);
+            await AdoptCurrentSelectionAsync();
             _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, result.Success);
 
             if (!result.Success)
@@ -1743,54 +2182,30 @@
 
     public async ValueTask DisposeAsync()
     {
-        Composer.OnStreamingUpdate -= HandleStreamingUpdate;
-        Composer.OnQuestionAsked -= HandleQuestionAsked;
-        Composer.OnCompactingStarted -= HandleCompactingStarted;
-        Composer.OnCompacted -= HandleCompacted;
-        Composer.OnSubAgentChanged -= HandleSubAgentChanged;
-        Composer.OnActiveInjection -= HandleActiveInjection;
+        // Disposal releases ONLY this component's own event subscriptions and JS interop handles. It never
+        // disposes the Composer it was subscribed to: the singleton ComposerRuntimeManager is the sole
+        // owner and disposer of every runtime (and of the legacy singleton), so a circuit teardown can never
+        // tear down a runtime another request — or the host — still uses.
+        UnsubscribeFromBoundComposer();
 
-        if (_pasteModule is not null)
-        {
-            // Independently attempted: an uninstall fault must not skip the module disposal.
-            try
-            {
-                await _pasteModule.InvokeVoidAsync("uninstall");
-            }
-            catch (JSDisconnectedException)
-            {
-                // Circuit teardown / navigation: the browser is already gone — expected, not a fault.
-            }
-            catch (Exception ex)
-            {
-                // Never silently swallowed: re-throwing here would mask whatever triggered
-                // disposal, so an unexpected teardown fault is surfaced in the logs instead.
-                Console.Error.WriteLine($"[ComposerChat] Paste module uninstall failed: {ex.Message}");
-            }
-
-            try
-            {
-                await _pasteModule.DisposeAsync();
-            }
-            catch (JSDisconnectedException)
-            {
-                // Circuit teardown / navigation: the module reference dies with the circuit.
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[ComposerChat] Paste module disposal failed: {ex.Message}");
-            }
-
-            _pasteModule = null;
-        }
-
-        _pasteDotNetRef?.Dispose();
-        _pasteDotNetRef = null;
+        await ReleasePasteListenerAsync();
     }
 
+    /// <summary>
+    /// A sub-agent status change on the bound Composer. Queued like every other subscription callback, with the
+    /// same captured-binding freshness guard: a status from a replaced runtime never re-renders this circuit.
+    /// </summary>
     private void HandleSubAgentChanged(SubAgentInfo info)
     {
-        InvokeAsync(StateHasChanged);
+        var captured = CurrentCallbackBinding;
+        QueueCallback(async () =>
+        {
+            if (await DropStaleCallbackAsync(captured, CancellationToken.None))
+                return;
+
+            StateHasChanged();
+            await Task.CompletedTask;
+        });
     }
 
     private void ToggleSubAgents()
@@ -1830,37 +2245,72 @@
             : $"{(int)span.TotalSeconds}s";
     }
 
+    /// <summary>
+    /// A compaction started on the bound Composer. Queued with the captured-binding freshness guard, so a
+    /// compaction notification from a replaced runtime can never re-render this circuit.
+    /// </summary>
     private void HandleCompactingStarted()
     {
-        InvokeAsync(async () =>
+        var captured = CurrentCallbackBinding;
+        QueueCallback(async () =>
         {
+            if (await DropStaleCallbackAsync(captured, CancellationToken.None))
+                return;
+
             StateHasChanged();
             await SyncPasteAllowedAsync();
         });
     }
 
+    /// <summary>
+    /// A compaction finished on the bound Composer. Queued with the captured-binding freshness guard.
+    /// </summary>
     private void HandleCompacted()
     {
-        InvokeAsync(async () =>
+        var captured = CurrentCallbackBinding;
+        QueueCallback(async () =>
         {
+            if (await DropStaleCallbackAsync(captured, CancellationToken.None))
+                return;
+
             StateHasChanged();
             await SyncPasteAllowedAsync();
         });
     }
 
+    /// <summary>
+    /// A question was asked on the bound Composer. Queued with the captured-binding freshness guard: the question
+    /// widget belongs to the runtime that asked it, so a stale callback never renders it.
+    /// </summary>
     private void HandleQuestionAsked()
     {
-        InvokeAsync(StateHasChanged);
+        var captured = CurrentCallbackBinding;
+        QueueCallback(async () =>
+        {
+            if (await DropStaleCallbackAsync(captured, CancellationToken.None))
+                return;
+
+            StateHasChanged();
+            await Task.CompletedTask;
+        });
     }
 
     /// <summary>
     /// Raised when an active system notification was injected: reload history so the
     /// notification message appears in the chat, then re-render.
+    /// <para>
+    /// This callback RESTORES CONTENT, so it applies the FULL freshness guard: the captured binding must still be
+    /// the circuit's binding AND a fresh authorization re-check must still pass before any history is read.
+    /// </para>
     /// </summary>
     private void HandleActiveInjection(string _)
     {
-        InvokeAsync(async () =>
+        var captured = CurrentCallbackBinding;
+        QueueCallback(async () =>
         {
+            if (await DropStaleCallbackAsync(captured, CancellationToken.None))
+                return;
+
             LoadHistory();
             StateHasChanged();
             await SyncPasteAllowedAsync();
@@ -1880,7 +2330,7 @@
             _selectedOptions.Add(option);
     }
 
-    private void SubmitYesNo(bool yes, ComposerQuestion question)
+    private async Task SubmitYesNo(bool yes, ComposerQuestion question)
     {
         var answer = yes ? "Yes" : "No";
         if (!string.IsNullOrWhiteSpace(_questionFeedback))
@@ -1888,11 +2338,15 @@
 
         _selectedOptions = [];
         _questionFeedback = "";
-        Composer.SubmitAnswer(answer);
+
+        // ANSWERING A QUESTION IS A COMMAND: it re-selects the CURRENT runtime first, so an answer can
+        // never be delivered to a runtime this account no longer holds (or to one that was replaced).
+        var composer = await AcquireComposerForMutationAsync(CancellationToken.None);
+        composer?.SubmitAnswer(answer);
         StateHasChanged();
     }
 
-    private void SubmitChoice(ComposerQuestion question)
+    private async Task SubmitChoice(ComposerQuestion question)
     {
         var selected = string.Join(", ", _selectedOptions);
         var answer = string.IsNullOrWhiteSpace(_questionFeedback)
@@ -1901,15 +2355,19 @@
 
         _selectedOptions = [];
         _questionFeedback = "";
-        Composer.SubmitAnswer(answer);
+
+        var composer = await AcquireComposerForMutationAsync(CancellationToken.None);
+        composer?.SubmitAnswer(answer);
         StateHasChanged();
     }
 
-    private void CancelQuestion(ComposerQuestion question)
+    private async Task CancelQuestion(ComposerQuestion question)
     {
         _selectedOptions = [];
         _questionFeedback = "";
-        Composer.CancelQuestion();
+
+        var composer = await AcquireComposerForMutationAsync(CancellationToken.None);
+        composer?.CancelQuestion();
         StateHasChanged();
     }
 
