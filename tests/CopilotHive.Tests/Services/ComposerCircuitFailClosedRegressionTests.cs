@@ -41,7 +41,13 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     private const string OriginalGh = "failclosed-original";
     private const string Marker = "failclosed-thread-marker";
 
-    private readonly FacadeAuthorizationHarness _auth = new();
+    /// <summary>
+    /// THE USER DIRECTORY of this class: a REAL directory (production <see cref="UserService"/> over the
+    /// production EF model) whose EVERY context opens its OWN connection — see
+    /// <see cref="ComposerTestUserDirectory"/> for why a single shared connection is not usable here.
+    /// </summary>
+    private readonly ComposerTestUserDirectory _users = new();
+
     private readonly CopilotHiveDbContext _db = CopilotHiveDbContext.CreateInMemory();
     private readonly string _dir = Path.Combine(Path.GetTempPath(), $"composer-failclosed-{Guid.NewGuid():N}");
 
@@ -53,14 +59,14 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
-        _originalId = (await _auth.SeedAsync(OriginalGh, UserRole.Admin)).Id;
-        _memberId = (await _auth.SeedAsync(MemberGh, UserRole.Member)).Id;
+        _originalId = (await _users.SeedActivatedAccountAsync(OriginalGh, UserRole.Admin)).Id;
+        _memberId = (await _users.SeedActivatedAccountAsync(MemberGh, UserRole.Member)).Id;
     }
 
     public ValueTask DisposeAsync()
     {
         _db.Dispose();
-        _auth.Dispose();
+        _users.Dispose();
         try { if (Directory.Exists(_dir)) TestHelpers.ForceDeleteDirectory(_dir); }
         catch (IOException) { }
         return ValueTask.CompletedTask;
@@ -86,7 +92,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         rendered.Raise("HandleStreamingUpdate");
         await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct); // the re-query ANSWERED (Ready) and is held
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("ConnectRuntimeAsync"); // the NEWER operation applies Forbidden
@@ -106,7 +112,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: the same held re-query with NO newer change is APPLIED and keeps the subscription.</summary>
@@ -145,7 +151,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         Assert.Contains(Marker, rendered.Html, StringComparison.Ordinal);
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             rendered.Raise("HandleStreamingUpdate");
@@ -156,7 +162,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.DoesNotContain(Marker, html, StringComparison.Ordinal);
             Assert.Contains("You do not have access to the Composer.", html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized callback keeps the thread and shows no forbidden notice.</summary>
@@ -190,7 +196,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         var file = rendered.StagedFilePath();
         Assert.True(File.Exists(file));
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("RemoveAttachment");
@@ -200,7 +206,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Null(rendered.Subscribed);
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized removal deletes the file and the page stays Ready.</summary>
@@ -230,7 +236,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         var root = rendered.Page.CurrentCallbackBinding!.Attachments!.AttachmentsRootPath;
         Assert.Empty(Directory.GetFiles(root));
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.PasteAsync(new MemoryStream([1, 2, 3, 4]));
@@ -239,7 +245,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Null(rendered.Pending);
             Assert.NotEqual(ComposerChat.ComposerCircuitStatus.Ready, rendered.Status);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized paste writes the file and stages it.</summary>
@@ -274,7 +280,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         var paste = rendered.PasteAsync(stream);
         await stream.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct); // the write STARTED, authorized
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("ConnectRuntimeAsync"); // the demotion is applied by a page operation
@@ -287,7 +293,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Single(Directory.GetFiles(root)); // retained in the store that accepted it
             Assert.Equal(ComposerChat.ComposerCircuitStatus.Forbidden, rendered.Status);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: the same in-flight write with NO change is attached.</summary>
@@ -317,7 +323,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         Assert.NotNull(rendered.Subscribed);
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("CompactSession");
@@ -327,7 +333,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>A DEMOTED REASONING SWITCH hides the content and unsubscribes.</summary>
@@ -338,7 +344,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await SeedThreadAsync(host);
         await using var rendered = await RenderAsync(host, MemberGh);
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("HandleReasoningChange", new ChangeEventArgs { Value = "high" });
@@ -347,7 +353,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Null(rendered.Subscribed);
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized compaction leaves the page Ready, bound and subscribed.</summary>
@@ -501,6 +507,87 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// EVERY PARKED INVOCATION IS JOINED BY CLEANUP, NOT ONLY THE LAST ONE: several subscription callbacks are
+    /// parked (each queued body is a SEPARATE invocation), the page's <c>LastCallbackCompletion</c> is
+    /// OVERWRITTEN by each new callback and therefore aggregates nothing, and the cleanup must still await
+    /// EVERY tracked invocation.
+    /// <para>
+    /// WHY THE COUNT MATTERS: a cleanup that joined only the page's last recorded callback would leave the
+    /// EARLIER invocations un-awaited — they would still be blocked on the release latch, their faults would go
+    /// unobserved, and the renderer would be disposed under them. The row therefore pins the COUNT of joined
+    /// invocations against the count of tracked invocations, and observes every invocation's final state
+    /// (each must have RAN TO COMPLETION — released AND awaited, not merely released).
+    /// </para>
+    /// <para>
+    /// IT IS NON-VACUOUS: more than one invocation is actually parked (the count is asserted to be greater than
+    /// one), so the "join them all" contract is exercised rather than satisfied by a single invocation.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ParkedSubscriptionCallbacks_AreAllJoinedByCleanup_NotOnlyTheLastOne()
+    {
+        await using var host = NewHost();
+        await using var rendered = await RenderAsync(host, MemberGh);
+
+        await rendered.ParkCallbacksAsync();
+
+        // THREE SEPARATE queued bodies: each one is its own parked invocation, and each one overwrites the
+        // page's LastCallbackCompletion — so that property alone can observe only the LAST of them.
+        rendered.Raise("HandleStreamingUpdate");
+        rendered.Raise("HandleStreamingUpdate");
+        rendered.Raise("HandleStreamingUpdate");
+
+        // The invocations are queued on the DISPATCHER; wait until all three are parked.
+        await rendered.WaitForParkedCountAsync(3);
+        Assert.True(rendered.ParkedCount >= 3,
+            $"the scenario must park MORE THAN ONE invocation, or the join-all contract is not exercised (parked {rendered.ParkedCount})");
+
+        // The page's own record points at the LAST invocation only — which is exactly why the helper tracks them all.
+        Assert.NotNull(rendered.Page.LastCallbackCompletion);
+
+        // CLEANUP (the disposal above) releases and joins them; the observation happens on the disposal path,
+        // so the assertions live where the join really happens.
+        await rendered.DisposeAsync();
+
+        Assert.Equal(rendered.ParkedCount, rendered.JoinedParkedCount);
+        Assert.All(rendered.ParkedStatuses(), status =>
+            Assert.Equal(TaskStatus.RanToCompletion, status));
+    }
+
+    /// <summary>
+    /// A FAILING ROW STILL CLEANS UP EVERY PARKED INVOCATION: when the scenario's own assertion fails, the
+    /// cleanup must release AND join every parked invocation anyway (the failure-safe shape), and the ORIGINAL
+    /// failure must keep precedence over the cleanup's own.
+    /// <para>
+    /// The cleanup is exercised through the REAL disposal path (the runner-invoked <c>DisposeAsync</c>), and the
+    /// row proves the release happened: the parked invocations end RAN TO COMPLETION rather than still waiting.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AFailingRow_StillReleasesAndJoinsEveryParkedInvocation()
+    {
+        await using var host = NewHost();
+        await using var rendered = await RenderAsync(host, MemberGh);
+
+        await rendered.ParkCallbacksAsync();
+        rendered.Raise("HandleStreamingUpdate");
+        rendered.Raise("HandleStreamingUpdate");
+        await rendered.WaitForParkedCountAsync(2);
+
+        var parked = rendered.ParkedCount;
+        Assert.True(parked >= 2);
+
+        // Dispose the retained circuit WHILE the scenario is still "in flight": this is the failure-safe
+        // cleanup path (the same one a failing assertion would take through the `await using`).
+        await rendered.DisposeAsync();
+
+        // EVERY parked invocation was released (and joined) despite the scenario never reaching its end.
+        Assert.Equal(parked, rendered.JoinedParkedCount);
+        Assert.All(rendered.ParkedStatuses(), status =>
+            Assert.Equal(TaskStatus.RanToCompletion, status));
+    }
+
+    /// <summary>
     /// ADOPTION ADDS NO SECOND CONNECT: a deferred runtime's facade operation drives EXACTLY ONE request-path
     /// connect (the typed recovery contract: one connect, then the actionable 503) and the page's own adoption
     /// performs NO circuit connect.
@@ -549,7 +636,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await rendered.AfterRenderAsync();
         Assert.Equal(1, host.Js.Count("install"));
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("ConnectRuntimeAsync");
@@ -563,7 +650,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             await rendered.InvokeAsync("SyncPasteAllowedAsync");
             Assert.DoesNotContain(true, host.Js.AllowedValues.Skip(before));
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>
@@ -577,10 +664,10 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         await rendered.AfterRenderAsync();
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         await rendered.InvokeAsync("ConnectRuntimeAsync");
         await rendered.AfterRenderAsync();
-        await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+        await _users.SetRoleAsync(MemberGh, UserRole.Member);
         await rendered.InvokeAsync("ConnectRuntimeAsync");
         await rendered.AfterRenderAsync();
 
@@ -687,8 +774,8 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         var root = rendered.Page.CurrentCallbackBinding!.Attachments!.AttachmentsRootPath;
         var file = new ObservedBrowserFile(new MemoryStream([10, 20, 30, 40]));
-        if (disabled) await _auth.SetEnabledAsync(MemberGh, false);
-        else await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        if (disabled) await _users.SetEnabledAsync(MemberGh, false);
+        else await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.PickAsync(file);
@@ -702,8 +789,8 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         }
         finally
         {
-            if (disabled) await _auth.SetEnabledAsync(MemberGh, true);
-            else await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+            if (disabled) await _users.SetEnabledAsync(MemberGh, true);
+            else await _users.SetRoleAsync(MemberGh, UserRole.Member);
         }
     }
 
@@ -773,7 +860,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             await stream.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
             Assert.False(write.IsCompleted);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+            await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
             Assert.Same(accepting, rendered.Page.CurrentCallbackBinding); // no page operation observed it yet
             stream.Release();
             await write.WaitAsync(TimeSpan.FromSeconds(30), Ct);
@@ -789,7 +876,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             stream.Release();
             await write.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+            await _users.SetRoleAsync(MemberGh, UserRole.Member);
         }
     }
 
@@ -802,7 +889,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await rendered.AfterRenderAsync();
         Assert.Contains(true, host.Js.AllowedValues); // non-vacuous ready control
         var before = host.Js.AllowedValues.Count;
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             rendered.Raise("HandleStreamingUpdate");
@@ -817,7 +904,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Equal(1, host.Js.Count("uninstall"));
             Assert.True(host.Js.Modules[0].Disposed);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     [Fact]
@@ -860,7 +947,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var host = NewHost();
         await SeedThreadAsync(host);
         await using var rendered = await RenderAsync(host, MemberGh);
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             if (operation == "HandleModelChange")
@@ -871,7 +958,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     [Theory]
@@ -955,7 +1042,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
             Assert.False(installation.IsCompleted);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+            await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
             await rendered.UiEventAsync("ConnectRuntimeAsync");
             Assert.Equal(ComposerChat.ComposerCircuitStatus.Forbidden, rendered.Status);
             // A real circuit renders again while the prior import is outstanding.
@@ -974,7 +1061,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             hold.Release();
             await installation.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+            await _users.SetRoleAsync(MemberGh, UserRole.Member);
         }
     }
 
@@ -1042,7 +1129,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
 
     private async Task SeedThreadAsync(Host host)
     {
-        var state = await ComposerUserState.ResolveAsync(_auth.Directory.Service, _memberId, Ct);
+        var state = await ComposerUserState.ResolveAsync(_users.Service, _memberId, Ct);
         var path = ComposerUserState.SessionFilePath(host.StateDir, state);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var session = SharpCoder.AgentSession.Create("composer");
@@ -1070,7 +1157,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         services.AddSingleton<IGoalStore>(new GoalStore(_db, NullLogger<GoalStore>.Instance));
         services.AddSingleton(HiveAuthMode.AuthenticationEnabled);
         services.AddSingleton<HivePolicy>();
-        services.AddSingleton(_auth.Directory.Service);
+        services.AddSingleton(_users.Service);
         services.AddSingleton(sp => new HivePrincipalResolver(
             sp.GetRequiredService<UserService>(), sp.GetRequiredService<HiveAuthMode>(),
             NullLogger<HivePrincipalResolver>.Instance));
@@ -1144,6 +1231,10 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
 
         /// <summary>The one release latch for the parked subscription callbacks; set by <see cref="ParkCallbacksAsync"/>.</summary>
         private TaskCompletionSource? _parkedRelease;
+
+        /// <summary>Whether the retained circuit was already disposed (the cleanup is idempotent).</summary>
+        private bool _disposed;
+
         public ComposerChat Page { get; } = page;
         public Task<AuthenticationState> State { get; } = state;
         public IServiceScope ServiceScope { get; } = scope;
@@ -1229,13 +1320,53 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             await body();
         }
 
+        /// <summary>How many parked invocations this helper is tracking (the ones cleanup must join).</summary>
+        public int ParkedCount { get { lock (_parkedCallbacks) return _parkedCallbacks.Count; } }
+
+        /// <summary>
+        /// Waits until at least <paramref name="count"/> invocations are parked. The queued bodies are dispatched
+        /// on the renderer's dispatcher, so the count grows there — this waits on the SAME dispatcher, which
+        /// serializes it with the queuing, so no polling of private state is needed.
+        /// </summary>
+        public async Task WaitForParkedCountAsync(int count)
+        {
+            await renderer.Dispatcher.InvokeAsync(async () =>
+            {
+                // The dispatcher is the serialization point: the queued bodies are already registered by the
+                // time this continuation runs, because each Raise() ran ON the dispatcher too.
+                while (ParkedCount < count)
+                    await Task.Yield();
+            });
+        }
+
+        /// <summary>
+        /// How many parked invocations cleanup actually JOINED. It must equal <see cref="ParkedCount"/>:
+        /// a cleanup that joined only the page's <c>LastCallbackCompletion</c> would leave the EARLIER
+        /// invocations un-awaited (and their faults unobserved).
+        /// </summary>
+        public int JoinedParkedCount { get; private set; }
+
+        /// <summary>
+        /// The state of every tracked parked invocation AFTER cleanup: <c>null</c> when none was tracked,
+        /// otherwise one entry per invocation. A tracked invocation that cleanup did not join is left
+        /// <see cref="TaskStatus.WaitingForActivation"/> or <see cref="TaskStatus.Running"/>; one it joined
+        /// is <see cref="TaskStatus.RanToCompletion"/> or <see cref="TaskStatus.Faulted"/>.
+        /// </summary>
+        public TaskStatus[] ParkedStatuses()
+        {
+            lock (_parkedCallbacks) return [.. _parkedCallbacks.Select(t => t.Status)];
+        }
+
         public async ValueTask DisposeAsync()
         {
+            if (_disposed) return;
+            _disposed = true;
+
             var failures = new List<Exception>();
-            async Task Step(Func<Task> action)
+            async Task<bool> Step(Func<Task> action)
             {
-                try { await action(); }
-                catch (Exception ex) { failures.Add(ex); }
+                try { await action(); return true; }
+                catch (Exception ex) { failures.Add(ex); return false; }
             }
 
             // FAILURE-SAFE RELEASE, in a finally-shaped sequence: the parked callbacks are released FIRST (so no
@@ -1249,7 +1380,13 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Task[] parked;
             lock (_parkedCallbacks) parked = [.. _parkedCallbacks];
             foreach (var invocation in parked)
-                await Step(() => invocation.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
+            {
+                var joined = await Step(() => invocation.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
+                // A FAULTED invocation was still JOINED (awaited to its end); only a wait that TIMED OUT means
+                // the invocation was not joined.
+                if (joined || invocation.IsCompleted)
+                    JoinedParkedCount++;
+            }
             await Step(() => Page.LastCallbackCompletion.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
             await Step(() => renderer.DisposeAsync().AsTask());
             await Step(() => { ServiceScope.Dispose(); return Task.CompletedTask; });
