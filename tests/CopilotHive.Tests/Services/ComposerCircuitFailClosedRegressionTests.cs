@@ -369,6 +369,24 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     /// A RUNTIME REPLACEMENT UNIFIES THE PAGE WITH THE RUNTIME THE FACADE ACTED ON: the runtime is removed and
     /// recreated; after the facade operation the binding AND the subscription are the NEW runtime's — never the
     /// removed one.
+    /// <para>
+    /// THE COMPETING PATHS ARE CONTROLLED, NOT HOPED AWAY: disposing runtime A raises its Composer events, and every
+    /// such event QUEUES a subscription callback whose own selection runs the freshness guard <b>on the dispatcher,
+    /// concurrently with this scenario</b> — it can replace the binding record under the operation that is in flight
+    /// and can therefore supersede the adoption this row asserts. (That supersession is exactly what made the old
+    /// post-hoc re-query read a null runtime on CI.) The callbacks are therefore PARKED — drained first, then parked —
+    /// BEFORE the removal, so none of them can bind, drop or re-render while the scenario runs, and the assertions are
+    /// made on the state the ACTUAL facade operation (<c>CompactSession</c>, awaited to completion) leaves behind,
+    /// never on a second re-query. <c>RemoveAsync</c> already awaits the entry's full teardown AND its cache eviction,
+    /// so no extra teardown wait is added here, and <see cref="ComposerChat.ComposerCircuitStatus.Removed"/> is not
+    /// accepted as a success.
+    /// </para>
+    /// <para>
+    /// DISCRIMINATION, STATED HONESTLY: this row proves the UNIFICATION. On its own it does NOT kill an unconditional
+    /// stale-adoption mutant, because nothing stale is released while it runs — parking only removes interference.
+    /// The mutant evidence for the ownership guard is the adversarial row below,
+    /// <c>AHeldOlderSelection_ReleasedAfterTheReplacement_DoesNotRebindTheRemovedRuntime</c>.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task AFacadeOperation_OnAReplacedRuntime_UnifiesTheBindingAndSubscription()
@@ -376,14 +394,110 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var host = NewHost();
         await using var rendered = await RenderAsync(host, MemberGh);
         var old = rendered.Page.CurrentCallbackBinding!.Composer;
+        Assert.NotNull(old);
+
+        // PARK every subscription callback BEFORE the removal: the callbacks the initial render already queued are
+        // DRAINED, every later body (the removal's own teardown notifications) stands parked until disposal, and each
+        // parked invocation is tracked so cleanup can join all of them.
+        await rendered.ParkCallbacksAsync();
 
         Assert.True(await host.Manager.RemoveAsync(_memberId));
+
+        // THE ACTUAL FACADE OPERATION, AWAITED TO COMPLETION: the task is the milestone (the operation returns only
+        // after its own adoption/bind), so no post-hoc re-query is needed — or allowed — to observe the outcome.
         await rendered.InvokeAsync("CompactSession");
 
-        var current = (await host.Scope(rendered).Accessor.AcquireForCircuitAsync(rendered.State, Ct)).Runtime!.Composer;
+        var newer = rendered.Page.CurrentCallbackBinding;
+        Assert.NotNull(newer);
+        var current = newer!.Composer;
+        Assert.NotNull(current); // a null Composer here is precisely the CI flake this row removes
         Assert.NotSame(old, current);
-        Assert.Same(current, rendered.Page.CurrentCallbackBinding!.Composer);
         Assert.Same(current, rendered.Subscribed);
+        Assert.Equal(ComposerChat.ComposerCircuitStatus.Ready, newer.Status);
+
+        // NO PARKED CALLBACK RAN MID-SCENARIO: none of them could supersede the binding the operation adopted.
+        Assert.Equal(0, rendered.Page.AppliedCallbackCount);
+        Assert.Equal(0, rendered.Page.DroppedCallbackCount);
+    }
+
+    /// <summary>
+    /// THE OWNERSHIP GUARD FOR AN OLDER <b>OPERATION</b> ANSWER: an ordinary page operation's circuit acquisition is
+    /// HELD after the accessor computed its answer for runtime A; A is then removed (its real teardown awaited by
+    /// <c>RemoveAsync</c>), a NEWER facade operation adopts and binds the fresh runtime B, and only then is the older
+    /// answer released. That answer belongs to a binding this circuit no longer shows, so it must NOT be adopted: the
+    /// newer binding record and the subscription to B survive it, the removed runtime A is never re-subscribed, and
+    /// the held paste's write never starts (no file in A's store).
+    /// <para>
+    /// THE MECHANISM IT PINS: <c>AcquireCircuitRuntimeAsync</c> captures the binding it started under BEFORE its first
+    /// await and, once the accessor answered, refuses to bind an answer whose captured binding is no longer the
+    /// circuit's — the same pre-await capture plus post-await condition <c>RevalidateCompletionAsync</c> applies to
+    /// callbacks. The callback path has its own row in this class
+    /// (<c>HeldCallbackRequery_AfterNewerReplacement_PreservesItsBindingHistoryAndSubscriptions</c>); this row covers
+    /// an ordinary OPERATION's answer, which is the path the removal's competing callbacks can supersede.
+    /// </para>
+    /// <para>
+    /// THE DISCRIMINATOR, AND WHY THE ROW ABOVE IS NOT IT: with unconditional stale adoption restored in the
+    /// operation path, the released answer re-binds the REMOVED runtime A — the binding record is replaced, the
+    /// subscription returns to A — and the held paste's write starts in A's store, so this row fails on both. The
+    /// replacement row above still passes under that mutant. Parking the incidental callbacks alone therefore proves
+    /// nothing about this guard.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AHeldOlderSelection_ReleasedAfterTheReplacement_DoesNotRebindTheRemovedRuntime()
+    {
+        await using var host = NewHost();
+        await using var rendered = await RenderAsync(host, MemberGh);
+        var old = rendered.Page.CurrentCallbackBinding!.Composer;
+        var removedStore = rendered.Page.CurrentCallbackBinding!.Attachments!.AttachmentsRootPath;
+        Assert.NotNull(old);
+
+        // The incidental teardown callbacks are controlled FIRST, so the hold armed next is taken by the paste's own
+        // acquisition and never by a subscription callback's re-query.
+        await rendered.ParkCallbacksAsync();
+
+        // PATH 1: HOLD the older operation's answer — the paste's START gate is an ordinary circuit acquisition
+        // through the REAL accessor, so its answer (runtime A, Ready) is computed and then parked here.
+        var hold = host.Gate.Arm();
+        var held = rendered.PasteAsync(new MemoryStream([1, 2, 3, 4]));
+        try
+        {
+            await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+            Assert.False(held.IsCompleted, "the older operation's answer must be genuinely held across the replacement");
+
+            // A's real teardown and eviction are awaited by RemoveAsync itself.
+            Assert.True(await host.Manager.RemoveAsync(_memberId));
+
+            // PATH 2: the NEWER facade operation runs to COMPLETION and the page adopts/binds the fresh runtime B.
+            await rendered.InvokeAsync("CompactSession");
+            var newer = rendered.Page.CurrentCallbackBinding;
+            Assert.NotNull(newer);
+            var b = newer!.Composer;
+            Assert.NotNull(b);
+            Assert.NotSame(old, b);
+            Assert.Same(b, rendered.Subscribed);
+
+            // PATH 3: RELEASE the older answer, which is about the removed runtime A.
+            hold.Release();
+            await held.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+
+            // The newer binding record and the subscription to B SURVIVE the stale release...
+            Assert.Same(newer, rendered.Page.CurrentCallbackBinding);
+            Assert.NotNull(rendered.Page.CurrentCallbackBinding!.Composer);
+            Assert.NotSame(old, rendered.Page.CurrentCallbackBinding!.Composer);
+            Assert.Same(b, rendered.Page.CurrentCallbackBinding!.Composer);
+            Assert.Same(b, rendered.Subscribed);
+            Assert.Equal(ComposerChat.ComposerCircuitStatus.Ready, rendered.Status);
+
+            // ...and the held paste never started a write: nothing reached the removed runtime's store.
+            Assert.Empty(Directory.GetFiles(removedStore));
+            Assert.Null(rendered.Pending);
+        }
+        finally
+        {
+            // Failure-safe: a failing assertion must never leave the operation parked (disposal joins it either way).
+            hold.Release();
+        }
     }
 
     /// <summary>
@@ -1024,6 +1138,12 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     {
         private readonly List<Task> _storageWrites = [];
         private Task TrackStorage(Task task) { _storageWrites.Add(task); return task; }
+
+        /// <summary>EVERY parked subscription callback invocation, so cleanup can join ALL of them.</summary>
+        private readonly List<Task> _parkedCallbacks = [];
+
+        /// <summary>The one release latch for the parked subscription callbacks; set by <see cref="ParkCallbacksAsync"/>.</summary>
+        private TaskCompletionSource? _parkedRelease;
         public ComposerChat Page { get; } = page;
         public Task<AuthenticationState> State { get; } = state;
         public IServiceScope ServiceScope { get; } = scope;
@@ -1076,6 +1196,39 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         public Task PasteAsync(Stream content) => TrackStorage(renderer.Dispatcher.InvokeAsync(() =>
             Page.HandlePasteAsync(new FakeJSStreamReference(content), "image/png", 4)));
 
+        /// <summary>
+        /// CONTROLS THE INCIDENTAL SUBSCRIPTION PATHS of a replacement scenario: first DRAINS the callbacks the initial
+        /// render already queued (with no gate installed they run now, so they can neither take a hold armed for a
+        /// scenario path nor supersede a binding asserted later), then PARKS every LATER callback behind the page's
+        /// <see cref="ComposerChat.CallbackGate"/> so none of them can acquire, bind, drop or re-render until disposal
+        /// releases them.
+        /// <para>
+        /// EVERY PARKED INVOCATION IS TRACKED: the gate records the task of EACH invocation it holds, and
+        /// <see cref="DisposeAsync"/> joins all of them — <see cref="ComposerChat.LastCallbackCompletion"/> alone is
+        /// overwritten by each new callback and therefore aggregates nothing.
+        /// </para>
+        /// </summary>
+        public async Task ParkCallbacksAsync()
+        {
+            // DRAIN: everything queued so far runs to completion here (no gate is installed yet).
+            await renderer.Dispatcher.InvokeAsync(() => Page.LastCallbackCompletion);
+
+            var parked = _parkedRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Page.CallbackGate = body =>
+            {
+                var invocation = RunParkedAsync(parked.Task, body);
+                lock (_parkedCallbacks) _parkedCallbacks.Add(invocation);
+                return invocation;
+            };
+        }
+
+        /// <summary>One parked callback invocation: waits for the release latch, then runs its body.</summary>
+        private static async Task RunParkedAsync(Task release, Func<Task> body)
+        {
+            await release;
+            await body();
+        }
+
         public async ValueTask DisposeAsync()
         {
             var failures = new List<Exception>();
@@ -1084,9 +1237,19 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
                 try { await action(); }
                 catch (Exception ex) { failures.Add(ex); }
             }
+
+            // FAILURE-SAFE RELEASE, in a finally-shaped sequence: the parked callbacks are released FIRST (so no
+            // invocation stays blocked), then every hold/gate is released, then each tracked task is joined.
+            _parkedRelease?.TrySetResult();
             releaseGates();
             foreach (var write in _storageWrites)
                 await Step(() => write.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
+
+            // JOIN EVERY PARKED INVOCATION, not only the last one the page recorded.
+            Task[] parked;
+            lock (_parkedCallbacks) parked = [.. _parkedCallbacks];
+            foreach (var invocation in parked)
+                await Step(() => invocation.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
             await Step(() => Page.LastCallbackCompletion.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
             await Step(() => renderer.DisposeAsync().AsTask());
             await Step(() => { ServiceScope.Dispose(); return Task.CompletedTask; });
