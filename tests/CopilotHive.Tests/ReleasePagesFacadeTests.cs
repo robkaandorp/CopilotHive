@@ -524,14 +524,16 @@ public sealed class ReleasePagesFacadeTests
 
     /// <summary>
     /// The create-call itself goes through the facade with the exact
-    /// <see cref="CreateReleaseRequest"/>(version, repository) shape, and a failure surfaces
-    /// the facade's inner error text in <c>_createError</c>.
+    /// <see cref="CreateReleaseRequest"/>(version, repository) shape AND the circuit identity the
+    /// identity-aware facade now requires, and a failure surfaces the facade's inner error text in
+    /// <c>_createError</c>.
     /// </summary>
     [Fact]
     public void ReleasesPage_CreateRelease_CallsFacadeAndSurfacesError()
     {
         var method = ExtractMethodSource(ReadReleasesSource(), "private async Task CreateRelease()");
-        Assert.Contains("ReleaseFacade.CreateReleaseAsync(new CreateReleaseRequest(_createVersion, _createRepo))", method);
+        Assert.Contains("ReleaseFacade.CreateReleaseAsync(", method);
+        Assert.Contains("new CreateReleaseRequest(_createVersion, _createRepo), await ActingUserAsync())", method);
         Assert.Contains("_createError = result.Error ?? \"\";", method);
         Assert.DoesNotContain("Nav.NavigateTo", method);
     }

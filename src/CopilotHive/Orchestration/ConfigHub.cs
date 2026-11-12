@@ -1,3 +1,4 @@
+using CopilotHive.Security;
 using CopilotHive.Services;
 
 namespace CopilotHive.Orchestration;
@@ -8,15 +9,33 @@ namespace CopilotHive.Orchestration;
 public static class ConfigHub
 {
     /// <summary>
-    /// Registers the model-configuration endpoints on the given <see cref="WebApplication"/>.
+    /// Registers the configuration endpoints on the given <see cref="WebApplication"/>.
     /// </summary>
+    /// <remarks>
+    /// EVERY route delegates to <see cref="IConfigFacade"/> with the REQUEST's identity
+    /// (<see cref="HttpContext.User"/>), and every facade operation — each full configuration
+    /// projection AND every write — requires <see cref="HiveCapability.GlobalAdmin"/>, re-resolved
+    /// FRESH by the facade on every call. The mutating routes (POST/PUT/PATCH/DELETE) additionally
+    /// carry <see cref="ApiEndpoints.PreBindingAuthorization"/> metadata so an authenticated but insufficient,
+    /// demoted or disabled caller is refused with 403 BEFORE a typed body is bound, while an
+    /// authorized caller keeps the unchanged binding behaviour.
+    /// <para>
+    /// The pre-binding middleware itself is registered by <c>Program.cs</c> immediately AFTER
+    /// <c>UseAuthentication</c>/<c>UseAuthorization</c> — this hub is mapped EARLIER in startup, so
+    /// registering it here would place it before authentication had resolved the caller and every
+    /// request would look anonymous. The metadata attached below is inert until that one late
+    /// registration runs; it is global, so it covers these routes whatever their mapping order.
+    /// </para>
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
-    /// <param name="facade">The model-catalog facade backing the model endpoints.</param>
+    /// <param name="facade">The configuration facade backing the endpoints.</param>
     public static void MapConfigEndpoints(this WebApplication app, IConfigFacade facade)
     {
-        app.MapGet("/api/config/models", () =>
+
+        app.MapGet("/api/config/models", async (HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = facade.GetModels();
+            var result = await facade.GetModelsAsync(context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
 
@@ -28,124 +47,147 @@ public static class ConfigHub
         });
 
         app.MapMethods("/api/config/models", ["PATCH"], async (
+            HttpContext context,
             ModelConfigUpdate update,
             CancellationToken ct) =>
         {
-            var result = await facade.SaveModelsAsync(update, ct);
+            var result = await facade.SaveModelsAsync(update, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.models"));
 
         // Discover available models from providers
-        app.MapGet("/api/config/models/discover", async () =>
+        app.MapGet("/api/config/models/discover", async (HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = await facade.DiscoverModelsAsync();
+            var result = await facade.DiscoverModelsAsync(context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
         });
 
         // Add a model to available_models
-        app.MapPost("/api/config/available-models", async (AvailableModelRequest req) =>
+        app.MapPost("/api/config/available-models", async (AvailableModelRequest req, HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = await facade.AddAvailableModelAsync(req);
+            var result = await facade.AddAvailableModelAsync(req, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.available-models.add"));
 
         // Update a model
-        app.MapPut("/api/config/available-models/{name}", async (string name, AvailableModelRequest req) =>
+        app.MapPut("/api/config/available-models/{name}", async (string name, AvailableModelRequest req,
+            HttpContext context, CancellationToken ct) =>
         {
             name = Uri.UnescapeDataString(name);
-            var result = await facade.UpdateAvailableModelAsync(name, req);
+            var result = await facade.UpdateAvailableModelAsync(name, req, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.available-models.update"));
 
         // Remove a model
-        app.MapDelete("/api/config/available-models/{name}", async (string name) =>
+        app.MapDelete("/api/config/available-models/{name}", async (string name, HttpContext context,
+            CancellationToken ct) =>
         {
             name = Uri.UnescapeDataString(name);
-            var result = await facade.RemoveAvailableModelAsync(name);
+            var result = await facade.RemoveAvailableModelAsync(name, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.available-models.remove"));
 
         // Add a model to sub_agent_models
-        app.MapPost("/api/config/sub-agent-models", async (SubAgentModelRequest req) =>
+        app.MapPost("/api/config/sub-agent-models", async (SubAgentModelRequest req, HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = await facade.AddSubAgentModelAsync(req);
+            var result = await facade.AddSubAgentModelAsync(req, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.sub-agent-models.add"));
 
         // Update a sub-agent model
-        app.MapPut("/api/config/sub-agent-models/{name}", async (string name, SubAgentModelRequest req) =>
+        app.MapPut("/api/config/sub-agent-models/{name}", async (string name, SubAgentModelRequest req,
+            HttpContext context, CancellationToken ct) =>
         {
             name = Uri.UnescapeDataString(name);
-            var result = await facade.UpdateSubAgentModelAsync(name, req);
+            var result = await facade.UpdateSubAgentModelAsync(name, req, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.sub-agent-models.update"));
 
         // Remove a sub-agent model
-        app.MapDelete("/api/config/sub-agent-models/{name}", async (string name) =>
+        app.MapDelete("/api/config/sub-agent-models/{name}", async (string name, HttpContext context,
+            CancellationToken ct) =>
         {
             name = Uri.UnescapeDataString(name);
-            var result = await facade.RemoveSubAgentModelAsync(name);
+            var result = await facade.RemoveSubAgentModelAsync(name, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.sub-agent-models.remove"));
 
         // ── Repositories ────────────────────────────────────────────────────
 
         // List repositories
-        app.MapGet("/api/config/repositories", () =>
+        app.MapGet("/api/config/repositories", async (HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = facade.GetRepositories();
+            var result = await facade.GetRepositoriesAsync(context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
         });
 
         // Add a repository
-        app.MapPost("/api/config/repositories", async (RepositoryRequest req) =>
+        app.MapPost("/api/config/repositories", async (RepositoryRequest req, HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = await facade.AddRepositoryAsync(req);
+            var result = await facade.AddRepositoryAsync(req, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.repositories.add"));
 
         // Update a repository
-        app.MapPut("/api/config/repositories/{name}", async (string name, RepositoryRequest req) =>
+        app.MapPut("/api/config/repositories/{name}", async (string name, RepositoryRequest req,
+            HttpContext context, CancellationToken ct) =>
         {
-            var result = await facade.UpdateRepositoryAsync(name, req);
+            var result = await facade.UpdateRepositoryAsync(name, req, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.repositories.update"));
 
         // Remove a repository
-        app.MapDelete("/api/config/repositories/{name}", async (string name) =>
+        app.MapDelete("/api/config/repositories/{name}", async (string name, HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = await facade.RemoveRepositoryAsync(name);
+            var result = await facade.RemoveRepositoryAsync(name, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.repositories.remove"));
 
         // List remote branches for a repository
-        app.MapGet("/api/config/repositories/{name}/branches", async (string name, CancellationToken ct) =>
+        app.MapGet("/api/config/repositories/{name}/branches", async (string name, HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = await facade.GetBranchesAsync(name, ct);
+            var result = await facade.GetBranchesAsync(name, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -154,9 +196,10 @@ public static class ConfigHub
         // ── Orchestrator settings ───────────────────────────────────────────
 
         // Get orchestrator settings
-        app.MapGet("/api/config/orchestrator", () =>
+        app.MapGet("/api/config/orchestrator", async (HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = facade.GetOrchestrator();
+            var result = await facade.GetOrchestratorAsync(context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -164,20 +207,24 @@ public static class ConfigHub
 
         // Update orchestrator settings
         app.MapMethods("/api/config/orchestrator", ["PATCH"], async (
-            OrchestratorSettingsUpdate update) =>
+            HttpContext context,
+            OrchestratorSettingsUpdate update,
+            CancellationToken ct) =>
         {
-            var result = await facade.SaveOrchestratorAsync(update);
+            var result = await facade.SaveOrchestratorAsync(update, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.orchestrator"));
 
         // ── Worker settings ─────────────────────────────────────────────────
 
         // Get workers
-        app.MapGet("/api/config/workers", () =>
+        app.MapGet("/api/config/workers", async (HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = facade.GetWorkers();
+            var result = await facade.GetWorkersAsync(context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -185,20 +232,24 @@ public static class ConfigHub
 
         // Update worker context windows
         app.MapMethods("/api/config/workers", ["PATCH"], async (
-            Dictionary<string, int> contextWindows) =>
+            HttpContext context,
+            Dictionary<string, int> contextWindows,
+            CancellationToken ct) =>
         {
-            var result = await facade.SaveWorkersAsync(contextWindows);
+            var result = await facade.SaveWorkersAsync(contextWindows, context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.workers"));
 
         // ── Composer settings ───────────────────────────────────────────────
 
         // Get composer settings (runtime-effective values, not raw storage)
-        app.MapGet("/api/config/composer", () =>
+        app.MapGet("/api/config/composer", async (HttpContext context,
+            CancellationToken ct) =>
         {
-            var result = facade.GetComposer();
+            var result = await facade.GetComposerAsync(context.User, ct);
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
@@ -207,7 +258,7 @@ public static class ConfigHub
         // Update composer settings
         // IDENTITY IS PER REQUEST: this GLOBAL write forwards the request's authenticated principal
         // (HttpContext.User) to the facade, which re-resolves the caller's CURRENT role/enabled state
-        // and requires GlobalAdmin. Every other endpoint in this hub is unchanged by this slice.
+        // and requires GlobalAdmin.
         app.MapMethods("/api/config/composer", ["PATCH"], async (
             HttpContext context,
             ComposerSettingsUpdate update,
@@ -217,7 +268,8 @@ public static class ConfigHub
             if (!result.Success)
                 return MapModelFacadeError(result.Kind, result.Error);
             return Results.Ok(result.Value!);
-        });
+        })
+            .WithMetadata(new ApiEndpoints.PreBindingAuthorization(HiveCapability.GlobalAdmin, "config.composer"));
     }
 
     /// <summary>

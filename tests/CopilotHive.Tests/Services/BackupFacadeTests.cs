@@ -1,4 +1,5 @@
 using CopilotHive.Persistence;
+using CopilotHive.Tests.Security;
 using CopilotHive.Services;
 
 using Microsoft.EntityFrameworkCore;
@@ -53,7 +54,11 @@ public sealed class BackupFacadeTests
         }
 
         var service = new BackupService(stateDir, new TestDbContextFactory(options), NullLogger<BackupService>.Instance);
-        var facade = new BackupFacade(service, NullLogger<BackupFacade>.Instance);
+        // The production wiring: the singleton facade holds the stateless resolver + policy
+        // (never the scoped circuit accessor). This test class runs the OPEN-MODE pair, so every
+        // operation is the legacy single local operator — byte-identical to before the gate.
+        var facade = new BackupFacade(
+            service, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy, NullLogger<BackupFacade>.Instance);
         return (stateDir, service, facade);
     }
 
@@ -71,12 +76,12 @@ public sealed class BackupFacadeTests
     // ── GetBackups ───────────────────────────────────────────────────────────
 
     [Fact]
-    public void GetBackups_NoBackupsExist_ReturnsSuccessWithEmptyList()
+    public async Task GetBackups_NoBackupsExist_ReturnsSuccessWithEmptyList()
     {
         var (stateDir, _, facade) = CreateFacade();
         try
         {
-            var result = facade.GetBackups();
+            var result = await facade.GetBackupsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -99,7 +104,7 @@ public sealed class BackupFacadeTests
             var path = await service.CreateBackupAsync(TestContext.Current.CancellationToken);
             var expectedFileName = Path.GetFileName(path);
 
-            var result = facade.GetBackups();
+            var result = await facade.GetBackupsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -126,7 +131,7 @@ public sealed class BackupFacadeTests
             var second = Path.Combine(service.BackupDirectory, "copilothive-backup-29991231T235959.tar.gz");
             await File.WriteAllBytesAsync(second, [1, 2, 3], TestContext.Current.CancellationToken);
 
-            var result = facade.GetBackups();
+            var result = await facade.GetBackupsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(2, result.Value!.Count);
@@ -149,7 +154,7 @@ public sealed class BackupFacadeTests
         var (stateDir, service, facade) = CreateFacade();
         try
         {
-            var result = await facade.CreateBackupAsync(TestContext.Current.CancellationToken);
+            var result = await facade.CreateBackupAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -163,7 +168,7 @@ public sealed class BackupFacadeTests
             Assert.Equal(File.GetCreationTimeUtc(archivePath), result.Value.CreatedAt);
 
             // The returned entry is the one the list operation reports.
-            var listed = Assert.Single(facade.GetBackups().Value!);
+            var listed = Assert.Single((await facade.GetBackupsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken)).Value!);
             Assert.Equal(listed, result.Value);
         }
         finally
@@ -184,7 +189,7 @@ public sealed class BackupFacadeTests
                 TestContext.Current.CancellationToken);
 
             await Assert.ThrowsAsync<IOException>(
-                () => facade.CreateBackupAsync(TestContext.Current.CancellationToken));
+                () => facade.CreateBackupAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -203,7 +208,8 @@ public sealed class BackupFacadeTests
             using var cts = new CancellationTokenSource();
             await cts.CancelAsync();
 
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => facade.CreateBackupAsync(cts.Token));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => facade.CreateBackupAsync(OpenModeActingUser.User, cts.Token));
 
             Assert.Empty(service.ListBackups());
         }

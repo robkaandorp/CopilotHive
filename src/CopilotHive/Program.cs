@@ -533,10 +533,15 @@ public sealed class Program
                     sp.GetRequiredService<ILogger<BackupService>>()));
 
             // Backup facade: ALWAYS registered (not gated on a config repo) so the backup
-            // endpoints and the Configuration component resolve it unconditionally. It only
-            // depends on the BackupService singleton registered directly above.
+            // endpoints and the Configuration component resolve it unconditionally. It depends on
+            // the BackupService singleton registered directly above plus the stateless
+            // resolver/policy: EVERY backup operation (list, create, download, restore) re-resolves
+            // the caller's CURRENT stored state and requires GlobalAdmin before touching the file
+            // system. BackupService itself stays a trusted internal service, unchanged.
             builder.Services.AddSingleton<IBackupFacade>(sp => new BackupFacade(
                 sp.GetRequiredService<BackupService>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
                 sp.GetRequiredService<ILogger<BackupFacade>>()));
 
             // Metrics: per-iteration metrics persistence
@@ -678,6 +683,17 @@ public sealed class Program
             builder.Services.AddSingleton<WorkerUtilizationService>();
             builder.Services.AddSingleton<ClarificationQueueService>();
             builder.Services.AddSingleton<LlmSessionRegistry>();
+
+            // Clarification API adapter: ALWAYS registered so the clarification endpoints resolve it
+            // unconditionally. AUTHORIZATION is part of every operation (stateless resolver + policy,
+            // never the scoped circuit accessor): the three reads need SharedRead and answering needs
+            // ExecutionOperator. The ClarificationQueueService itself is unchanged, so the internal
+            // Composer / ClarificationHandler callers keep working exactly as before.
+            builder.Services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(
+                sp.GetRequiredService<ClarificationQueueService>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
+                sp.GetRequiredService<ILogger<ClarificationFacade>>()));
 
             // ── Authentication: GitHub OAuth (single-user admin model) ─────────────────
             // Enabled only when both OAuth env vars are set; otherwise the system runs in
@@ -1046,10 +1062,16 @@ public sealed class Program
             // monitor, the hive config (needed for LaunchNuGetMonitors), the application
             // lifetime and the knowledge-document cleanup service. The goal store and the
             // dashboard notifier are required — the endpoints bound them as required services.
+            // AUTHORIZATION is part of every release operation: the facade holds the stateless
+            // resolver + policy (never the scoped circuit accessor), so each call re-resolves the
+            // caller's CURRENT role/enabled state before any store work (the two reads need
+            // SharedRead, every mutation and the validation need ExecutionOperator).
             builder.Services.AddSingleton<IReleaseFacade>(sp => new ReleaseFacade(
                 sp.GetRequiredService<IGoalStore>(),
                 sp.GetRequiredService<DashboardNotifier>(),
                 sp.GetRequiredService<ILogger<ReleaseFacade>>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
                 sp.GetService<ReleaseExecutionService>(),
                 sp.GetService<IEventBus>(),
                 sp.GetService<NuGetPublishMonitorService>(),
@@ -1316,6 +1338,17 @@ public sealed class Program
                 app.UseAuthentication();
                 app.UseAuthorization();
             }
+
+            // Pre-binding authorization: ONE registration, deliberately placed AFTER
+            // UseAuthentication/UseAuthorization and BEFORE the endpoints that carry
+            // PreBindingAuthorization metadata are reached. Registered here (rather than only from the
+            // route-mapping helpers) because the configuration hub — which attaches that metadata to
+            // its mutating routes — is mapped EARLIER in startup, before authentication exists in the
+            // pipeline; a registration made there would run with an unresolved caller and refuse
+            // everybody. The registration is idempotent, so the route-mapping helpers below may ask
+            // for it again without adding a second middleware.
+            ApiEndpoints.EnsurePreBindingAuthorization(app);
+
             app.UseAntiforgery();
             app.MapRazorComponents<CopilotHive.Components.App>()
                 .AddInteractiveServerRenderMode();

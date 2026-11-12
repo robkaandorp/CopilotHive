@@ -5,6 +5,7 @@ using ConfigurationPage = CopilotHive.Components.Pages.Configuration;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 using CopilotHive.Tests.Services;
 
 using Microsoft.Extensions.AI;
@@ -119,7 +120,11 @@ public sealed class ConfigurationModelEditorTests
     private static ConfigurationPage LoadPage(ConfigFacade facade)
     {
         var page = new ConfigurationPage();
-        var result = facade.GetModels();
+        // The open-mode resolver completes synchronously, so this bridge keeps the helper
+        // synchronous exactly as before the identity-aware migration.
+        var result = facade
+            .GetModelsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken)
+            .GetAwaiter().GetResult();
         Assert.True(result.Success);
         SetData(page, result.Value!);
         page.PopulateModelEditorFields(result.Value!);
@@ -138,7 +143,8 @@ public sealed class ConfigurationModelEditorTests
         ConfigFacade facade, ConfigurationPage page, string configRepoDir)
     {
         var update = page.BuildModelConfigUpdate();
-        var result = await facade.SaveModelsAsync(update, TestContext.Current.CancellationToken);
+        var result = await facade.SaveModelsAsync(
+            update, OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.True(result.Success, result.Error ?? "save failed");
         return ParsePersistedYaml(configRepoDir);
     }

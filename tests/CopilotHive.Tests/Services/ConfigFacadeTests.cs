@@ -171,7 +171,7 @@ public class ConfigFacadeTests
         using var factory = new FacadeFactory(hiveConfig: null);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetModels();
+        var result = await facade.GetModelsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -211,7 +211,8 @@ public class ConfigFacadeTests
         using var factory = new FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetModels();
+        var result = await facade.GetModelsAsync(
+            OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -256,42 +257,49 @@ public class ConfigFacadeTests
         var save = await facade.SaveModelsAsync(
             new ModelConfigUpdate(OrchestratorModel: "copilot/x", ComposerModel: null,
                 WorkerModels: null, PremiumWorkerModels: null, CompactionModel: null),
-            TestContext.Current.CancellationToken);
+            OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(save.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, save.Kind);
         Assert.Equal(SaveNotConfiguredMessage, save.Error);
 
-        var discover = await facade.DiscoverModelsAsync();
+        var discover = await facade.DiscoverModelsAsync(
+            OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(discover.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, discover.Kind);
         Assert.Equal(DiscoverNotConfiguredMessage, discover.Error);
 
-        var addAvail = await facade.AddAvailableModelAsync(new AvailableModelRequest("m", null));
+        var addAvail = await facade.AddAvailableModelAsync(
+            new AvailableModelRequest("m", null), OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(addAvail.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, addAvail.Kind);
         Assert.Equal(CrudNotConfiguredMessage, addAvail.Error);
 
-        var updateAvail = await facade.UpdateAvailableModelAsync("m", new AvailableModelRequest("m", null));
+        var updateAvail = await facade.UpdateAvailableModelAsync(
+            "m", new AvailableModelRequest("m", null), OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(updateAvail.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, updateAvail.Kind);
         Assert.Equal(CrudNotConfiguredMessage, updateAvail.Error);
 
-        var removeAvail = await facade.RemoveAvailableModelAsync("m");
+        var removeAvail = await facade.RemoveAvailableModelAsync(
+            "m", OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(removeAvail.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, removeAvail.Kind);
         Assert.Equal(CrudNotConfiguredMessage, removeAvail.Error);
 
-        var addSub = await facade.AddSubAgentModelAsync(new SubAgentModelRequest("m", null, null));
+        var addSub = await facade.AddSubAgentModelAsync(
+            new SubAgentModelRequest("m", null, null), OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(addSub.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, addSub.Kind);
         Assert.Equal(CrudNotConfiguredMessage, addSub.Error);
 
-        var updateSub = await facade.UpdateSubAgentModelAsync("m", new SubAgentModelRequest("m", null, null));
+        var updateSub = await facade.UpdateSubAgentModelAsync(
+            "m", new SubAgentModelRequest("m", null, null), OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(updateSub.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, updateSub.Kind);
         Assert.Equal(CrudNotConfiguredMessage, updateSub.Error);
 
-        var removeSub = await facade.RemoveSubAgentModelAsync("m");
+        var removeSub = await facade.RemoveSubAgentModelAsync(
+            "m", OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(removeSub.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, removeSub.Kind);
         Assert.Equal(CrudNotConfiguredMessage, removeSub.Error);
@@ -314,7 +322,8 @@ public class ConfigFacadeTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.AddAvailableModelAsync(
-                new AvailableModelRequest("DUP-MODEL", null));
+                new AvailableModelRequest("DUP-MODEL", null),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -338,7 +347,8 @@ public class ConfigFacadeTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.UpdateAvailableModelAsync(
-                "missing-model", new AvailableModelRequest("missing-model", null));
+                "missing-model", new AvailableModelRequest("missing-model", null),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -359,7 +369,8 @@ public class ConfigFacadeTests
             using var factory = new FacadeFactory(config, service);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.RemoveAvailableModelAsync("no-such-model");
+            var result = await facade.RemoveAvailableModelAsync(
+                "no-such-model", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -385,7 +396,8 @@ public class ConfigFacadeTests
             using var factory = new FacadeFactory(config, service);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.RemoveAvailableModelAsync("gone-model");
+            var result = await facade.RemoveAvailableModelAsync(
+                "gone-model", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -416,7 +428,8 @@ public class ConfigFacadeTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.AddSubAgentModelAsync(
-                new SubAgentModelRequest("SA-DUP", null, null));
+                new SubAgentModelRequest("SA-DUP", null, null),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -438,7 +451,8 @@ public class ConfigFacadeTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.UpdateSubAgentModelAsync(
-                "sa-missing", new SubAgentModelRequest("sa-missing", null, null));
+                "sa-missing", new SubAgentModelRequest("sa-missing", null, null),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -459,7 +473,8 @@ public class ConfigFacadeTests
             using var factory = new FacadeFactory(config, service);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.RemoveSubAgentModelAsync("sa-no-such");
+            var result = await facade.RemoveSubAgentModelAsync(
+                "sa-no-such", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -501,7 +516,8 @@ public class ConfigFacadeTests
                     ["SA-SAVE"] = ReasoningEffort.Low
                 });
 
-            var result = await facade.SaveModelsAsync(update, TestContext.Current.CancellationToken);
+            var result = await facade.SaveModelsAsync(
+                update, OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -546,7 +562,7 @@ public class ConfigFacadeTests
                 OrchestratorModel: "copilot/new-model", ComposerModel: null, WorkerModels: null,
                 PremiumWorkerModels: null, CompactionModel: null);
 
-            var saveCall = facade.SaveModelsAsync(update, cts.Token);
+            var saveCall = facade.SaveModelsAsync(update, OpenModeActingUser.User, cts.Token);
 
             // Deterministically unwind the gated write via cancellation (never a timing wait).
             cts.Cancel();
@@ -586,7 +602,8 @@ public class ConfigFacadeTests
                 PremiumWorkerModels: null, CompactionModel: null);
 
             var ex = await Assert.ThrowsAsync<IOException>(
-                () => facade.SaveModelsAsync(update, TestContext.Current.CancellationToken));
+                () => facade.SaveModelsAsync(
+                    update, OpenModeActingUser.User, TestContext.Current.CancellationToken));
             Assert.Equal("simulated storage outage", ex.Message);
         }
         finally
@@ -620,7 +637,8 @@ public class ConfigFacadeTests
 
             var ex = await Assert.ThrowsAsync<ApplicationException>(
                 () => facade.AddSubAgentModelAsync(
-                    new SubAgentModelRequest("copilot/rethrow", null, null)));
+                    new SubAgentModelRequest("copilot/rethrow", null, null),
+                    OpenModeActingUser.User, TestContext.Current.CancellationToken));
             Assert.Equal("unexpected storage outage", ex.Message);
         }
         finally
@@ -642,12 +660,13 @@ public class ConfigFacadeTests
 
             var result = await facade.AddSubAgentModelAsync(
                 new SubAgentModelRequest("copilot/round-trip", 128000, ReasoningEffort.High,
-                    Description: "Round trip", SupportsVision: true));
+                    Description: "Round trip", SupportsVision: true),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
 
-            var models = facade.GetModels();
+            var models = await facade.GetModelsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
             Assert.True(models.Success);
             var sub = Assert.Single(models.Value!.SubAgentModels!);
             Assert.Equal("copilot/round-trip", sub.Name);
@@ -673,6 +692,17 @@ public class ConfigFacadeTests
             OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy);
 
     /// <summary>
+    /// The SYNCHRONOUS bridge the pre-existing projection-shape and lock-participation tests use to
+    /// drive the (now identity-aware, asynchronous) <see cref="IConfigFacade.GetModelsAsync"/> from a
+    /// plain test method and from the dedicated reader thread. The open-mode resolver completes
+    /// synchronously, so this bridge adds no scheduling: the only blocking construct the reader can
+    /// reach remains the config catalog monitor.
+    /// </summary>
+    private static FacadeResult<ModelsConfigDto> ReadModels(ConfigFacade facade) =>
+        facade.GetModelsAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken)
+            .GetAwaiter().GetResult();
+
+    /// <summary>
     /// Missing <c>Models</c> and null/empty catalogs preserve the exact null-versus-empty
     /// boundary of the DTO: a null catalog stays <c>null</c>, an empty one stays an empty list
     /// (and the reasoning dictionary follows the curated list's null/empty shape).
@@ -682,7 +712,7 @@ public class ConfigFacadeTests
     {
         // Models == null entirely.
         var noModels = CreateReadFacade(new HiveConfigFile { Orchestrator = new OrchestratorConfig() });
-        var noModelsDto = noModels.GetModels().Value!;
+        var noModelsDto = ReadModels(noModels).Value!;
         Assert.Null(noModelsDto.Compaction);
         Assert.Null(noModelsDto.AvailableModels);
         Assert.Null(noModelsDto.SubAgentModels);
@@ -694,7 +724,7 @@ public class ConfigFacadeTests
             Orchestrator = new OrchestratorConfig(),
             Models = new ModelsConfig { CompactionModel = "cm", AvailableModels = null, SubAgentModels = null }
         });
-        var nullCatalogsDto = nullCatalogs.GetModels().Value!;
+        var nullCatalogsDto = ReadModels(nullCatalogs).Value!;
         Assert.Equal("cm", nullCatalogsDto.Compaction);
         Assert.Null(nullCatalogsDto.AvailableModels);
         Assert.Null(nullCatalogsDto.SubAgentModels);
@@ -706,7 +736,7 @@ public class ConfigFacadeTests
             Orchestrator = new OrchestratorConfig(),
             Models = new ModelsConfig { AvailableModels = [], SubAgentModels = null }
         });
-        var emptyAvailableDto = emptyAvailable.GetModels().Value!;
+        var emptyAvailableDto = ReadModels(emptyAvailable).Value!;
         Assert.NotNull(emptyAvailableDto.AvailableModels);
         Assert.Empty(emptyAvailableDto.AvailableModels!);
         Assert.Null(emptyAvailableDto.SubAgentModels);
@@ -719,7 +749,7 @@ public class ConfigFacadeTests
             Orchestrator = new OrchestratorConfig(),
             Models = new ModelsConfig { AvailableModels = null, SubAgentModels = [] }
         });
-        var emptyCuratedDto = emptyCurated.GetModels().Value!;
+        var emptyCuratedDto = ReadModels(emptyCurated).Value!;
         Assert.Null(emptyCuratedDto.AvailableModels);
         Assert.NotNull(emptyCuratedDto.SubAgentModels);
         Assert.Empty(emptyCuratedDto.SubAgentModels!);
@@ -760,7 +790,7 @@ public class ConfigFacadeTests
                 ],
             },
         };
-        var dto = CreateReadFacade(config).GetModels().Value!;
+        var dto = ReadModels(CreateReadFacade(config)).Value!;
 
         // Lenient reasoning: valid non-canonical spelling → enum; whitespace → null.
         Assert.Equal(ReasoningEffort.High, dto.OrchestratorReasoningEffort);
@@ -837,7 +867,7 @@ public class ConfigFacadeTests
         config.SetCompactionModel("cm-a");
 
         var facade = CreateReadFacade(config);
-        var dtoA = facade.GetModels().Value!;
+        var dtoA = ReadModels(facade).Value!;
 
         // ── CURRENT-GENERATION container isolation ────────────────────────────────────────
         // A SECOND response from the SAME (still current) generation is the mutation victim,
@@ -846,7 +876,7 @@ public class ConfigFacadeTests
         // reasoning dictionary — WHILE this response is the current generation. If any of
         // them aliased the live/snapshot catalog, the source reads immediately afterwards
         // would observe the injected/removed entries and FAIL.
-        var dtoMutable = facade.GetModels().Value!;
+        var dtoMutable = ReadModels(facade).Value!;
         Assert.Single(dtoMutable.AvailableModels!);
         Assert.Single(dtoMutable.SubAgentModels!);
         Assert.Single(dtoMutable.SubAgentModelReasoning!);
@@ -879,7 +909,7 @@ public class ConfigFacadeTests
         Assert.False(sourceSub.SupportsVision);
 
         // …and through a fresh facade response of that same still-current generation.
-        var dtoAfterContainerMutation = facade.GetModels().Value!;
+        var dtoAfterContainerMutation = ReadModels(facade).Value!;
         var freshAvailable = Assert.Single(dtoAfterContainerMutation.AvailableModels!);
         Assert.Equal("model-a", freshAvailable.Name);
         Assert.Equal(1000, freshAvailable.ContextWindow);
@@ -930,7 +960,7 @@ public class ConfigFacadeTests
         Assert.Equal(ReasoningEffort.High, aReasoning.Value);
 
         // ── A fresh response sees the CURRENT (state B) values — field by field. ───────────
-        var dtoB = facade.GetModels().Value!;
+        var dtoB = ReadModels(facade).Value!;
         Assert.Equal("orch-b", dtoB.Orchestrator);
         Assert.Equal(ReasoningEffort.Low, dtoB.OrchestratorReasoningEffort);
         Assert.Null(dtoB.Composer);
@@ -950,7 +980,7 @@ public class ConfigFacadeTests
         // The DTO record properties are init-only: replace the element to attempt a mutation.
         ((List<AvailableModelDto>)dtoA.AvailableModels!)[0] =
             new AvailableModelDto("MUTATED", 1, null, null);
-        var sourceAfterContainerMutation = Assert.Single(facade.GetModels().Value!.AvailableModels!);
+        var sourceAfterContainerMutation = Assert.Single(ReadModels(facade).Value!.AvailableModels!);
         Assert.Equal("reloaded", sourceAfterContainerMutation.Name);
         Assert.Equal(9000, sourceAfterContainerMutation.ContextWindow);
     }
@@ -1087,7 +1117,7 @@ public class ConfigFacadeTests
     }
 
     /// <summary>
-    /// Lock-participation proof for <see cref="ConfigFacade.GetModels"/>: the facade reader is
+    /// Lock-participation proof for <see cref="ConfigFacade.GetModelsAsync"/>: the facade reader is
     /// positively observed BLOCKED on the instance's <c>_catalogLock</c> monitor, a synchronized
     /// writer then commits a new entry state behind it, and the returned DTO must carry the
     /// POST-commit values — a post-acquisition observation proving GetModels reads the catalog
@@ -1106,7 +1136,7 @@ public class ConfigFacadeTests
 
         var observed = AssertReaderBlocksOnCatalogMonitor(
             config,
-            () => Assert.IsType<ModelsConfigDto>(facade.GetModels().Value),
+            () => Assert.IsType<ModelsConfigDto>(ReadModels(facade).Value),
             () => Assert.True(config.TryUpdateAvailableModel(
                 "m", new AvailableModelRequest("ignored", 99, "post", false))));
 
@@ -1190,7 +1220,8 @@ public sealed class ConfigFacadeDiscoveryTests
             using var factory = new ConfigFacadeTests.FacadeFactory(config, service, discovery);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.DiscoverModelsAsync();
+            var result = await facade.DiscoverModelsAsync(
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -1255,7 +1286,8 @@ public sealed class ConfigFacadeDiscoveryTests
             using var factory = new ConfigFacadeTests.FacadeFactory(config, service, discovery);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.DiscoverModelsAsync();
+            var result = await facade.DiscoverModelsAsync(
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);

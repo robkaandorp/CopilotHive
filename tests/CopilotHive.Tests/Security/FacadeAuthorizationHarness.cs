@@ -64,6 +64,23 @@ internal sealed class FacadeAuthorizationHarness : IDisposable
 }
 
 /// <summary>
+/// THE OPEN-MODE IDENTITY every pre-existing facade test hands to an identity-aware facade method.
+/// <para>
+/// Open mode registers NO authentication services, so no cascading <c>AuthenticationState</c> exists
+/// and a component genuinely has no principal to forward — it passes <c>null</c>. That is NOT a
+/// fail-open sentinel and NOT an identity-free overload: <see cref="HivePrincipalResolver"/> treats
+/// <c>null</c> as "signed out" and, in the EXPLICIT open mode only, answers the legacy local operator;
+/// while authentication is enabled the same <c>null</c> is refused. Using this named constant keeps
+/// the reason visible at every migrated call site instead of an unexplained literal.
+/// </para>
+/// </summary>
+internal static class OpenModeActingUser
+{
+    /// <summary>The open-mode identity: no cascade exists, so the caller forwards no principal.</summary>
+    internal static System.Security.Claims.ClaimsPrincipal? User => null;
+}
+
+/// <summary>
 /// The OPEN-MODE (no authentication configured) resolver/policy pair used by every pre-existing
 /// facade test. In open mode the resolver consults NO directory at all, so this is exactly the
 /// legacy single-local-operator behaviour; the shared instance keeps those tests unchanged.

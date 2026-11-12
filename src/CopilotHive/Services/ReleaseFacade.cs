@@ -1,6 +1,9 @@
+using System.Security.Claims;
+
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
+using CopilotHive.Security;
 
 using Microsoft.Extensions.Logging;
 
@@ -43,9 +46,59 @@ namespace CopilotHive.Services;
 /// <see cref="DeleteReleaseAsync"/> and <see cref="ValidateReleaseAsync"/> propagate the token to
 /// the store, exactly as their handlers did.
 /// </para>
+/// <para>
+/// AUTHORIZATION IS PART OF EVERY OPERATION, AND IT RUNS FIRST. Each operation takes the caller's
+/// per-request (or per-circuit) <see cref="ClaimsPrincipal"/> and re-resolves the acting principal
+/// FRESH through <see cref="HivePrincipalResolver"/> — never trusting cookie claims and never
+/// retaining a resolved principal between calls — so a demoted, disabled or deleted account is
+/// refused on its very NEXT operation. A refusal, or a principal that does not hold the required
+/// <see cref="HiveCapability"/>, produces <see cref="FacadeErrorKind.Forbidden"/> BEFORE any store
+/// read, any validation and any side effect: a Viewer sending an invalid release update therefore
+/// gets Forbidden, never BadRequest. There is deliberately NO identity-free overload, so no caller
+/// can reach a covered operation without an identity.
+/// </para>
+/// <para>
+/// THE ROLE MAP this facade enforces: the two reads
+/// (<see cref="GetReleaseAsync"/>, <see cref="GetGoalsByReleaseAsync"/>) require
+/// <see cref="HiveCapability.SharedRead"/>; every release mutation (create, status, notes, tag,
+/// repositories, delete) and the validation the release workflow runs before execution require
+/// <see cref="HiveCapability.ExecutionOperator"/>. <see cref="HiveCapability.GlobalAdmin"/> is never
+/// consulted here. Open mode resolves the explicit open-mode local operator through the same
+/// resolver, so the single-operator installation keeps its previous behaviour exactly.
+/// </para>
 /// </remarks>
 public interface IReleaseFacade
 {
+    /// <summary>
+    /// Reads one release by ID, replacing the direct
+    /// <see cref="IGoalStore.GetReleaseAsync"/> read the Releases / Release Detail surface performs.
+    /// </summary>
+    /// <param name="id">The release ID to read.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token forwarded to the store.</param>
+    /// <returns>
+    /// The release as a <see cref="ReleaseDto"/>, <see cref="FacadeErrorKind.NotFound"/> when it does
+    /// not exist, or <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// shared read.
+    /// </returns>
+    Task<FacadeResult<ReleaseDto>> GetReleaseAsync(string id, ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Lists the goals attached to a release, replacing the direct
+    /// <see cref="IGoalStore.GetGoalsByReleaseAsync"/> read the Releases / Release Detail surface
+    /// performs.
+    /// </summary>
+    /// <param name="releaseId">The release whose goals to list.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token forwarded to the store.</param>
+    /// <returns>
+    /// The DOMAIN goals (the unchanged projection those surfaces consumed; an empty list when the
+    /// release has none), or <see cref="FacadeErrorKind.Forbidden"/> when the caller does not
+    /// currently hold shared read.
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<Goal>>> GetGoalsByReleaseAsync(
+        string releaseId, ClaimsPrincipal? actingUser, CancellationToken ct);
+
     /// <summary>
     /// Applies a status transition to a release. Validation order is frozen: release-not-found →
     /// blank status → numeric status → unknown status → comma-combined status →
@@ -54,6 +107,7 @@ public interface IReleaseFacade
     /// </summary>
     /// <param name="id">The release ID to update.</param>
     /// <param name="request">The requested status.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <param name="ct">
     /// Cancellation token forwarded ONLY to <see cref="ReleaseExecutionService.ExecuteReleaseAsync"/>
     /// and the knowledge-document cleanup — the exact two calls the pre-facade handler passed
@@ -63,11 +117,12 @@ public interface IReleaseFacade
     /// <see cref="PlanningNoOpOutcome"/> for a Planning→Planning no-op (bare Release JSON),
     /// <see cref="ExecutionSuccessOutcome"/> for a successful Planning→Released execution
     /// (<c>{release, result}</c>), or <see cref="StatusFailureOutcome"/> with the exact
-    /// per-variant kind (404 not-found, 400 status validation / <c>{errors:[...]}</c> validation,
-    /// 409 conflicts, 500 execution failure with <c>{detail, results}</c>, 503 missing execution
-    /// service).
+    /// per-variant kind (403 forbidden, 404 not-found, 400 status validation /
+    /// <c>{errors:[...]}</c> validation, 409 conflicts, 500 execution failure with
+    /// <c>{detail, results}</c>, 503 missing execution service).
     /// </returns>
-    Task<ReleaseStatusOutcome> UpdateReleaseStatusAsync(string id, UpdateReleaseStatusRequest request, CancellationToken ct);
+    Task<ReleaseStatusOutcome> UpdateReleaseStatusAsync(
+        string id, UpdateReleaseStatusRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Creates a new release. The version-required check runs FIRST; a duplicate release ID/version
@@ -76,12 +131,15 @@ public interface IReleaseFacade
     /// to <see cref="FacadeErrorKind.Conflict"/>. Tag uniqueness is NOT enforced.
     /// </summary>
     /// <param name="request">The release to create.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <returns>
-    /// The created release as a <see cref="ReleaseDto"/>, <see cref="FacadeErrorKind.BadRequest"/>
+    /// The created release as a <see cref="ReleaseDto"/>, <see cref="FacadeErrorKind.Forbidden"/> when
+    /// the caller does not currently hold
+    /// <see cref="HiveCapability.ExecutionOperator"/>, <see cref="FacadeErrorKind.BadRequest"/>
     /// when the version is blank, or <see cref="FacadeErrorKind.Conflict"/> when a release with the
     /// same ID already exists. Any other exception propagates to the caller.
     /// </returns>
-    Task<FacadeResult<ReleaseDto>> CreateReleaseAsync(CreateReleaseRequest request);
+    Task<FacadeResult<ReleaseDto>> CreateReleaseAsync(CreateReleaseRequest request, ClaimsPrincipal? actingUser);
 
     /// <summary>
     /// Replaces a release's notes. <paramref name="request"/>.Notes is <c>string?</c> — a null
@@ -89,11 +147,14 @@ public interface IReleaseFacade
     /// </summary>
     /// <param name="id">The release ID to update.</param>
     /// <param name="request">The new notes (null clears).</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <returns>
-    /// The updated release as a <see cref="ReleaseDto"/>, or <see cref="FacadeErrorKind.NotFound"/>
-    /// when the release does not exist.
+    /// The updated release as a <see cref="ReleaseDto"/>, <see cref="FacadeErrorKind.NotFound"/>
+    /// when the release does not exist, or <see cref="FacadeErrorKind.Forbidden"/> when the caller
+    /// does not currently hold <see cref="HiveCapability.ExecutionOperator"/>.
     /// </returns>
-    Task<FacadeResult<ReleaseDto>> UpdateReleaseNotesAsync(string id, UpdateReleaseNotesRequest request);
+    Task<FacadeResult<ReleaseDto>> UpdateReleaseNotesAsync(
+        string id, UpdateReleaseNotesRequest request, ClaimsPrincipal? actingUser);
 
     /// <summary>
     /// Replaces a Planning release's tag. The tag-required check runs FIRST; a non-Planning release
@@ -101,12 +162,16 @@ public interface IReleaseFacade
     /// </summary>
     /// <param name="id">The release ID to update.</param>
     /// <param name="request">The new tag.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <returns>
     /// The updated release as a <see cref="ReleaseDto"/>, <see cref="FacadeErrorKind.BadRequest"/>
-    /// when the tag is blank or the release is not Planning, or
-    /// <see cref="FacadeErrorKind.NotFound"/> when the release does not exist.
+    /// when the tag is blank or the release is not Planning,
+    /// <see cref="FacadeErrorKind.NotFound"/> when the release does not exist, or
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.ExecutionOperator"/>.
     /// </returns>
-    Task<FacadeResult<ReleaseDto>> UpdateReleaseTagAsync(string id, UpdateReleaseTagRequest request);
+    Task<FacadeResult<ReleaseDto>> UpdateReleaseTagAsync(
+        string id, UpdateReleaseTagRequest request, ClaimsPrincipal? actingUser);
 
     /// <summary>
     /// Replaces a Planning release's repository list. <paramref name="request"/>.Repositories is
@@ -115,12 +180,15 @@ public interface IReleaseFacade
     /// </summary>
     /// <param name="id">The release ID to update.</param>
     /// <param name="request">The new repository list (null = no-op).</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <returns>
     /// The updated release as a <see cref="ReleaseDto"/>, <see cref="FacadeErrorKind.NotFound"/>
-    /// when the release does not exist, or <see cref="FacadeErrorKind.BadRequest"/> when the
-    /// release is not Planning.
+    /// when the release does not exist, <see cref="FacadeErrorKind.BadRequest"/> when the
+    /// release is not Planning, or <see cref="FacadeErrorKind.Forbidden"/> when the caller does not
+    /// currently hold <see cref="HiveCapability.ExecutionOperator"/>.
     /// </returns>
-    Task<FacadeResult<ReleaseDto>> UpdateReleaseRepositoriesAsync(string id, UpdateReleaseRepositoriesRequest request);
+    Task<FacadeResult<ReleaseDto>> UpdateReleaseRepositoriesAsync(
+        string id, UpdateReleaseRepositoriesRequest request, ClaimsPrincipal? actingUser);
 
     /// <summary>
     /// Deletes a Planning release with no attached goals and no in-flight execution. The FIVE
@@ -131,24 +199,30 @@ public interface IReleaseFacade
     /// <see cref="FacadeErrorKind.Conflict"/>.
     /// </summary>
     /// <param name="id">The release ID to delete.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <param name="ct">Cancellation token forwarded to every store call.</param>
     /// <returns>
     /// A success result carrying <see cref="RemovedResult"/> (the route answers 204 No Content),
-    /// or one of the five failure outcomes above.
+    /// one of the five failure outcomes above, or <see cref="FacadeErrorKind.Forbidden"/> when the
+    /// caller does not currently hold <see cref="HiveCapability.ExecutionOperator"/>.
     /// </returns>
-    Task<FacadeResult<RemovedResult>> DeleteReleaseAsync(string id, CancellationToken ct);
+    Task<FacadeResult<RemovedResult>> DeleteReleaseAsync(
+        string id, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Validates a release prior to execution. A missing execution service yields
     /// <c>{valid:true}</c> exactly as today.
     /// </summary>
     /// <param name="id">The release ID to validate.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <param name="ct">Cancellation token forwarded to the store and the execution service.</param>
     /// <returns>
-    /// The validation outcome as a <see cref="ValidationDto"/>, or
-    /// <see cref="FacadeErrorKind.NotFound"/> when the release does not exist.
+    /// The validation outcome as a <see cref="ValidationDto"/>, <see cref="FacadeErrorKind.NotFound"/>
+    /// when the release does not exist, or <see cref="FacadeErrorKind.Forbidden"/> when the caller
+    /// does not currently hold <see cref="HiveCapability.ExecutionOperator"/>.
     /// </returns>
-    Task<FacadeResult<ValidationDto>> ValidateReleaseAsync(string id, CancellationToken ct);
+    Task<FacadeResult<ValidationDto>> ValidateReleaseAsync(
+        string id, ClaimsPrincipal? actingUser, CancellationToken ct);
 }
 
 /// <summary>
@@ -167,6 +241,8 @@ public sealed class ReleaseFacade : IReleaseFacade
     private readonly IGoalStore _goalStore;
     private readonly DashboardNotifier _dashboardNotifier;
     private readonly ILogger<ReleaseFacade> _log;
+    private readonly HivePrincipalResolver _resolver;
+    private readonly HivePolicy _policy;
     private readonly ReleaseExecutionService? _executionService;
     private readonly IEventBus? _eventBus;
     private readonly NuGetPublishMonitorService? _nuGetMonitor;
@@ -180,16 +256,25 @@ public sealed class ReleaseFacade : IReleaseFacade
     /// <param name="goalStore">The goal/release store (required).</param>
     /// <param name="dashboardNotifier">The dashboard change notifier (required).</param>
     /// <param name="log">Logger instance (required).</param>
+    /// <param name="resolver">
+    /// The stateless principal resolver every operation re-resolves through (required). It is
+    /// required so there is no unauthenticated construction: the resolver and the policy are
+    /// stateless singletons, and this facade never captures the scoped circuit accessor.
+    /// </param>
+    /// <param name="policy">The pure capability evaluator (required together with <paramref name="resolver"/>).</param>
     /// <param name="executionService">The release execution service, or <c>null</c> (503 case).</param>
     /// <param name="eventBus">The event bus, or <c>null</c> to skip publication.</param>
     /// <param name="nuGetMonitor">The NuGet publish monitor, or <c>null</c> to skip monitoring.</param>
     /// <param name="hiveConfig">The hive configuration (needed for <see cref="ApiEndpoints.LaunchNuGetMonitors"/>), or <c>null</c>.</param>
     /// <param name="appLifetime">The application lifetime, or <c>null</c>.</param>
     /// <param name="docCleanup">The knowledge-document cleanup service, or <c>null</c>.</param>
+    /// <exception cref="ArgumentNullException">A required dependency is null.</exception>
     public ReleaseFacade(
         IGoalStore goalStore,
         DashboardNotifier dashboardNotifier,
         ILogger<ReleaseFacade> log,
+        HivePrincipalResolver resolver,
+        HivePolicy policy,
         ReleaseExecutionService? executionService,
         IEventBus? eventBus,
         NuGetPublishMonitorService? nuGetMonitor,
@@ -199,7 +284,9 @@ public sealed class ReleaseFacade : IReleaseFacade
     {
         _goalStore = goalStore;
         _dashboardNotifier = dashboardNotifier;
-        _log = log;
+        _log = log ?? throw new ArgumentNullException(nameof(log));
+        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _executionService = executionService;
         _eventBus = eventBus;
         _nuGetMonitor = nuGetMonitor;
@@ -208,10 +295,48 @@ public sealed class ReleaseFacade : IReleaseFacade
         _docCleanup = docCleanup;
     }
 
+    // ── Authorized reads (SharedRead) ───────────────────────────────────────
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<ReleaseDto>> GetReleaseAsync(
+        string id, ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetReleaseAsync), ct))
+            return Forbidden<ReleaseDto>();
+
+        var release = await _goalStore.GetReleaseAsync(id, ct);
+        return release is null
+            ? new(false, null, $"Release '{id}' not found.", FacadeErrorKind.NotFound)
+            : new(true, ReleaseDto.From(release), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<Goal>>> GetGoalsByReleaseAsync(
+        string releaseId, ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetGoalsByReleaseAsync), ct))
+            return Forbidden<IReadOnlyList<Goal>>();
+
+        var goals = await _goalStore.GetGoalsByReleaseAsync(releaseId, ct);
+        return new(true, goals, null, FacadeErrorKind.None);
+    }
+
+    // ── Authorized mutations (ExecutionOperator) ────────────────────────────
+
     /// <inheritdoc />
     public async Task<ReleaseStatusOutcome> UpdateReleaseStatusAsync(
-        string id, UpdateReleaseStatusRequest request, CancellationToken ct)
+        string id, UpdateReleaseStatusRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        // AUTHORIZATION FIRST — before the store read and before every status-validation branch, so
+        // an unauthorized caller learns nothing about the release's existence or its status.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(UpdateReleaseStatusAsync), ct))
+        {
+            return new StatusFailureOutcome(
+                FacadeErrorKind.Forbidden,
+                FacadeAuthorization.ForbiddenMessage,
+                null, [], []);
+        }
+
         // The initial read keeps a DEFAULT token, exactly as the pre-facade handler called
         // store.GetReleaseAsync(id) without a token.
         var existing = await _goalStore.GetReleaseAsync(id);
@@ -354,8 +479,12 @@ public sealed class ReleaseFacade : IReleaseFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<ReleaseDto>> CreateReleaseAsync(CreateReleaseRequest request)
+    public async Task<FacadeResult<ReleaseDto>> CreateReleaseAsync(
+        CreateReleaseRequest request, ClaimsPrincipal? actingUser)
     {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(CreateReleaseAsync), CancellationToken.None))
+            return Forbidden<ReleaseDto>();
+
         if (string.IsNullOrWhiteSpace(request.Version))
             return new(false, null, "Version is required.", FacadeErrorKind.BadRequest);
 
@@ -380,8 +509,12 @@ public sealed class ReleaseFacade : IReleaseFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<ReleaseDto>> UpdateReleaseNotesAsync(string id, UpdateReleaseNotesRequest request)
+    public async Task<FacadeResult<ReleaseDto>> UpdateReleaseNotesAsync(
+        string id, UpdateReleaseNotesRequest request, ClaimsPrincipal? actingUser)
     {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(UpdateReleaseNotesAsync), CancellationToken.None))
+            return Forbidden<ReleaseDto>();
+
         var existing = await _goalStore.GetReleaseAsync(id);
         if (existing is null)
             return new(false, null, $"Release '{id}' not found.", FacadeErrorKind.NotFound);
@@ -395,8 +528,12 @@ public sealed class ReleaseFacade : IReleaseFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<ReleaseDto>> UpdateReleaseTagAsync(string id, UpdateReleaseTagRequest request)
+    public async Task<FacadeResult<ReleaseDto>> UpdateReleaseTagAsync(
+        string id, UpdateReleaseTagRequest request, ClaimsPrincipal? actingUser)
     {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(UpdateReleaseTagAsync), CancellationToken.None))
+            return Forbidden<ReleaseDto>();
+
         if (string.IsNullOrWhiteSpace(request.Tag))
             return new(false, null, "Tag is required.", FacadeErrorKind.BadRequest);
 
@@ -420,8 +557,12 @@ public sealed class ReleaseFacade : IReleaseFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<ReleaseDto>> UpdateReleaseRepositoriesAsync(string id, UpdateReleaseRepositoriesRequest request)
+    public async Task<FacadeResult<ReleaseDto>> UpdateReleaseRepositoriesAsync(
+        string id, UpdateReleaseRepositoriesRequest request, ClaimsPrincipal? actingUser)
     {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(UpdateReleaseRepositoriesAsync), CancellationToken.None))
+            return Forbidden<ReleaseDto>();
+
         try
         {
             // request.Repositories is List<string>? — a null value reaches ReleaseUpdateData as a
@@ -444,8 +585,12 @@ public sealed class ReleaseFacade : IReleaseFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<RemovedResult>> DeleteReleaseAsync(string id, CancellationToken ct)
+    public async Task<FacadeResult<RemovedResult>> DeleteReleaseAsync(
+        string id, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(DeleteReleaseAsync), ct))
+            return Forbidden<RemovedResult>();
+
         var release = await _goalStore.GetReleaseAsync(id, ct);
         if (release is null)
             return new(false, null, $"Release '{id}' not found.", FacadeErrorKind.NotFound);
@@ -475,8 +620,12 @@ public sealed class ReleaseFacade : IReleaseFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<ValidationDto>> ValidateReleaseAsync(string id, CancellationToken ct)
+    public async Task<FacadeResult<ValidationDto>> ValidateReleaseAsync(
+        string id, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.ExecutionOperator, nameof(ValidateReleaseAsync), ct))
+            return Forbidden<ValidationDto>();
+
         var release = await _goalStore.GetReleaseAsync(id, ct);
         if (release is null)
             return new(false, null, $"Release '{id}' not found.", FacadeErrorKind.NotFound);
@@ -488,4 +637,25 @@ public sealed class ReleaseFacade : IReleaseFacade
         var validation = await execService.ValidateReleaseAsync(release, ct);
         return new(true, new ValidationDto(validation.IsValid, validation.Errors), null, FacadeErrorKind.None);
     }
+
+    // ── Authorization + shared results ──────────────────────────────────────
+
+    /// <summary>
+    /// THE ONE AUTHORIZATION CALL every operation makes, BEFORE any of its own work: one fresh
+    /// resolution of the caller's CURRENT stored state and one capability evaluation.
+    /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="capability">The capability the operation requires.</param>
+    /// <param name="operation">The operation name (log context only).</param>
+    /// <param name="ct">Caller cancellation token; cancellation propagates, never a denial.</param>
+    /// <returns><c>true</c> only when the caller currently holds <paramref name="capability"/>.</returns>
+    private Task<bool> IsAllowedAsync(
+        ClaimsPrincipal? actingUser, HiveCapability capability, string operation, CancellationToken ct) =>
+        FacadeAuthorization.IsAllowedAsync(_resolver, _policy, actingUser, capability, _log, operation, ct);
+
+    /// <summary>Builds the shared denial result for a value-producing operation.</summary>
+    /// <typeparam name="T">The facade value type of the operation.</typeparam>
+    /// <returns>A <see cref="FacadeErrorKind.Forbidden"/> result carrying the sanitized denial text.</returns>
+    private static FacadeResult<T> Forbidden<T>() =>
+        new(false, default, FacadeAuthorization.ForbiddenMessage, FacadeErrorKind.Forbidden);
 }

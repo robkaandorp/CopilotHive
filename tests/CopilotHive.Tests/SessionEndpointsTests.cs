@@ -124,7 +124,6 @@ public class SessionEndpointsTests : IDisposable
     [Theory]
     [InlineData(LlmSessionType.Brain, "Brain")]
     [InlineData(LlmSessionType.BrainGoal, "BrainGoal")]
-    [InlineData(LlmSessionType.Composer, "Composer")]
     [InlineData(LlmSessionType.GoalReview, "GoalReview")]
     public async Task GetSessions_SerializesSessionType_AsJsonString(LlmSessionType type, string expectedJson)
     {
@@ -160,6 +159,84 @@ public class SessionEndpointsTests : IDisposable
         finally
         {
             registry.Unregister(sessionId);
+        }
+    }
+
+    /// <summary>
+    /// THE COMPOSER EXCLUSION CONTRACT of <c>GET /api/sessions</c>, together with the two carriers
+    /// the previous Composer theory row provided:
+    /// <list type="bullet">
+    ///   <item>The endpoint REPORTS SHARED EXECUTION SESSIONS ONLY: a registered
+    ///   <see cref="LlmSessionType.Composer"/> session is absent from the response, while a
+    ///   simultaneously registered execution session is present (the positive control proving the
+    ///   filter removes Composer rather than emptying the route).</item>
+    ///   <item><see cref="LlmSessionRegistry.GetAll"/> keeps its UNCHANGED semantics — the dashboard
+    ///   still sees the Composer entry, so the filter is provably endpoint-local.</item>
+    ///   <item>The Composer enum value still serializes as the JSON STRING <c>"Composer"</c> through
+    ///   the host's own HTTP JSON options, which is the same converter chain the endpoint serializes
+    ///   with — so moving this row off the endpoint did not drop the snake_case-converter guard.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task GetSessions_ExcludesComposerSessions_FromTheEndpointButNotFromTheRegistry()
+    {
+        var registry = _factory.Services.GetRequiredService<LlmSessionRegistry>();
+        var composerSessionId = $"test-session-{Guid.NewGuid():N}";
+        var executionSessionId = $"test-session-{Guid.NewGuid():N}";
+        registry.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = composerSessionId,
+            SessionType = LlmSessionType.Composer,
+            Model = "composer-model",
+            Status = "active",
+            CurrentTokens = 0,
+            MaxTokens = 1,
+        });
+        registry.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = executionSessionId,
+            SessionType = LlmSessionType.Brain,
+            Model = "brain-model",
+            Status = "active",
+            CurrentTokens = 0,
+            MaxTokens = 1,
+        });
+
+        try
+        {
+            var response = await _client.GetAsync("/api/sessions", TestContext.Current.CancellationToken);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+            using var document = JsonDocument.Parse(content);
+            var ids = document.RootElement.EnumerateArray()
+                .Select(e => e.GetProperty("sessionId").GetString())
+                .ToList();
+
+            // Composer is excluded; the execution session is still reported (positive control).
+            Assert.DoesNotContain(composerSessionId, ids);
+            Assert.Contains(executionSessionId, ids);
+            Assert.DoesNotContain(
+                document.RootElement.EnumerateArray(),
+                e => e.GetProperty("sessionType").GetString() == nameof(LlmSessionType.Composer));
+
+            // GetAll() semantics are UNCHANGED: the dashboard still sees the Composer entry.
+            Assert.Contains(registry.GetAll(), session => session.SessionId == composerSessionId);
+
+            // The Composer enum still renders as the JSON string "Composer" through the host's own
+            // HTTP JSON options — the same converter chain the endpoint uses.
+            var jsonOptions = _factory.Services
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions>>()
+                .Value.SerializerOptions;
+            using var serialized = JsonDocument.Parse(
+                JsonSerializer.Serialize(LlmSessionType.Composer, jsonOptions));
+            Assert.Equal(JsonValueKind.String, serialized.RootElement.ValueKind);
+            Assert.Equal(nameof(LlmSessionType.Composer), serialized.RootElement.GetString());
+        }
+        finally
+        {
+            registry.Unregister(composerSessionId);
+            registry.Unregister(executionSessionId);
         }
     }
 }

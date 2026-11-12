@@ -120,11 +120,23 @@ public sealed class ConfigurationComposerGateTests : IDisposable
     /// </summary>
     private sealed class EmptyBackupFacade : IBackupFacade
     {
-        public FacadeResult<IReadOnlyList<BackupInfoDto>> GetBackups() =>
-            new(true, [], null, FacadeErrorKind.None);
+        public Task<FacadeResult<IReadOnlyList<BackupInfoDto>>> GetBackupsAsync(
+            System.Security.Claims.ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            Task.FromResult(new FacadeResult<IReadOnlyList<BackupInfoDto>>(true, [], null, FacadeErrorKind.None));
 
-        public Task<FacadeResult<BackupInfoDto>> CreateBackupAsync(CancellationToken ct) =>
+        public Task<FacadeResult<BackupInfoDto>> CreateBackupAsync(
+            System.Security.Claims.ClaimsPrincipal? actingUser, CancellationToken ct) =>
             Task.FromResult(new FacadeResult<BackupInfoDto>(
+                false, null, "not used", FacadeErrorKind.NotFound));
+
+        public Task<FacadeResult<BackupDownload>> OpenBackupForDownloadAsync(
+            string fileName, System.Security.Claims.ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            Task.FromResult(new FacadeResult<BackupDownload>(
+                false, null, "not used", FacadeErrorKind.NotFound));
+
+        public Task<FacadeResult<BackupRestore>> RestoreBackupAsync(
+            string fileName, System.Security.Claims.ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            Task.FromResult(new FacadeResult<BackupRestore>(
                 false, null, "not used", FacadeErrorKind.NotFound));
     }
 

@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -44,7 +45,8 @@ public class ConfigFacadeRepositoryTests
         using var factory = new ConfigFacadeTests.FacadeFactory(hiveConfig: null);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetRepositories();
+        var result = await facade.GetRepositoriesAsync(
+            OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -90,7 +92,8 @@ public class ConfigFacadeRepositoryTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetRepositories();
+        var result = await facade.GetRepositoriesAsync(
+            OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -136,17 +139,20 @@ public class ConfigFacadeRepositoryTests
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
         var request = new RepositoryRequest("r", "https://github.com/org/r.git", "main");
 
-        var add = await facade.AddRepositoryAsync(request);
+        var add = await facade.AddRepositoryAsync(
+            request, OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(add.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, add.Kind);
         Assert.Equal(CrudNotConfiguredMessage, add.Error);
 
-        var update = await facade.UpdateRepositoryAsync("r", request);
+        var update = await facade.UpdateRepositoryAsync(
+            "r", request, OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(update.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, update.Kind);
         Assert.Equal(CrudNotConfiguredMessage, update.Error);
 
-        var remove = await facade.RemoveRepositoryAsync("r");
+        var remove = await facade.RemoveRepositoryAsync(
+            "r", OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(remove.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, remove.Kind);
         Assert.Equal(CrudNotConfiguredMessage, remove.Error);
@@ -168,7 +174,8 @@ public class ConfigFacadeRepositoryTests
         });
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = await facade.GetBranchesAsync("repo", TestContext.Current.CancellationToken);
+        var result = await facade.GetBranchesAsync(
+            "repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.ServiceUnavailable, result.Kind);
@@ -192,7 +199,8 @@ public class ConfigFacadeRepositoryTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.AddRepositoryAsync(
-                new RepositoryRequest("bad-repo", "", "main"));
+                new RepositoryRequest("bad-repo", "", "main"),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -225,7 +233,8 @@ public class ConfigFacadeRepositoryTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.AddRepositoryAsync(
-                new RepositoryRequest("DUP-REPO", "https://github.com/org/other.git", "develop"));
+                new RepositoryRequest("DUP-REPO", "https://github.com/org/other.git", "develop"),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -254,7 +263,8 @@ public class ConfigFacadeRepositoryTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.AddRepositoryAsync(
-                new RepositoryRequest("new-repo", "https://github.com/org/new.git", "main"));
+                new RepositoryRequest("new-repo", "https://github.com/org/new.git", "main"),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -286,7 +296,8 @@ public class ConfigFacadeRepositoryTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.UpdateRepositoryAsync(
-                "missing", new RepositoryRequest("missing", "https://github.com/org/new.git", "main"));
+                "missing", new RepositoryRequest("missing", "https://github.com/org/new.git", "main"),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -317,7 +328,8 @@ public class ConfigFacadeRepositoryTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.UpdateRepositoryAsync(
-                "upd-repo", new RepositoryRequest("upd-repo", "https://github.com/org/new.git", "develop"));
+                "upd-repo", new RepositoryRequest("upd-repo", "https://github.com/org/new.git", "develop"),
+                OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -347,7 +359,8 @@ public class ConfigFacadeRepositoryTests
             using var factory = new ConfigFacadeTests.FacadeFactory(config, service);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.RemoveRepositoryAsync("no-such-repo");
+            var result = await facade.RemoveRepositoryAsync(
+                "no-such-repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.False(result.Success);
             Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -377,7 +390,8 @@ public class ConfigFacadeRepositoryTests
             using var factory = new ConfigFacadeTests.FacadeFactory(config, service);
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-            var result = await facade.RemoveRepositoryAsync("gone-repo");
+            var result = await facade.RemoveRepositoryAsync(
+                "gone-repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -407,7 +421,8 @@ public class ConfigFacadeRepositoryTests
             repoManager: fake);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = await facade.GetBranchesAsync("test-repo", TestContext.Current.CancellationToken);
+        var result = await facade.GetBranchesAsync(
+            "test-repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -430,7 +445,8 @@ public class ConfigFacadeRepositoryTests
             repoManager: fake);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = await facade.GetBranchesAsync("../evil", TestContext.Current.CancellationToken);
+        var result = await facade.GetBranchesAsync(
+            "../evil", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -455,7 +471,8 @@ public class ConfigFacadeRepositoryTests
             repoManager: fake);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = await facade.GetBranchesAsync("test-repo", TestContext.Current.CancellationToken);
+        var result = await facade.GetBranchesAsync(
+            "test-repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Internal, result.Kind);
@@ -477,7 +494,8 @@ public class ConfigFacadeRepositoryTests
             repoManager: fake);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = await facade.GetBranchesAsync("test-repo", TestContext.Current.CancellationToken);
+        var result = await facade.GetBranchesAsync(
+            "test-repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -501,7 +519,8 @@ public class ConfigFacadeRepositoryTests
             repoManager: fake);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = await facade.GetBranchesAsync("test-repo", TestContext.Current.CancellationToken);
+        var result = await facade.GetBranchesAsync(
+            "test-repo", OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Internal, result.Kind);

@@ -3,12 +3,15 @@
 @using CopilotHive.Goals
 @using Markdig
 @inject IGoalStore GoalStore
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @inject IReleaseFacade ReleaseFacade
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
 @inject PageHeaderState PageHeader
 @using CopilotHive.Services
+@using Microsoft.AspNetCore.Components.Authorization
+@using System.Security.Claims
 
 @if (_release is not null)
 {
@@ -326,6 +329,27 @@ else if (_loaded)
     private bool _isDeleting;
     private string? _deleteError;
 
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. This is also the page's MINIMAL circuit
+    /// identity acquisition: the scoped <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/> is initialised
+    /// from the same cascading state exactly once per circuit.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
     protected override async Task OnInitializedAsync()
     {
         var decoded = Uri.UnescapeDataString(ReleaseId);
@@ -356,7 +380,8 @@ else if (_loaded)
         _releaseError = null;
         try
         {
-            var result = await ReleaseFacade.ValidateReleaseAsync(_release!.Id, CancellationToken.None);
+            var result = await ReleaseFacade.ValidateReleaseAsync(
+                _release!.Id, await ActingUserAsync(), CancellationToken.None);
             if (result.Success && result.Value is not null)
             {
                 _isValid = result.Value.Valid;
@@ -389,7 +414,8 @@ else if (_loaded)
         try
         {
             var outcome = await ReleaseFacade.UpdateReleaseStatusAsync(
-                _release!.Id, new UpdateReleaseStatusRequest("Released"), CancellationToken.None);
+                _release!.Id, new UpdateReleaseStatusRequest("Released"),
+                await ActingUserAsync(), CancellationToken.None);
             switch (outcome)
             {
                 case PlanningNoOpOutcome noOp:
@@ -455,7 +481,8 @@ else if (_loaded)
         _isDeleting = true;
         try
         {
-            var result = await ReleaseFacade.DeleteReleaseAsync(_release!.Id, CancellationToken.None);
+            var result = await ReleaseFacade.DeleteReleaseAsync(
+                _release!.Id, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 Nav.NavigateTo("/releases");
@@ -480,7 +507,7 @@ else if (_loaded)
         _notesError = null;
         _notesSaved = false;
         var result = await ReleaseFacade.UpdateReleaseNotesAsync(
-            ReleaseId, new UpdateReleaseNotesRequest(_editNotes));
+            ReleaseId, new UpdateReleaseNotesRequest(_editNotes), await ActingUserAsync());
         if (result.Success && result.Value is not null)
         {
             _release = result.Value;
@@ -505,7 +532,7 @@ else if (_loaded)
             return;
         }
         var result = await ReleaseFacade.UpdateReleaseTagAsync(
-            ReleaseId, new UpdateReleaseTagRequest(_editTag.Trim()));
+            ReleaseId, new UpdateReleaseTagRequest(_editTag.Trim()), await ActingUserAsync());
         if (result.Success && result.Value is not null)
         {
             _release = result.Value;
@@ -546,7 +573,7 @@ else if (_loaded)
         _repositoriesSaved = false;
         var repos = _selectedRepos.ToList();
         var result = await ReleaseFacade.UpdateReleaseRepositoriesAsync(
-            ReleaseId, new UpdateReleaseRepositoriesRequest(repos));
+            ReleaseId, new UpdateReleaseRepositoriesRequest(repos), await ActingUserAsync());
         if (result.Success && result.Value is not null)
         {
             _release = result.Value;

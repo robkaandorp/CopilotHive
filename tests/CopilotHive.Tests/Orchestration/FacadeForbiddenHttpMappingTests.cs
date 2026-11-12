@@ -201,8 +201,7 @@ public sealed class FacadeForbiddenHttpMappingTests : IAsyncLifetime, IDisposabl
 
     /// <summary>
     /// The GLOBAL composer write answers a Viewer with 403 for every update shape, and NOTHING is
-    /// persisted. The other config endpoints are untouched by this slice, which the 200 rows below
-    /// (a read that needs no admin) confirm.
+    /// persisted.
     /// </summary>
     [Theory]
     [InlineData("{}")]
@@ -222,16 +221,67 @@ public sealed class FacadeForbiddenHttpMappingTests : IAsyncLifetime, IDisposabl
     }
 
     /// <summary>
-    /// Other config endpoints keep their pre-slice behaviour: the composer READ has no admin
-    /// requirement, so a Viewer still gets 200. This is the control proving the 403 rows above come
-    /// from the global WRITE's authorization and not from a hub-wide block.
+    /// EVERY configuration projection is an administration surface: the Composer READ answers a
+    /// Viewer with 403 and the sanitized <c>{error}</c> body — it is the same full projection the
+    /// write is gated on, so a Viewer cannot read the global settings either. This row is the
+    /// read-side counterpart of the write rows above.
     /// </summary>
     [Fact]
-    public async Task ConfigComposerGet_IsUnchangedForAViewer()
+    public async Task ConfigComposerGet_Viewer_Gets403_WithSanitizedBody()
     {
         var response = await _configClient!.GetAsync("/api/config/composer", Ct);
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.NotEqual(HttpStatusCode.BadRequest, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(Ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal(
+            "The acting account is not authorized to perform this operation.",
+            doc.RootElement.GetProperty("error").GetString());
+    }
+
+    /// <summary>
+    /// THE POSITIVE CONTROL for the config matrix: the very same hub, over the very same facade and
+    /// the very same config, answers an ADMIN with 200 and the real projection. Without this, the
+    /// 403 rows could be satisfied by a hub that refuses everyone.
+    /// </summary>
+    [Fact]
+    public async Task ConfigComposerGet_Admin_Gets200_WithTheRealProjection()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] },
+            Composer = new ComposerConfig { Model = "copilot/composer", MaxSteps = 42 },
+        };
+        var builder = WebApplication.CreateBuilder();
+        Program.AddHiveJsonOptions(builder.Services);
+        var app = builder.Build();
+        UseIdentity(app, "http-admin");
+        app.MapConfigEndpoints(new ConfigFacade(
+            config,
+            configModel: null,
+            discovery: null,
+            NullLogger<ConfigFacade>.Instance,
+            _auth.Resolver(HiveAuthMode.AuthenticationEnabled),
+            _auth.Policy));
+        await app.StartAsync(Ct);
+        try
+        {
+            using var client = new HttpClient { BaseAddress = new Uri(app.Urls.First()) };
+            var response = await client.GetAsync("/api/config/composer", Ct);
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var body = await response.Content.ReadFromJsonAsync<JsonElement>(Ct);
+            Assert.Equal("copilot/composer", body.GetProperty("model").GetString());
+            Assert.Equal(42, body.GetProperty("maxSteps").GetInt32());
+        }
+        finally
+        {
+            await app.StopAsync(Ct);
+            await app.DisposeAsync();
+        }
     }
 
     public async ValueTask DisposeAsync()
