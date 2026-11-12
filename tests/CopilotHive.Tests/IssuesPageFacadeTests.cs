@@ -177,8 +177,8 @@ public sealed class IssuesPageFacadeTests
     /// </summary>
     [Theory]
     [InlineData("private async Task LoadIssues()", "var result = await IssueFacade.GetIssuesAsync(new IssueFilter(")]
-    [InlineData("private async Task UpdateField(LinkedIssueDto issue, string field, string newValue)", "var result = await IssueFacade.UpdateIssueAsync(issue.Id, request, CancellationToken.None);")]
-    [InlineData("private async Task DeleteIssue(LinkedIssueDto issue)", "var result = await IssueFacade.DeleteIssueAsync(issue.Id, CancellationToken.None);")]
+    [InlineData("private async Task UpdateField(LinkedIssueDto issue, string field, string newValue)", "var result = await IssueFacade.UpdateIssueAsync(issue.Id, request, await ActingUserAsync(), CancellationToken.None);")]
+    [InlineData("private async Task DeleteIssue(LinkedIssueDto issue)", "var result = await IssueFacade.DeleteIssueAsync(issue.Id, await ActingUserAsync(), CancellationToken.None);")]
     [InlineData("private async Task CreateIssue()", "var result = await IssueFacade.CreateIssueAsync(new CreateIssueRequest(")]
     public void IssuesPage_Handler_CallsItsFacadeMethod(string signature, string expectedCall)
     {

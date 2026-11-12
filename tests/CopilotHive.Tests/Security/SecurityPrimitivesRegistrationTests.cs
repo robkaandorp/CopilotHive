@@ -132,13 +132,14 @@ public sealed class SecurityPrimitivesRegistrationTests
 
     /// <summary>
     /// ENFORCEMENT IS CONFINED TO THE BOUNDARIES THE AUTHORIZATION SLICES WIRE: the Composer tool
-    /// surface and — as of the server-side authorization slice — the two facades, the two hubs, the
-    /// circuit-side identity acquisition helper and the two component call sites.
+    /// surface, the composer/config facades and hubs, the circuit-side identity acquisition helper,
+    /// the two component call sites — and, as of the GOAL/ISSUE OPERATION AUTHORIZATION slice, the
+    /// goal and issue facades plus the goal/issue routes in <c>ApiEndpoints.cs</c> (which now forward
+    /// the request's <c>HttpContext.User</c> to those facades instead of reading the stores).
     /// <para>
-    /// Every OTHER boundary (the general API endpoints, the goal/release/issue/backup facades, the
-    /// router, the nav menu, the Composer actor, the user directory and the credential entity) still
-    /// references none of the primitives, so no boundary OUTSIDE this slice's declared surface
-    /// gained enforcement. <see cref="UserService"/> and
+    /// Every OTHER boundary (the release/backup facades, the router, the nav menu, the Composer
+    /// actor, the user directory and the credential entity) still references none of the primitives,
+    /// so no boundary OUTSIDE the declared surface gained enforcement. <see cref="UserService"/> and
     /// <see cref="CopilotHive.Persistence.Entities.UserEntity"/> remain untouched contracts the
     /// primitives consume rather than modify, and <c>Program.cs</c> remains the DI registration site.
     /// </para>
@@ -149,14 +150,17 @@ public sealed class SecurityPrimitivesRegistrationTests
         var repoRoot = TestRepoRoot.Find();
         var src = Path.Combine(repoRoot, "src", "CopilotHive");
 
-        // The boundaries this iteration's slices deliberately LEFT unchanged. Wiring any of them is a
-        // new enforcement decision that must come with its own contract tests, so it fails here first.
+        // The boundaries still deliberately LEFT unchanged. Wiring any of them is a new enforcement
+        // decision that must come with its own contract tests, so it fails here first.
+        //
+        // REMOVED FROM THIS LIST BY THE GOAL/ISSUE OPERATION AUTHORIZATION SLICE (and therefore now
+        // covered by TheAuthorizedFacadesAndHubs_ReferenceTheResolverAndPolicy below):
+        // "ApiEndpoints.cs" (only its GOAL/ISSUE routes are covered — release/config/backup/
+        // clarification/session routes stay unchanged), "Services/GoalFacade.cs" and
+        // "Services/IssueFacade.cs".
         var boundaries = new[]
         {
-            "ApiEndpoints.cs",
-            "Services/GoalFacade.cs",
             "Services/ReleaseFacade.cs",
-            "Services/IssueFacade.cs",
             "Services/BackupFacade.cs",
             "Services/UserService.cs",
             "Components/Routes.razor",
@@ -193,10 +197,12 @@ public sealed class SecurityPrimitivesRegistrationTests
     }
 
     /// <summary>
-    /// THE DECLARED SERVER-SIDE SURFACE REALLY ENFORCES: the two facades resolve the acting principal
+    /// THE DECLARED SERVER-SIDE SURFACE REALLY ENFORCES: the facades resolve the acting principal
     /// through <see cref="HivePrincipalResolver"/> and consult <see cref="HivePolicy"/> on every
-    /// operation, and both hubs carry the request's identity to them. A facade or hub that dropped the
-    /// enforcement — or a re-introduced identity-free overload — fails this test.
+    /// operation (through the single <c>FacadeAuthorization</c> seam), the goal/issue REST routes in
+    /// <c>ApiEndpoints.cs</c> carry the REQUEST identity to them, and both hubs carry the request's
+    /// identity to their facades. A facade or hub that dropped the enforcement — or a re-introduced
+    /// identity-free overload — fails this test.
     /// </summary>
     [Fact]
     public void TheAuthorizedFacadesAndHubs_ReferenceTheResolverAndPolicy()
@@ -208,6 +214,10 @@ public sealed class SecurityPrimitivesRegistrationTests
         {
             "Services/ComposerFacade.cs",
             "Services/ConfigFacade.cs",
+            // The GOAL/ISSUE OPERATION AUTHORIZATION slice: every goal and issue operation is
+            // authorized before any store work.
+            "Services/GoalFacade.cs",
+            "Services/IssueFacade.cs",
         })
         {
             var body = TestSourceScanner.StripNonCode(
@@ -220,6 +230,27 @@ public sealed class SecurityPrimitivesRegistrationTests
             // The SCOPED circuit accessor must never be captured by a facade.
             Assert.DoesNotContain("CircuitUserPrincipalAccessor", body, StringComparison.Ordinal);
         }
+
+        // THE GOAL/ISSUE ROUTES FORWARD THE REQUEST IDENTITY: every covered handler takes the
+        // HttpContext and passes its User to the facade, so the facade can re-resolve current state.
+        // The collapsed (whitespace-free) form is used so a reformatted parameter list can neither
+        // hide nor fake the wiring.
+        var api = TestSourceScanner.StripNonCode(
+            File.ReadAllText(Path.Combine(src, "ApiEndpoints.cs")).ReplaceLineEndings("\n"));
+        var apiCollapsed = new string(api.Where(c => !char.IsWhiteSpace(c)).ToArray());
+        Assert.Contains("HttpContextcontext", apiCollapsed, StringComparison.Ordinal);
+        Assert.Contains("context.User", apiCollapsed, StringComparison.Ordinal);
+
+        // No covered goal/issue read or mutation reaches a store directly any more: the routes bind
+        // the FACADE, not IGoalStore/IIssueStore, except goal creation (a separate dependent goal).
+        Assert.DoesNotContain(
+            "MapGet(\"/\",async(IGoalStorestore)", apiCollapsed, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "MapGet(\"/{id}\",async(stringid,IGoalStorestore)", apiCollapsed, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "MapGet(\"/search\",async(stringq,string?status,IGoalStorestore)", apiCollapsed, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "review-status\",async(stringid,GoalReviewStatusUpdateupdate,IGoalStorestore", apiCollapsed, StringComparison.Ordinal);
 
         foreach (var relativePath in new[]
         {

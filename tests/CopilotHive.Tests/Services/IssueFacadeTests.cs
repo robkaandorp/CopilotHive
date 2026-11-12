@@ -1,5 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -153,7 +154,14 @@ public sealed class IssueFacadeTests
     private static IssueFacade CreateFacade(
         RecordingIssueStore store,
         IEventBus? eventBus = null)
-        => new(store, eventBus, NullLogger<IssueFacade>.Instance);
+        => new(store, eventBus, OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy, NullLogger<IssueFacade>.Instance);
+
+    /// <summary>
+    /// The OPEN-MODE identity: no cascade exists in open mode, so the caller passes <c>null</c> and
+    /// the production resolver answers with the legacy full local operator — which is exactly what
+    /// these pre-existing behavioural tests exercised.
+    /// </summary>
+    private static readonly System.Security.Claims.ClaimsPrincipal? OpenModeUser = null;
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
@@ -165,7 +173,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -188,7 +196,7 @@ public sealed class IssueFacadeTests
 
         var result = await facade.GetIssuesAsync(new IssueFilter(
             Status: "in_progress", Type: "bug", Severity: "high",
-            Repository: "CopilotHive", SourceGoalId: "goal-1", LinkedGoalId: "goal-2"), Ct);
+            Repository: "CopilotHive", SourceGoalId: "goal-1", LinkedGoalId: "goal-2"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var issue = Assert.Single(result.Value!);
@@ -209,7 +217,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(Status: value), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(Status: value), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -228,7 +236,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(Type: value), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(Type: value), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -246,7 +254,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(Severity: value), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(Severity: value), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -261,7 +269,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("cq", type: IssueType.CodeQuality));
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(Type: "codequality"), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(Type: "codequality"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var issue = Assert.Single(result.Value!);
@@ -277,7 +285,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("in-progress-issue", status: IssueStatus.InProgress));
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(Status: "in_progress"), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(Status: "in_progress"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var issue = Assert.Single(result.Value!);
@@ -293,7 +301,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("a", sourceGoalId: "goal-1", linkedGoalId: "goal-2"));
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssuesAsync(new IssueFilter(), Ct);
+        var result = await facade.GetIssuesAsync(new IssueFilter(), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var dto = Assert.Single(result.Value!);
@@ -312,7 +320,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("found"));
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssueAsync("found", Ct);
+        var result = await facade.GetIssueAsync("found", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -326,7 +334,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.GetIssueAsync("missing", Ct);
+        var result = await facade.GetIssueAsync("missing", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -343,7 +351,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store, eventBus);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "new-issue", Type: IssueType.Bug, Title: "My issue", Description: "Desc"), Ct);
+            Id: "new-issue", Type: IssueType.Bug, Title: "My issue", Description: "Desc"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -368,7 +376,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store, eventBus: null);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "new-issue", Type: IssueType.Bug, Title: "My issue", Description: "Desc"), Ct);
+            Id: "new-issue", Type: IssueType.Bug, Title: "My issue", Description: "Desc"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal("new-issue", result.Value!.Id);
@@ -382,7 +390,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store, eventBus);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "invalid id", Type: null, Title: " ", Description: " "), Ct);
+            Id: "invalid id", Type: null, Title: " ", Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -400,7 +408,7 @@ public sealed class IssueFacadeTests
         // Every later rule also fails: only checking Type before Title, Description, and ID
         // can produce the frozen Type error.
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "Bad ID!", Type: null, Title: " ", Description: " "), Ct);
+            Id: "Bad ID!", Type: null, Title: " ", Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -416,7 +424,7 @@ public sealed class IssueFacadeTests
 
         // Description and ID are also invalid: Title must win after Type has passed.
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "Bad ID!", Type: IssueType.Bug, Title: "  ", Description: " "), Ct);
+            Id: "Bad ID!", Type: IssueType.Bug, Title: "  ", Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -432,7 +440,7 @@ public sealed class IssueFacadeTests
 
         // ID is also invalid: Description must win after Type and Title have passed.
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "Bad ID!", Type: IssueType.Bug, Title: "T", Description: " "), Ct);
+            Id: "Bad ID!", Type: IssueType.Bug, Title: "T", Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -447,7 +455,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "Bad ID!", Type: IssueType.Bug, Title: "T", Description: "D"), Ct);
+            Id: "Bad ID!", Type: IssueType.Bug, Title: "T", Description: "D"), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -462,7 +470,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "   ", Type: IssueType.Bug, Title: "My Great Issue", Description: "D"), Ct);
+            Id: "   ", Type: IssueType.Bug, Title: "My Great Issue", Description: "D"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal("my-great-issue", result.Value!.Id);
@@ -475,7 +483,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: null, Type: IssueType.Bug, Title: "My Great Issue", Description: "D"), Ct);
+            Id: null, Type: IssueType.Bug, Title: "My Great Issue", Description: "D"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal("my-great-issue", result.Value!.Id);
@@ -490,7 +498,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store, eventBus);
 
         var result = await facade.CreateIssueAsync(new CreateIssueRequest(
-            Id: "dup", Type: IssueType.Bug, Title: "T", Description: "D"), Ct);
+            Id: "dup", Type: IssueType.Bug, Title: "T", Description: "D"), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -511,7 +519,7 @@ public sealed class IssueFacadeTests
 
         var ex = await Assert.ThrowsAsync<DbUpdateException>(
             () => facade.CreateIssueAsync(new CreateIssueRequest(
-                Id: "new-issue", Type: IssueType.Bug, Title: "T", Description: "D"), Ct));
+                Id: "new-issue", Type: IssueType.Bug, Title: "T", Description: "D"), OpenModeUser, Ct));
 
         Assert.Same(persistenceFailure, ex);
         Assert.Empty(eventBus.Published);
@@ -528,7 +536,7 @@ public sealed class IssueFacadeTests
 
         var ex = await Assert.ThrowsAsync<ArgumentException>(
             () => facade.CreateIssueAsync(new CreateIssueRequest(
-                Id: "new-issue", Type: IssueType.Bug, Title: "T", Description: "D"), Ct));
+                Id: "new-issue", Type: IssueType.Bug, Title: "T", Description: "D"), OpenModeUser, Ct));
 
         Assert.Equal("bad argument", ex.Message);
     }
@@ -543,7 +551,7 @@ public sealed class IssueFacadeTests
 
         // Both later validations fail, but existence is checked FIRST.
         var result = await facade.UpdateIssueAsync(
-            "missing", new UpdateIssueRequest(Title: "  ", Description: " "), Ct);
+            "missing", new UpdateIssueRequest(Title: "  ", Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -560,7 +568,7 @@ public sealed class IssueFacadeTests
 
         // Description is also blank, proving Title validation runs first.
         var result = await facade.UpdateIssueAsync(
-            "existing", new UpdateIssueRequest(Title: "  ", Description: " "), Ct);
+            "existing", new UpdateIssueRequest(Title: "  ", Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -575,7 +583,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("existing"));
         var facade = CreateFacade(store);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Description: " "), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Description: " "), OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -590,7 +598,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("existing", status: IssueStatus.Open));
         var facade = CreateFacade(store);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Title: "New title"), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Title: "New title"), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -608,7 +616,7 @@ public sealed class IssueFacadeTests
         var eventBus = new RecordingEventBus();
         var facade = CreateFacade(store, eventBus);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var evt = Assert.Single(eventBus.Published);
@@ -628,7 +636,7 @@ public sealed class IssueFacadeTests
         var eventBus = new RecordingEventBus();
         var facade = CreateFacade(store, eventBus);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Closed), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Closed), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var evt = Assert.Single(eventBus.Published);
@@ -648,7 +656,7 @@ public sealed class IssueFacadeTests
         var eventBus = new RecordingEventBus();
         var facade = CreateFacade(store, eventBus);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Empty(eventBus.Published);
@@ -662,7 +670,7 @@ public sealed class IssueFacadeTests
         var eventBus = new RecordingEventBus();
         var facade = CreateFacade(store, eventBus);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.InProgress), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.InProgress), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Empty(eventBus.Published);
@@ -676,7 +684,7 @@ public sealed class IssueFacadeTests
         var eventBus = new RecordingEventBus();
         var facade = CreateFacade(store, eventBus);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var evt = Assert.Single(eventBus.Published);
@@ -690,7 +698,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("existing", status: IssueStatus.Open));
         var facade = CreateFacade(store, eventBus: null);
 
-        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), Ct);
+        var result = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Status: IssueStatus.Resolved), OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal("existing", result.Value!.Id);
@@ -708,7 +716,7 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Title: "New"), Ct));
+            () => facade.UpdateIssueAsync("existing", new UpdateIssueRequest(Title: "New"), OpenModeUser, Ct));
 
         Assert.Equal("store failure", ex.Message);
     }
@@ -721,12 +729,12 @@ public sealed class IssueFacadeTests
         var facade = CreateFacade(store);
 
         // Empty string clears the linked goal.
-        var cleared = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(LinkedGoalId: ""), Ct);
+        var cleared = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(LinkedGoalId: ""), OpenModeUser, Ct);
         Assert.True(cleared.Success);
         Assert.Null(cleared.Value!.LinkedGoalId);
 
         // Non-empty sets it.
-        var set = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(LinkedGoalId: "goal-2"), Ct);
+        var set = await facade.UpdateIssueAsync("existing", new UpdateIssueRequest(LinkedGoalId: "goal-2"), OpenModeUser, Ct);
         Assert.True(set.Success);
         Assert.Equal("goal-2", set.Value!.LinkedGoalId);
     }
@@ -740,7 +748,7 @@ public sealed class IssueFacadeTests
         store.AddIssue(MakeIssue("doomed"));
         var facade = CreateFacade(store);
 
-        var result = await facade.DeleteIssueAsync("doomed", Ct);
+        var result = await facade.DeleteIssueAsync("doomed", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -755,7 +763,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.DeleteIssueAsync("missing", Ct);
+        var result = await facade.DeleteIssueAsync("missing", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -768,7 +776,7 @@ public sealed class IssueFacadeTests
         var store = new RecordingIssueStore { DeleteReturnsFalse = true };
         var facade = CreateFacade(store);
 
-        var result = await facade.DeleteIssueAsync("missing", Ct);
+        var result = await facade.DeleteIssueAsync("missing", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);

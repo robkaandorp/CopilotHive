@@ -1001,30 +1001,41 @@ public sealed class Program
                     sp.GetRequiredService<ILogger<IssueStore>>()));
 
             // Goal facade: ALWAYS registered so the goal endpoints (and the Goals / Goal Detail
-            // components) resolve it unconditionally. The optional dependencies are resolved
-            // with GetService exactly where the endpoints resolved them optionally
-            // ([FromServices] nullable parameters): the Brain repo manager, the knowledge
-            // document cleanup service, the goal-ready notifier and the dispatcher. The goal
-            // store, issue store, review service and dashboard notifier are required — the
+            // components) resolve it unconditionally. AUTHORIZATION is part of every operation: the
+            // facade holds the stateless resolver + policy (never the scoped circuit accessor), so
+            // each call re-resolves the caller's CURRENT role/enabled state before any store work.
+            // The optional dependencies are resolved with GetService exactly where the endpoints
+            // resolved them optionally ([FromServices] nullable parameters): the Brain repo manager,
+            // the knowledge document cleanup service, the goal-ready notifier, the dispatcher and the
+            // two live dashboard sources (whose reads the covered pages route through this facade).
+            // The goal store, issue store, review service and dashboard notifier are required — the
             // endpoints bound them as required services too.
             builder.Services.AddSingleton<IGoalFacade>(sp => new GoalFacade(
                 sp.GetRequiredService<IGoalStore>(),
                 sp.GetRequiredService<IIssueStore>(),
                 sp.GetRequiredService<GoalReviewService>(),
                 sp.GetRequiredService<DashboardNotifier>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
+                sp.GetRequiredService<ILogger<GoalFacade>>(),
                 sp.GetService<IBrainRepoManager>(),
                 sp.GetService<KnowledgeDocumentCleanupService>(),
                 sp.GetService<GoalReadyNotifier>(),
                 sp.GetService<GoalDispatcher>(),
-                sp.GetRequiredService<ILogger<GoalFacade>>()));
+                sp.GetService<DashboardStateService>(),
+                sp.GetService<ProgressReportService>()));
 
             // Issue facade: ALWAYS registered so the issue endpoints and the Issues component
-            // resolve it unconditionally. The event bus is resolved with GetService exactly where
-            // the endpoints resolved it optionally ([FromServices] nullable parameter): in open
-            // mode (no composer) it is null and event publication is skipped silently.
+            // resolve it unconditionally. AUTHORIZATION is part of every operation (same stateless
+            // resolver + policy, never the scoped circuit accessor). The event bus is resolved with
+            // GetService exactly where the endpoints resolved it optionally ([FromServices] nullable
+            // parameter): in open mode (no composer) it is null and event publication is skipped
+            // silently.
             builder.Services.AddSingleton<IIssueFacade>(sp => new IssueFacade(
                 sp.GetRequiredService<IIssueStore>(),
                 sp.GetService<IEventBus>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
                 sp.GetRequiredService<ILogger<IssueFacade>>()));
 
             // Release facade: ALWAYS registered so the release endpoints (and, in a follow-up

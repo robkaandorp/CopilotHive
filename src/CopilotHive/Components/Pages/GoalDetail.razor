@@ -2,15 +2,17 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using CopilotHive.Orchestration
+@using CopilotHive.Security
 @using CopilotHive.Services
 @using Markdig
+@using System.Security.Claims
 @implements IDisposable
 @inject DashboardStateService State
-@inject ProgressReportService ProgressReports
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @inject IGoalFacade GoalFacade
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject PageHeaderState PageHeader
 
 @if (_detail is not null || _storedGoal is not null)
@@ -931,6 +933,11 @@
         </div>
     </div>
 }
+else if (!string.IsNullOrEmpty(_loadError))
+{
+    @* A REFUSED (or otherwise failed) read: nothing previously loaded is presented. *@
+    <p class="error-msg">@_loadError</p>
+}
 else
 {
     <p>Goal not found.</p>
@@ -955,6 +962,7 @@ else
     private string? _deleteError;
     private bool _extendingIterations;
     private string? _extendError;
+    private string? _loadError;
     private Dictionary<string, GoalStatus> _dependencyStatuses = new();
     private List<Release> _planningReleases = [];
     private string _selectedReleaseId = "";
@@ -963,6 +971,27 @@ else
     // Issues referencing this goal, read through IGoalFacade.GetLinkedIssuesAsync as the
     // shared LinkedIssueDto — the page no longer models its own issue shape.
     private List<LinkedIssueDto> _linkedIssues = [];
+
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. This is also the page's MINIMAL circuit
+    /// identity acquisition: the scoped <see cref="CircuitUserPrincipalAccessor"/> is initialised
+    /// from the same cascading state exactly once per circuit.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
 
     protected override Task OnInitializedAsync()
     {
@@ -980,72 +1009,109 @@ else
         await RefreshAsync();
     }
 
+    /// <summary>
+    /// Reads EVERYTHING this page renders through the AUTHORIZED facade: the live dashboard detail,
+    /// the live progress feed, the stored goal (and its iterations) for the completed/failed path,
+    /// the dependency statuses and the linked issues. The release-assignment dropdown keeps reading
+    /// the store's release list, which is this slice's explicit exception.
+    /// <para>
+    /// A REFUSED read CLEARS every previously loaded goal/live/detail/progress/dependency/iteration
+    /// value and stops — there is deliberately no fallback to a direct store read, and no stale data
+    /// is ever presented after a denial.
+    /// </para>
+    /// </summary>
     private async Task RefreshAsync()
     {
-        _detail = await State.GetGoalDetail(GoalId);
-        _progress = ProgressReports.GetProgressForGoal(GoalId);
+        var user = await ActingUserAsync();
+        var ct = CancellationToken.None;
+
+        var detailResult = await GoalFacade.GetLiveGoalDetailAsync(GoalId, user, ct);
+        if (!detailResult.Success)
+        {
+            ClearLoadedState(detailResult.Error);
+            return;
+        }
+        _detail = detailResult.Value;
+
+        var progressResult = await GoalFacade.GetProgressAsync(GoalId, user, ct);
+        if (!progressResult.Success)
+        {
+            ClearLoadedState(progressResult.Error);
+            return;
+        }
+        _progress = progressResult.Value ?? [];
 
         // Fallback: load from SQLite for completed/failed goals not in active pipelines
         if (_detail is null)
         {
-            _storedGoal = await GoalStore.GetGoalAsync(GoalId);
-            _storedIterations = _storedGoal is not null
-                ? await GoalStore.GetIterationsAsync(GoalId)
-                : [];
+            var storedResult = await GoalFacade.GetGoalAsync(GoalId, user, ct);
+            if (storedResult.Kind == FacadeErrorKind.Forbidden)
+            {
+                ClearLoadedState(storedResult.Error);
+                return;
+            }
+            _storedGoal = storedResult.Success ? storedResult.Value : null;
+
+            if (_storedGoal is not null)
+            {
+                var iterationsResult = await GoalFacade.GetIterationsAsync(GoalId, user, ct);
+                if (!iterationsResult.Success)
+                {
+                    ClearLoadedState(iterationsResult.Error);
+                    return;
+                }
+                _storedIterations = iterationsResult.Value ?? [];
+            }
+            else
+            {
+                _storedIterations = [];
+            }
         }
         else
         {
             _storedGoal = null;
             _storedIterations = [];
+
+            // Resolve release ID — the pipeline goal does not carry ReleaseId, so the stored goal is
+            // read through the SAME authorized facade read.
+            var liveResult = await GoalFacade.GetGoalAsync(GoalId, user, ct);
+            if (liveResult.Kind == FacadeErrorKind.Forbidden)
+            {
+                ClearLoadedState(liveResult.Error);
+                return;
+            }
+            _goalReleaseId = liveResult.Success ? liveResult.Value?.ReleaseId : null;
         }
+
+        if (_detail is null)
+            _goalReleaseId = _storedGoal?.ReleaseId;
 
         // Build timeline for the active iteration
         BuildActiveTimeline();
 
-        // Resolve release ID — load from store for _detail branch (pipeline goals don't carry ReleaseId)
-        if (_detail is not null)
-        {
-            var liveGoal = await GoalStore.GetGoalAsync(GoalId);
-            _goalReleaseId = liveGoal?.ReleaseId;
-        }
-        else
-        {
-            _goalReleaseId = _storedGoal?.ReleaseId;
-        }
-
         // Pre-fetch dependency statuses for display
-        var depIds = _detail?.DependsOn ?? _storedGoal?.DependsOn ?? [];
-        if (depIds.Count > 0)
+        var depResult = await GoalFacade.GetDependencyStatusesAsync(GoalId, user, ct);
+        if (!depResult.Success)
         {
-            var statuses = new Dictionary<string, GoalStatus>();
-            foreach (var depId in depIds)
-            {
-                var depDetail = await State.GetGoalDetail(depId);
-                if (depDetail is not null)
-                {
-                    statuses[depId] = depDetail.Status;
-                }
-                else
-                {
-                    var stored = await GoalStore.GetGoalAsync(depId);
-                    if (stored is not null)
-                        statuses[depId] = stored.Status;
-                }
-            }
-            _dependencyStatuses = statuses;
+            ClearLoadedState(depResult.Error);
+            return;
         }
-        else
-        {
-            _dependencyStatuses = new();
-        }
+        _dependencyStatuses = new Dictionary<string, GoalStatus>(depResult.Value ?? new Dictionary<string, GoalStatus>());
 
         // Fetch issues related to this goal (linked or source). The facade performs BOTH
         // queries (source-goal and linked-goal) and deduplicates by ID, exactly as the two
         // separate HTTP reads plus the local merge used to.
-        var linkedIssuesResult = await GoalFacade.GetLinkedIssuesAsync(GoalId, CancellationToken.None);
+        var linkedIssuesResult = await GoalFacade.GetLinkedIssuesAsync(GoalId, user, ct);
+        if (linkedIssuesResult.Kind == FacadeErrorKind.Forbidden)
+        {
+            ClearLoadedState(linkedIssuesResult.Error);
+            return;
+        }
         _linkedIssues = linkedIssuesResult.Success
             ? linkedIssuesResult.Value?.ToList() ?? []
             : [];
+
+        _loadError = null;
 
         // Load Planning releases for release-assignment dropdown (shown when goal is Completed and unassigned)
         var goalStatus = _detail?.Status ?? _storedGoal?.Status;
@@ -1064,6 +1130,28 @@ else
         {
             _planningReleases = [];
         }
+    }
+
+    /// <summary>
+    /// Clears EVERYTHING this page previously loaded — the live detail, the stored goal, its
+    /// iterations, the progress feed, the timeline, the dependency statuses, the linked issues and
+    /// the release dropdown — and records why. A denied refresh therefore presents NO stale data.
+    /// </summary>
+    /// <param name="error">The facade error to display, or <c>null</c>.</param>
+    private void ClearLoadedState(string? error)
+    {
+        _detail = null;
+        _storedGoal = null;
+        _storedIterations = [];
+        _progress = [];
+        _timeline = [];
+        _lastTimelineCount = 0;
+        _dependencyStatuses = new();
+        _linkedIssues = [];
+        _planningReleases = [];
+        _goalReleaseId = null;
+        _selectedReleaseId = "";
+        _loadError = error ?? "This goal could not be loaded.";
     }
 
     private void RefreshState() => InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); });
@@ -1284,7 +1372,7 @@ else
     private async Task ApproveGoal()
     {
         _approveError = null;
-        var result = await GoalFacade.UpdateGoalStatusAsync(GoalId, "Pending");
+        var result = await GoalFacade.UpdateGoalStatusAsync(GoalId, "Pending", await ActingUserAsync());
         if (result.Success)
         {
             await RefreshAsync();
@@ -1304,7 +1392,7 @@ else
         _reviewError = null;
         try
         {
-            var result = await GoalFacade.RequestReviewAsync(GoalId, CancellationToken.None);
+            var result = await GoalFacade.RequestReviewAsync(GoalId, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _reviewError = null;
@@ -1327,7 +1415,7 @@ else
     private async Task RevertToDraft()
     {
         _revertError = null;
-        var result = await GoalFacade.UpdateGoalStatusAsync(GoalId, "Draft");
+        var result = await GoalFacade.UpdateGoalStatusAsync(GoalId, "Draft", await ActingUserAsync());
         if (result.Success)
         {
             await RefreshAsync();
@@ -1348,7 +1436,7 @@ else
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to cancel goal '{GoalId}'?");
         if (!confirmed) return;
 
-        var result = await GoalFacade.CancelGoalAsync(GoalId);
+        var result = await GoalFacade.CancelGoalAsync(GoalId, await ActingUserAsync());
         if (result.Success)
         {
             await RefreshAsync();
@@ -1367,7 +1455,7 @@ else
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to delete goal '{GoalId}'?");
         if (!confirmed) return;
 
-        var result = await GoalFacade.DeleteGoalAsync(GoalId);
+        var result = await GoalFacade.DeleteGoalAsync(GoalId, await ActingUserAsync());
         if (result.Success)
         {
             Nav.NavigateTo("/goals");
@@ -1385,7 +1473,7 @@ else
         _extendingIterations = true;
         try
         {
-            var result = await GoalFacade.ExtendIterationsAsync(GoalId, 5, CancellationToken.None);
+            var result = await GoalFacade.ExtendIterationsAsync(GoalId, 5, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await RefreshAsync();
@@ -1472,7 +1560,7 @@ else
         _releaseAssignError = null;
         if (string.IsNullOrEmpty(_selectedReleaseId)) return;
 
-        var result = await GoalFacade.AttachReleaseAsync(GoalId, _selectedReleaseId);
+        var result = await GoalFacade.AttachReleaseAsync(GoalId, _selectedReleaseId, await ActingUserAsync());
         if (result.Success)
         {
             // Update local state

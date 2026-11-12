@@ -423,12 +423,12 @@ public sealed class GoalDetailExtendButtonTests
     /// another handler's call cannot satisfy it.
     /// </summary>
     [Theory]
-    [InlineData("private async Task ApproveGoal()", "GoalFacade.UpdateGoalStatusAsync(GoalId, \"Pending\")")]
-    [InlineData("private async Task RevertToDraft()", "GoalFacade.UpdateGoalStatusAsync(GoalId, \"Draft\")")]
-    [InlineData("private async Task ReviewGoal()", "GoalFacade.RequestReviewAsync(GoalId")]
-    [InlineData("private async Task CancelGoal()", "GoalFacade.CancelGoalAsync(GoalId)")]
-    [InlineData("private async Task DeleteCurrentGoal()", "GoalFacade.DeleteGoalAsync(GoalId)")]
-    [InlineData("private async Task AssignToRelease()", "GoalFacade.AttachReleaseAsync(GoalId")]
+    [InlineData("private async Task ApproveGoal()", "GoalFacade.UpdateGoalStatusAsync(GoalId, \"Pending\", await ActingUserAsync())")]
+    [InlineData("private async Task RevertToDraft()", "GoalFacade.UpdateGoalStatusAsync(GoalId, \"Draft\", await ActingUserAsync())")]
+    [InlineData("private async Task ReviewGoal()", "GoalFacade.RequestReviewAsync(GoalId, await ActingUserAsync()")]
+    [InlineData("private async Task CancelGoal()", "GoalFacade.CancelGoalAsync(GoalId, await ActingUserAsync())")]
+    [InlineData("private async Task DeleteCurrentGoal()", "GoalFacade.DeleteGoalAsync(GoalId, await ActingUserAsync())")]
+    [InlineData("private async Task AssignToRelease()", "GoalFacade.AttachReleaseAsync(GoalId, _selectedReleaseId, await ActingUserAsync()")]
     public void GoalDetail_Handler_CallsItsFacadeMethod(string signature, string expectedCall)
     {
         var method = ExtractMethodSource(ReadGoalDetailRazorSource(), signature);
@@ -494,10 +494,10 @@ public sealed class GoalDetailExtendButtonTests
     /// single reverted handler fails.
     /// </summary>
     [Theory]
-    [InlineData("private async Task DeleteGoal(string goalId)", "GoalFacade.DeleteGoalAsync(goalId)")]
-    [InlineData("private async Task ApproveGoal(string goalId)", "GoalFacade.UpdateGoalStatusAsync(goalId, \"Pending\")")]
-    [InlineData("private async Task RevertToDraft(string goalId)", "GoalFacade.UpdateGoalStatusAsync(goalId, \"Draft\")")]
-    [InlineData("private async Task RetryFailedGoal(string goalId)", "GoalFacade.UpdateGoalStatusAsync(goalId, \"Draft\")")]
+    [InlineData("private async Task DeleteGoal(string goalId)", "GoalFacade.DeleteGoalAsync(goalId, await ActingUserAsync())")]
+    [InlineData("private async Task ApproveGoal(string goalId)", "GoalFacade.UpdateGoalStatusAsync(goalId, \"Pending\", await ActingUserAsync())")]
+    [InlineData("private async Task RevertToDraft(string goalId)", "GoalFacade.UpdateGoalStatusAsync(goalId, \"Draft\", await ActingUserAsync())")]
+    [InlineData("private async Task RetryFailedGoal(string goalId)", "GoalFacade.UpdateGoalStatusAsync(goalId, \"Draft\", await ActingUserAsync())")]
     public void GoalsPage_Handler_CallsItsFacadeMethod(string signature, string expectedCall)
     {
         var method = ExtractMethodSource(ReadGoalsRazorSource(), signature);
