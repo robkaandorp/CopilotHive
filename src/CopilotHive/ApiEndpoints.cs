@@ -81,19 +81,38 @@ public static class ApiEndpoints
     /// <summary>
     /// Registers the goals REST API endpoints under <c>/api/goals</c>.
     /// </summary>
+    /// <remarks>
+    /// EVERY covered goal route — the three GET reads, the status/review-status/review/cancel/
+    /// extend-iterations/release mutations and the delete — delegates to <see cref="IGoalFacade"/>
+    /// with the REQUEST's identity (<see cref="HttpContext.User"/>), so the facade re-resolves the
+    /// caller's CURRENT role/enabled state and answers <see cref="FacadeErrorKind.Forbidden"/> (403)
+    /// before any store work. Goal CREATION (<c>POST /api/goals</c>) is deliberately unchanged: it is
+    /// a separate, dependent goal.
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapGoalEndpoints(this WebApplication app)
     {
         // ── Goals REST API ───────────────────────────────────────────────────────
         var goalsApi = app.MapGroup("/api/goals");
 
-        goalsApi.MapGet("/", async (IGoalStore store) =>
-            Results.Ok(await store.GetAllGoalsAsync()));
-
-        goalsApi.MapGet("/{id}", async (string id, IGoalStore store) =>
+        // IDENTITY IS PER REQUEST: each covered handler forwards the request's authenticated
+        // principal (HttpContext.User) to the facade, which re-resolves the caller's CURRENT
+        // role/enabled state and requires shared read (GET) or ExecutionOperator (mutations).
+        goalsApi.MapGet("/", async (HttpContext context, [FromServices] IGoalFacade facade, CancellationToken ct) =>
         {
-            var goal = await store.GetGoalAsync(id);
-            return goal is null ? Results.NotFound(new { error = $"Goal '{id}' not found." }) : Results.Ok(goal);
+            var result = await facade.GetGoalsAsync(context.User, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
+        });
+
+        goalsApi.MapGet("/{id}", async (string id, HttpContext context,
+            [FromServices] IGoalFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.GetGoalAsync(id, context.User, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
         goalsApi.MapPost("/", async (Goal goal, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier,
@@ -121,35 +140,35 @@ public static class ApiEndpoints
             }
         });
 
-        goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update,
+        goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, HttpContext context,
             [FromServices] IGoalFacade facade) =>
         {
-            var result = await facade.UpdateGoalStatusAsync(id, update.Status);
+            var result = await facade.UpdateGoalStatusAsync(id, update.Status, context.User);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapDelete("/{id}", async (string id, [FromServices] IGoalFacade facade) =>
+        goalsApi.MapDelete("/{id}", async (string id, HttpContext context, [FromServices] IGoalFacade facade) =>
         {
-            var result = await facade.DeleteGoalAsync(id);
+            var result = await facade.DeleteGoalAsync(id, context.User);
             return result.Success
                 ? Results.NoContent()
                 : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapPost("/{id}/cancel", async (string id, [FromServices] IGoalFacade facade) =>
+        goalsApi.MapPost("/{id}/cancel", async (string id, HttpContext context, [FromServices] IGoalFacade facade) =>
         {
-            var result = await facade.CancelGoalAsync(id);
+            var result = await facade.CancelGoalAsync(id, context.User);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
         });
 
         goalsApi.MapPost("/{id}/extend-iterations", async (string id, ExtendIterationsRequest request,
-            [FromServices] IGoalFacade facade, CancellationToken ct) =>
+            HttpContext context, [FromServices] IGoalFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.ExtendIterationsAsync(id, request.AdditionalIterations, ct);
+            var result = await facade.ExtendIterationsAsync(id, request.AdditionalIterations, context.User, ct);
             if (result.Success)
                 return Results.Ok(result.Value);
 
@@ -160,52 +179,37 @@ public static class ApiEndpoints
                 : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapGet("/search", async (string q, string? status, IGoalStore store) =>
+        goalsApi.MapGet("/search", async (string q, string? status, HttpContext context,
+            [FromServices] IGoalFacade facade, CancellationToken ct) =>
         {
-            GoalStatus? statusFilter = null;
-            if (!string.IsNullOrEmpty(status) && Enum.TryParse<GoalStatus>(status, ignoreCase: true, out var s))
-                statusFilter = s;
-            var results = await store.SearchGoalsAsync(q, statusFilter);
-            return Results.Ok(results);
-        });
-
-        goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request,
-            [FromServices] IGoalFacade facade) =>
-        {
-            var result = await facade.AttachReleaseAsync(id, request.ReleaseId);
+            var result = await facade.SearchGoalsAsync(q, status, context.User, ct);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request,
+            HttpContext context, [FromServices] IGoalFacade facade) =>
         {
-            var goal = await store.GetGoalAsync(id);
-            if (goal is null)
-                return Results.NotFound(new { error = $"Goal '{id}' not found." });
-
-            // Reject numeric input — only named enum values are accepted.
-            if (int.TryParse(update.ReviewStatus, out _))
-                return Results.BadRequest(new { error = "Invalid review status. Valid values: none, pending, approved, needschanges." });
-
-            // Parse and validate that the result is a defined single enum value.
-            if (!Enum.TryParse<ReviewStatus>(update.ReviewStatus, ignoreCase: true, out var reviewStatus) || !Enum.IsDefined(reviewStatus))
-                return Results.BadRequest(new { error = "Invalid review status. Valid values: none, pending, approved, needschanges." });
-
-            // Reject comma-combined inputs (e.g. "Pending, Approved") that Enum.TryParse may accept via bitwise OR.
-            if (update.ReviewStatus.Contains(','))
-                return Results.BadRequest(new { error = "Invalid review status. Valid values: none, pending, approved, needschanges." });
-
-            goal.ReviewStatus = reviewStatus;
-            await store.UpdateGoalAsync(goal);
-            var updated = await store.GetGoalAsync(id);
-            dashboardNotifier.NotifyStateChanged();
-            return Results.Ok(updated);
+            var result = await facade.AttachReleaseAsync(id, request.ReleaseId, context.User);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapPost("/{goalId}/review", async (string goalId, [FromServices] IGoalFacade facade, CancellationToken ct) =>
+        goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update,
+            HttpContext context, [FromServices] IGoalFacade facade) =>
         {
-            var result = await facade.RequestReviewAsync(goalId, ct);
+            var result = await facade.UpdateReviewStatusAsync(id, update.ReviewStatus, context.User);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
+        });
+
+        goalsApi.MapPost("/{goalId}/review", async (string goalId, HttpContext context,
+            [FromServices] IGoalFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.RequestReviewAsync(goalId, context.User, ct);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
@@ -215,9 +219,10 @@ public static class ApiEndpoints
     /// <summary>
     /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IGoalFacade"/> to the exact HTTP
     /// response the pre-facade goal handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
-    /// <c>Conflict</c> all return a JSON <c>{error}</c> body. <see cref="FacadeErrorKind.None"/>
-    /// is a programming error (a success result must not be mapped here) and throws, as does
-    /// any kind these six routes never produce — including
+    /// <c>Conflict</c> all return a JSON <c>{error}</c> body, and the AUTHORIZATION answer
+    /// <c>Forbidden</c> returns HTTP 403 with the same body shape.
+    /// <see cref="FacadeErrorKind.None"/> is a programming error (a success result must not be mapped
+    /// here) and throws, as does any kind these routes never produce — including
     /// <see cref="FacadeErrorKind.ServiceUnavailable"/>, which only the extend-iterations route
     /// produces and handles itself as a bare bodyless 503.
     /// </summary>
@@ -231,6 +236,7 @@ public static class ApiEndpoints
             FacadeErrorKind.NotFound => Results.NotFound(new { error }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
             FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            FacadeErrorKind.Forbidden => Results.Json(new { error }, statusCode: StatusCodes.Status403Forbidden),
             _ => throw new InvalidOperationException($"Unexpected goal facade error kind: {kind}."),
         };
     }
@@ -380,14 +386,24 @@ public static class ApiEndpoints
     /// <summary>
     /// Registers the issues REST API endpoints under <c>/api/issues</c>.
     /// </summary>
+    /// <remarks>
+    /// EVERY issue route delegates to <see cref="IIssueFacade"/> with the REQUEST's identity
+    /// (<see cref="HttpContext.User"/>), so the facade re-resolves the caller's CURRENT
+    /// role/enabled state before any store work: reads need shared read, create needs
+    /// <see cref="Security.HiveCapability.InteractiveMember"/>, and the whole update/delete surface
+    /// needs <see cref="Security.HiveCapability.ExecutionOperator"/>.
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapIssueEndpoints(this WebApplication app)
     {
         // ── Issues REST API ─────────────────────────────────────────────────────
         var issuesApi = app.MapGroup("/api/issues");
 
+        // IDENTITY IS PER REQUEST: each handler forwards the request's authenticated principal
+        // (HttpContext.User) to the facade, which re-resolves the caller's CURRENT role/enabled state.
         issuesApi.MapGet("/", async (string? status, string? type, string? severity, string? repository,
-            string? source_goal_id, string? linked_goal_id, [FromServices] IIssueFacade facade, CancellationToken ct) =>
+            string? source_goal_id, string? linked_goal_id, HttpContext context,
+            [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
             var result = await facade.GetIssuesAsync(new IssueFilter(
                 Status: status,
@@ -395,39 +411,43 @@ public static class ApiEndpoints
                 Severity: severity,
                 Repository: repository,
                 SourceGoalId: source_goal_id,
-                LinkedGoalId: linked_goal_id), ct);
+                LinkedGoalId: linked_goal_id), context.User, ct);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapGet("/{id}", async (string id, [FromServices] IIssueFacade facade, CancellationToken ct) =>
+        issuesApi.MapGet("/{id}", async (string id, HttpContext context,
+            [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.GetIssueAsync(id, ct);
+            var result = await facade.GetIssueAsync(id, context.User, ct);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapPost("/", async (CreateIssueRequest request, [FromServices] IIssueFacade facade, CancellationToken ct) =>
+        issuesApi.MapPost("/", async (CreateIssueRequest request, HttpContext context,
+            [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.CreateIssueAsync(request, ct);
+            var result = await facade.CreateIssueAsync(request, context.User, ct);
             if (result.Success)
                 return Results.Created($"/api/issues/{Uri.EscapeDataString(result.Value!.Id)}", result.Value);
             return MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, [FromServices] IIssueFacade facade, CancellationToken ct) =>
+        issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, HttpContext context,
+            [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.UpdateIssueAsync(id, request, ct);
+            var result = await facade.UpdateIssueAsync(id, request, context.User, ct);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapDelete("/{id}", async (string id, [FromServices] IIssueFacade facade, CancellationToken ct) =>
+        issuesApi.MapDelete("/{id}", async (string id, HttpContext context,
+            [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.DeleteIssueAsync(id, ct);
+            var result = await facade.DeleteIssueAsync(id, context.User, ct);
             return result.Success
                 ? Results.NoContent()
                 : MapIssueFacadeError(result.Kind, result.Error);
@@ -437,9 +457,10 @@ public static class ApiEndpoints
     /// <summary>
     /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IIssueFacade"/> to the exact HTTP
     /// response the pre-facade issue handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
-    /// <c>Conflict</c> all return a JSON <c>{error}</c> body. <see cref="FacadeErrorKind.None"/>
-    /// is a programming error (a success result must not be mapped here) and throws, as does any
-    /// kind these five routes never produce.
+    /// <c>Conflict</c> all return a JSON <c>{error}</c> body, and the AUTHORIZATION answer
+    /// <c>Forbidden</c> returns HTTP 403 with the same body shape.
+    /// <see cref="FacadeErrorKind.None"/> is a programming error (a success result must not be mapped
+    /// here) and throws, as does any kind these five routes never produce.
     /// </summary>
     /// <param name="kind">The failure category reported by the facade.</param>
     /// <param name="error">The human-readable error message.</param>
@@ -451,6 +472,7 @@ public static class ApiEndpoints
             FacadeErrorKind.NotFound => Results.NotFound(new { error }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
             FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            FacadeErrorKind.Forbidden => Results.Json(new { error }, statusCode: StatusCodes.Status403Forbidden),
             _ => throw new InvalidOperationException($"Unexpected issue facade error kind: {kind}."),
         };
     }

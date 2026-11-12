@@ -5,6 +5,7 @@ using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 using CopilotHive.Workers;
 
 using Microsoft.Extensions.AI;
@@ -419,17 +420,31 @@ public sealed class GoalFacadeTests : IDisposable
         IBrainRepoManager? repoManager = null,
         KnowledgeDocumentCleanupService? docCleanup = null,
         GoalReadyNotifier? goalReadyNotifier = null,
-        GoalDispatcher? dispatcher = null)
+        GoalDispatcher? dispatcher = null,
+        DashboardStateService? dashboardState = null,
+        ProgressReportService? progressReports = null)
         => new(
             goalStore,
             issueStore ?? new RecordingIssueStore([], []),
             reviewService ?? CreateReviewService(),
             dashboardNotifier ?? new DashboardNotifier(),
+            // OPEN MODE over the REAL production resolver/policy: what these pre-existing
+            // behavioural tests exercised (the legacy single local operator).
+            OpenModeFacadeAuth.Resolver,
+            OpenModeFacadeAuth.Policy,
+            NullLogger<GoalFacade>.Instance,
             repoManager,
             docCleanup,
             goalReadyNotifier,
             dispatcher,
-            NullLogger<GoalFacade>.Instance);
+            dashboardState,
+            progressReports);
+
+    /// <summary>
+    /// The OPEN-MODE identity: no cascade exists in open mode, so the caller passes <c>null</c> and
+    /// the production resolver answers with the legacy full local operator.
+    /// </summary>
+    private static System.Security.Claims.ClaimsPrincipal? OpenModeUser => null;
 
     private static Goal MakeGoal(
         string id = "goal-1",
@@ -457,7 +472,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.DeleteGoalAsync("missing");
+        var result = await facade.DeleteGoalAsync("missing", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -478,7 +493,7 @@ public sealed class GoalFacadeTests : IDisposable
         var counter = new NotificationCounter();
         var facade = CreateFacade(store, dashboardNotifier: counter.Notifier);
 
-        var result = await facade.DeleteGoalAsync("goal-1");
+        var result = await facade.DeleteGoalAsync("goal-1", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -498,7 +513,7 @@ public sealed class GoalFacadeTests : IDisposable
         var counter = new NotificationCounter();
         var facade = CreateFacade(store, dashboardNotifier: counter.Notifier);
 
-        var result = await facade.DeleteGoalAsync("goal-1");
+        var result = await facade.DeleteGoalAsync("goal-1", OpenModeUser);
 
         // Success is the NON-generic FacadeResult — the route maps it to 204 with no body.
         Assert.IsType<FacadeResult>(result);
@@ -518,7 +533,7 @@ public sealed class GoalFacadeTests : IDisposable
         var counter = new NotificationCounter();
         var facade = CreateFacade(store, dashboardNotifier: counter.Notifier);
 
-        var result = await facade.DeleteGoalAsync("goal-1");
+        var result = await facade.DeleteGoalAsync("goal-1", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -533,7 +548,7 @@ public sealed class GoalFacadeTests : IDisposable
         var repoManager = new RecordingRepoManager();
         var facade = CreateFacade(store, repoManager: repoManager);
 
-        var result = await facade.DeleteGoalAsync("goal-1");
+        var result = await facade.DeleteGoalAsync("goal-1", OpenModeUser);
 
         Assert.True(result.Success);
         Assert.Equal(
@@ -549,7 +564,7 @@ public sealed class GoalFacadeTests : IDisposable
         var repoManager = new RecordingRepoManager();
         var facade = CreateFacade(store, repoManager: repoManager);
 
-        var result = await facade.DeleteGoalAsync("goal-1");
+        var result = await facade.DeleteGoalAsync("goal-1", OpenModeUser);
 
         Assert.True(result.Success);
         // Branch cleanup is a Failed-goal-only side effect.
@@ -576,7 +591,7 @@ public sealed class GoalFacadeTests : IDisposable
             graph, NullLogger<KnowledgeDocumentCleanupService>.Instance);
         var facade = CreateFacade(store, docCleanup: cleanup);
 
-        var result = await facade.DeleteGoalAsync("goal-1");
+        var result = await facade.DeleteGoalAsync("goal-1", OpenModeUser);
 
         Assert.True(result.Success);
         Assert.Null(graph.GetDocument("progress-goal-1"));
@@ -593,7 +608,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.UpdateGoalStatusAsync("missing", "Pending");
+        var result = await facade.UpdateGoalStatusAsync("missing", "Pending", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -607,7 +622,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: GoalStatus.Completed));
         var facade = CreateFacade(store);
 
-        var result = await facade.UpdateGoalStatusAsync("goal-1", "Pending");
+        var result = await facade.UpdateGoalStatusAsync("goal-1", "Pending", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -625,7 +640,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: GoalStatus.Draft));
         var facade = CreateFacade(store);
 
-        var result = await facade.UpdateGoalStatusAsync("goal-1", "NotAStatus");
+        var result = await facade.UpdateGoalStatusAsync("goal-1", "NotAStatus", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -641,7 +656,7 @@ public sealed class GoalFacadeTests : IDisposable
         var readyNotifier = new GoalReadyNotifier();
         var facade = CreateFacade(store, dashboardNotifier: counter.Notifier, goalReadyNotifier: readyNotifier);
 
-        var result = await facade.UpdateGoalStatusAsync("goal-1", "Pending");
+        var result = await facade.UpdateGoalStatusAsync("goal-1", "Pending", OpenModeUser);
 
         Assert.True(result.Success);
         Assert.NotNull(result.Value);
@@ -665,7 +680,7 @@ public sealed class GoalFacadeTests : IDisposable
         var readyNotifier = new GoalReadyNotifier();
         var facade = CreateFacade(store, goalReadyNotifier: readyNotifier);
 
-        var result = await facade.UpdateGoalStatusAsync("goal-1", "Draft");
+        var result = await facade.UpdateGoalStatusAsync("goal-1", "Draft", OpenModeUser);
 
         Assert.True(result.Success);
         // Only a transition INTO Pending wakes the dispatcher.
@@ -681,7 +696,7 @@ public sealed class GoalFacadeTests : IDisposable
         var counter = new NotificationCounter();
         var facade = CreateFacade(store, repoManager: repoManager, dashboardNotifier: counter.Notifier);
 
-        var result = await facade.UpdateGoalStatusAsync("goal-1", "Draft");
+        var result = await facade.UpdateGoalStatusAsync("goal-1", "Draft", OpenModeUser);
 
         Assert.True(result.Success);
         // Each Failed→Draft side effect runs exactly once.
@@ -701,7 +716,7 @@ public sealed class GoalFacadeTests : IDisposable
         var repoManager = new RecordingRepoManager();
         var facade = CreateFacade(store, repoManager: repoManager);
 
-        var result = await facade.UpdateGoalStatusAsync("goal-1", "Pending");
+        var result = await facade.UpdateGoalStatusAsync("goal-1", "Pending", OpenModeUser);
 
         Assert.True(result.Success);
         // The reset + branch cleanup belong to Failed→Draft only.
@@ -717,7 +732,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store);
 
-        var result = await facade.RequestReviewAsync("missing", Ct);
+        var result = await facade.RequestReviewAsync("missing", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -736,7 +751,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: status));
         var facade = CreateFacade(store);
 
-        var result = await facade.RequestReviewAsync("goal-1", Ct);
+        var result = await facade.RequestReviewAsync("goal-1", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -750,7 +765,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: GoalStatus.Draft, reviewStatus: ReviewStatus.Pending));
         var facade = CreateFacade(store);
 
-        var result = await facade.RequestReviewAsync("goal-1", Ct);
+        var result = await facade.RequestReviewAsync("goal-1", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -769,7 +784,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: GoalStatus.Completed, reviewStatus: ReviewStatus.Pending));
         var facade = CreateFacade(store);
 
-        var result = await facade.RequestReviewAsync("goal-1", Ct);
+        var result = await facade.RequestReviewAsync("goal-1", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -783,7 +798,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: GoalStatus.Draft));
         var facade = CreateFacade(store, reviewService: CreateReviewService());
 
-        var result = await facade.RequestReviewAsync("goal-1", Ct);
+        var result = await facade.RequestReviewAsync("goal-1", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -823,7 +838,7 @@ public sealed class GoalFacadeTests : IDisposable
         await entered.Task;
 
         // Second review through the facade hits the service's in-process guard.
-        var result = await facade.RequestReviewAsync("goal-1", Ct);
+        var result = await facade.RequestReviewAsync("goal-1", OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -842,7 +857,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store, dispatcher: CreateDispatcher(store));
 
-        var result = await facade.CancelGoalAsync("missing");
+        var result = await facade.CancelGoalAsync("missing", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -864,7 +879,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: status));
         var facade = CreateFacade(store, dispatcher: CreateDispatcher(store));
 
-        var result = await facade.CancelGoalAsync("goal-1");
+        var result = await facade.CancelGoalAsync("goal-1", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -880,7 +895,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddGoal(MakeGoal(status: GoalStatus.Pending));
         var facade = CreateFacade(store, dispatcher: CreateDispatcher(store));
 
-        var result = await facade.CancelGoalAsync("goal-1");
+        var result = await facade.CancelGoalAsync("goal-1", OpenModeUser);
 
         Assert.True(result.Success);
         Assert.NotNull(result.Value);
@@ -903,7 +918,7 @@ public sealed class GoalFacadeTests : IDisposable
         var dispatcher = CreateDispatcher(new RecordingGoalStore());
         var facade = CreateFacade(facadeStore, dispatcher: dispatcher);
 
-        var result = await facade.CancelGoalAsync("goal-1");
+        var result = await facade.CancelGoalAsync("goal-1", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -923,7 +938,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store, dispatcher: CreateDispatcher(store));
 
-        var result = await facade.ExtendIterationsAsync("goal-1", additionalIterations, Ct);
+        var result = await facade.ExtendIterationsAsync("goal-1", additionalIterations, OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -936,7 +951,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store, dispatcher: null);
 
-        var result = await facade.ExtendIterationsAsync("goal-1", 5, Ct);
+        var result = await facade.ExtendIterationsAsync("goal-1", 5, OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.ServiceUnavailable, result.Kind);
@@ -957,7 +972,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store, dispatcher: null);
 
-        var result = await facade.ExtendIterationsAsync("goal-1", additionalIterations, Ct);
+        var result = await facade.ExtendIterationsAsync("goal-1", additionalIterations, OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.ServiceUnavailable, result.Kind);
@@ -969,7 +984,7 @@ public sealed class GoalFacadeTests : IDisposable
         var store = new RecordingGoalStore();
         var facade = CreateFacade(store, dispatcher: CreateDispatcher(store));
 
-        var result = await facade.ExtendIterationsAsync("goal-1", 5, Ct);
+        var result = await facade.ExtendIterationsAsync("goal-1", 5, OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -992,7 +1007,7 @@ public sealed class GoalFacadeTests : IDisposable
 
         // The goal IS iteration-exhaustion eligible, so ResumeGoalAsync gets past its first
         // gate and fails only on the missing pipeline — proving the dispatcher ran.
-        var result = await facade.ExtendIterationsAsync("goal-1", 5, Ct);
+        var result = await facade.ExtendIterationsAsync("goal-1", 5, OpenModeUser, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -1014,7 +1029,7 @@ public sealed class GoalFacadeTests : IDisposable
         var counter = new NotificationCounter();
         var facade = CreateFacade(store, dashboardNotifier: counter.Notifier);
 
-        var result = await facade.AttachReleaseAsync("goal-1", "missing-release");
+        var result = await facade.AttachReleaseAsync("goal-1", "missing-release", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -1031,7 +1046,7 @@ public sealed class GoalFacadeTests : IDisposable
         store.AddRelease(new Release { Id = "rel-1", Tag = "v1.0.0" });
         var facade = CreateFacade(store);
 
-        var result = await facade.AttachReleaseAsync("missing", "rel-1");
+        var result = await facade.AttachReleaseAsync("missing", "rel-1", OpenModeUser);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -1048,7 +1063,7 @@ public sealed class GoalFacadeTests : IDisposable
         var counter = new NotificationCounter();
         var facade = CreateFacade(store, dashboardNotifier: counter.Notifier);
 
-        var result = await facade.AttachReleaseAsync("goal-1", "rel-1");
+        var result = await facade.AttachReleaseAsync("goal-1", "rel-1", OpenModeUser);
 
         Assert.True(result.Success);
         Assert.NotNull(result.Value);
@@ -1080,7 +1095,7 @@ public sealed class GoalFacadeTests : IDisposable
         var issueStore = new RecordingIssueStore([MakeIssue("a", sourceGoalId: "goal-1")], [MakeIssue("b", linkedGoalId: "goal-1")]);
         var facade = CreateFacade(new RecordingGoalStore(), issueStore: issueStore);
 
-        var result = await facade.GetLinkedIssuesAsync("goal-1", Ct);
+        var result = await facade.GetLinkedIssuesAsync("goal-1", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         // Exactly two queries: one filtered by source goal, one by linked goal.
@@ -1097,7 +1112,7 @@ public sealed class GoalFacadeTests : IDisposable
             [MakeIssue("dup", linkedGoalId: "goal-1"), MakeIssue("only-linked", linkedGoalId: "goal-1")]);
         var facade = CreateFacade(new RecordingGoalStore(), issueStore: issueStore);
 
-        var result = await facade.GetLinkedIssuesAsync("goal-1", Ct);
+        var result = await facade.GetLinkedIssuesAsync("goal-1", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.NotNull(result.Value);
@@ -1126,7 +1141,7 @@ public sealed class GoalFacadeTests : IDisposable
         var issueStore = new RecordingIssueStore([sourceIssue], [linkedIssue]);
         var facade = CreateFacade(new RecordingGoalStore(), issueStore: issueStore);
 
-        var result = await facade.GetLinkedIssuesAsync("goal-1", Ct);
+        var result = await facade.GetLinkedIssuesAsync("goal-1", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         var only = Assert.Single(result.Value!);
@@ -1140,7 +1155,7 @@ public sealed class GoalFacadeTests : IDisposable
         var issueStore = new RecordingIssueStore([], []);
         var facade = CreateFacade(new RecordingGoalStore(), issueStore: issueStore);
 
-        var result = await facade.GetLinkedIssuesAsync("goal-1", Ct);
+        var result = await facade.GetLinkedIssuesAsync("goal-1", OpenModeUser, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -1172,7 +1187,7 @@ public sealed class GoalFacadeTests : IDisposable
         var issueStore = new RecordingIssueStore([issue], []);
         var facade = CreateFacade(new RecordingGoalStore(), issueStore: issueStore);
 
-        var result = await facade.GetLinkedIssuesAsync("goal-1", Ct);
+        var result = await facade.GetLinkedIssuesAsync("goal-1", OpenModeUser, Ct);
 
         var dto = Assert.Single(result.Value!);
         // Every field of the issues-API shape is carried — not a five-field projection.
@@ -1199,7 +1214,7 @@ public sealed class GoalFacadeTests : IDisposable
         var facade = CreateFacade(new RecordingGoalStore(), issueStore: issueStore);
         using var cts = new CancellationTokenSource();
 
-        await facade.GetLinkedIssuesAsync("goal-1", cts.Token);
+        await facade.GetLinkedIssuesAsync("goal-1", OpenModeUser, cts.Token);
 
         Assert.Equal(2, issueStore.Tokens.Count);
         Assert.All(issueStore.Tokens, t => Assert.Equal(cts.Token, t));

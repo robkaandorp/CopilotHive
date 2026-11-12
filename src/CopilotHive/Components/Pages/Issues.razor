@@ -1,10 +1,13 @@
 @page "/issues"
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
+@using CopilotHive.Security
 @using CopilotHive.Services
 @using Markdig
+@using System.Security.Claims
 @using System.Text.Json
 @inject IIssueFacade IssueFacade
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject NavigationManager Nav
 @inject PageHeaderState PageHeader
 
@@ -98,6 +101,10 @@
 }
 
 <!-- Issues Table -->
+@if (!string.IsNullOrEmpty(_loadError))
+{
+    <p class="error-msg" style="margin-top:1rem">@_loadError</p>
+}
 @if (_issues.Count > 0)
 {
     <div class="goals-table-wrap">
@@ -256,6 +263,7 @@ else if (_loaded)
     private bool _showCreateForm;
     private string _createError = "";
     private bool _loaded;
+    private string? _loadError;
     private int _loadGeneration;
 
     private IssueType _createType = IssueType.Suggestion;
@@ -263,6 +271,27 @@ else if (_loaded)
     private string _createDescription = "";
     private IssueSeverity _createSeverity = IssueSeverity.Low;
     private string _createRepos = "";
+
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. This is also the page's MINIMAL circuit
+    /// identity acquisition: the scoped <see cref="CircuitUserPrincipalAccessor"/> is initialised
+    /// from the same cascading state exactly once per circuit.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
 
     protected override async Task OnInitializedAsync()
     {
@@ -277,27 +306,52 @@ else if (_loaded)
             Status: string.IsNullOrEmpty(_statusFilter) ? null : _statusFilter,
             Type: string.IsNullOrEmpty(_typeFilter) ? null : _typeFilter,
             Severity: string.IsNullOrEmpty(_severityFilter) ? null : _severityFilter,
-            Repository: string.IsNullOrEmpty(_repoFilter) ? null : _repoFilter), CancellationToken.None);
-        if (result.Success)
+            Repository: string.IsNullOrEmpty(_repoFilter) ? null : _repoFilter), await ActingUserAsync(), CancellationToken.None);
+        if (generation != _loadGeneration)
+            return; // stale — discard
+        if (!result.Success)
         {
-            var issues = result.Value!.ToList();
-            if (generation != _loadGeneration)
-                return; // stale — discard
-            if (string.IsNullOrEmpty(_statusFilter))
-                issues = issues.Where(i => i.Status != IssueStatus.Closed).ToList();
-            _issues = issues;
-            _loaded = true;
-            if (_expandedIssueId is not null)
+            // DENIED (or otherwise failed) refresh: nothing read is presented. Every previously
+            // loaded list/detail/error state is CLEARED — there is deliberately no fallback to a
+            // direct store read and no stale issue list left on screen.
+            ClearIssueState();
+            _loadError = result.Error ?? "Issues could not be loaded.";
+            StateHasChanged();
+            return;
+        }
+
+        var issues = result.Value!.ToList();
+        if (string.IsNullOrEmpty(_statusFilter))
+            issues = issues.Where(i => i.Status != IssueStatus.Closed).ToList();
+        _issues = issues;
+        _loaded = true;
+        _loadError = null;
+        if (_expandedIssueId is not null)
+        {
+            var issue = _issues.FirstOrDefault(i => i.Id == _expandedIssueId);
+            if (issue is not null)
             {
-                var issue = _issues.FirstOrDefault(i => i.Id == _expandedIssueId);
-                if (issue is not null)
-                {
-                    _editStatus = ToSnakeCase(issue.Status);
-                    _editSeverity = ToSnakeCase(issue.Severity);
-                    _editType = ToSnakeCase(issue.Type);
-                }
+                _editStatus = ToSnakeCase(issue.Status);
+                _editSeverity = ToSnakeCase(issue.Severity);
+                _editType = ToSnakeCase(issue.Type);
             }
         }
+    }
+
+    /// <summary>
+    /// Clears EVERYTHING this page previously loaded: the issue list, the expanded detail, the
+    /// per-issue error text and the "loaded" marker. Called on a refused read so a denied refresh
+    /// can never present stale data.
+    /// </summary>
+    private void ClearIssueState()
+    {
+        _issues = [];
+        _expandedIssueId = null;
+        _errors.Clear();
+        _editStatus = "";
+        _editSeverity = "";
+        _editType = "";
+        _loaded = false;
     }
 
     private void ToggleDetail(string id, LinkedIssueDto issue)
@@ -341,7 +395,7 @@ else if (_loaded)
             return;
         }
 
-        var result = await IssueFacade.UpdateIssueAsync(issue.Id, request, CancellationToken.None);
+        var result = await IssueFacade.UpdateIssueAsync(issue.Id, request, await ActingUserAsync(), CancellationToken.None);
         if (result.Success)
         {
             // Re-query with the active filters so the list only shows issues
@@ -380,7 +434,7 @@ else if (_loaded)
     private async Task DeleteIssue(LinkedIssueDto issue)
     {
         _errors.Remove(issue.Id);
-        var result = await IssueFacade.DeleteIssueAsync(issue.Id, CancellationToken.None);
+        var result = await IssueFacade.DeleteIssueAsync(issue.Id, await ActingUserAsync(), CancellationToken.None);
         if (result.Success)
         {
             _issues.RemoveAll(i => i.Id == issue.Id);
@@ -415,7 +469,7 @@ else if (_loaded)
             Severity: _createSeverity,
             RepositoryNames: _createRepos
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .ToList()), CancellationToken.None);
+                .ToList()), await ActingUserAsync(), CancellationToken.None);
         if (result.Success)
         {
             // Re-query with the active filters so the created issue only appears
