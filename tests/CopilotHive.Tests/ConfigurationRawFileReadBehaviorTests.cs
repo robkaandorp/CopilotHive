@@ -91,11 +91,17 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
             configRepo: new ConfigRepoManager("https://example.com/config.git", repoRoot));
 
     /// <summary>
-    /// Builds the page with the circuit identity of <paramref name="gitHubId"/> (or NO cascade at
-    /// all, which is what open mode looks like), then runs its REAL <c>LoadFilesAsync</c>.
+    /// Builds ONE page instance with the circuit identity of <paramref name="gitHubId"/> (or NO cascade
+    /// at all, which is what open mode looks like) and the page's own config-repo handle, WITHOUT
+    /// running its load. Separating construction from loading is what lets a row drive the SAME page
+    /// through SEVERAL loads — the only way "does a denied reload clear what was already loaded?" can
+    /// be asked at all.
     /// </summary>
-    private async Task<(Dictionary<string, string> Files, string? Error, List<string> Tabs)>
-        RunLoadFilesAsync(ConfigFacade facade, string? gitHubId, string? repoRoot = null)
+    /// <param name="facade">The config facade the page reads through.</param>
+    /// <param name="gitHubId">The circuit identity's GitHub id, or <c>null</c> to inject no cascade.</param>
+    /// <param name="repoRoot">The config-repo clone directory, or <c>null</c> to leave the handle unset.</param>
+    /// <returns>The constructed page, with NO load performed yet.</returns>
+    private ConfigurationPage CreatePage(ConfigFacade facade, string? gitHubId, string? repoRoot)
     {
         var page = new ConfigurationPage();
 
@@ -121,6 +127,19 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
                 Task.FromResult(new AuthenticationState(principal)));
         }
 
+        return page;
+    }
+
+    /// <summary>
+    /// Runs the REAL <c>LoadFilesAsync</c> on <paramref name="page"/> — the SAME instance passed in, so
+    /// its existing state (and any content already loaded into it) is exactly what the load starts
+    /// from, just as in the running page.
+    /// </summary>
+    /// <param name="page">The page to load on.</param>
+    /// <returns>The page's own file map, error field and tab list AFTER the load.</returns>
+    private static async Task<(Dictionary<string, string> Files, string? Error, List<string> Tabs)>
+        LoadFilesAsync(ConfigurationPage page)
+    {
         await (Task)typeof(ConfigurationPage)
             .GetMethod("LoadFilesAsync", NonPublicInstance)!
             .Invoke(page, null)!;
@@ -136,6 +155,17 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
             .GetValue(page)!;
 
         return (files, error, tabs);
+    }
+
+    /// <summary>
+    /// Builds a FRESH page for <paramref name="gitHubId"/> and runs ONE load — the single-shot shape the
+    /// rows that do not care about carried-over state use.
+    /// </summary>
+    private async Task<(Dictionary<string, string> Files, string? Error, List<string> Tabs)>
+        RunLoadFilesAsync(ConfigFacade facade, string? gitHubId, string? repoRoot = null)
+    {
+        var page = CreatePage(facade, gitHubId, repoRoot);
+        return await LoadFilesAsync(page);
     }
 
     private static void SetProperty(object target, string name, object value)
@@ -187,32 +217,66 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
     }
 
     /// <summary>
-    /// A DENIED CALLER'S PAGE STATE NEVER CONTAINS THE CONTENT EVEN WHEN A PREVIOUSLY LOADED PAGE
-    /// STILL HOLDS IT: the failure branch clears the file map before returning, so a demotion
-    /// between two loads cannot leave the old configuration on the page.
+    /// A DENIED RELOAD CLEARS CONTENT THAT IS ALREADY ON THE PAGE — proved on ONE page instance across
+    /// the whole sequence, so the content under test is genuinely the page's own loaded state.
+    /// <para>
+    /// The sequence, all against the SAME <see cref="ConfigurationPage"/> and the SAME circuit
+    /// identity (one Admin account whose STORED role is changed in between):
+    /// </para>
+    /// <list type="number">
+    ///   <item>Load as the Admin through the REAL authorized facade operation — the page's map is
+    ///   genuinely populated (asserted as a PREMISE, so the row fails loudly if the populate step ever
+    ///   stops loading anything).</item>
+    ///   <item>DEMOTE that same account in the real directory (a stored-role change through the
+    ///   production EF model, exactly as an administrator would).</item>
+    ///   <item>Load AGAIN on the SAME page, with the SAME circuit identity.</item>
+    ///   <item>The previously populated map is now EMPTY and the sanitized refusal is surfaced.</item>
+    /// </list>
+    /// <para>
+    /// This is what makes the row BEARING on the production failure branch's <c>_files.Clear()</c>: a
+    /// fresh page per step would start from an already-empty map and pass even with the clear removed.
+    /// The config file is asserted still on disk, so the GATE — not a missing file — is what emptied
+    /// the map.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task LoadFiles_DeniedCaller_ClearsAnyPreviouslyLoadedContent()
     {
         await _auth.SeedAsync(AdminId, UserRole.Admin);
-        await _auth.SeedAsync(ViewerId, UserRole.Viewer);
 
         var (root, yaml) = CreateConfigRepo();
         var facade = CreateConfigFacade(root, HiveAuthMode.AuthenticationEnabled);
 
-        // The ADMIN loads the genuine content first — proving the fixture really has content.
-        var (adminFiles, adminError, _) = await RunLoadFilesAsync(facade, AdminId, root);
-        Assert.Null(adminError);
-        Assert.NotEmpty(adminFiles);
-        Assert.Contains(SecretMarker, adminFiles["hive-config.yaml"], StringComparison.Ordinal);
+        // ONE page instance and ONE circuit identity for the WHOLE sequence.
+        var page = CreatePage(facade, AdminId, root);
 
-        // The VIEWER loads the SAME page: the map must be empty.
-        var (viewerFiles, viewerError, _) = await RunLoadFilesAsync(facade, ViewerId, root);
+        // ── 1. The Admin loads the genuine content into THAT page. ──
+        var (adminFiles, adminError, adminTabs) = await LoadFilesAsync(page);
+
+        Assert.Null(adminError);
+
+        // PREMISE: the populate step really loaded content into this page's own map. Without this the
+        // clearing assertion below would be vacuous.
+        Assert.NotEmpty(adminFiles);
+        Assert.Equal(3, adminFiles.Count);
+        Assert.Contains(SecretMarker, adminFiles["hive-config.yaml"], StringComparison.Ordinal);
+        Assert.Contains("hive-config.yaml", adminTabs);
+
+        // ── 2. DEMOTE the SAME account in the REAL directory (a stored-role change). ──
+        await _auth.SetRoleAsync(AdminId, UserRole.Viewer);
+
+        // ── 3. Load AGAIN on the SAME page, with the SAME circuit identity. ──
+        var (viewerFiles, viewerError, _) = await LoadFilesAsync(page);
+
+        // ── 4. The previously loaded content is GONE, and the refusal is surfaced. ──
         Assert.Empty(viewerFiles);
+        Assert.DoesNotContain(viewerFiles.Keys, name => name.Contains("hive-config", StringComparison.Ordinal));
+        Assert.DoesNotContain(viewerFiles.Values, content =>
+            content.Contains(SecretMarker, StringComparison.Ordinal));
         Assert.Equal(ForbiddenMessage, viewerError);
 
-        // The content is on disk the whole time — the gate, not a missing file, is what emptied the
-        // map.
+        // The content is on disk the whole time — the GATE, not a missing file, is what emptied the
+        // map. (A missing file would also make the admin populate step above impossible.)
         Assert.True(File.Exists(Path.Combine(root, "hive-config.yaml")));
         Assert.Contains(SecretMarker, yaml, StringComparison.Ordinal);
     }
