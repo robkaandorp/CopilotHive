@@ -666,7 +666,12 @@ public sealed class Program
                 // accessor) is captured by this singleton facade.
                 sp.GetRequiredService<HivePrincipalResolver>(),
                 sp.GetRequiredService<HivePolicy>(),
-                sp.GetService<IBrainRepoManager>()));
+                sp.GetService<IBrainRepoManager>(),
+                // The config repo manager whose local clone the Configuration page's raw
+                // configuration-file read projects. GetService, exactly like the other optional
+                // dependencies: a host booted without a config repo leaves it null and that read
+                // reports no files.
+                sp.GetService<ConfigRepoManager>()));
 
             // Brain: direct LLM connection via SharpCoder. Registered UNCONDITIONALLY — CopilotHive
             // has no no-Brain operating mode, so a missing orchestrator.model FAILS STARTUP

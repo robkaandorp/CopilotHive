@@ -467,8 +467,8 @@ public static class ApiEndpoints
     /// handler produced: <see cref="PlanningNoOpOutcome"/> → 200 with the bare Release JSON;
     /// <see cref="ExecutionSuccessOutcome"/> → 200 with the <c>{release, result}</c> envelope; a
     /// <see cref="StatusFailureOutcome"/> → the per-variant status and body from the frozen
-    /// contract (404/400/409 <c>{error}</c>, 400 <c>{errors:[...]}</c>, 500 <c>{detail, results}</c>,
-    /// 503 <c>{detail}</c>).
+    /// contract (403/404/400/409 <c>{error}</c>, 400 <c>{errors:[...]}</c>, 500
+    /// <c>{detail, results}</c>, 503 <c>{detail}</c>).
     /// </summary>
     /// <param name="outcome">The outcome reported by the facade.</param>
     /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
@@ -489,6 +489,16 @@ public static class ApiEndpoints
     /// the <c>{errors:[...]}</c> body uses <see cref="StatusFailureOutcome.Errors"/>, the 500 body
     /// uses <see cref="StatusFailureOutcome.Detail"/> + <see cref="StatusFailureOutcome.Results"/>,
     /// and the 503 body uses <see cref="StatusFailureOutcome.Detail"/> alone.
+    /// <para>
+    /// <see cref="FacadeErrorKind.Forbidden"/> → 403 with the sanitized <c>{error}</c> body, matching
+    /// <see cref="MapReleaseFacadeError"/> and <see cref="MapBackupFacadeResult"/>. This arm is
+    /// REACHABLE even though this route also carries <see cref="PreBindingAuthorization"/>: the
+    /// pre-binding gate and the facade's own fresh resolution are two independent evaluations, so an
+    /// Operator who passes the gate can be demoted or disabled WHILE the request's body is being
+    /// bound, and the facade's per-call resolution then correctly refuses. Without this arm that
+    /// refusal would surface as an unexpected-kind <see cref="InvalidOperationException"/> (HTTP 500)
+    /// instead of the authorization answer.
+    /// </para>
     /// </summary>
     /// <param name="failure">The failure outcome to map.</param>
     /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
@@ -497,6 +507,8 @@ public static class ApiEndpoints
         return failure.Kind switch
         {
             FacadeErrorKind.NotFound => Results.NotFound(new { error = failure.Error }),
+            FacadeErrorKind.Forbidden => Results.Json(
+                new { error = failure.Error }, statusCode: StatusCodes.Status403Forbidden),
             FacadeErrorKind.BadRequest when failure.Errors.Length > 0
                 => Results.BadRequest(new { errors = failure.Errors }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error = failure.Error }),

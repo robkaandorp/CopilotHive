@@ -1407,23 +1407,28 @@ else
 
     private async Task LoadFilesAsync()
     {
-        var basePath = ConfigRepo.LocalPath;
+        // THE RAW CONFIGURATION FILES ARE A FULL CONFIG PROJECTION: the read goes through
+        // IConfigFacade, which re-resolves this circuit user's CURRENT role/enabled state and requires
+        // GlobalAdmin BEFORE touching the file system. Reading straight off disk here (as this page
+        // used to) bypassed that requirement and rendered the entire hive-config.yaml and the agents
+        // files to any authenticated role. A refusal yields NO content at all, so nothing reaches
+        // unauthorized state; open mode answers the local operator through the same seam, unchanged.
+        var filesResult = await ConfigFacade.GetConfigFilesAsync(
+            await ActingUserAsync(), CancellationToken.None);
 
-        // Load hive-config.yaml
-        var configPath = Path.Combine(basePath, "hive-config.yaml");
-        if (File.Exists(configPath))
-            _files["hive-config.yaml"] = await File.ReadAllTextAsync(configPath);
-
-        // Load agents/*.agents.md
-        var agentsDir = Path.Combine(basePath, "agents");
-        if (Directory.Exists(agentsDir))
+        if (!filesResult.Success || filesResult.Value is null)
         {
-            foreach (var file in Directory.GetFiles(agentsDir, "*.agents.md").OrderBy(f => f))
-            {
-                var name = Path.GetFileName(file);
-                _files[name] = await File.ReadAllTextAsync(file);
-            }
+            // The page's EXISTING sanitized error surface — the same one the load sequence already
+            // uses — so a refusal neither crashes the renderer nor renders any file content.
+            _files.Clear();
+            _error = filesResult.Error;
+            _tabs = [ModelsTabName, AvailableModelsTabName, SubAgentModelsTabName, BackupTabName,
+                RepositoriesTabName, OrchestratorTabName, WorkersTabName, ComposerTabName];
+            return;
         }
+
+        foreach (var file in filesResult.Value)
+            _files[file.Name] = file.Content;
 
         _tabs = [.. _files.Keys];
         _tabs.Insert(0, ModelsTabName);

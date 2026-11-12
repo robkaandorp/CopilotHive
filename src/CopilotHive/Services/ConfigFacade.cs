@@ -296,6 +296,36 @@ public interface IConfigFacade
     Task<FacadeResult<ComposerConfigDto>> GetComposerAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
+    /// Reads the RAW configuration-repo file contents the Configuration page's file tabs render: the
+    /// whole <c>hive-config.yaml</c> and every <c>agents/*.agents.md</c> file, verbatim.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS A FULL CONFIGURATION PROJECTION AND IT REQUIRES
+    /// <see cref="HiveCapability.GlobalAdmin"/>. It is deliberately NOT a sanitized projection: no
+    /// filtering is applied to the content, so the ONLY thing standing between a non-admin and the
+    /// complete configuration is this gate — which is why the gate runs BEFORE the file system is
+    /// touched and why a refusal returns no content at all (never a partial or redacted document that
+    /// could be mistaken for the real one).
+    /// </para>
+    /// <para>
+    /// The gate exists because rendering these files is a raw full-config read: before this operation
+    /// existed, the page read them straight off disk and rendered them to any authenticated role,
+    /// bypassing the administration requirement every other configuration projection enforces.
+    /// </para>
+    /// </remarks>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// The files in the page's existing order (<c>hive-config.yaml</c> first, then the agents files by
+    /// name; EMPTY when no config repo is configured or none exist), or
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.GlobalAdmin"/>.
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<ConfigFileContentDto>>> GetConfigFilesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
     /// Persists Composer setting changes (validate → mutate → write → commit).
     /// </summary>
     /// <remarks>
@@ -334,6 +364,7 @@ public sealed class ConfigFacade : IConfigFacade
     private readonly ConfigModelService? _configModel;
     private readonly ModelDiscoveryService? _discovery;
     private readonly IBrainRepoManager? _repoManager;
+    private readonly ConfigRepoManager? _configRepo;
     private readonly HivePrincipalResolver _resolver;
     private readonly HivePolicy _policy;
     private readonly ILogger<ConfigFacade> _log;
@@ -352,6 +383,11 @@ public sealed class ConfigFacade : IConfigFacade
     /// </param>
     /// <param name="policy">The pure capability evaluator (required together with <paramref name="resolver"/>).</param>
     /// <param name="repoManager">The <see cref="IBrainRepoManager"/> (may be <c>null</c> when not registered).</param>
+    /// <param name="configRepo">
+    /// The <see cref="ConfigRepoManager"/> whose local clone the raw configuration-file read
+    /// (<see cref="GetConfigFilesAsync"/>) projects (may be <c>null</c> when no config repo was
+    /// configured at startup, in which case that read reports no files).
+    /// </param>
     /// <exception cref="ArgumentNullException">A required dependency is null.</exception>
     public ConfigFacade(
         HiveConfigFile? hiveConfig,
@@ -360,7 +396,8 @@ public sealed class ConfigFacade : IConfigFacade
         ILogger<ConfigFacade> log,
         HivePrincipalResolver resolver,
         HivePolicy policy,
-        IBrainRepoManager? repoManager = null)
+        IBrainRepoManager? repoManager = null,
+        ConfigRepoManager? configRepo = null)
     {
         _hiveConfig = hiveConfig;
         _configModel = configModel;
@@ -369,6 +406,7 @@ public sealed class ConfigFacade : IConfigFacade
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _repoManager = repoManager;
+        _configRepo = configRepo;
     }
 
     /// <inheritdoc />
@@ -903,6 +941,44 @@ public sealed class ConfigFacade : IConfigFacade
                 activeEvents,
                 ValidActiveEvents,
                 notif?.EffectiveThrottleSeconds ?? 30)), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<ConfigFileContentDto>>> GetConfigFilesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST, before the file system is touched at all: the raw configuration files
+        // are a FULL projection, so a non-admin learns nothing — not even whether the repo exists or
+        // which files it holds.
+        if (!await IsAllowedAsync(actingUser, nameof(GetConfigFilesAsync), ct).ConfigureAwait(false))
+            return Forbidden<IReadOnlyList<ConfigFileContentDto>>();
+
+        // No config repo configured: there are no files to project. This is a SUCCESS with an empty
+        // list, exactly the state the page rendered when its clone directory did not exist.
+        var configRepo = _configRepo;
+        if (configRepo is null)
+            return new(true, [], null, FacadeErrorKind.None);
+
+        var files = new List<ConfigFileContentDto>();
+
+        // hive-config.yaml FIRST — the same order the page's tab list has always used.
+        var configPath = Path.Combine(configRepo.LocalPath, "hive-config.yaml");
+        if (File.Exists(configPath))
+            files.Add(new ConfigFileContentDto("hive-config.yaml", await File.ReadAllTextAsync(configPath, ct).ConfigureAwait(false)));
+
+        // …then agents/*.agents.md, ordered by file name.
+        var agentsDir = Path.Combine(configRepo.LocalPath, "agents");
+        if (Directory.Exists(agentsDir))
+        {
+            foreach (var path in Directory.GetFiles(agentsDir, "*.agents.md").OrderBy(f => f, StringComparer.Ordinal))
+            {
+                files.Add(new ConfigFileContentDto(
+                    Path.GetFileName(path),
+                    await File.ReadAllTextAsync(path, ct).ConfigureAwait(false)));
+            }
+        }
+
+        return new(true, files, null, FacadeErrorKind.None);
     }
 
     /// <inheritdoc />
