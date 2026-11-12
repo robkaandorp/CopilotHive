@@ -262,6 +262,12 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
         Assert.Contains(SecretMarker, adminFiles["hive-config.yaml"], StringComparison.Ordinal);
         Assert.Contains("hive-config.yaml", adminTabs);
 
+        // THE POPULATED MAP'S IDENTITY, captured BEFORE the denied reload: the denied reload must
+        // return this very dictionary (emptied), not a different one. A fixture that built a fresh
+        // page for the denied reload would hand back a DIFFERENT map — so this assertion is what
+        // makes the same-instance reuse load-bearing rather than incidental.
+        var populatedMap = adminFiles;
+
         // ── 2. DEMOTE the SAME account in the REAL directory (a stored-role change). ──
         await _auth.SetRoleAsync(AdminId, UserRole.Viewer);
 
@@ -274,6 +280,14 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
         Assert.DoesNotContain(viewerFiles.Values, content =>
             content.Contains(SecretMarker, StringComparison.Ordinal));
         Assert.Equal(ForbiddenMessage, viewerError);
+
+        // THE SAME-INSTANCE PROPERTY IS DIRECTLY OBSERVABLE: the denied reload returned the page's
+        // OWN map — the very dictionary the authorized populate step filled — so the "empty map"
+        // assertion above is about content this page really had, not about a fresh page that never
+        // had any. Without this, a fixture that built a NEW page for the denied reload would still
+        // pass the "empty map" assertion (a new page's map starts empty), and the row would stop
+        // being load-bearing on the production `_files.Clear()`.
+        Assert.Same(populatedMap, viewerFiles);
 
         // The content is on disk the whole time — the GATE, not a missing file, is what emptied the
         // map. (A missing file would also make the admin populate step above impossible.)
