@@ -507,20 +507,21 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// EVERY PARKED INVOCATION IS JOINED BY CLEANUP, NOT ONLY THE LAST ONE: several subscription callbacks are
-    /// parked (each queued body is a SEPARATE invocation), the page's <c>LastCallbackCompletion</c> is
-    /// OVERWRITTEN by each new callback and therefore aggregates nothing, and the cleanup must still await
-    /// EVERY tracked invocation.
+    /// EVERY PARKED INVOCATION IS JOINED BY CLEANUP, NOT ONLY THE LAST ONE (the SUCCESSFUL path): several
+    /// subscription callbacks are parked (each queued body is a SEPARATE invocation), the page's
+    /// <c>LastCallbackCompletion</c> is OVERWRITTEN by each new callback and therefore aggregates nothing, and the
+    /// cleanup must still await EVERY tracked invocation.
     /// <para>
-    /// WHY THE COUNT MATTERS: a cleanup that joined only the page's last recorded callback would leave the
-    /// EARLIER invocations un-awaited — they would still be blocked on the release latch, their faults would go
-    /// unobserved, and the renderer would be disposed under them. The row therefore pins the COUNT of joined
-    /// invocations against the count of tracked invocations, and observes every invocation's final state
-    /// (each must have RAN TO COMPLETION — released AND awaited, not merely released).
+    /// WHAT IT EXERCISES, EXACTLY: the row calls <c>rendered.DisposeAsync()</c> EXPLICITLY (the later
+    /// <c>await using</c> disposal is then an idempotent no-op) so it can read the join observations afterwards. It
+    /// proves the join-all behaviour of the cleanup body on a scenario that did NOT fail. It does NOT exercise the
+    /// runner/<c>await using</c> unwind and says nothing about failure precedence — those are the two rows below.
     /// </para>
     /// <para>
-    /// IT IS NON-VACUOUS: more than one invocation is actually parked (the count is asserted to be greater than
-    /// one), so the "join them all" contract is exercised rather than satisfied by a single invocation.
+    /// WHY THE COUNT MATTERS: the shared release latch completes every parked invocation whether or not it is
+    /// joined, so a terminal state alone proves nothing about joining. The join loop therefore counts the
+    /// invocations it actually awaited (<c>JoinedParkedCount</c>) against the number tracked; a cleanup that joined
+    /// only the last one fails the count. It is non-vacuous: at least three invocations are parked.
     /// </para>
     /// </summary>
     [Fact]
@@ -545,8 +546,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         // The page's own record points at the LAST invocation only — which is exactly why the helper tracks them all.
         Assert.NotNull(rendered.Page.LastCallbackCompletion);
 
-        // CLEANUP (the disposal above) releases and joins them; the observation happens on the disposal path,
-        // so the assertions live where the join really happens.
+        // EXPLICIT disposal (see the remarks): the join observations are read right after it.
         await rendered.DisposeAsync();
 
         Assert.Equal(rendered.ParkedCount, rendered.JoinedParkedCount);
@@ -555,37 +555,111 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A FAILING ROW STILL CLEANS UP EVERY PARKED INVOCATION: when the scenario's own assertion fails, the
-    /// cleanup must release AND join every parked invocation anyway (the failure-safe shape), and the ORIGINAL
-    /// failure must keep precedence over the cleanup's own.
+    /// THE REAL EXCEPTIONAL PATH: a scenario failure UNWINDS through the retained circuit's own <c>await using</c>
+    /// (the scope's compiler-generated disposal — there is NO explicit <c>DisposeAsync()</c> call in the body), and
+    /// that unwinding cleanup releases AND individually joins every parked invocation.
     /// <para>
-    /// The cleanup is exercised through the REAL disposal path (the runner-invoked <c>DisposeAsync</c>), and the
-    /// row proves the release happened: the parked invocations end RAN TO COMPLETION rather than still waiting.
+    /// WHAT IT PROVES: (1) the thrown exception is exactly the scenario's own sentinel — cleanup neither replaced
+    /// nor wrapped it (the cleanup had no fault of its own here); (2) after the unwind, the join loop counted every
+    /// tracked invocation (<c>JoinedParkedCount == ParkedCount</c>, with more than two parked), and none is left
+    /// waiting. The count is the observation at the join: the release latch completes every task whether or not it
+    /// is joined, so the terminal states are only a secondary check.
+    /// </para>
+    /// <para>
+    /// WHAT IT DOES NOT PROVE: it says nothing about a cleanup fault coexisting with the scenario failure — that
+    /// is <c>AScenarioFailure_IsNotReplacedByACleanupFault_AndTheCleanupFaultIsStillReported</c>. (Claim changed
+    /// from the previous revision, which awaited <c>DisposeAsync()</c> explicitly, never threw, and so did not
+    /// exercise this path.)
     /// </para>
     /// </summary>
     [Fact]
     public async Task AFailingRow_StillReleasesAndJoinsEveryParkedInvocation()
     {
         await using var host = NewHost();
-        await using var rendered = await RenderAsync(host, MemberGh);
+        Rendered? captured = null;
 
-        await rendered.ParkCallbacksAsync();
-        rendered.Raise("HandleStreamingUpdate");
-        rendered.Raise("HandleStreamingUpdate");
-        await rendered.WaitForParkedCountAsync(2);
+        var thrown = await Assert.ThrowsAsync<ScenarioSentinelException>(async () =>
+        {
+            await using var rendered = await RenderAsync(host, MemberGh);
+            captured = rendered;
 
-        var parked = rendered.ParkedCount;
-        Assert.True(parked >= 2);
+            await rendered.ParkCallbacksAsync();
+            rendered.Raise("HandleStreamingUpdate");
+            rendered.Raise("HandleStreamingUpdate");
+            rendered.Raise("HandleStreamingUpdate");
+            await rendered.WaitForParkedCountAsync(3);
+            Assert.True(rendered.ParkedCount >= 3);
 
-        // Dispose the retained circuit WHILE the scenario is still "in flight": this is the failure-safe
-        // cleanup path (the same one a failing assertion would take through the `await using`).
-        await rendered.DisposeAsync();
+            // THE SCENARIO FAILS HERE, after parking: the `await using` unwinds through its disposal.
+            throw new ScenarioSentinelException("scenario failed after parking three invocations");
+        });
 
-        // EVERY parked invocation was released (and joined) despite the scenario never reaching its end.
-        Assert.Equal(parked, rendered.JoinedParkedCount);
-        Assert.All(rendered.ParkedStatuses(), status =>
-            Assert.Equal(TaskStatus.RanToCompletion, status));
+        Assert.Equal("scenario failed after parking three invocations", thrown.Message);
+
+        // Observed AFTER the unwind: the cleanup that ran was the scope's own disposal.
+        Assert.NotNull(captured);
+        Assert.True(captured!.ParkedCount >= 3);
+        Assert.Equal(captured.ParkedCount, captured.JoinedParkedCount);
+        Assert.All(captured.ParkedStatuses(), status => Assert.Equal(TaskStatus.RanToCompletion, status));
     }
+
+    /// <summary>
+    /// A SCENARIO FAILURE IS NOT REPLACED BY A CLEANUP FAULT, AND THE CLEANUP FAULT IS STILL REPORTED: the scenario
+    /// (run through <c>RunScenarioAsync</c>) fails with one sentinel; the unwinding <c>await using</c> disposal then
+    /// meets a DIFFERENT fault from a parked invocation. Cleanup must still release and join ALL invocations (the
+    /// faulting one sits in the middle), and the exception that escapes must keep the scenario failure identifiable
+    /// — the very same instance, first — with the cleanup fault alongside it.
+    /// <para>
+    /// SCOPE OF THE CLAIM: this precedence applies to a scenario run through <c>Rendered.RunScenarioAsync</c> (a
+    /// <c>DisposeAsync</c> cannot see the exception of an <c>await using</c> body by itself). Existing rows that do
+    /// not use that wrapper are unchanged: a cleanup fault there is still reported as the cleanup aggregate.
+    /// </para>
+    /// <para>
+    /// LOAD-BEARING: with the previous behaviour restored (the cleanup aggregate thrown without the primary
+    /// failure) this row fails at <c>Assert.Same(scenario, escaped.InnerExceptions[0])</c>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AScenarioFailure_IsNotReplacedByACleanupFault_AndTheCleanupFaultIsStillReported()
+    {
+        await using var host = NewHost();
+        Rendered? captured = null;
+        var scenario = new ScenarioSentinelException("the scenario failure");
+        var cleanup = new CleanupSentinelException("the cleanup fault");
+
+        var escaped = await Assert.ThrowsAsync<AggregateException>(async () =>
+        {
+            await using var rendered = await RenderAsync(host, MemberGh);
+            captured = rendered;
+
+            await rendered.RunScenarioAsync(async () =>
+            {
+                await rendered.ParkCallbacksAsync();
+                rendered.Raise("HandleStreamingUpdate");
+                rendered.ParkFaultingInvocation(cleanup); // faults during cleanup, in the MIDDLE of the tracked set
+                rendered.Raise("HandleStreamingUpdate");
+                await rendered.WaitForParkedCountAsync(3);
+                throw scenario;
+            });
+        });
+
+        // The primary is identifiable: the very same instance, first; the cleanup fault is visible, not swallowed.
+        Assert.Same(scenario, escaped.InnerExceptions[0]);
+        Assert.Contains(cleanup, escaped.InnerExceptions);
+        Assert.Equal(2, escaped.InnerExceptions.Count);
+
+        // The fault did not stop the cleanup: every invocation was still joined, the faulting one observed as such.
+        Assert.NotNull(captured);
+        Assert.Equal(3, captured!.ParkedCount);
+        Assert.Equal(captured.ParkedCount, captured.JoinedParkedCount);
+        var statuses = captured.ParkedStatuses();
+        Assert.Equal(1, statuses.Count(s => s == TaskStatus.Faulted));
+        Assert.Equal(2, statuses.Count(s => s == TaskStatus.RanToCompletion));
+    }
+
+    private sealed class ScenarioSentinelException(string message) : Exception(message);
+
+    private sealed class CleanupSentinelException(string message) : Exception(message);
 
     /// <summary>
     /// ADOPTION ADDS NO SECOND CONNECT: a deferred runtime's facade operation drives EXACTLY ONE request-path
@@ -1390,7 +1464,44 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             await Step(() => Page.LastCallbackCompletion.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
             await Step(() => renderer.DisposeAsync().AsTask());
             await Step(() => { ServiceScope.Dispose(); return Task.CompletedTask; });
-            if (failures.Count > 0) throw new AggregateException("Retained circuit cleanup failed", failures);
+
+            if (failures.Count == 0)
+                return; // a primary scenario failure (if any) keeps propagating from the `await using` untouched
+
+            // PRECEDENCE: an exception thrown by DisposeAsync REPLACES whatever the `await using` body threw, and a
+            // DisposeAsync cannot observe that body exception by itself. So when the scenario was run through
+            // RunScenarioAsync (which captured its failure), the PRIMARY failure is thrown FIRST in the aggregate and
+            // the cleanup failures ride alongside it — never silently dropped, never replacing it. A scenario NOT run
+            // through RunScenarioAsync has no known primary, so only the cleanup failures can be reported.
+            if (_primaryFailure is { } primary)
+                throw new AggregateException("Scenario failed; retained circuit cleanup ALSO failed", [primary, .. failures]);
+
+            throw new AggregateException("Retained circuit cleanup failed", failures);
+        }
+
+        private Exception? _primaryFailure;
+
+        /// <summary>
+        /// Runs a scenario body and CAPTURES its failure (then rethrows it unchanged), so that a later cleanup fault
+        /// can be reported alongside it instead of replacing it. Only a scenario run through this method gets the
+        /// primary-failure precedence in <see cref="DisposeAsync"/>.
+        /// </summary>
+        public async Task RunScenarioAsync(Func<Task> scenario)
+        {
+            try { await scenario(); }
+            catch (Exception ex) { _primaryFailure = ex; throw; }
+        }
+
+        /// <summary>
+        /// TEST SEAM for the cleanup-fault path: tracks one more parked invocation, on the SAME release latch and
+        /// through the SAME tracking list as every real parked callback, whose body FAULTS with
+        /// <paramref name="fault"/> once released — i.e. a cleanup-time fault that cleanup must observe by joining it.
+        /// </summary>
+        public void ParkFaultingInvocation(Exception fault)
+        {
+            var release = (_parkedRelease ?? throw new InvalidOperationException("ParkCallbacksAsync was not called.")).Task;
+            var invocation = RunParkedAsync(release, () => throw fault);
+            lock (_parkedCallbacks) _parkedCallbacks.Add(invocation);
         }
     }
 
