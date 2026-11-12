@@ -490,7 +490,7 @@ public sealed class ActiveModeConfigUiTests
     }
 
     /// <summary>
-    /// The mode load goes through <c>IConfigFacade.GetComposer()</c> — NOT an HTTP GET. Both
+    /// The mode load goes through <c>IConfigFacade.GetComposerAsync(identity, ct)</c> — NOT an HTTP GET. Both
     /// failure paths (an unsuccessful result and a thrown exception) must clear the mode rather
     /// than leave a fabricated default in place, and both surface the error text. Reverting to
     /// <c>HttpClient.GetFromJsonAsync("/api/config/composer", …)</c> fails this test.
@@ -499,9 +499,9 @@ public sealed class ActiveModeConfigUiTests
     public void ComposerChat_LoadMode_FailureLeavesModeUnloaded()
     {
         var source = ReadComposerChatSource();
-        var method = ExtractMethodSource(source, "private Task LoadActiveNotificationsModeAsync()");
+        var method = ExtractMethodSource(source, "private async Task LoadActiveNotificationsModeAsync()");
         Assert.Contains("NormalizeLoadedNotificationsMode", method);
-        Assert.Contains("ConfigFacade.GetComposer()", method);
+        Assert.Contains("ConfigFacade.GetComposerAsync(", method);
         Assert.DoesNotContain("/api/config/composer", method);
         Assert.DoesNotContain("HttpClient", method);
 
@@ -699,7 +699,7 @@ public sealed class ActiveModeConfigUiTests
         }
 
         // The not-configured default load must populate only the 4 defaults, never the new events.
-        var method = ExtractMethodSource(source, "private Task LoadComposerAsync()");
+        var method = ExtractMethodSource(source, "private async Task LoadComposerAsync()");
         var defaultsStart = method.IndexOf("_composerNotifActiveEvents.Add(\"goal_completed\")", StringComparison.Ordinal);
         Assert.True(defaultsStart >= 0, "Default load must seed goal_completed");
         var defaultsBody = method.Substring(defaultsStart);
@@ -748,7 +748,7 @@ public sealed class ActiveModeConfigUiTests
     public void Configuration_LoadComposer_LoadsEffectiveValues()
     {
         var source = ReadConfigurationSource();
-        var method = ExtractMethodSource(source, "private Task LoadComposerAsync()");
+        var method = ExtractMethodSource(source, "private async Task LoadComposerAsync()");
         Assert.Contains("EventNotifications?.Mode", method);
         Assert.Contains("EventNotifications?.ThrottleSeconds", method);
         Assert.Contains("EventNotifications?.ActiveEvents", method);

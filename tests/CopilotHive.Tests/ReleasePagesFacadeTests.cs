@@ -433,17 +433,34 @@ public sealed class ReleasePagesFacadeTests
     // ── 5. DTO state replacement ─────────────────────────────────────────────
 
     /// <summary>
-    /// <c>_release</c> is initialized from the domain <see cref="Release"/> via an explicit
-    /// mapping: the page calls <c>ReleaseDto.From(release)</c> on the store-loaded entity, and
-    /// the field itself is declared as <see cref="ReleaseDto"/>.
+    /// <c>_release</c> is declared as <see cref="ReleaseDto"/> and is initialized from the
+    /// AUTHORIZED facade read — <c>ReleaseFacade.GetReleaseAsync</c> already returns the
+    /// <see cref="ReleaseDto"/>, so the page assigns the returned value directly instead of
+    /// projecting a store-loaded entity itself.
+    /// <para>
+    /// UPDATED COHERENTLY with the authorized-read migration: the release detail read is NO LONGER an
+    /// identity-free <c>GoalStore.GetReleaseAsync</c> call — it goes through the facade so the caller's
+    /// current role/enabled state is re-resolved. This test keeps pinning the DTO state shape (the
+    /// field's declared type and its assignment from the release read) while asserting the read is the
+    /// authorized one and that the identity-free store read is GONE — a strictly stronger contract
+    /// than the previous assertion, never a weaker one.
+    /// </para>
     /// </summary>
     [Fact]
     public void ReleaseDetail_InitialState_MapsDomainReleaseToDto()
     {
         var source = ReadReleaseDetailSource();
         Assert.Contains("private ReleaseDto? _release;", source);
-        Assert.Contains("_release = ReleaseDto.From(release);", source);
-        Assert.Contains("var release = await GoalStore.GetReleaseAsync(decoded);", source);
+
+        // The load path assigns the DTO the AUTHORIZED facade read returns...
+        var method = ExtractMethodSource(source, "protected override async Task OnInitializedAsync()");
+        Assert.Contains("var releaseResult = await ReleaseFacade.GetReleaseAsync(", method);
+        Assert.Contains("await ActingUserAsync()", method);
+        Assert.Contains("_release = releaseResult.Value;", method);
+
+        // ...and the identity-free store read of the release is GONE from the whole page.
+        Assert.DoesNotContain("GoalStore.GetReleaseAsync(", source);
+        Assert.DoesNotContain("ReleaseDto.From(release)", source);
     }
 
     /// <summary>
@@ -524,14 +541,16 @@ public sealed class ReleasePagesFacadeTests
 
     /// <summary>
     /// The create-call itself goes through the facade with the exact
-    /// <see cref="CreateReleaseRequest"/>(version, repository) shape, and a failure surfaces
-    /// the facade's inner error text in <c>_createError</c>.
+    /// <see cref="CreateReleaseRequest"/>(version, repository) shape AND the circuit identity the
+    /// identity-aware facade now requires, and a failure surfaces the facade's inner error text in
+    /// <c>_createError</c>.
     /// </summary>
     [Fact]
     public void ReleasesPage_CreateRelease_CallsFacadeAndSurfacesError()
     {
         var method = ExtractMethodSource(ReadReleasesSource(), "private async Task CreateRelease()");
-        Assert.Contains("ReleaseFacade.CreateReleaseAsync(new CreateReleaseRequest(_createVersion, _createRepo))", method);
+        Assert.Contains("ReleaseFacade.CreateReleaseAsync(", method);
+        Assert.Contains("new CreateReleaseRequest(_createVersion, _createRepo), await ActingUserAsync())", method);
         Assert.Contains("_createError = result.Error ?? \"\";", method);
         Assert.DoesNotContain("Nav.NavigateTo", method);
     }

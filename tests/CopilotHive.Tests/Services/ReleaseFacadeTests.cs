@@ -6,6 +6,7 @@ using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -81,6 +82,10 @@ public sealed class ReleaseFacadeTests : IDisposable
             store,
             notifier ?? new DashboardNotifier(),
             NullLogger<ReleaseFacade>.Instance,
+            // OPEN MODE over the REAL production resolver/policy: what these pre-existing
+            // behavioural tests exercised (the legacy single local operator).
+            OpenModeFacadeAuth.Resolver,
+            OpenModeFacadeAuth.Policy,
             executionService,
             eventBus,
             nuGetMonitor,
@@ -89,6 +94,12 @@ public sealed class ReleaseFacadeTests : IDisposable
             docCleanup);
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
+    /// <summary>
+    /// The OPEN-MODE identity handed to every migrated facade call: open mode has no cascade, so no
+    /// principal exists and the production resolver answers the legacy local operator.
+    /// </summary>
+    private static System.Security.Claims.ClaimsPrincipal? User => OpenModeActingUser.User;
 
     private static async Task SeedReleaseAsync(
         GoalStore store, string id, string tag = "v1.0.0", ReleaseStatus status = ReleaseStatus.Planning,
@@ -111,7 +122,7 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("missing", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("missing", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.NotFound, failure.Kind);
@@ -127,7 +138,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0");
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest(""), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest(""), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.BadRequest, failure.Kind);
@@ -142,7 +153,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0");
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest(numericStatus), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest(numericStatus), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.BadRequest, failure.Kind);
@@ -155,7 +166,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0");
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Bogus"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Bogus"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.BadRequest, failure.Kind);
@@ -168,7 +179,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0");
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released,Planning"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released,Planning"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.BadRequest, failure.Kind);
@@ -181,7 +192,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", status: ReleaseStatus.Released);
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.Conflict, failure.Kind);
@@ -194,7 +205,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", status: ReleaseStatus.Released);
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Planning"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Planning"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.Conflict, failure.Kind);
@@ -207,7 +218,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", repos: ["repo1"]);
         var facade = CreateFacade(_store);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Planning"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Planning"), User, Ct);
 
         var noOp = Assert.IsType<PlanningNoOpOutcome>(outcome);
         Assert.Equal("v1.0.0", noOp.Release.Id);
@@ -224,7 +235,7 @@ public sealed class ReleaseFacadeTests : IDisposable
             new Goal { Id = "goal-1", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, Ct);
         var facade = CreateFacade(_store, executionService: null);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.ServiceUnavailable, failure.Kind);
@@ -251,7 +262,7 @@ public sealed class ReleaseFacadeTests : IDisposable
             NullLogger<ReleaseExecutionService>.Instance);
         var facade = CreateFacade(store, execService);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.NotFound, failure.Kind);
@@ -274,7 +285,7 @@ public sealed class ReleaseFacadeTests : IDisposable
             NullLogger<ReleaseExecutionService>.Instance);
         var facade = CreateFacade(store, execService);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.Conflict, failure.Kind);
@@ -297,7 +308,7 @@ public sealed class ReleaseFacadeTests : IDisposable
             NullLogger<ReleaseExecutionService>.Instance);
         var facade = CreateFacade(store, execService);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.Conflict, failure.Kind);
@@ -316,7 +327,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var execService = CreateExecutionService(CreateConfig(), fake);
         var facade = CreateFacade(_store, execService);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.BadRequest, failure.Kind);
@@ -342,7 +353,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var execService = CreateExecutionService(CreateConfig(), fake);
         var facade = CreateFacade(_store, execService);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var failure = Assert.IsType<StatusFailureOutcome>(outcome);
         Assert.Equal(FacadeErrorKind.Internal, failure.Kind);
@@ -372,7 +383,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         notifier.OnStateChanged += () => notifyCount++;
         var facade = CreateFacade(_store, execService, eventBus: eventBus, notifier: notifier);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         var success = Assert.IsType<ExecutionSuccessOutcome>(outcome);
         Assert.Equal(ReleaseStatus.Released, success.Release.Status);
@@ -413,7 +424,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var execService = CreateExecutionService(CreateConfig(), fake);
         var facade = CreateFacade(_store, execService, eventBus: null);
 
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), Ct);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, Ct);
 
         Assert.IsType<ExecutionSuccessOutcome>(outcome);
     }
@@ -436,7 +447,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var facade = CreateFacade(store, execService, docCleanup: docCleanup);
 
         using var cts = new CancellationTokenSource();
-        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), cts.Token);
+        var outcome = await facade.UpdateReleaseStatusAsync("v1.0.0", new UpdateReleaseStatusRequest("Released"), User, cts.Token);
 
         Assert.IsType<ExecutionSuccessOutcome>(outcome);
 
@@ -473,7 +484,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         notifier.OnStateChanged += () => notifyCount++;
         var facade = CreateFacade(_store, notifier: notifier);
 
-        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("v2.0.0"));
+        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("v2.0.0"), User);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -489,7 +500,8 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("v2.0.0", Repository: "repo1"));
+        var result = await facade.CreateReleaseAsync(
+            new CreateReleaseRequest("v2.0.0", Repository: "repo1"), User);
 
         Assert.True(result.Success);
         Assert.Equal(["repo1"], result.Value!.RepositoryNames);
@@ -500,7 +512,7 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("  "));
+        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("  "), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -515,7 +527,7 @@ public sealed class ReleaseFacadeTests : IDisposable
 
         // The real GoalStore converts the duplicate-ID DbUpdateException into
         // InvalidOperationException — the same exception the pre-facade handler caught.
-        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("v1.0.0"));
+        var result = await facade.CreateReleaseAsync(new CreateReleaseRequest("v1.0.0"), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -533,7 +545,8 @@ public sealed class ReleaseFacadeTests : IDisposable
         notifier.OnStateChanged += () => notifyCount++;
         var facade = CreateFacade(_store, notifier: notifier);
 
-        var result = await facade.UpdateReleaseNotesAsync("v1.0.0", new UpdateReleaseNotesRequest("New notes"));
+        var result = await facade.UpdateReleaseNotesAsync(
+            "v1.0.0", new UpdateReleaseNotesRequest("New notes"), User);
 
         Assert.True(result.Success);
         Assert.Equal("New notes", result.Value!.Notes);
@@ -547,7 +560,8 @@ public sealed class ReleaseFacadeTests : IDisposable
         await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Notes = "Old notes" }, Ct);
         var facade = CreateFacade(_store);
 
-        var result = await facade.UpdateReleaseNotesAsync("v1.0.0", new UpdateReleaseNotesRequest(null));
+        var result = await facade.UpdateReleaseNotesAsync(
+            "v1.0.0", new UpdateReleaseNotesRequest(null), User);
 
         Assert.True(result.Success);
         Assert.Null(result.Value!.Notes);
@@ -558,7 +572,8 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var result = await facade.UpdateReleaseNotesAsync("missing", new UpdateReleaseNotesRequest("notes"));
+        var result = await facade.UpdateReleaseNotesAsync(
+            "missing", new UpdateReleaseNotesRequest("notes"), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -573,7 +588,8 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0");
         var facade = CreateFacade(_store);
 
-        var result = await facade.UpdateReleaseTagAsync("v1.0.0", new UpdateReleaseTagRequest("  "));
+        var result = await facade.UpdateReleaseTagAsync(
+            "v1.0.0", new UpdateReleaseTagRequest("  "), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -589,7 +605,8 @@ public sealed class ReleaseFacadeTests : IDisposable
         notifier.OnStateChanged += () => notifyCount++;
         var facade = CreateFacade(_store, notifier: notifier);
 
-        var result = await facade.UpdateReleaseTagAsync("v1.0.0", new UpdateReleaseTagRequest("  v2.0.0  "));
+        var result = await facade.UpdateReleaseTagAsync(
+            "v1.0.0", new UpdateReleaseTagRequest("  v2.0.0  "), User);
 
         Assert.True(result.Success);
         Assert.Equal("v2.0.0", result.Value!.Tag); // trimmed
@@ -601,7 +618,8 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var result = await facade.UpdateReleaseTagAsync("missing", new UpdateReleaseTagRequest("v2.0.0"));
+        var result = await facade.UpdateReleaseTagAsync(
+            "missing", new UpdateReleaseTagRequest("v2.0.0"), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -614,7 +632,8 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", status: ReleaseStatus.Released);
         var facade = CreateFacade(_store);
 
-        var result = await facade.UpdateReleaseTagAsync("v1.0.0", new UpdateReleaseTagRequest("v2.0.0"));
+        var result = await facade.UpdateReleaseTagAsync(
+            "v1.0.0", new UpdateReleaseTagRequest("v2.0.0"), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -633,7 +652,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var facade = CreateFacade(_store, notifier: notifier);
 
         var result = await facade.UpdateReleaseRepositoriesAsync(
-            "v1.0.0", new UpdateReleaseRepositoriesRequest(["repo1", "repo2"]));
+            "v1.0.0", new UpdateReleaseRepositoriesRequest(["repo1", "repo2"]), User);
 
         Assert.True(result.Success);
         Assert.Equal(["repo1", "repo2"], result.Value!.RepositoryNames);
@@ -648,7 +667,8 @@ public sealed class ReleaseFacadeTests : IDisposable
 
         // A null list reaches ReleaseUpdateData as a no-op update followed by a 200 — preserved
         // exactly from the pre-facade handler (the store applies only non-null fields).
-        var result = await facade.UpdateReleaseRepositoriesAsync("v1.0.0", new UpdateReleaseRepositoriesRequest(null));
+        var result = await facade.UpdateReleaseRepositoriesAsync(
+            "v1.0.0", new UpdateReleaseRepositoriesRequest(null), User);
 
         Assert.True(result.Success);
         // The repository list is unchanged.
@@ -661,7 +681,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var facade = CreateFacade(_store);
 
         var result = await facade.UpdateReleaseRepositoriesAsync(
-            "missing", new UpdateReleaseRepositoriesRequest(["repo1"]));
+            "missing", new UpdateReleaseRepositoriesRequest(["repo1"]), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -675,7 +695,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var facade = CreateFacade(_store);
 
         var result = await facade.UpdateReleaseRepositoriesAsync(
-            "v1.0.0", new UpdateReleaseRepositoriesRequest(["repo1"]));
+            "v1.0.0", new UpdateReleaseRepositoriesRequest(["repo1"]), User);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -689,7 +709,7 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var result = await facade.DeleteReleaseAsync("missing", Ct);
+        var result = await facade.DeleteReleaseAsync("missing", User, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -702,7 +722,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", status: ReleaseStatus.Released);
         var facade = CreateFacade(_store);
 
-        var result = await facade.DeleteReleaseAsync("v1.0.0", Ct);
+        var result = await facade.DeleteReleaseAsync("v1.0.0", User, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -715,7 +735,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", executionState: ReleaseExecutionState.Executing);
         var facade = CreateFacade(_store);
 
-        var result = await facade.DeleteReleaseAsync("v1.0.0", Ct);
+        var result = await facade.DeleteReleaseAsync("v1.0.0", User, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -730,7 +750,7 @@ public sealed class ReleaseFacadeTests : IDisposable
             new Goal { Id = "goal-1", Description = "Attached", ReleaseId = "v1.0.0" }, Ct);
         var facade = CreateFacade(_store);
 
-        var result = await facade.DeleteReleaseAsync("v1.0.0", Ct);
+        var result = await facade.DeleteReleaseAsync("v1.0.0", User, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.BadRequest, result.Kind);
@@ -751,7 +771,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         notifier.OnStateChanged += () => notifyCount++;
         var facade = CreateFacade(store, notifier: notifier);
 
-        var result = await facade.DeleteReleaseAsync("v1.0.0", Ct);
+        var result = await facade.DeleteReleaseAsync("v1.0.0", User, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.Conflict, result.Kind);
@@ -769,7 +789,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         notifier.OnStateChanged += () => notifyCount++;
         var facade = CreateFacade(_store, notifier: notifier);
 
-        var result = await facade.DeleteReleaseAsync("v1.0.0", Ct);
+        var result = await facade.DeleteReleaseAsync("v1.0.0", User, Ct);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -788,7 +808,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var facade = CreateFacade(store);
 
         using var cts = new CancellationTokenSource();
-        var result = await facade.DeleteReleaseAsync("v1.0.0", cts.Token);
+        var result = await facade.DeleteReleaseAsync("v1.0.0", User, cts.Token);
 
         Assert.True(result.Success);
 
@@ -811,7 +831,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var execService = CreateExecutionService(CreateConfig(), fake);
         var facade = CreateFacade(_store, execService);
 
-        var result = await facade.ValidateReleaseAsync("v1.0.0", Ct);
+        var result = await facade.ValidateReleaseAsync("v1.0.0", User, Ct);
 
         Assert.True(result.Success);
         Assert.True(result.Value!.Valid);
@@ -829,7 +849,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         var execService = CreateExecutionService(CreateConfig(), fake);
         var facade = CreateFacade(_store, execService);
 
-        var result = await facade.ValidateReleaseAsync("v1.0.0", Ct);
+        var result = await facade.ValidateReleaseAsync("v1.0.0", User, Ct);
 
         Assert.True(result.Success);
         Assert.False(result.Value!.Valid);
@@ -842,7 +862,7 @@ public sealed class ReleaseFacadeTests : IDisposable
         await SeedReleaseAsync(_store, "v1.0.0", repos: ["repo1"]);
         var facade = CreateFacade(_store, executionService: null);
 
-        var result = await facade.ValidateReleaseAsync("v1.0.0", Ct);
+        var result = await facade.ValidateReleaseAsync("v1.0.0", User, Ct);
 
         Assert.True(result.Success);
         Assert.True(result.Value!.Valid);
@@ -854,7 +874,7 @@ public sealed class ReleaseFacadeTests : IDisposable
     {
         var facade = CreateFacade(_store);
 
-        var result = await facade.ValidateReleaseAsync("missing", Ct);
+        var result = await facade.ValidateReleaseAsync("missing", User, Ct);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);

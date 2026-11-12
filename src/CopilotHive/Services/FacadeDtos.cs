@@ -327,6 +327,16 @@ public sealed record OrchestratorConfigDto(
     string? ReasoningEffort);
 
 /// <summary>
+/// One RAW configuration-repo file as the Configuration page's file tabs render it. Carries the file's
+/// name and its VERBATIM content — this is a full configuration projection, deliberately NOT sanitized,
+/// so it is only ever produced for a caller that holds
+/// <see cref="Security.HiveCapability.GlobalAdmin"/>.
+/// </summary>
+/// <param name="Name">The file name (e.g. <c>hive-config.yaml</c> or <c>coder.agents.md</c>).</param>
+/// <param name="Content">The file's complete, unmodified text.</param>
+public sealed record ConfigFileContentDto(string Name, string Content);
+
+/// <summary>
 /// Response DTO for GET /api/config/composer — the runtime-effective Composer settings
 /// projection (model, max steps, reasoning effort, and the typed event-notifications shape).
 /// </summary>

@@ -1628,7 +1628,7 @@
     };
 
     /// <summary>
-    /// Normalizes a mode reported by <see cref="IConfigFacade.GetComposer"/>. The projection
+    /// Normalizes a mode reported by <see cref="IConfigFacade.GetComposerAsync"/>. The projection
     /// already returns the effective (normalized) mode, so anything outside the three known
     /// values is treated as "not loaded" (<c>null</c>) rather than being coerced into a default
     /// that would let the toggle persist a transition derived from a value never reported.
@@ -1733,23 +1733,24 @@
         _notificationToggleHost ??= new ComponentNotificationToggleHost(this);
 
     /// <summary>
-    /// Loads the effective event-notification mode through <see cref="IConfigFacade.GetComposer"/>.
+    /// Loads the effective event-notification mode through <see cref="IConfigFacade.GetComposerAsync"/>.
     /// This runs regardless of whether the Composer agent is connected — the config projection is
     /// independent of that connection. A failed load leaves the mode <c>null</c> (not loaded),
     /// which keeps the toggle disabled instead of letting it persist a transition computed from a
     /// fabricated <c>passive</c> default that could overwrite a stored <c>active</c>/<c>off</c>.
     /// </summary>
-    private Task LoadActiveNotificationsModeAsync()
+    private async Task LoadActiveNotificationsModeAsync()
     {
         try
         {
-            var result = ConfigFacade.GetComposer();
+            var result = await ConfigFacade.GetComposerAsync(
+                await ActingUserAsync(), CancellationToken.None);
             if (!result.Success)
             {
                 // Left unloaded on purpose: the toggle stays disabled rather than guessing.
                 _activeNotifMode = null;
                 _notifToggleError = $"Failed to load notification mode: {result.Error}";
-                return Task.CompletedTask;
+                return;
             }
 
             _activeNotifMode = NormalizeLoadedNotificationsMode(result.Value?.EventNotifications?.Mode);
@@ -1762,8 +1763,6 @@
             _activeNotifMode = null;
             _notifToggleError = $"Failed to load notification mode: {ex.Message}";
         }
-
-        return Task.CompletedTask;
     }
 
     /// <summary>

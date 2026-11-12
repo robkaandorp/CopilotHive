@@ -1,8 +1,11 @@
 @page "/releases"
+@using System.Security.Claims
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using CopilotHive.Services
+@using Microsoft.AspNetCore.Components.Authorization
 @inject IGoalStore GoalStore
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject NavigationManager Nav
 @inject IReleaseFacade ReleaseFacade
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
@@ -202,11 +205,39 @@ else if (_loaded)
         ApplyFilters();
     }
 
+    /// <summary>
+    /// Loads each release's goals through the AUTHORIZED <see cref="IReleaseFacade.GetGoalsByReleaseAsync"/>
+    /// read, which re-resolves this circuit user's CURRENT role/enabled state and requires shared read.
+    /// A direct <c>GoalStore.GetGoalsByReleaseAsync</c> read here would be an identity-free bypass of
+    /// the covered release-read surface. The release LIST read in
+    /// <see cref="OnInitializedAsync"/> stays a direct <c>GoalStore.GetReleasesAsync</c> call — the
+    /// goal's explicit, documented exception.
+    /// <para>
+    /// A denied (or otherwise failed) read leaves that release at the empty state the page ALREADY
+    /// renders for a release with no goals, so a refusal never throws out of the renderer and never
+    /// fabricates counts.
+    /// </para>
+    /// </summary>
     private async Task LoadGoalCountsAsync()
     {
         foreach (var release in _allReleases)
         {
-            var goals = await GoalStore.GetGoalsByReleaseAsync(release.Id);
+            var result = await ReleaseFacade.GetGoalsByReleaseAsync(
+                release.Id, await ActingUserAsync(), CancellationToken.None);
+
+            if (!result.Success || result.Value is null)
+            {
+                // NON-CRASHING, MINIMAL: a denied (or otherwise failed) read keeps this release at the
+                // page's EXISTING empty default — the same state it already renders for a release with
+                // no goals — instead of throwing out of the renderer. Deliberately no new error UI, no
+                // denial-state machinery and no reuse of the create-form's _createError field: denial
+                // handling/redesign is a separate phase.
+                _goalsByRelease[release.Id] = [];
+                _goalCountsByRelease[release.Id] = (0, 0, 0);
+                continue;
+            }
+
+            var goals = result.Value;
             _goalsByRelease[release.Id] = goals;
             _goalCountsByRelease[release.Id] = (
                 Breaking: goals.Count(g => g.Scope == GoalScope.Breaking),
@@ -269,6 +300,27 @@ else if (_loaded)
     private void NavigateToRelease(string releaseId) =>
         Nav.NavigateTo($"/releases/{Uri.EscapeDataString(releaseId)}");
 
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. This is also the page's MINIMAL circuit
+    /// identity acquisition: the scoped <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/> is initialised
+    /// from the same cascading state exactly once per circuit.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
     private async Task CreateRelease()
     {
         _createError = null;
@@ -278,7 +330,8 @@ else if (_loaded)
             return;
         }
 
-        var result = await ReleaseFacade.CreateReleaseAsync(new CreateReleaseRequest(_createVersion, _createRepo));
+        var result = await ReleaseFacade.CreateReleaseAsync(
+            new CreateReleaseRequest(_createVersion, _createRepo), await ActingUserAsync());
         if (result.Success && result.Value is not null)
         {
             var created = ToDomainRelease(result.Value);

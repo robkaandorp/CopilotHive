@@ -14,11 +14,33 @@ namespace CopilotHive.Services;
 /// (status codes, problem details, error bodies) lives in one place.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Each operation returns a <see cref="FacadeResult{T}"/> whose <see cref="FacadeErrorKind"/>
 /// mirrors the HTTP status the endpoint would have returned before the facade existed. A
 /// facade method catches ONLY the exception types its previous endpoint handler caught;
 /// anything else is rethrown so unexpected failures surface as exceptions instead of being
 /// silently converted into a result.
+/// </para>
+/// <para>
+/// AUTHORIZATION IS PART OF EVERY OPERATION, AND IT RUNS FIRST. Each operation takes the caller's
+/// per-request (or per-circuit) <see cref="ClaimsPrincipal"/> and re-resolves the acting principal
+/// FRESH through <see cref="HivePrincipalResolver"/> — never trusting cookie claims and never
+/// retaining a resolved principal between calls — so a demoted, disabled or deleted account is
+/// refused on its very NEXT operation. A refusal, or a principal that does not hold the required
+/// capability, produces <see cref="FacadeErrorKind.Forbidden"/> BEFORE any configuration read and
+/// before any validate → mutate → write → commit work.
+/// </para>
+/// <para>
+/// THE ROLE MAP this facade enforces: EVERY operation — the full configuration projections
+/// (<see cref="GetModelsAsync"/>, <see cref="GetRepositoriesAsync"/>, <see cref="GetBranchesAsync"/>,
+/// <see cref="GetOrchestratorAsync"/>, <see cref="GetWorkersAsync"/>, <see cref="GetComposerAsync"/>,
+/// <see cref="DiscoverModelsAsync"/>) and every write (models, available models, sub-agent models,
+/// repositories, orchestrator, workers, Composer) — requires
+/// <see cref="HiveCapability.GlobalAdmin"/>. There is no shared-read projection on this surface and
+/// deliberately NONE is created here. Open mode resolves the explicit open-mode local operator
+/// through the same resolver, so the single-operator installation keeps its previous behaviour
+/// exactly.
+/// </para>
 /// </remarks>
 public interface IConfigFacade
 {
@@ -26,9 +48,11 @@ public interface IConfigFacade
     /// Reads the full model configuration (orchestrator/composer/compaction models, per-role
     /// worker models, reasoning efforts, available models, sub-agent models).
     /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>The model configuration, or <see cref="FacadeErrorKind.NotFound"/> when no
     /// <see cref="HiveConfigFile"/> is registered.</returns>
-    FacadeResult<ModelsConfigDto> GetModels();
+    Task<FacadeResult<ModelsConfigDto>> GetModelsAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Persists a batch of model configuration changes (validate → mutate → write → commit →
@@ -36,116 +60,146 @@ public interface IConfigFacade
     /// </summary>
     /// <param name="update">The model changes to apply.</param>
     /// <param name="ct">Cancellation token forwarded to the persistence layer.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <returns>
     /// Success with the saved description, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or <see cref="FacadeErrorKind.BadRequest"/>
     /// when the update is invalid. Cancellation and any other exception propagate to the caller.
     /// </returns>
-    Task<FacadeResult<SavedResult>> SaveModelsAsync(ModelConfigUpdate update, CancellationToken ct);
+    Task<FacadeResult<SavedResult>> SaveModelsAsync(
+        ModelConfigUpdate update, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Discovers models available from all configured providers (Copilot, Ollama).
     /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// The discovered models, or <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ModelDiscoveryService"/> is registered.
     /// </returns>
-    Task<FacadeResult<IReadOnlyList<DiscoveredModelDto>>> DiscoverModelsAsync();
+    Task<FacadeResult<IReadOnlyList<DiscoveredModelDto>>> DiscoverModelsAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Adds a model to the global <c>available_models</c> list.
     /// </summary>
     /// <param name="request">The model to add.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or
     /// <see cref="FacadeErrorKind.Conflict"/> when the name already exists.
     /// </returns>
-    Task<FacadeResult<SavedResult>> AddAvailableModelAsync(AvailableModelRequest request);
+    Task<FacadeResult<SavedResult>> AddAvailableModelAsync(
+        AvailableModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Updates an existing <c>available_models</c> entry by name.
     /// </summary>
     /// <param name="name">Model name to update (already URL-unescaped by the caller).</param>
     /// <param name="request">The new values.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or
     /// <see cref="FacadeErrorKind.NotFound"/> when the model does not exist.
     /// </returns>
-    Task<FacadeResult<SavedResult>> UpdateAvailableModelAsync(string name, AvailableModelRequest request);
+    Task<FacadeResult<SavedResult>> UpdateAvailableModelAsync(
+        string name, AvailableModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Removes a model from the <c>available_models</c> list by name.
     /// </summary>
     /// <param name="name">Model name to remove (already URL-unescaped by the caller).</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or
     /// <see cref="FacadeErrorKind.NotFound"/> when the model does not exist.
     /// </returns>
-    Task<FacadeResult<RemovedResult>> RemoveAvailableModelAsync(string name);
+    Task<FacadeResult<RemovedResult>> RemoveAvailableModelAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Adds a model to the curated <c>sub_agent_models</c> list.
     /// </summary>
     /// <param name="request">The model to add.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or
     /// <see cref="FacadeErrorKind.Conflict"/> when the name already exists.
     /// </returns>
-    Task<FacadeResult<SavedResult>> AddSubAgentModelAsync(SubAgentModelRequest request);
+    Task<FacadeResult<SavedResult>> AddSubAgentModelAsync(
+        SubAgentModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Updates an existing <c>sub_agent_models</c> entry by name.
     /// </summary>
     /// <param name="name">Model name to update (already URL-unescaped by the caller).</param>
     /// <param name="request">The new values.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or
     /// <see cref="FacadeErrorKind.NotFound"/> when the model does not exist.
     /// </returns>
-    Task<FacadeResult<SavedResult>> UpdateSubAgentModelAsync(string name, SubAgentModelRequest request);
+    Task<FacadeResult<SavedResult>> UpdateSubAgentModelAsync(
+        string name, SubAgentModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Removes a model from the <c>sub_agent_models</c> list by name.
     /// </summary>
     /// <param name="name">Model name to remove (already URL-unescaped by the caller).</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or
     /// <see cref="FacadeErrorKind.NotFound"/> when the model does not exist.
     /// </returns>
-    Task<FacadeResult<RemovedResult>> RemoveSubAgentModelAsync(string name);
+    Task<FacadeResult<RemovedResult>> RemoveSubAgentModelAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Lists the configured repositories.
     /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// The configured repositories as DTOs, or <see cref="FacadeErrorKind.NotFound"/> when no
     /// <see cref="HiveConfigFile"/> is registered.
     /// </returns>
-    FacadeResult<IReadOnlyList<RepositoryDto>> GetRepositories();
+    Task<FacadeResult<IReadOnlyList<RepositoryDto>>> GetRepositoriesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Adds a repository to the config (validate → mutate → write → commit → clone).
     /// </summary>
     /// <param name="request">The repository to add.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, <see cref="FacadeErrorKind.BadRequest"/>
     /// when the request is invalid, or <see cref="FacadeErrorKind.Conflict"/> when a repository
     /// with the same name already exists. Any other exception propagates to the caller.
     /// </returns>
-    Task<FacadeResult<SavedResult>> AddRepositoryAsync(RepositoryRequest request);
+    Task<FacadeResult<SavedResult>> AddRepositoryAsync(
+        RepositoryRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Lists the remote branches of a repository via the brain repo manager.
     /// </summary>
     /// <param name="name">Repository name (NOT URL-unescaped — the repository routes do not unescape).</param>
     /// <param name="ct">Cancellation token forwarded to the repo manager.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
     /// <returns>
     /// The branch names, <see cref="FacadeErrorKind.ServiceUnavailable"/> when no
     /// <see cref="IBrainRepoManager"/> is registered, <see cref="FacadeErrorKind.NotFound"/>
@@ -153,73 +207,123 @@ public interface IConfigFacade
     /// name is invalid, or <see cref="FacadeErrorKind.Internal"/> for any other failure
     /// (including cancellation, matching the pre-facade catch-all).
     /// </returns>
-    Task<FacadeResult<IReadOnlyList<string>>> GetBranchesAsync(string name, CancellationToken ct);
+    Task<FacadeResult<IReadOnlyList<string>>> GetBranchesAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Updates an existing repository's URL, default branch, and optional release configuration.
     /// </summary>
     /// <param name="name">Repository name to update (NOT URL-unescaped — the repository routes do not unescape).</param>
     /// <param name="request">The new values.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, <see cref="FacadeErrorKind.BadRequest"/>
     /// when the request is invalid, or <see cref="FacadeErrorKind.NotFound"/> when the
     /// repository does not exist. Any other exception propagates to the caller.
     /// </returns>
-    Task<FacadeResult<SavedResult>> UpdateRepositoryAsync(string name, RepositoryRequest request);
+    Task<FacadeResult<SavedResult>> UpdateRepositoryAsync(
+        string name, RepositoryRequest request, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Removes a repository from the config.
     /// </summary>
     /// <param name="name">Repository name to remove (NOT URL-unescaped — the repository routes do not unescape).</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered, or <see cref="FacadeErrorKind.NotFound"/>
     /// when the repository does not exist.
     /// </returns>
-    Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(string name);
+    Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Reads the orchestrator-level settings (model, iteration limits, logging, timeouts).
     /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>The orchestrator settings, or <see cref="FacadeErrorKind.NotFound"/> when no
     /// <see cref="HiveConfigFile"/> is registered.</returns>
-    FacadeResult<OrchestratorConfigDto> GetOrchestrator();
+    Task<FacadeResult<OrchestratorConfigDto>> GetOrchestratorAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Persists orchestrator-level setting changes (validate → mutate → write → commit).
     /// </summary>
     /// <param name="update">The orchestrator settings to apply.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success with the saved result, or <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered. Any other exception propagates to the caller.
     /// </returns>
-    Task<FacadeResult<SavedResult>> SaveOrchestratorAsync(OrchestratorSettingsUpdate update);
+    Task<FacadeResult<SavedResult>> SaveOrchestratorAsync(
+        OrchestratorSettingsUpdate update, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Reads the per-role worker settings (model, premium model, context window) keyed by role.
     /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>The workers dictionary, or <see cref="FacadeErrorKind.NotFound"/> when no
     /// <see cref="HiveConfigFile"/> is registered.</returns>
-    FacadeResult<WorkersConfigDto> GetWorkers();
+    Task<FacadeResult<WorkersConfigDto>> GetWorkersAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Persists per-role worker context windows (validate → mutate → write → commit).
     /// </summary>
     /// <param name="contextWindows">Role → context window size mapping.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>
     /// Success with the saved result, or <see cref="FacadeErrorKind.NotConfigured"/> when no
     /// <see cref="ConfigModelService"/> is registered. Any other exception propagates to the caller.
     /// </returns>
-    Task<FacadeResult<SavedResult>> SaveWorkersAsync(Dictionary<string, int> contextWindows);
+    Task<FacadeResult<SavedResult>> SaveWorkersAsync(
+        Dictionary<string, int> contextWindows, ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Reads the runtime-effective Composer settings (model, max steps, reasoning effort, and
     /// the typed event-notifications shape).
     /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
     /// <returns>The Composer settings, or <see cref="FacadeErrorKind.NotFound"/> when no
     /// <see cref="HiveConfigFile"/> is registered.</returns>
-    FacadeResult<ComposerConfigDto> GetComposer();
+    Task<FacadeResult<ComposerConfigDto>> GetComposerAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads the RAW configuration-repo file contents the Configuration page's file tabs render: the
+    /// whole <c>hive-config.yaml</c> and every <c>agents/*.agents.md</c> file, verbatim.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS A FULL CONFIGURATION PROJECTION AND IT REQUIRES
+    /// <see cref="HiveCapability.GlobalAdmin"/>. It is deliberately NOT a sanitized projection: no
+    /// filtering is applied to the content, so the ONLY thing standing between a non-admin and the
+    /// complete configuration is this gate — which is why the gate runs BEFORE the file system is
+    /// touched and why a refusal returns no content at all (never a partial or redacted document that
+    /// could be mistaken for the real one).
+    /// </para>
+    /// <para>
+    /// The gate exists because rendering these files is a raw full-config read: before this operation
+    /// existed, the page read them straight off disk and rendered them to any authenticated role,
+    /// bypassing the administration requirement every other configuration projection enforces.
+    /// </para>
+    /// </remarks>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// The files in the page's existing order (<c>hive-config.yaml</c> first, then the agents files by
+    /// name; EMPTY when no config repo is configured or none exist), or
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.GlobalAdmin"/>.
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<ConfigFileContentDto>>> GetConfigFilesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Persists Composer setting changes (validate → mutate → write → commit).
@@ -260,6 +364,7 @@ public sealed class ConfigFacade : IConfigFacade
     private readonly ConfigModelService? _configModel;
     private readonly ModelDiscoveryService? _discovery;
     private readonly IBrainRepoManager? _repoManager;
+    private readonly ConfigRepoManager? _configRepo;
     private readonly HivePrincipalResolver _resolver;
     private readonly HivePolicy _policy;
     private readonly ILogger<ConfigFacade> _log;
@@ -278,6 +383,11 @@ public sealed class ConfigFacade : IConfigFacade
     /// </param>
     /// <param name="policy">The pure capability evaluator (required together with <paramref name="resolver"/>).</param>
     /// <param name="repoManager">The <see cref="IBrainRepoManager"/> (may be <c>null</c> when not registered).</param>
+    /// <param name="configRepo">
+    /// The <see cref="ConfigRepoManager"/> whose local clone the raw configuration-file read
+    /// (<see cref="GetConfigFilesAsync"/>) projects (may be <c>null</c> when no config repo was
+    /// configured at startup, in which case that read reports no files).
+    /// </param>
     /// <exception cref="ArgumentNullException">A required dependency is null.</exception>
     public ConfigFacade(
         HiveConfigFile? hiveConfig,
@@ -286,7 +396,8 @@ public sealed class ConfigFacade : IConfigFacade
         ILogger<ConfigFacade> log,
         HivePrincipalResolver resolver,
         HivePolicy policy,
-        IBrainRepoManager? repoManager = null)
+        IBrainRepoManager? repoManager = null,
+        ConfigRepoManager? configRepo = null)
     {
         _hiveConfig = hiveConfig;
         _configModel = configModel;
@@ -295,11 +406,15 @@ public sealed class ConfigFacade : IConfigFacade
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _repoManager = repoManager;
+        _configRepo = configRepo;
     }
 
     /// <inheritdoc />
-    public FacadeResult<ModelsConfigDto> GetModels()
+    public async Task<FacadeResult<ModelsConfigDto>> GetModelsAsync(ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(GetModelsAsync), ct).ConfigureAwait(false))
+            return Forbidden<ModelsConfigDto>();
+
         var config = _hiveConfig;
         if (config is null)
         {
@@ -360,8 +475,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> SaveModelsAsync(ModelConfigUpdate update, CancellationToken ct)
+    public async Task<FacadeResult<SavedResult>> SaveModelsAsync(
+        ModelConfigUpdate update, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(SaveModelsAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -383,8 +502,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<IReadOnlyList<DiscoveredModelDto>>> DiscoverModelsAsync()
+    public async Task<FacadeResult<IReadOnlyList<DiscoveredModelDto>>> DiscoverModelsAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(DiscoverModelsAsync), ct).ConfigureAwait(false))
+            return Forbidden<IReadOnlyList<DiscoveredModelDto>>();
+
         var discovery = _discovery;
         if (discovery is null)
         {
@@ -400,8 +523,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> AddAvailableModelAsync(AvailableModelRequest request)
+    public async Task<FacadeResult<SavedResult>> AddAvailableModelAsync(
+        AvailableModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(AddAvailableModelAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -421,8 +548,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> UpdateAvailableModelAsync(string name, AvailableModelRequest request)
+    public async Task<FacadeResult<SavedResult>> UpdateAvailableModelAsync(
+        string name, AvailableModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(UpdateAvailableModelAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -442,8 +573,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<RemovedResult>> RemoveAvailableModelAsync(string name)
+    public async Task<FacadeResult<RemovedResult>> RemoveAvailableModelAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(RemoveAvailableModelAsync), ct).ConfigureAwait(false))
+            return Forbidden<RemovedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -458,8 +593,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> AddSubAgentModelAsync(SubAgentModelRequest request)
+    public async Task<FacadeResult<SavedResult>> AddSubAgentModelAsync(
+        SubAgentModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(AddSubAgentModelAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -479,8 +618,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> UpdateSubAgentModelAsync(string name, SubAgentModelRequest request)
+    public async Task<FacadeResult<SavedResult>> UpdateSubAgentModelAsync(
+        string name, SubAgentModelRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(UpdateSubAgentModelAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -500,8 +643,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<RemovedResult>> RemoveSubAgentModelAsync(string name)
+    public async Task<FacadeResult<RemovedResult>> RemoveSubAgentModelAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(RemoveSubAgentModelAsync), ct).ConfigureAwait(false))
+            return Forbidden<RemovedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -516,8 +663,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public FacadeResult<IReadOnlyList<RepositoryDto>> GetRepositories()
+    public async Task<FacadeResult<IReadOnlyList<RepositoryDto>>> GetRepositoriesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(GetRepositoriesAsync), ct).ConfigureAwait(false))
+            return Forbidden<IReadOnlyList<RepositoryDto>>();
+
         var config = _hiveConfig;
         if (config is null)
         {
@@ -542,8 +693,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> AddRepositoryAsync(RepositoryRequest request)
+    public async Task<FacadeResult<SavedResult>> AddRepositoryAsync(
+        RepositoryRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(AddRepositoryAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -568,8 +723,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<IReadOnlyList<string>>> GetBranchesAsync(string name, CancellationToken ct)
+    public async Task<FacadeResult<IReadOnlyList<string>>> GetBranchesAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(GetBranchesAsync), ct).ConfigureAwait(false))
+            return Forbidden<IReadOnlyList<string>>();
+
         var repoManager = _repoManager;
         if (repoManager is null)
         {
@@ -600,8 +759,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> UpdateRepositoryAsync(string name, RepositoryRequest request)
+    public async Task<FacadeResult<SavedResult>> UpdateRepositoryAsync(
+        string name, RepositoryRequest request, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(UpdateRepositoryAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -626,8 +789,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(string name)
+    public async Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(
+        string name, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(RemoveRepositoryAsync), ct).ConfigureAwait(false))
+            return Forbidden<RemovedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -642,8 +809,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public FacadeResult<OrchestratorConfigDto> GetOrchestrator()
+    public async Task<FacadeResult<OrchestratorConfigDto>> GetOrchestratorAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(GetOrchestratorAsync), ct).ConfigureAwait(false))
+            return Forbidden<OrchestratorConfigDto>();
+
         var config = _hiveConfig;
         if (config is null)
         {
@@ -667,8 +838,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> SaveOrchestratorAsync(OrchestratorSettingsUpdate update)
+    public async Task<FacadeResult<SavedResult>> SaveOrchestratorAsync(
+        OrchestratorSettingsUpdate update, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(SaveOrchestratorAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -682,8 +857,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public FacadeResult<WorkersConfigDto> GetWorkers()
+    public async Task<FacadeResult<WorkersConfigDto>> GetWorkersAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(GetWorkersAsync), ct).ConfigureAwait(false))
+            return Forbidden<WorkersConfigDto>();
+
         var config = _hiveConfig;
         if (config is null)
         {
@@ -700,8 +879,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public async Task<FacadeResult<SavedResult>> SaveWorkersAsync(Dictionary<string, int> contextWindows)
+    public async Task<FacadeResult<SavedResult>> SaveWorkersAsync(
+        Dictionary<string, int> contextWindows, ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(SaveWorkersAsync), ct).ConfigureAwait(false))
+            return Forbidden<SavedResult>();
+
         var svc = _configModel;
         if (svc is null)
         {
@@ -715,8 +898,12 @@ public sealed class ConfigFacade : IConfigFacade
     }
 
     /// <inheritdoc />
-    public FacadeResult<ComposerConfigDto> GetComposer()
+    public async Task<FacadeResult<ComposerConfigDto>> GetComposerAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
     {
+        if (!await IsAllowedAsync(actingUser, nameof(GetComposerAsync), ct).ConfigureAwait(false))
+            return Forbidden<ComposerConfigDto>();
+
         var config = _hiveConfig;
         if (config is null)
         {
@@ -754,6 +941,44 @@ public sealed class ConfigFacade : IConfigFacade
                 activeEvents,
                 ValidActiveEvents,
                 notif?.EffectiveThrottleSeconds ?? 30)), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<ConfigFileContentDto>>> GetConfigFilesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST, before the file system is touched at all: the raw configuration files
+        // are a FULL projection, so a non-admin learns nothing — not even whether the repo exists or
+        // which files it holds.
+        if (!await IsAllowedAsync(actingUser, nameof(GetConfigFilesAsync), ct).ConfigureAwait(false))
+            return Forbidden<IReadOnlyList<ConfigFileContentDto>>();
+
+        // No config repo configured: there are no files to project. This is a SUCCESS with an empty
+        // list, exactly the state the page rendered when its clone directory did not exist.
+        var configRepo = _configRepo;
+        if (configRepo is null)
+            return new(true, [], null, FacadeErrorKind.None);
+
+        var files = new List<ConfigFileContentDto>();
+
+        // hive-config.yaml FIRST — the same order the page's tab list has always used.
+        var configPath = Path.Combine(configRepo.LocalPath, "hive-config.yaml");
+        if (File.Exists(configPath))
+            files.Add(new ConfigFileContentDto("hive-config.yaml", await File.ReadAllTextAsync(configPath, ct).ConfigureAwait(false)));
+
+        // …then agents/*.agents.md, ordered by file name.
+        var agentsDir = Path.Combine(configRepo.LocalPath, "agents");
+        if (Directory.Exists(agentsDir))
+        {
+            foreach (var path in Directory.GetFiles(agentsDir, "*.agents.md").OrderBy(f => f, StringComparer.Ordinal))
+            {
+                files.Add(new ConfigFileContentDto(
+                    Path.GetFileName(path),
+                    await File.ReadAllTextAsync(path, ct).ConfigureAwait(false)));
+            }
+        }
+
+        return new(true, files, null, FacadeErrorKind.None);
     }
 
     /// <inheritdoc />
@@ -795,6 +1020,34 @@ public sealed class ConfigFacade : IConfigFacade
         // OperationCanceledException and any other exception propagate to the caller —
         // the endpoint never caught them either.
     }
+
+    // ── Authorization + shared results ──────────────────────────────────────
+
+    /// <summary>
+    /// THE ONE AUTHORIZATION CALL every non-Composer operation makes, BEFORE any of its own work:
+    /// one fresh resolution of the caller's CURRENT stored state and one
+    /// <see cref="HiveCapability.GlobalAdmin"/> evaluation.
+    /// <para>
+    /// EVERY configuration projection and every configuration write in this facade — the model
+    /// catalog, the available/sub-agent model lists, the repositories (including the branches read),
+    /// the orchestrator settings, the worker settings and the Composer settings — is a GLOBAL
+    /// administration surface, so it requires the administration capability and nothing less. No
+    /// sanitized shared-read projection is created here.
+    /// </para>
+    /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="operation">The operation name (log context only).</param>
+    /// <param name="ct">Caller cancellation token; cancellation propagates, never a denial.</param>
+    /// <returns><c>true</c> only when the caller currently holds <see cref="HiveCapability.GlobalAdmin"/>.</returns>
+    private Task<bool> IsAllowedAsync(ClaimsPrincipal? actingUser, string operation, CancellationToken ct) =>
+        FacadeAuthorization.IsAllowedAsync(
+            _resolver, _policy, actingUser, HiveCapability.GlobalAdmin, _log, operation, ct);
+
+    /// <summary>Builds the shared denial result for a value-producing operation.</summary>
+    /// <typeparam name="T">The facade value type of the operation.</typeparam>
+    /// <returns>A <see cref="FacadeErrorKind.Forbidden"/> result carrying the sanitized denial text.</returns>
+    private static FacadeResult<T> Forbidden<T>() =>
+        new(false, default, FacadeAuthorization.ForbiddenMessage, FacadeErrorKind.Forbidden);
 
     /// <summary>The canonical snake_case names of the four default active events.</summary>
     private static readonly string[] DefaultActiveEvents =

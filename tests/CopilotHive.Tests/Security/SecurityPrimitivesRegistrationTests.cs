@@ -137,9 +137,16 @@ public sealed class SecurityPrimitivesRegistrationTests
     /// goal and issue facades plus the goal/issue routes in <c>ApiEndpoints.cs</c> (which now forward
     /// the request's <c>HttpContext.User</c> to those facades instead of reading the stores).
     /// <para>
-    /// Every OTHER boundary (the release/backup facades, the router, the nav menu, the Composer
-    /// actor, the user directory and the credential entity) still references none of the primitives,
-    /// so no boundary OUTSIDE the declared surface gained enforcement. <see cref="UserService"/> and
+    /// As of the RELEASE/CONFIG/BACKUP/CLARIFICATION BACKEND AUTHORIZATION slice the declared surface
+    /// also covers <c>ReleaseFacade</c> (two SharedRead reads, ExecutionOperator mutations),
+    /// <c>BackupFacade</c> (GlobalAdmin throughout, including download and restore) and
+    /// <c>ClarificationFacade</c> (SharedRead reads, ExecutionOperator answer), plus their routes in
+    /// <c>ApiEndpoints.cs</c>.
+    /// </para>
+    /// <para>
+    /// Every OTHER boundary (the router, the nav menu, the Composer actor, the user directory and the
+    /// credential entity) still references none of the primitives, so no boundary OUTSIDE the
+    /// declared surface gained enforcement. <see cref="UserService"/> and
     /// <see cref="CopilotHive.Persistence.Entities.UserEntity"/> remain untouched contracts the
     /// primitives consume rather than modify, and <c>Program.cs</c> remains the DI registration site.
     /// </para>
@@ -155,13 +162,16 @@ public sealed class SecurityPrimitivesRegistrationTests
         //
         // REMOVED FROM THIS LIST BY THE GOAL/ISSUE OPERATION AUTHORIZATION SLICE (and therefore now
         // covered by TheAuthorizedFacadesAndHubs_ReferenceTheResolverAndPolicy below):
-        // "ApiEndpoints.cs" (only its GOAL/ISSUE routes are covered — release/config/backup/
-        // clarification/session routes stay unchanged), "Services/GoalFacade.cs" and
+        // "ApiEndpoints.cs" (its GOAL/ISSUE routes), "Services/GoalFacade.cs" and
         // "Services/IssueFacade.cs".
+        //
+        // REMOVED FROM THIS LIST BY THE RELEASE/CONFIG/BACKUP/CLARIFICATION BACKEND AUTHORIZATION
+        // SLICE (and therefore now covered below): "Services/ReleaseFacade.cs",
+        // "Services/BackupFacade.cs" and — for the release/config/backup/clarification/session routes
+        // only — "ApiEndpoints.cs". The remaining ApiEndpoints boundaries (health, the gRPC service,
+        // the Composer hub's own routes) are still not in scope.
         var boundaries = new[]
         {
-            "Services/ReleaseFacade.cs",
-            "Services/BackupFacade.cs",
             "Services/UserService.cs",
             "Components/Routes.razor",
             "Components/Layout/NavMenu.razor",
@@ -218,6 +228,13 @@ public sealed class SecurityPrimitivesRegistrationTests
             // authorized before any store work.
             "Services/GoalFacade.cs",
             "Services/IssueFacade.cs",
+            // The RELEASE/CONFIG/BACKUP/CLARIFICATION slice: the two release reads are SharedRead and
+            // every release mutation/validation is ExecutionOperator; every backup operation and every
+            // configuration projection/write is GlobalAdmin; the clarification adapter splits
+            // SharedRead reads from an ExecutionOperator answer.
+            "Services/ReleaseFacade.cs",
+            "Services/BackupFacade.cs",
+            "Services/ClarificationFacade.cs",
         })
         {
             var body = TestSourceScanner.StripNonCode(

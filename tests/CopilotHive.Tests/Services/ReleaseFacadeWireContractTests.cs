@@ -10,6 +10,7 @@ using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Tests.Security;
 
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
@@ -803,10 +804,12 @@ public sealed class ReleaseFacadeWireContractTests
                 store, config, fake, NullLogger<ReleaseExecutionService>.Instance);
             var facade = new ReleaseFacade(
                 store, notifier, NullLogger<ReleaseFacade>.Instance,
+                // OPEN MODE over the REAL production resolver/policy: the legacy local operator.
+                OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy,
                 execService, eventBus, monitor, config, appLifetime: null, docCleanup);
 
             var outcome = await facade.UpdateReleaseStatusAsync(
-                "v1.0.0", new UpdateReleaseStatusRequest("Released"), ct);
+                "v1.0.0", new UpdateReleaseStatusRequest("Released"), OpenModeActingUser.User, ct);
 
             Assert.IsType<ExecutionSuccessOutcome>(outcome);
 
@@ -881,6 +884,7 @@ public sealed class ReleaseFacadeWireContractTests
 
             var facade = new ReleaseFacade(
                 store, notifier, NullLogger<ReleaseFacade>.Instance,
+                OpenModeFacadeAuth.Resolver, OpenModeFacadeAuth.Policy,
                 execService, eventBus, nuGetMonitor: null, hiveConfig: null, appLifetime: null, docCleanup);
 
             // The event publication fires AFTER the success re-read + timestamp update (default
@@ -888,7 +892,7 @@ public sealed class ReleaseFacadeWireContractTests
             eventBus.OnPublish = _ => cts.Cancel();
 
             var outcome = await facade.UpdateReleaseStatusAsync(
-                "v1.0.0", new UpdateReleaseStatusRequest("Released"), cts.Token);
+                "v1.0.0", new UpdateReleaseStatusRequest("Released"), OpenModeActingUser.User, cts.Token);
 
             var success = Assert.IsType<ExecutionSuccessOutcome>(outcome);
             Assert.Equal(ReleaseStatus.Released, success.Release.Status);

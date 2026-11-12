@@ -1,9 +1,11 @@
 @page "/configuration"
+@using System.Security.Claims
 @using CopilotHive.Configuration
 @using CopilotHive.Dashboard
 @using CopilotHive.Services
 @using Markdig
 @using Microsoft.Extensions.AI
+@using Microsoft.AspNetCore.Components.Authorization
 @implements IDisposable
 @inject ConfigRepoManager ConfigRepo
 @inject PageHeaderState PageHeader
@@ -1337,6 +1339,16 @@ else
     private bool _composerAdminAllowed;
 
     /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. Every configuration projection and every
+    /// configuration/backup write is an administration surface, so the facade requires GlobalAdmin.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
+    /// <summary>
     /// Re-evaluates the caller's admin capability from CURRENT stored state. Called once per
     /// initialisation; the value only gates RENDERING, never authorization — the facade re-resolves
     /// and refuses independently, so a stale flag can only under-render, never over-grant.
@@ -1395,23 +1407,28 @@ else
 
     private async Task LoadFilesAsync()
     {
-        var basePath = ConfigRepo.LocalPath;
+        // THE RAW CONFIGURATION FILES ARE A FULL CONFIG PROJECTION: the read goes through
+        // IConfigFacade, which re-resolves this circuit user's CURRENT role/enabled state and requires
+        // GlobalAdmin BEFORE touching the file system. Reading straight off disk here (as this page
+        // used to) bypassed that requirement and rendered the entire hive-config.yaml and the agents
+        // files to any authenticated role. A refusal yields NO content at all, so nothing reaches
+        // unauthorized state; open mode answers the local operator through the same seam, unchanged.
+        var filesResult = await ConfigFacade.GetConfigFilesAsync(
+            await ActingUserAsync(), CancellationToken.None);
 
-        // Load hive-config.yaml
-        var configPath = Path.Combine(basePath, "hive-config.yaml");
-        if (File.Exists(configPath))
-            _files["hive-config.yaml"] = await File.ReadAllTextAsync(configPath);
-
-        // Load agents/*.agents.md
-        var agentsDir = Path.Combine(basePath, "agents");
-        if (Directory.Exists(agentsDir))
+        if (!filesResult.Success || filesResult.Value is null)
         {
-            foreach (var file in Directory.GetFiles(agentsDir, "*.agents.md").OrderBy(f => f))
-            {
-                var name = Path.GetFileName(file);
-                _files[name] = await File.ReadAllTextAsync(file);
-            }
+            // The page's EXISTING sanitized error surface — the same one the load sequence already
+            // uses — so a refusal neither crashes the renderer nor renders any file content.
+            _files.Clear();
+            _error = filesResult.Error;
+            _tabs = [ModelsTabName, AvailableModelsTabName, SubAgentModelsTabName, BackupTabName,
+                RepositoriesTabName, OrchestratorTabName, WorkersTabName, ComposerTabName];
+            return;
         }
+
+        foreach (var file in filesResult.Value)
+            _files[file.Name] = file.Content;
 
         _tabs = [.. _files.Keys];
         _tabs.Insert(0, ModelsTabName);
@@ -1427,20 +1444,19 @@ else
     // Load methods that only read through the synchronous facade projections return a completed
     // Task rather than being `async`: they keep the awaited call-site shape the page already
     // uses while carrying no await (which would be a CS1998 warning under TreatWarningsAsErrors).
-    // Reads go through the synchronous IConfigFacade projections, so this method carries no
-    // await. It stays Task-returning (rather than `async`) to keep the awaited call sites
-    // unchanged without tripping CS1998 under TreatWarningsAsErrors.
-    private Task LoadModelsAsync()
+    // Reads go through the identity-aware IConfigFacade projections: the circuit principal travels
+    // with every call so the facade re-resolves current role/enabled state and requires GlobalAdmin.
+    private async Task LoadModelsAsync()
     {
         _modelsLoading = true;
         try
         {
-            var result = ConfigFacade.GetModels();
+            var result = await ConfigFacade.GetModelsAsync(await ActingUserAsync(), CancellationToken.None);
             if (!result.Success)
             {
                 // Same inner message the endpoint body carried, without an HTTP status prefix.
                 _saveError = $"Failed to load model config: {result.Error}";
-                return Task.CompletedTask;
+                return;
             }
 
             _modelsData = result.Value;
@@ -1457,8 +1473,6 @@ else
         {
             _modelsLoading = false;
         }
-
-        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -1663,7 +1677,7 @@ else
         {
             var update = BuildModelConfigUpdate();
 
-            var result = await ConfigFacade.SaveModelsAsync(update, CancellationToken.None);
+            var result = await ConfigFacade.SaveModelsAsync(update, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadModelsAsync();
@@ -1687,12 +1701,12 @@ else
         }
     }
 
-    private Task LoadBackupsAsync()
+    private async Task LoadBackupsAsync()
     {
         _backupsLoading = true;
         try
         {
-            var result = BackupFacade.GetBackups();
+            var result = await BackupFacade.GetBackupsAsync(await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _backups = result.Value ?? [];
@@ -1713,8 +1727,6 @@ else
         {
             _backupsLoading = false;
         }
-
-        return Task.CompletedTask;
     }
 
     private async Task CreateBackupAsync()
@@ -1724,7 +1736,7 @@ else
         _backupError = null;
         try
         {
-            var result = await BackupFacade.CreateBackupAsync(CancellationToken.None);
+            var result = await BackupFacade.CreateBackupAsync(await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadBackupsAsync();
@@ -1753,12 +1765,12 @@ else
 
     // ===== Repositories / Orchestrator / Workers / Composer tab methods =====
 
-    private Task LoadRepositoriesAsync()
+    private async Task LoadRepositoriesAsync()
     {
         _reposLoading = true;
         try
         {
-            var result = ConfigFacade.GetRepositories();
+            var result = await ConfigFacade.GetRepositoriesAsync(await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _repositories = result.Value ?? [];
@@ -1776,16 +1788,14 @@ else
             _repositories = [];
         }
         finally { _reposLoading = false; }
-
-        return Task.CompletedTask;
     }
 
-    private Task LoadOrchestratorAsync()
+    private async Task LoadOrchestratorAsync()
     {
         _orchestratorLoading = true;
         try
         {
-            var result = ConfigFacade.GetOrchestrator();
+            var result = await ConfigFacade.GetOrchestratorAsync(await ActingUserAsync(), CancellationToken.None);
             if (!result.Success)
             {
                 _orchestratorSaveError = $"Failed to load orchestrator settings: {result.Error}";
@@ -1810,16 +1820,14 @@ else
             _orchestratorSaveError = $"Failed to load orchestrator settings: {ex.Message}";
         }
         finally { _orchestratorLoading = false; }
-
-        return Task.CompletedTask;
     }
 
-    private Task LoadWorkersAsync()
+    private async Task LoadWorkersAsync()
     {
         _workersLoading = true;
         try
         {
-            var result = ConfigFacade.GetWorkers();
+            var result = await ConfigFacade.GetWorkersAsync(await ActingUserAsync(), CancellationToken.None);
             if (!result.Success)
             {
                 _workersSaveError = $"Failed to load worker settings: {result.Error}";
@@ -1842,16 +1850,14 @@ else
             _workersSaveError = $"Failed to load worker settings: {ex.Message}";
         }
         finally { _workersLoading = false; }
-
-        return Task.CompletedTask;
     }
 
-    private Task LoadComposerAsync()
+    private async Task LoadComposerAsync()
     {
         _composerLoading = true;
         try
         {
-            var result = ConfigFacade.GetComposer();
+            var result = await ConfigFacade.GetComposerAsync(await ActingUserAsync(), CancellationToken.None);
             if (!result.Success)
             {
                 _composerSaveError = $"Failed to load composer settings: {result.Error}";
@@ -1890,8 +1896,6 @@ else
             _composerSaveError = $"Failed to load composer settings: {ex.Message}";
         }
         finally { _composerLoading = false; }
-
-        return Task.CompletedTask;
     }
 
     private async Task SaveOrchestratorAsync()
@@ -1908,7 +1912,8 @@ else
                 VerboseLogging: _orchVerboseLogging,
                 BrainMaxSteps: _orchBrainMaxSteps,
                 BranchCleanupDelayHours: _orchBranchCleanupDelayHours,
-                WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes));
+                WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes),
+                await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadOrchestratorAsync();
@@ -1942,7 +1947,7 @@ else
                 ["reviewer"] = _reviewerContextWindow,
                 ["docwriter"] = _docwriterContextWindow,
                 ["improver"] = _improverContextWindow,
-            });
+            }, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadWorkersAsync();
@@ -2066,7 +2071,8 @@ else
                 DefaultBranch: branch,
                 Release: release,
                 MonitorCi: _newRepoMonitorCi,
-                CiTimeoutMinutes: _newRepoMonitorCi ? _newRepoCiTimeout : (int?)null));
+                CiTimeoutMinutes: _newRepoMonitorCi ? _newRepoCiTimeout : (int?)null),
+                await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main"; _newRepoMergeTo = ""; _newRepoTagBranch = "";
@@ -2111,7 +2117,7 @@ else
         try
         {
             // The repository routes never unescaped the name, so the facade receives it raw.
-            var result = await ConfigFacade.GetBranchesAsync(repo.Name, token);
+            var result = await ConfigFacade.GetBranchesAsync(repo.Name, await ActingUserAsync(), token);
             if (generation == _branchFetchGeneration)
             {
                 if (result.Success)
@@ -2171,7 +2177,8 @@ else
                 DefaultBranch: branch,
                 Release: release,
                 MonitorCi: _editRepoMonitorCi,
-                CiTimeoutMinutes: _editRepoMonitorCi ? _editRepoCiTimeout : (int?)null));
+                CiTimeoutMinutes: _editRepoMonitorCi ? _editRepoCiTimeout : (int?)null),
+                await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _editingRepoName = null;
@@ -2199,7 +2206,7 @@ else
         if (!confirmed) return;
         try
         {
-            var result = await ConfigFacade.RemoveRepositoryAsync(name);
+            var result = await ConfigFacade.RemoveRepositoryAsync(name, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadRepositoriesAsync();
@@ -2236,7 +2243,7 @@ else
         _availableModelsSuccess = null;
         try
         {
-            var result = await ConfigFacade.DiscoverModelsAsync();
+            var result = await ConfigFacade.DiscoverModelsAsync(await ActingUserAsync(), CancellationToken.None);
             if (!result.Success)
             {
                 _availableModelsError = $"Discovery failed: {result.Error}";
@@ -2357,7 +2364,8 @@ else
                     Name: _editingModelName,
                     ContextWindow: _editModelContextWindow,
                     Description: editDescription,
-                    SupportsVision: _editModelSupportsVision));
+                    SupportsVision: _editModelSupportsVision),
+                await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _editingModelName = null;
@@ -2390,7 +2398,7 @@ else
 
         try
         {
-            var result = await ConfigFacade.RemoveAvailableModelAsync(name);
+            var result = await ConfigFacade.RemoveAvailableModelAsync(name, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadModelsAsync();
@@ -2427,11 +2435,15 @@ else
     };
 
     // Thin wrappers so both the single-add form and the bulk discovery path share one call shape.
-    private Task<FacadeResult<SavedResult>> AddAvailableModelEntryAsync(string name, int? contextWindow, string? description = null, bool? supportsVision = null) =>
-        ConfigFacade.AddAvailableModelAsync(new AvailableModelRequest(name, contextWindow, description, supportsVision));
+    private async Task<FacadeResult<SavedResult>> AddAvailableModelEntryAsync(string name, int? contextWindow, string? description = null, bool? supportsVision = null) =>
+        await ConfigFacade.AddAvailableModelAsync(
+            new AvailableModelRequest(name, contextWindow, description, supportsVision),
+            await ActingUserAsync(), CancellationToken.None);
 
-    private Task<FacadeResult<SavedResult>> AddSubAgentModelEntryAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision) =>
-        ConfigFacade.AddSubAgentModelAsync(new SubAgentModelRequest(name, contextWindow, reasoningEffort, description, supportsVision));
+    private async Task<FacadeResult<SavedResult>> AddSubAgentModelEntryAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision) =>
+        await ConfigFacade.AddSubAgentModelAsync(
+            new SubAgentModelRequest(name, contextWindow, reasoningEffort, description, supportsVision),
+            await ActingUserAsync(), CancellationToken.None);
 
     private async Task AddSubAgentModelAsync()
     {
@@ -2506,7 +2518,8 @@ else
                     ContextWindow: _editSubAgentModelContextWindow,
                     ReasoningEffort: reasoning,
                     Description: description,
-                    SupportsVision: _editSubAgentModelSupportsVision));
+                    SupportsVision: _editSubAgentModelSupportsVision),
+                await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 _editingSubAgentModelName = null;
@@ -2539,7 +2552,7 @@ else
 
         try
         {
-            var result = await ConfigFacade.RemoveSubAgentModelAsync(name);
+            var result = await ConfigFacade.RemoveSubAgentModelAsync(name, await ActingUserAsync(), CancellationToken.None);
             if (result.Success)
             {
                 await LoadModelsAsync();

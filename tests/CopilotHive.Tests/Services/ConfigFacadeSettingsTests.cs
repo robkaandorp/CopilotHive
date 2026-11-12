@@ -75,7 +75,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(hiveConfig: null);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetOrchestrator();
+        var result = await facade.GetOrchestratorAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -92,7 +92,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(hiveConfig: null);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetWorkers();
+        var result = await facade.GetWorkersAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -109,7 +109,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(hiveConfig: null);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetComposer();
+        var result = await facade.GetComposerAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.False(result.Success);
         Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
@@ -135,12 +135,13 @@ public class ConfigFacadeSettingsTests
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
         var orchestrator = await facade.SaveOrchestratorAsync(
-            new OrchestratorSettingsUpdate(5, null, null, null, null, null));
+            new OrchestratorSettingsUpdate(5, null, null, null, null, null), OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(orchestrator.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, orchestrator.Kind);
         Assert.Equal(CrudNotConfiguredMessage, orchestrator.Error);
 
-        var workers = await facade.SaveWorkersAsync(new Dictionary<string, int> { ["coder"] = 50000 });
+        var workers = await facade.SaveWorkersAsync(
+            new Dictionary<string, int> { ["coder"] = 50000 }, OpenModeActingUser.User, TestContext.Current.CancellationToken);
         Assert.False(workers.Success);
         Assert.Equal(FacadeErrorKind.NotConfigured, workers.Kind);
         Assert.Equal(CrudNotConfiguredMessage, workers.Error);
@@ -241,7 +242,7 @@ public class ConfigFacadeSettingsTests
 
             var ex = await Assert.ThrowsAsync<IOException>(
                 () => facade.SaveOrchestratorAsync(
-                    new OrchestratorSettingsUpdate(5, null, null, null, null, null)));
+                    new OrchestratorSettingsUpdate(5, null, null, null, null, null), OpenModeActingUser.User, TestContext.Current.CancellationToken));
             Assert.Equal("simulated storage outage", ex.Message);
         }
         finally
@@ -270,7 +271,8 @@ public class ConfigFacadeSettingsTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var ex = await Assert.ThrowsAsync<ApplicationException>(
-                () => facade.SaveWorkersAsync(new Dictionary<string, int> { ["coder"] = 50000 }));
+                () => facade.SaveWorkersAsync(
+                    new Dictionary<string, int> { ["coder"] = 50000 }, OpenModeActingUser.User, TestContext.Current.CancellationToken));
             Assert.Equal("unexpected storage outage", ex.Message);
         }
         finally
@@ -340,7 +342,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetOrchestrator();
+        var result = await facade.GetOrchestratorAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -377,7 +379,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetWorkers();
+        var result = await facade.GetWorkersAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -424,7 +426,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetComposer();
+        var result = await facade.GetComposerAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -484,7 +486,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetComposer();
+        var result = await facade.GetComposerAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         var dto = Assert.IsType<ComposerConfigDto>(result.Value);
@@ -531,7 +533,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetComposer();
+        var result = await facade.GetComposerAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         var dto = Assert.IsType<ComposerConfigDto>(result.Value);
@@ -558,7 +560,7 @@ public class ConfigFacadeSettingsTests
         using var factory = new ConfigFacadeTests.FacadeFactory(config);
         var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
-        var result = facade.GetComposer();
+        var result = await facade.GetComposerAsync(OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -588,7 +590,7 @@ public class ConfigFacadeSettingsTests
 
             var result = await facade.SaveOrchestratorAsync(
                 new OrchestratorSettingsUpdate(MaxIterations: 9, MaxRetriesPerTask: 2, MaxParallelGoals: 3,
-                    VerboseLogging: true, BrainMaxSteps: 70, BranchCleanupDelayHours: 6));
+                    VerboseLogging: true, BrainMaxSteps: 70, BranchCleanupDelayHours: 6), OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -632,7 +634,7 @@ public class ConfigFacadeSettingsTests
                 new OrchestratorSettingsUpdate(
                     MaxIterations: null, MaxRetriesPerTask: null, MaxParallelGoals: null,
                     VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null,
-                    WorkerTaskTimeoutMinutes: submitted));
+                    WorkerTaskTimeoutMinutes: submitted), OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success, result.Error);
             Assert.True(result.Value!.Saved);
@@ -661,7 +663,7 @@ public class ConfigFacadeSettingsTests
             var result = await facade.SaveOrchestratorAsync(
                 new OrchestratorSettingsUpdate(
                     MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
-                    VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null));
+                    VerboseLogging: null, BrainMaxSteps: null, BranchCleanupDelayHours: null), OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success, result.Error);
             Assert.Equal(5, config.Orchestrator.MaxIterations);
@@ -687,7 +689,7 @@ public class ConfigFacadeSettingsTests
             var facade = factory.Services.GetRequiredService<IConfigFacade>();
 
             var result = await facade.SaveWorkersAsync(
-                new Dictionary<string, int> { ["coder"] = 50000, ["reviewer"] = 64000 });
+                new Dictionary<string, int> { ["coder"] = 50000, ["reviewer"] = 64000 }, OpenModeActingUser.User, TestContext.Current.CancellationToken);
 
             Assert.True(result.Success);
             Assert.Equal(FacadeErrorKind.None, result.Kind);
@@ -784,7 +786,7 @@ public class ConfigFacadeSettingsTests
 
     /// <summary>
     /// Load path of the new field: the real <c>Configuration.LoadOrchestratorAsync</c> reads the
-    /// REAL <see cref="ConfigFacade.GetOrchestrator"/> projection into the bound backing field.
+    /// REAL <see cref="ConfigFacade.GetOrchestratorAsync"/> projection into the bound backing field.
     /// The backing field is seeded with a DISTINCTIVE pre-state first, so a load that silently
     /// leaves the field untouched is observable even when the stored value is 0 (the field's
     /// own default) — a stored 0 (the documented "never reclaim inactive tasks" value) must
@@ -848,9 +850,12 @@ public class ConfigFacadeSettingsTests
             "_orchWorkerTaskTimeoutMinutes = _orchestratorData.WorkerTaskTimeoutMinutes;",
             source, StringComparison.Ordinal);
 
-        // Save: the named argument matches the DTO parameter (declared last).
+        // Save: the named argument matches the DTO parameter, and the SAME call forwards the
+        // circuit identity (the facade requires GlobalAdmin for every configuration write).
         Assert.Contains(
-            "WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes));", source, StringComparison.Ordinal);
+            "WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes),", source, StringComparison.Ordinal);
+        Assert.Contains(
+            "await ActingUserAsync(), CancellationToken.None);", source, StringComparison.Ordinal);
     }
 
     /// <summary>Reads <c>Configuration.razor</c> by walking up to the repository root.</summary>

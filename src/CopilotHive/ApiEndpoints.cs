@@ -88,11 +88,11 @@ public static class ApiEndpoints
     internal sealed record PreBindingAuthorization(HiveCapability Capability, string Operation);
 
     /// <summary>Application-property key that makes the pre-binding middleware registration idempotent.</summary>
-    private const string PreBindingMiddlewareKey = "CopilotHive.GoalIssuePreBindingAuthorization";
+    private const string PreBindingMiddlewareKey = "CopilotHive.PreBindingAuthorization";
 
     /// <summary>
-    /// Registers (once per application) the PRE-BINDING AUTHORIZATION middleware for the covered
-    /// goal/issue mutating routes.
+    /// Registers (once per application) the PRE-BINDING AUTHORIZATION middleware for every covered
+    /// mutating route (goals, issues, releases, config and clarifications).
     /// <para>
     /// WHY MIDDLEWARE: in minimal APIs, parameter binding — including typed JSON body deserialization
     /// and enum conversion — runs BEFORE any endpoint filter and before the handler, so a facade-level
@@ -102,8 +102,9 @@ public static class ApiEndpoints
     /// </para>
     /// <para>
     /// ORDER: it is registered from the route-mapping methods, which <c>Program.cs</c> calls AFTER
-    /// <c>UseAuthentication</c>/<c>UseAuthorization</c>, so an anonymous caller is still challenged
-    /// with the path-aware 401 (no redirect) by the fallback policy before this runs. For an
+    /// <c>UseAuthentication</c>/<c>UseAuthorization</c> (the config hub's routes are mapped earlier, so
+    /// <c>Program.cs</c> calls this explicitly at that same late point), so an anonymous caller is still
+    /// challenged with the path-aware 401 (no redirect) by the fallback policy before this runs. For an
     /// authenticated caller it performs ONE FRESH <see cref="HivePrincipalResolver"/> resolution per
     /// request through the single <see cref="FacadeAuthorization"/> seam (nothing is cached across
     /// requests) and answers 403 with the same <c>{ error }</c> body the facade mapping uses. An
@@ -113,7 +114,7 @@ public static class ApiEndpoints
     /// </para>
     /// </summary>
     /// <param name="app">The web application to register the middleware on.</param>
-    private static void EnsurePreBindingAuthorization(WebApplication app)
+    internal static void EnsurePreBindingAuthorization(WebApplication app)
     {
         var properties = ((IApplicationBuilder)app).Properties;
         if (properties.ContainsKey(PreBindingMiddlewareKey))
@@ -323,70 +324,114 @@ public static class ApiEndpoints
     }
 
     /// <summary>
-    /// Registers the releases REST API endpoints under <c>/api/releases</c>. All seven routes
-    /// (create, status, notes, tag, repositories, delete, validate) delegate to
+    /// Registers the releases REST API endpoints under <c>/api/releases</c>. All nine routes
+    /// (the two reads, create, status, notes, tag, repositories, delete, validate) delegate to
     /// <see cref="IReleaseFacade"/> so the validation order, the status orchestration side
     /// effects and the failure mapping live in exactly one place and run exactly once.
     /// </summary>
+    /// <remarks>
+    /// EVERY covered release route delegates to <see cref="IReleaseFacade"/> with the REQUEST's
+    /// identity (<see cref="HttpContext.User"/>), so the facade re-resolves the caller's CURRENT
+    /// role/enabled state before any store work: the two reads need
+    /// <see cref="HiveCapability.SharedRead"/> and every mutation/validation needs
+    /// <see cref="HiveCapability.ExecutionOperator"/>. The mutating routes additionally carry
+    /// <see cref="PreBindingAuthorization"/> metadata so an authenticated but insufficient/demoted/
+    /// disabled caller is refused with 403 BEFORE a typed body is bound (a malformed body therefore
+    /// never answers 400 to a caller who may not perform the operation), while an authorized caller
+    /// keeps the unchanged binding behaviour.
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapReleaseEndpoints(this WebApplication app)
     {
         // ── Releases REST API ────────────────────────────────────────────────────
         var releasesApi = app.MapGroup("/api/releases");
+        EnsurePreBindingAuthorization(app);
 
-        releasesApi.MapPost("/", async (CreateReleaseRequest request, [FromServices] IReleaseFacade facade) =>
+        releasesApi.MapPost("/", async (CreateReleaseRequest request, HttpContext context,
+            [FromServices] IReleaseFacade facade) =>
         {
-            var result = await facade.CreateReleaseAsync(request);
+            var result = await facade.CreateReleaseAsync(request, context.User);
             return result.Success
                 ? Results.Created($"/api/releases/{result.Value!.Id}", result.Value)
                 : MapReleaseFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.create"));
 
         releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request,
-            [FromServices] IReleaseFacade facade, CancellationToken ct) =>
+            HttpContext context, [FromServices] IReleaseFacade facade, CancellationToken ct) =>
         {
-            var outcome = await facade.UpdateReleaseStatusAsync(id, request, ct);
+            var outcome = await facade.UpdateReleaseStatusAsync(id, request, context.User, ct);
             return MapReleaseStatusOutcome(outcome);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.status"));
 
         releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request,
-            [FromServices] IReleaseFacade facade) =>
+            HttpContext context, [FromServices] IReleaseFacade facade) =>
         {
-            var result = await facade.UpdateReleaseNotesAsync(id, request);
+            var result = await facade.UpdateReleaseNotesAsync(id, request, context.User);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapReleaseFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.notes"));
 
         releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request,
-            [FromServices] IReleaseFacade facade) =>
+            HttpContext context, [FromServices] IReleaseFacade facade) =>
         {
-            var result = await facade.UpdateReleaseTagAsync(id, request);
+            var result = await facade.UpdateReleaseTagAsync(id, request, context.User);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapReleaseFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.tag"));
 
         releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request,
-            [FromServices] IReleaseFacade facade) =>
+            HttpContext context, [FromServices] IReleaseFacade facade) =>
         {
-            var result = await facade.UpdateReleaseRepositoriesAsync(id, request);
+            var result = await facade.UpdateReleaseRepositoriesAsync(id, request, context.User);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapReleaseFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.repositories"));
 
-        releasesApi.MapDelete("/{id}", async (string id, [FromServices] IReleaseFacade facade, CancellationToken ct) =>
+        releasesApi.MapDelete("/{id}", async (string id, HttpContext context,
+            [FromServices] IReleaseFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.DeleteReleaseAsync(id, ct);
+            var result = await facade.DeleteReleaseAsync(id, context.User, ct);
             return result.Success
                 ? Results.NoContent()
                 : MapReleaseFacadeError(result.Kind, result.Error);
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.delete"));
+
+        releasesApi.MapGet("/{id}/validate", async (string id, HttpContext context,
+            [FromServices] IReleaseFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.ValidateReleaseAsync(id, context.User, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "releases.validate"));
+
+        // ── Authorized reads (SharedRead) ─────────────────────────────────────────
+        // No pre-binding gate: these routes take no body, and the fallback policy already challenges
+        // an anonymous caller with the path-aware 401 before the facade re-resolves the caller.
+
+        releasesApi.MapGet("/{id}", async (string id, HttpContext context,
+            [FromServices] IReleaseFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.GetReleaseAsync(id, context.User, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
 
-        releasesApi.MapGet("/{id}/validate", async (string id, [FromServices] IReleaseFacade facade, CancellationToken ct) =>
+        releasesApi.MapGet("/{id}/goals", async (string id, HttpContext context,
+            [FromServices] IReleaseFacade facade, CancellationToken ct) =>
         {
-            var result = await facade.ValidateReleaseAsync(id, ct);
+            var result = await facade.GetGoalsByReleaseAsync(id, context.User, ct);
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapReleaseFacadeError(result.Kind, result.Error);
@@ -395,11 +440,12 @@ public static class ApiEndpoints
 
     /// <summary>
     /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IReleaseFacade"/>'s simple operations
-    /// (create, notes, tag, repositories, delete, validate) to the exact HTTP response the
-    /// pre-facade release handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
-    /// <c>Conflict</c> all return a JSON <c>{error}</c> body. <see cref="FacadeErrorKind.None"/>
-    /// is a programming error (a success result must not be mapped here) and throws, as does any
-    /// kind these six routes never produce.
+    /// (the two reads, create, notes, tag, repositories, delete, validate) to the exact HTTP response
+    /// the pre-facade release handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
+    /// <c>Conflict</c> all return a JSON <c>{error}</c> body, and the AUTHORIZATION answer
+    /// <c>Forbidden</c> returns HTTP 403 with the same body shape.
+    /// <see cref="FacadeErrorKind.None"/> is a programming error (a success result must not be mapped
+    /// here) and throws, as does any kind these eight routes never produce.
     /// </summary>
     /// <param name="kind">The failure category reported by the facade.</param>
     /// <param name="error">The human-readable error message.</param>
@@ -411,6 +457,7 @@ public static class ApiEndpoints
             FacadeErrorKind.NotFound => Results.NotFound(new { error }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
             FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            FacadeErrorKind.Forbidden => Results.Json(new { error }, statusCode: StatusCodes.Status403Forbidden),
             _ => throw new InvalidOperationException($"Unexpected release facade error kind: {kind}."),
         };
     }
@@ -420,8 +467,8 @@ public static class ApiEndpoints
     /// handler produced: <see cref="PlanningNoOpOutcome"/> → 200 with the bare Release JSON;
     /// <see cref="ExecutionSuccessOutcome"/> → 200 with the <c>{release, result}</c> envelope; a
     /// <see cref="StatusFailureOutcome"/> → the per-variant status and body from the frozen
-    /// contract (404/400/409 <c>{error}</c>, 400 <c>{errors:[...]}</c>, 500 <c>{detail, results}</c>,
-    /// 503 <c>{detail}</c>).
+    /// contract (403/404/400/409 <c>{error}</c>, 400 <c>{errors:[...]}</c>, 500
+    /// <c>{detail, results}</c>, 503 <c>{detail}</c>).
     /// </summary>
     /// <param name="outcome">The outcome reported by the facade.</param>
     /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
@@ -442,6 +489,16 @@ public static class ApiEndpoints
     /// the <c>{errors:[...]}</c> body uses <see cref="StatusFailureOutcome.Errors"/>, the 500 body
     /// uses <see cref="StatusFailureOutcome.Detail"/> + <see cref="StatusFailureOutcome.Results"/>,
     /// and the 503 body uses <see cref="StatusFailureOutcome.Detail"/> alone.
+    /// <para>
+    /// <see cref="FacadeErrorKind.Forbidden"/> → 403 with the sanitized <c>{error}</c> body, matching
+    /// <see cref="MapReleaseFacadeError"/> and <see cref="MapBackupFacadeResult"/>. This arm is
+    /// REACHABLE even though this route also carries <see cref="PreBindingAuthorization"/>: the
+    /// pre-binding gate and the facade's own fresh resolution are two independent evaluations, so an
+    /// Operator who passes the gate can be demoted or disabled WHILE the request's body is being
+    /// bound, and the facade's per-call resolution then correctly refuses. Without this arm that
+    /// refusal would surface as an unexpected-kind <see cref="InvalidOperationException"/> (HTTP 500)
+    /// instead of the authorization answer.
+    /// </para>
     /// </summary>
     /// <param name="failure">The failure outcome to map.</param>
     /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
@@ -450,6 +507,8 @@ public static class ApiEndpoints
         return failure.Kind switch
         {
             FacadeErrorKind.NotFound => Results.NotFound(new { error = failure.Error }),
+            FacadeErrorKind.Forbidden => Results.Json(
+                new { error = failure.Error }, statusCode: StatusCodes.Status403Forbidden),
             FacadeErrorKind.BadRequest when failure.Errors.Length > 0
                 => Results.BadRequest(new { errors = failure.Errors }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error = failure.Error }),
@@ -565,146 +624,239 @@ public static class ApiEndpoints
     /// <summary>
     /// Registers the clarifications REST API endpoints under <c>/api/clarifications</c>.
     /// </summary>
+    /// <remarks>
+    /// EVERY route delegates to <see cref="IClarificationFacade"/> with the REQUEST's identity
+    /// (<see cref="HttpContext.User"/>), so the caller's CURRENT role/enabled state is re-resolved
+    /// before the queue is read or mutated: the three reads need
+    /// <see cref="HiveCapability.SharedRead"/> and answering needs
+    /// <see cref="HiveCapability.ExecutionOperator"/>. The answer route additionally carries
+    /// <see cref="PreBindingAuthorization"/> metadata so a malformed answer body from an unauthorized
+    /// caller is refused with 403 before binding, while an authorized caller keeps the unchanged
+    /// 400/404 bodies. <see cref="ClarificationQueueService"/> itself is untouched, so the internal
+    /// Composer and <c>ClarificationHandler</c> callers keep working; the MainLayout caller is
+    /// deferred to a later phase.
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapClarificationEndpoints(this WebApplication app)
     {
         // ── Clarifications REST API ──────────────────────────────────────────────
         var clarificationsApi = app.MapGroup("/api/clarifications");
+        EnsurePreBindingAuthorization(app);
 
-        clarificationsApi.MapGet("/", (ClarificationQueueService queue) =>
-            Results.Ok(queue.GetAllRequests()));
-
-        clarificationsApi.MapGet("/pending", (ClarificationQueueService queue) =>
-            Results.Ok(queue.GetPendingHumanRequests()));
-
-        clarificationsApi.MapGet("/count", (ClarificationQueueService queue) =>
-            Results.Ok(new { count = queue.PendingHumanCount }));
-
-        clarificationsApi.MapPost("/{id}/answer", (string id, SubmitClarificationRequest body, ClarificationQueueService queue) =>
+        clarificationsApi.MapGet("/", async (HttpContext context,
+            [FromServices] IClarificationFacade facade, CancellationToken ct) =>
         {
-            if (string.IsNullOrWhiteSpace(body.Answer))
-                return Results.BadRequest(new { error = "Answer is required." });
-
-            var answered = queue.SubmitAnswer(id, body.Answer, "human");
-            if (!answered)
-                return Results.NotFound(new { error = $"Clarification '{id}' not found." });
-
-            return Results.Ok(new { message = $"Answer submitted for clarification '{id}'." });
+            var result = await facade.GetAllRequestsAsync(context.User, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapClarificationFacadeError(result.Kind, result.Error);
         });
+
+        clarificationsApi.MapGet("/pending", async (HttpContext context,
+            [FromServices] IClarificationFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.GetPendingHumanRequestsAsync(context.User, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapClarificationFacadeError(result.Kind, result.Error);
+        });
+
+        clarificationsApi.MapGet("/count", async (HttpContext context,
+            [FromServices] IClarificationFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.GetPendingHumanCountAsync(context.User, ct);
+            return result.Success
+                ? Results.Ok(new { count = result.Value })
+                : MapClarificationFacadeError(result.Kind, result.Error);
+        });
+
+        clarificationsApi.MapPost("/{id}/answer", async (string id, SubmitClarificationRequest body,
+            HttpContext context, [FromServices] IClarificationFacade facade, CancellationToken ct) =>
+        {
+            var result = await facade.SubmitAnswerAsync(id, body.Answer, context.User, ct);
+            return result.Success
+                ? Results.Ok(new { message = result.Value!.Message })
+                : MapClarificationFacadeError(result.Kind, result.Error);
+        })
+            .WithMetadata(new PreBindingAuthorization(
+                HiveCapability.ExecutionOperator, "clarifications.answer"));
+    }
+
+    /// <summary>
+    /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IClarificationFacade"/> to the exact HTTP
+    /// response the pre-facade clarification handlers produced: <c>BadRequest</c> and <c>NotFound</c>
+    /// return their JSON <c>{error}</c> bodies, and the AUTHORIZATION answer <c>Forbidden</c> returns
+    /// HTTP 403 with the same body shape. <see cref="FacadeErrorKind.None"/> is a programming error (a
+    /// success result must not be mapped here) and throws, as does any kind these four routes never
+    /// produce.
+    /// </summary>
+    /// <param name="kind">The failure category reported by the facade.</param>
+    /// <param name="error">The human-readable error message.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapClarificationFacadeError(FacadeErrorKind kind, string? error)
+    {
+        return kind switch
+        {
+            FacadeErrorKind.NotFound => Results.NotFound(new { error }),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
+            FacadeErrorKind.Forbidden => Results.Json(new { error }, statusCode: StatusCodes.Status403Forbidden),
+            _ => throw new InvalidOperationException($"Unexpected clarification facade error kind: {kind}."),
+        };
     }
 
     /// <summary>
     /// Registers the backup REST API endpoints under <c>/api/backup</c>.
     /// </summary>
+    /// <remarks>
+    /// EVERY backup route — list, create, download and restore — delegates to
+    /// <see cref="IBackupFacade"/> with the REQUEST's identity (<see cref="HttpContext.User"/>) and
+    /// requires <see cref="HiveCapability.GlobalAdmin"/>, re-resolved FRESH on every call. The
+    /// archive-name validation and the two validation messages live in the facade (the download and
+    /// restore paths), so a handler can never serve or restore a file without it.
+    /// <para>
+    /// RESTORE binds a TYPED BODY, so it additionally carries
+    /// <see cref="PreBindingAuthorization"/> metadata: an authenticated but insufficient caller is
+    /// refused with 403 BEFORE the body is deserialized (a malformed body therefore never answers 400
+    /// to a caller who may not restore), while an authorized caller keeps the unchanged binding
+    /// behaviour. The facade gate still re-checks in the handler (defence in depth).
+    /// </para>
+    /// <see cref="BackupService"/> stays a trusted internal service with its public API unchanged.
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapBackupEndpoints(this WebApplication app)
     {
         // ── Backup REST API ──────────────────────────────────────────────────────
         var backupApi = app.MapGroup("/api/backup");
 
-        backupApi.MapPost("/", async ([FromServices] IBackupFacade facade, CancellationToken ct) =>
+        backupApi.MapPost("/", async (HttpContext context,
+            [FromServices] IBackupFacade facade, CancellationToken ct) =>
         {
             // Failures (including cancellation) propagate out of the facade and become a 500,
             // exactly as before the facade existed.
-            var result = await facade.CreateBackupAsync(ct);
+            var result = await facade.CreateBackupAsync(context.User, ct);
             return MapBackupFacadeResult(result);
         });
 
-        backupApi.MapGet("/", ([FromServices] IBackupFacade facade) =>
-            MapBackupFacadeResult(facade.GetBackups()));
+        backupApi.MapGet("/", async (HttpContext context,
+            [FromServices] IBackupFacade facade, CancellationToken ct) =>
+            MapBackupFacadeResult(await facade.GetBackupsAsync(context.User, ct)));
 
-        backupApi.MapGet("/{fileName}", (string fileName, [FromServices] BackupService svc) =>
+        backupApi.MapGet("/{fileName}", async (string fileName, HttpContext context,
+            [FromServices] IBackupFacade facade, CancellationToken ct) =>
         {
-            // Path traversal protection: reject any fileName that is not a bare file name.
-            if (string.IsNullOrWhiteSpace(fileName)
-                || fileName.Contains('/')
-                || fileName.Contains('\\')
-                || fileName.Contains("..")
-                || Path.GetFileName(fileName) != fileName)
-            {
-                return Results.BadRequest(new { error = "Invalid file name." });
-            }
+            var result = await facade.OpenBackupForDownloadAsync(fileName, context.User, ct);
+            if (!result.Success)
+                return MapBackupFacadeResult(result);
 
-            var backupDir = Path.GetFullPath(svc.BackupDirectory);
-            var fullPath = Path.GetFullPath(Path.Combine(backupDir, fileName));
-
-            // Ensure the resolved path stays within the backup directory.
-            var backupDirWithSep = backupDir.EndsWith(Path.DirectorySeparatorChar)
-                ? backupDir
-                : backupDir + Path.DirectorySeparatorChar;
-            if (!fullPath.StartsWith(backupDirWithSep, StringComparison.Ordinal))
-                return Results.BadRequest(new { error = "Invalid file name." });
-
-            if (!File.Exists(fullPath))
-                return Results.NotFound(new { error = "Backup not found." });
-
-            return Results.File(fullPath, "application/gzip", fileName);
+            var download = result.Value!;
+            return Results.File(download.FullPath, "application/gzip", download.FileName);
         });
 
-        backupApi.MapPost("/restore", async (RestoreRequest request, [FromServices] BackupService svc) =>
+        backupApi.MapPost("/restore", async (RestoreRequest request, HttpContext context,
+            [FromServices] IBackupFacade facade, CancellationToken ct) =>
         {
-            if (string.IsNullOrWhiteSpace(request.FileName))
-                return Results.BadRequest(new { error = "FileName is required." });
+            var result = await facade.RestoreBackupAsync(request.FileName, context.User, ct);
+            if (!result.Success)
+                return MapBackupFacadeResult(result);
 
-            var fileName = request.FileName;
-            if (fileName.Contains('/') || fileName.Contains('\\') || fileName.Contains("..")
-                || Path.GetFileName(fileName) != fileName)
-            {
-                return Results.BadRequest(new { error = "Invalid file name." });
-            }
-
-            var fullPath = Path.GetFullPath(Path.Combine(svc.BackupDirectory, fileName));
-            var backupDirWithSep = Path.GetFullPath(svc.BackupDirectory)
-                .TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            if (!fullPath.StartsWith(backupDirWithSep, StringComparison.Ordinal))
-                return Results.BadRequest(new { error = "Invalid file name." });
-
-            if (!File.Exists(fullPath))
-                return Results.NotFound(new { error = "Backup not found." });
-
-            var result = await svc.RestoreBackupAsync(fullPath);
+            var restored = result.Value!;
             return Results.Ok(new
             {
                 message = "Restore complete. Restart the orchestrator for changes to take effect.",
-                result.DatabaseRestored,
-                result.BrainMasterSession,
-                result.BrainGoalSessionCount,
-                result.ComposerSession,
-                result.MetricsCount,
-                result.KeysCount,
-                result.SafetyBackupPath,
+                restored.DatabaseRestored,
+                restored.BrainMasterSession,
+                restored.BrainGoalSessionCount,
+                restored.ComposerSession,
+                restored.MetricsCount,
+                restored.KeysCount,
+                restored.SafetyBackupPath,
             });
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.GlobalAdmin, "backup.restore"));
     }
 
     /// <summary>
     /// Maps a backup facade result to the HTTP response the pre-facade handlers produced.
-    /// The backup facade only ever reports <see cref="FacadeErrorKind.None"/> (failures throw
-    /// and become ASP.NET's 500), so <see cref="FacadeErrorKind.None"/> → 200 with the value;
-    /// the switch exists for uniformity with the other facades and throws for any other kind
-    /// rather than silently falling back.
+    /// <see cref="FacadeErrorKind.None"/> → 200 with the value; the AUTHORIZATION answer
+    /// <see cref="FacadeErrorKind.Forbidden"/> → 403 with the sanitized <c>{error}</c> body; the
+    /// download/restore validation outcomes keep their frozen bodies —
+    /// <see cref="FacadeErrorKind.BadRequest"/> → 400, <see cref="FacadeErrorKind.NotFound"/> → 404.
+    /// Any other kind is a programming error and throws rather than silently falling back.
     /// </summary>
     /// <typeparam name="T">The facade value type.</typeparam>
     /// <param name="result">The facade result to map.</param>
-    /// <returns>A 200 result carrying the facade value.</returns>
+    /// <returns>A 200 result carrying the facade value, or the matching failure response.</returns>
     private static IResult MapBackupFacadeResult<T>(FacadeResult<T> result)
     {
         return result.Kind switch
         {
             FacadeErrorKind.None => Results.Ok(result.Value!),
+            FacadeErrorKind.Forbidden => Results.Json(
+                new { error = result.Error }, statusCode: StatusCodes.Status403Forbidden),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error = result.Error }),
+            FacadeErrorKind.NotFound => Results.NotFound(new { error = result.Error }),
             _ => throw new InvalidOperationException($"Unexpected backup facade error kind: {result.Kind}."),
         };
     }
 
     /// <summary>
-    /// Registers the LLM sessions REST API endpoints under <c>/api/sessions</c>.
+    /// Registers the LLM sessions REST API endpoint under <c>/api/sessions</c>.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE ROUTE IS A SHARED-READ SURFACE: it resolves the caller FRESH through the SAME
+    /// <see cref="FacadeAuthorization"/> seam every facade uses (one
+    /// <see cref="HivePrincipalResolver"/> resolution + one <see cref="HivePolicy"/> evaluation per
+    /// request, nothing cached between requests) and requires
+    /// <see cref="HiveCapability.SharedRead"/>. A refusal — signed out while authentication is
+    /// enabled, unknown account, disabled account, unreadable directory — answers 403 with the single
+    /// sanitized <c>{ error }</c> body, so a disabled or unknown identity can never read the shared
+    /// execution-session list. Cancellation propagates and is never turned into a denial. This is the
+    /// same seam, the same resolver/policy singletons and the same denial text as the facades and the
+    /// pre-binding middleware — deliberately no parallel authorization code.
+    /// </para>
+    /// <para>
+    /// The route reports SHARED EXECUTION sessions only: <see cref="Dashboard.LlmSessionType.Composer"/>
+    /// entries are excluded, because a Composer session is per-user private metadata. The filter lives
+    /// HERE, at the endpoint, and <see cref="Dashboard.LlmSessionRegistry.GetAll"/> keeps its
+    /// unchanged semantics (the dashboard renders Composer entries).
+    /// </para>
+    /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapSessionEndpoints(this WebApplication app)
     {
         // ── LLM Sessions REST API ────────────────────────────────────────────────
-        app.MapGet("/api/sessions", (LlmSessionRegistry registry) =>
-            Results.Ok(registry.GetAll()));
+        // IDENTITY IS PER REQUEST: the handler forwards the request's authenticated principal
+        // (HttpContext.User) to the shared authorization seam, which re-resolves the caller's CURRENT
+        // role/enabled state and requires shared read.
+        app.MapGet("/api/sessions", async (
+            HttpContext context,
+            LlmSessionRegistry registry,
+            HivePrincipalResolver resolver,
+            HivePolicy policy,
+            ILoggerFactory loggerFactory,
+            CancellationToken ct) =>
+        {
+            var allowed = await FacadeAuthorization.IsAllowedAsync(
+                resolver,
+                policy,
+                context.User,
+                HiveCapability.SharedRead,
+                loggerFactory.CreateLogger(nameof(ApiEndpoints)),
+                "sessions.list",
+                ct);
+
+            if (!allowed)
+            {
+                return Results.Json(
+                    new { error = FacadeAuthorization.ForbiddenMessage },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            return Results.Ok(registry.GetAll()
+                .Where(session => session.SessionType != LlmSessionType.Composer)
+                .ToList());
+        });
     }
 
     /// <summary>
