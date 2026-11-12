@@ -41,7 +41,13 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     private const string OriginalGh = "failclosed-original";
     private const string Marker = "failclosed-thread-marker";
 
-    private readonly FacadeAuthorizationHarness _auth = new();
+    /// <summary>
+    /// THE USER DIRECTORY of this class: a REAL directory (production <see cref="UserService"/> over the
+    /// production EF model) whose EVERY context opens its OWN connection — see
+    /// <see cref="ComposerTestUserDirectory"/> for why a single shared connection is not usable here.
+    /// </summary>
+    private readonly ComposerTestUserDirectory _users = new();
+
     private readonly CopilotHiveDbContext _db = CopilotHiveDbContext.CreateInMemory();
     private readonly string _dir = Path.Combine(Path.GetTempPath(), $"composer-failclosed-{Guid.NewGuid():N}");
 
@@ -53,17 +59,45 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
-        _originalId = (await _auth.SeedAsync(OriginalGh, UserRole.Admin)).Id;
-        _memberId = (await _auth.SeedAsync(MemberGh, UserRole.Member)).Id;
+        _originalId = (await _users.SeedActivatedAccountAsync(OriginalGh, UserRole.Admin)).Id;
+        _memberId = (await _users.SeedActivatedAccountAsync(MemberGh, UserRole.Member)).Id;
     }
 
+    private readonly List<Rendered> _renderedCircuits = [];
+    private bool _resourcesDisposed;
+
+    /// <summary>
+    /// xUnit invokes this PER TEST, after the row's await-using scopes have unwound. Rendered disposal retains
+    /// faults without throwing, so it cannot replace a pending scenario exception. This reporting point then
+    /// fails the row for every unreported cleanup fault (even when the body succeeded). xUnit aggregates body
+    /// and lifecycle failures; no opt-in scenario wrapper is needed by any existing row.
+    /// </summary>
     public ValueTask DisposeAsync()
     {
-        _db.Dispose();
-        _auth.Dispose();
-        try { if (Directory.Exists(_dir)) TestHelpers.ForceDeleteDirectory(_dir); }
-        catch (IOException) { }
+        var failures = new List<Exception>();
+        if (!_resourcesDisposed)
+        {
+            _resourcesDisposed = true;
+            try { _db.Dispose(); } catch (Exception ex) { failures.Add(ex); }
+            try { _users.Dispose(); } catch (Exception ex) { failures.Add(ex); }
+            try { if (Directory.Exists(_dir)) TestHelpers.ForceDeleteDirectory(_dir); }
+            catch (Exception ex) { failures.Add(ex); }
+        }
+        try { ReportCleanupFailures(); } catch (Exception ex) { failures.Add(ex); }
+        if (failures.Count > 0) throw new AggregateException("Per-test cleanup failed", failures);
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Reports each retained fault ONCE. Consumption advances a per-circuit cursor over specific exceptions,
+    /// not a blanket 'checked' flag: faults retained after a report remain visible to the next lifecycle call.
+    /// Sentinel rows may assert this same reporting layer explicitly for their expected injected faults.
+    /// </summary>
+    private void ReportCleanupFailures()
+    {
+        var failures = _renderedCircuits.SelectMany(r => r.TakeUnreportedCleanupFailures()).ToArray();
+        if (failures.Length > 0)
+            throw new AggregateException("Retained circuit cleanup failed", failures);
     }
 
     // ── (a) FINDING 1: a held re-query must never overwrite a NEWER binding ──────────────────────
@@ -86,7 +120,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         rendered.Raise("HandleStreamingUpdate");
         await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct); // the re-query ANSWERED (Ready) and is held
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("ConnectRuntimeAsync"); // the NEWER operation applies Forbidden
@@ -106,7 +140,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: the same held re-query with NO newer change is APPLIED and keeps the subscription.</summary>
@@ -145,7 +179,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         Assert.Contains(Marker, rendered.Html, StringComparison.Ordinal);
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             rendered.Raise("HandleStreamingUpdate");
@@ -156,7 +190,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.DoesNotContain(Marker, html, StringComparison.Ordinal);
             Assert.Contains("You do not have access to the Composer.", html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized callback keeps the thread and shows no forbidden notice.</summary>
@@ -190,7 +224,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         var file = rendered.StagedFilePath();
         Assert.True(File.Exists(file));
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("RemoveAttachment");
@@ -200,7 +234,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Null(rendered.Subscribed);
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized removal deletes the file and the page stays Ready.</summary>
@@ -230,7 +264,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         var root = rendered.Page.CurrentCallbackBinding!.Attachments!.AttachmentsRootPath;
         Assert.Empty(Directory.GetFiles(root));
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.PasteAsync(new MemoryStream([1, 2, 3, 4]));
@@ -239,7 +273,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Null(rendered.Pending);
             Assert.NotEqual(ComposerChat.ComposerCircuitStatus.Ready, rendered.Status);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized paste writes the file and stages it.</summary>
@@ -274,7 +308,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         var paste = rendered.PasteAsync(stream);
         await stream.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct); // the write STARTED, authorized
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("ConnectRuntimeAsync"); // the demotion is applied by a page operation
@@ -287,7 +321,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Single(Directory.GetFiles(root)); // retained in the store that accepted it
             Assert.Equal(ComposerChat.ComposerCircuitStatus.Forbidden, rendered.Status);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: the same in-flight write with NO change is attached.</summary>
@@ -317,7 +351,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         Assert.NotNull(rendered.Subscribed);
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("CompactSession");
@@ -327,7 +361,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>A DEMOTED REASONING SWITCH hides the content and unsubscribes.</summary>
@@ -338,7 +372,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await SeedThreadAsync(host);
         await using var rendered = await RenderAsync(host, MemberGh);
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("HandleReasoningChange", new ChangeEventArgs { Value = "high" });
@@ -347,7 +381,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Null(rendered.Subscribed);
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>POSITIVE CONTROL: an authorized compaction leaves the page Ready, bound and subscribed.</summary>
@@ -369,6 +403,24 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     /// A RUNTIME REPLACEMENT UNIFIES THE PAGE WITH THE RUNTIME THE FACADE ACTED ON: the runtime is removed and
     /// recreated; after the facade operation the binding AND the subscription are the NEW runtime's — never the
     /// removed one.
+    /// <para>
+    /// THE COMPETING PATHS ARE CONTROLLED, NOT HOPED AWAY: disposing runtime A raises its Composer events, and every
+    /// such event QUEUES a subscription callback whose own selection runs the freshness guard <b>on the dispatcher,
+    /// concurrently with this scenario</b> — it can replace the binding record under the operation that is in flight
+    /// and can therefore supersede the adoption this row asserts. (That supersession is exactly what made the old
+    /// post-hoc re-query read a null runtime on CI.) The callbacks are therefore PARKED — drained first, then parked —
+    /// BEFORE the removal, so none of them can bind, drop or re-render while the scenario runs, and the assertions are
+    /// made on the state the ACTUAL facade operation (<c>CompactSession</c>, awaited to completion) leaves behind,
+    /// never on a second re-query. <c>RemoveAsync</c> already awaits the entry's full teardown AND its cache eviction,
+    /// so no extra teardown wait is added here, and <see cref="ComposerChat.ComposerCircuitStatus.Removed"/> is not
+    /// accepted as a success.
+    /// </para>
+    /// <para>
+    /// DISCRIMINATION, STATED HONESTLY: this row proves the UNIFICATION. On its own it does NOT kill an unconditional
+    /// stale-adoption mutant, because nothing stale is released while it runs — parking only removes interference.
+    /// The mutant evidence for the ownership guard is the adversarial row below,
+    /// <c>AHeldOlderSelection_ReleasedAfterTheReplacement_DoesNotRebindTheRemovedRuntime</c>.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task AFacadeOperation_OnAReplacedRuntime_UnifiesTheBindingAndSubscription()
@@ -376,15 +428,316 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var host = NewHost();
         await using var rendered = await RenderAsync(host, MemberGh);
         var old = rendered.Page.CurrentCallbackBinding!.Composer;
+        Assert.NotNull(old);
+
+        // PARK every subscription callback BEFORE the removal: the callbacks the initial render already queued are
+        // DRAINED, every later body (the removal's own teardown notifications) stands parked until disposal, and each
+        // parked invocation is tracked so cleanup can join all of them.
+        await rendered.ParkCallbacksAsync();
 
         Assert.True(await host.Manager.RemoveAsync(_memberId));
+
+        // THE ACTUAL FACADE OPERATION, AWAITED TO COMPLETION: the task is the milestone (the operation returns only
+        // after its own adoption/bind), so no post-hoc re-query is needed — or allowed — to observe the outcome.
         await rendered.InvokeAsync("CompactSession");
 
-        var current = (await host.Scope(rendered).Accessor.AcquireForCircuitAsync(rendered.State, Ct)).Runtime!.Composer;
+        var newer = rendered.Page.CurrentCallbackBinding;
+        Assert.NotNull(newer);
+        var current = newer!.Composer;
+        Assert.NotNull(current); // a null Composer here is precisely the CI flake this row removes
         Assert.NotSame(old, current);
-        Assert.Same(current, rendered.Page.CurrentCallbackBinding!.Composer);
         Assert.Same(current, rendered.Subscribed);
+        Assert.Equal(ComposerChat.ComposerCircuitStatus.Ready, newer.Status);
+
+        // NO PARKED CALLBACK RAN MID-SCENARIO: none of them could supersede the binding the operation adopted.
+        Assert.Equal(0, rendered.Page.AppliedCallbackCount);
+        Assert.Equal(0, rendered.Page.DroppedCallbackCount);
     }
+
+    /// <summary>
+    /// THE OWNERSHIP GUARD FOR AN OLDER <b>OPERATION</b> ANSWER: an ordinary page operation's circuit acquisition is
+    /// HELD after the accessor computed its answer for runtime A; A is then removed (its real teardown awaited by
+    /// <c>RemoveAsync</c>), a NEWER facade operation adopts and binds the fresh runtime B, and only then is the older
+    /// answer released. That answer belongs to a binding this circuit no longer shows, so it must NOT be adopted: the
+    /// newer binding record and the subscription to B survive it, the removed runtime A is never re-subscribed, and
+    /// the held paste's write never starts (no file in A's store).
+    /// <para>
+    /// THE MECHANISM IT PINS: <c>AcquireCircuitRuntimeAsync</c> captures the binding it started under BEFORE its first
+    /// await and, once the accessor answered, refuses to bind an answer whose captured binding is no longer the
+    /// circuit's — the same pre-await capture plus post-await condition <c>RevalidateCompletionAsync</c> applies to
+    /// callbacks. The callback path has its own row in this class
+    /// (<c>HeldCallbackRequery_AfterNewerReplacement_PreservesItsBindingHistoryAndSubscriptions</c>); this row covers
+    /// an ordinary OPERATION's answer, which is the path the removal's competing callbacks can supersede.
+    /// </para>
+    /// <para>
+    /// THE DISCRIMINATOR, AND WHY THE ROW ABOVE IS NOT IT: with unconditional stale adoption restored in the
+    /// operation path, the released answer re-binds the REMOVED runtime A — the binding record is replaced, the
+    /// subscription returns to A — and the held paste's write starts in A's store, so this row fails on both. The
+    /// replacement row above still passes under that mutant. Parking the incidental callbacks alone therefore proves
+    /// nothing about this guard.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AHeldOlderSelection_ReleasedAfterTheReplacement_DoesNotRebindTheRemovedRuntime()
+    {
+        await using var host = NewHost();
+        await using var rendered = await RenderAsync(host, MemberGh);
+        var old = rendered.Page.CurrentCallbackBinding!.Composer;
+        var removedStore = rendered.Page.CurrentCallbackBinding!.Attachments!.AttachmentsRootPath;
+        Assert.NotNull(old);
+
+        // The incidental teardown callbacks are controlled FIRST, so the hold armed next is taken by the paste's own
+        // acquisition and never by a subscription callback's re-query.
+        await rendered.ParkCallbacksAsync();
+
+        // PATH 1: HOLD the older operation's answer — the paste's START gate is an ordinary circuit acquisition
+        // through the REAL accessor, so its answer (runtime A, Ready) is computed and then parked here.
+        var hold = host.Gate.Arm();
+        var held = rendered.PasteAsync(new MemoryStream([1, 2, 3, 4]));
+        try
+        {
+            await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+            Assert.False(held.IsCompleted, "the older operation's answer must be genuinely held across the replacement");
+
+            // A's real teardown and eviction are awaited by RemoveAsync itself.
+            Assert.True(await host.Manager.RemoveAsync(_memberId));
+
+            // PATH 2: the NEWER facade operation runs to COMPLETION and the page adopts/binds the fresh runtime B.
+            await rendered.InvokeAsync("CompactSession");
+            var newer = rendered.Page.CurrentCallbackBinding;
+            Assert.NotNull(newer);
+            var b = newer!.Composer;
+            Assert.NotNull(b);
+            Assert.NotSame(old, b);
+            Assert.Same(b, rendered.Subscribed);
+
+            // PATH 3: RELEASE the older answer, which is about the removed runtime A.
+            hold.Release();
+            await held.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+
+            // The newer binding record and the subscription to B SURVIVE the stale release...
+            Assert.Same(newer, rendered.Page.CurrentCallbackBinding);
+            Assert.NotNull(rendered.Page.CurrentCallbackBinding!.Composer);
+            Assert.NotSame(old, rendered.Page.CurrentCallbackBinding!.Composer);
+            Assert.Same(b, rendered.Page.CurrentCallbackBinding!.Composer);
+            Assert.Same(b, rendered.Subscribed);
+            Assert.Equal(ComposerChat.ComposerCircuitStatus.Ready, rendered.Status);
+
+            // ...and the held paste never started a write: nothing reached the removed runtime's store.
+            Assert.Empty(Directory.GetFiles(removedStore));
+            Assert.Null(rendered.Pending);
+        }
+        finally
+        {
+            // Failure-safe: a failing assertion must never leave the operation parked (disposal joins it either way).
+            hold.Release();
+        }
+    }
+
+    /// <summary>
+    /// EVERY PARKED INVOCATION IS JOINED BY CLEANUP, NOT ONLY THE LAST ONE (the SUCCESSFUL path): several
+    /// subscription callbacks are parked (each queued body is a SEPARATE invocation), the page's
+    /// <c>LastCallbackCompletion</c> is OVERWRITTEN by each new callback and therefore aggregates nothing, and the
+    /// cleanup must still await EVERY tracked invocation.
+    /// <para>
+    /// WHAT IT EXERCISES, EXACTLY: the row calls <c>rendered.DisposeAsync()</c> EXPLICITLY (the later
+    /// <c>await using</c> disposal is then an idempotent no-op) so it can read the join observations afterwards. It
+    /// proves the join-all behaviour of the cleanup body on a scenario that did NOT fail. It does NOT exercise the
+    /// runner/<c>await using</c> unwind and says nothing about failure precedence — those are the two rows below.
+    /// </para>
+    /// <para>
+    /// WHY THE COUNT MATTERS: the shared release latch completes every parked invocation whether or not it is
+    /// joined, so a terminal state alone proves nothing about joining. The join loop therefore counts the
+    /// invocations it actually awaited (<c>JoinedParkedCount</c>) against the number tracked; a cleanup that joined
+    /// only the last one fails the count. It is non-vacuous: at least three invocations are parked.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ParkedSubscriptionCallbacks_AreAllJoinedByCleanup_NotOnlyTheLastOne()
+    {
+        await using var host = NewHost();
+        await using var rendered = await RenderAsync(host, MemberGh);
+
+        await rendered.ParkCallbacksAsync();
+
+        // THREE SEPARATE queued bodies: each one is its own parked invocation, and each one overwrites the
+        // page's LastCallbackCompletion — so that property alone can observe only the LAST of them.
+        rendered.Raise("HandleStreamingUpdate");
+        rendered.Raise("HandleStreamingUpdate");
+        rendered.Raise("HandleStreamingUpdate");
+
+        // The invocations are queued on the DISPATCHER; wait until all three are parked.
+        await rendered.WaitForParkedCountAsync(3);
+        Assert.True(rendered.ParkedCount >= 3,
+            $"the scenario must park MORE THAN ONE invocation, or the join-all contract is not exercised (parked {rendered.ParkedCount})");
+
+        // The page's own record points at the LAST invocation only — which is exactly why the helper tracks them all.
+        Assert.NotNull(rendered.Page.LastCallbackCompletion);
+
+        // EXPLICIT disposal (see the remarks): the join observations are read right after it.
+        await rendered.DisposeAsync();
+
+        Assert.Equal(rendered.ParkedCount, rendered.JoinedParkedCount);
+        Assert.All(rendered.ParkedStatuses(), status =>
+            Assert.Equal(TaskStatus.RanToCompletion, status));
+    }
+
+    /// <summary>
+    /// A genuine scenario throw unwinds through compiler-generated await-using disposal (not a manual call).
+    /// An EARLIER tracked write faults during cleanup, but every parked callback must still be individually
+    /// awaited. The callbacks are deliberately released and completed BEFORE the throw: their successful terminal
+    /// states cannot prove disposal joined them. JoinedParkedCount, killed by join-only-last and skip-on-fault
+    /// mutants, is the load-bearing observation. The raw scenario exception survives; the earlier write fault
+    /// remains identifiable and is reported by the same reporting layer used at per-test xUnit disposal.
+    /// </summary>
+    [Fact]
+    public async Task AFailingRow_StillReleasesAndJoinsEveryParkedInvocation()
+    {
+        await using var host = NewHost();
+        Rendered? captured = null;
+        var scenario = new ScenarioSentinelException("scenario failed after parking three invocations");
+        var cleanup = new CleanupSentinelException("earlier write fault must not skip the callback joins");
+
+        var thrown = await Assert.ThrowsAsync<ScenarioSentinelException>(async () =>
+        {
+            await using var rendered = await RenderAsync(host, MemberGh);
+            captured = rendered;
+            await rendered.ParkCallbacksAsync();
+            rendered.Raise("HandleStreamingUpdate");
+            rendered.Raise("HandleStreamingUpdate");
+            rendered.Raise("HandleStreamingUpdate");
+            await rendered.WaitForParkedCountAsync(3);
+            Assert.True(rendered.ParkedCount >= 3);
+            rendered.TrackFaultingWrite(cleanup);
+
+            // Pin the completed-but-still-must-be-joined case. This does not increment the disposal join count.
+            await rendered.ReleaseAndCompleteParkedCallbacksAsync();
+            Assert.All(rendered.ParkedStatuses(), status => Assert.Equal(TaskStatus.RanToCompletion, status));
+            Assert.Equal(0, rendered.JoinedParkedCount);
+            throw scenario;
+        });
+
+        Assert.Same(scenario, thrown);
+        Assert.Equal("scenario failed after parking three invocations", thrown.Message);
+        Assert.NotNull(captured);
+        Assert.True(captured!.ParkedCount >= 3);
+        Assert.Equal(captured.ParkedCount, captured.JoinedParkedCount);
+        Assert.All(captured.ParkedStatuses(), status => Assert.Equal(TaskStatus.RanToCompletion, status));
+        Assert.Same(cleanup, Assert.Single(captured.CleanupFailures));
+        var reported = Assert.Throws<AggregateException>(ReportCleanupFailures);
+        Assert.Same(cleanup, Assert.Single(reported.InnerExceptions));
+    }
+
+    /// <summary>
+    /// Uniform precedence, with NO opt-in wrapper: a raw scenario sentinel escapes await-using unchanged even
+    /// though a middle parked invocation faults during disposal. Disposal retains that different cleanup sentinel,
+    /// joins all three invocations, and the per-test reporting layer surfaces the retained fault separately.
+    /// Restoring throwing disposal replaces the primary and fails the exact-type/identity assertions here.
+    /// This row tests scope unwind and reporting directly; xUnit invokes the reporting point after each test,
+    /// not DisposeAsync on the private Rendered object. Expected injected faults are consumed individually.
+    /// </summary>
+    [Fact]
+    public async Task AScenarioFailure_IsNotReplacedByACleanupFault_AndTheCleanupFaultIsStillReported()
+    {
+        await using var host = NewHost();
+        Rendered? captured = null;
+        var scenario = new ScenarioSentinelException("the scenario failure");
+        var cleanup = new CleanupSentinelException("the cleanup fault");
+
+        var escaped = await Assert.ThrowsAsync<ScenarioSentinelException>(async () =>
+        {
+            await using var rendered = await RenderAsync(host, MemberGh);
+            captured = rendered;
+            await rendered.ParkCallbacksAsync();
+            rendered.Raise("HandleStreamingUpdate");
+            // Rendezvous before inserting the seam, so it really is the middle tracked invocation.
+            await rendered.WaitForParkedCountAsync(1);
+            rendered.ParkFaultingInvocation(cleanup);
+            rendered.Raise("HandleStreamingUpdate");
+            await rendered.WaitForParkedCountAsync(3);
+            throw scenario;
+        });
+
+        Assert.Same(scenario, escaped);
+        Assert.NotNull(captured);
+        Assert.Equal(3, captured!.ParkedCount);
+        Assert.Equal(captured.ParkedCount, captured.JoinedParkedCount);
+        var statuses = captured.ParkedStatuses();
+        Assert.Equal(1, statuses.Count(s => s == TaskStatus.Faulted));
+        Assert.Equal(2, statuses.Count(s => s == TaskStatus.RanToCompletion));
+        Assert.Same(cleanup, Assert.Single(captured.CleanupFailures));
+        var reported = Assert.Throws<AggregateException>(ReportCleanupFailures);
+        Assert.Same(cleanup, Assert.Single(reported.InnerExceptions));
+        ReportCleanupFailures(); // expected fault is reported once, not repeated at xUnit teardown
+    }
+
+    /// <summary>
+    /// A successful scenario with a cleanup-only fault must still fail loudly at the reporting layer. This row
+    /// calls the SAME per-test IAsyncLifetime.DisposeAsync on an isolated test instance inside Assert.ThrowsAsync
+    /// to observe the expected lifecycle failure without making this outer row fail. It does not claim xUnit
+    /// invokes disposal on that isolated instance; a deliberately failing lifecycle-hook mutant verifies that
+    /// xUnit reaches this reporting point on the real outer test instance too.
+    /// </summary>
+    [Fact]
+    public async Task ACleanupFault_WithNoScenarioFailure_IsReportedByPerTestLifecycle()
+    {
+        var owner = new ComposerCircuitFailClosedRegressionTests();
+        var cleanup = new CleanupSentinelException("cleanup-only failure");
+        try
+        {
+            await owner.InitializeAsync();
+            await using (var host = owner.NewHost())
+            {
+                await using var rendered = await owner.RenderAsync(host, MemberGh);
+                await rendered.ParkCallbacksAsync();
+                rendered.ParkFaultingInvocation(cleanup);
+            } // successful scenario, non-throwing Rendered disposal
+
+            var reported = await Assert.ThrowsAsync<AggregateException>(() => owner.DisposeAsync().AsTask());
+            Assert.Same(cleanup, Assert.Single(reported.Flatten().InnerExceptions));
+        }
+        finally { await owner.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Reporting is per-fault, not a blanket 'already checked' switch: after consuming one circuit's expected
+    /// fault (and an idempotent second report), another circuit retains a DIFFERENT fault. Per-test disposal must
+    /// still report the latter. This invokes that lifecycle method directly on an isolated owner for inspection.
+    /// </summary>
+    [Fact]
+    public async Task ReportingOneFault_DoesNotSuppressALaterCircuitFaultAtPerTestDisposal()
+    {
+        var owner = new ComposerCircuitFailClosedRegressionTests();
+        var first = new CleanupSentinelException("first consumed fault");
+        var later = new CleanupSentinelException("later fault must still be reported");
+        try
+        {
+            await owner.InitializeAsync();
+            await using (var host = owner.NewHost())
+            {
+                await using (var rendered = await owner.RenderAsync(host, MemberGh))
+                {
+                    await rendered.ParkCallbacksAsync();
+                    rendered.ParkFaultingInvocation(first);
+                }
+                var initial = Assert.Throws<AggregateException>(owner.ReportCleanupFailures);
+                Assert.Same(first, Assert.Single(initial.InnerExceptions));
+                owner.ReportCleanupFailures();
+                await using (var rendered = await owner.RenderAsync(host, MemberGh))
+                {
+                    await rendered.ParkCallbacksAsync();
+                    rendered.ParkFaultingInvocation(later);
+                }
+            }
+            var reported = await Assert.ThrowsAsync<AggregateException>(() => owner.DisposeAsync().AsTask());
+            Assert.Same(later, Assert.Single(reported.Flatten().InnerExceptions));
+        }
+        finally { await owner.DisposeAsync(); }
+    }
+
+    private sealed class ScenarioSentinelException(string message) : Exception(message);
+
+    private sealed class CleanupSentinelException(string message) : Exception(message);
 
     /// <summary>
     /// ADOPTION ADDS NO SECOND CONNECT: a deferred runtime's facade operation drives EXACTLY ONE request-path
@@ -435,7 +788,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await rendered.AfterRenderAsync();
         Assert.Equal(1, host.Js.Count("install"));
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.InvokeAsync("ConnectRuntimeAsync");
@@ -449,7 +802,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             await rendered.InvokeAsync("SyncPasteAllowedAsync");
             Assert.DoesNotContain(true, host.Js.AllowedValues.Skip(before));
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     /// <summary>
@@ -463,10 +816,10 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         await rendered.AfterRenderAsync();
 
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         await rendered.InvokeAsync("ConnectRuntimeAsync");
         await rendered.AfterRenderAsync();
-        await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+        await _users.SetRoleAsync(MemberGh, UserRole.Member);
         await rendered.InvokeAsync("ConnectRuntimeAsync");
         await rendered.AfterRenderAsync();
 
@@ -573,8 +926,8 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var rendered = await RenderAsync(host, MemberGh);
         var root = rendered.Page.CurrentCallbackBinding!.Attachments!.AttachmentsRootPath;
         var file = new ObservedBrowserFile(new MemoryStream([10, 20, 30, 40]));
-        if (disabled) await _auth.SetEnabledAsync(MemberGh, false);
-        else await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        if (disabled) await _users.SetEnabledAsync(MemberGh, false);
+        else await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             await rendered.PickAsync(file);
@@ -588,8 +941,8 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         }
         finally
         {
-            if (disabled) await _auth.SetEnabledAsync(MemberGh, true);
-            else await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+            if (disabled) await _users.SetEnabledAsync(MemberGh, true);
+            else await _users.SetRoleAsync(MemberGh, UserRole.Member);
         }
     }
 
@@ -659,7 +1012,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             await stream.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
             Assert.False(write.IsCompleted);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+            await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
             Assert.Same(accepting, rendered.Page.CurrentCallbackBinding); // no page operation observed it yet
             stream.Release();
             await write.WaitAsync(TimeSpan.FromSeconds(30), Ct);
@@ -675,7 +1028,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             stream.Release();
             await write.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+            await _users.SetRoleAsync(MemberGh, UserRole.Member);
         }
     }
 
@@ -688,7 +1041,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await rendered.AfterRenderAsync();
         Assert.Contains(true, host.Js.AllowedValues); // non-vacuous ready control
         var before = host.Js.AllowedValues.Count;
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             rendered.Raise("HandleStreamingUpdate");
@@ -703,7 +1056,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.Equal(1, host.Js.Count("uninstall"));
             Assert.True(host.Js.Modules[0].Disposed);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     [Fact]
@@ -746,7 +1099,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         await using var host = NewHost();
         await SeedThreadAsync(host);
         await using var rendered = await RenderAsync(host, MemberGh);
-        await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+        await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
         try
         {
             if (operation == "HandleModelChange")
@@ -757,7 +1110,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
             Assert.DoesNotContain(Marker, rendered.Html, StringComparison.Ordinal);
             Assert.Contains("You do not have access to the Composer.", rendered.Html, StringComparison.Ordinal);
         }
-        finally { await _auth.SetRoleAsync(MemberGh, UserRole.Member); }
+        finally { await _users.SetRoleAsync(MemberGh, UserRole.Member); }
     }
 
     [Theory]
@@ -841,7 +1194,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
             Assert.False(installation.IsCompleted);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Viewer);
+            await _users.SetRoleAsync(MemberGh, UserRole.Viewer);
             await rendered.UiEventAsync("ConnectRuntimeAsync");
             Assert.Equal(ComposerChat.ComposerCircuitStatus.Forbidden, rendered.Status);
             // A real circuit renders again while the prior import is outstanding.
@@ -860,7 +1213,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         {
             hold.Release();
             await installation.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
-            await _auth.SetRoleAsync(MemberGh, UserRole.Member);
+            await _users.SetRoleAsync(MemberGh, UserRole.Member);
         }
     }
 
@@ -928,7 +1281,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
 
     private async Task SeedThreadAsync(Host host)
     {
-        var state = await ComposerUserState.ResolveAsync(_auth.Directory.Service, _memberId, Ct);
+        var state = await ComposerUserState.ResolveAsync(_users.Service, _memberId, Ct);
         var path = ComposerUserState.SessionFilePath(host.StateDir, state);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var session = SharpCoder.AgentSession.Create("composer");
@@ -956,7 +1309,7 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         services.AddSingleton<IGoalStore>(new GoalStore(_db, NullLogger<GoalStore>.Instance));
         services.AddSingleton(HiveAuthMode.AuthenticationEnabled);
         services.AddSingleton<HivePolicy>();
-        services.AddSingleton(_auth.Directory.Service);
+        services.AddSingleton(_users.Service);
         services.AddSingleton(sp => new HivePrincipalResolver(
             sp.GetRequiredService<UserService>(), sp.GetRequiredService<HiveAuthMode>(),
             NullLogger<HivePrincipalResolver>.Instance));
@@ -1012,7 +1365,9 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
 
         Assert.NotNull(page);
         host.Scopes[page!] = scope;
-        return new Rendered(page!, scope, renderer, rootHtml!, state, host.Gate.ReleaseAll);
+        var rendered = new Rendered(page!, scope, renderer, rootHtml!, state, host.Gate.ReleaseAll);
+        _renderedCircuits.Add(rendered);
+        return rendered;
     }
 
     // ── Doubles ──────────────────────────────────────────────────────────────────────────────────
@@ -1024,6 +1379,16 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
     {
         private readonly List<Task> _storageWrites = [];
         private Task TrackStorage(Task task) { _storageWrites.Add(task); return task; }
+
+        /// <summary>EVERY parked subscription callback invocation, so cleanup can join ALL of them.</summary>
+        private readonly List<Task> _parkedCallbacks = [];
+
+        /// <summary>The one release latch for the parked subscription callbacks; set by <see cref="ParkCallbacksAsync"/>.</summary>
+        private TaskCompletionSource? _parkedRelease;
+
+        /// <summary>Whether the retained circuit was already disposed (the cleanup is idempotent).</summary>
+        private bool _disposed;
+
         public ComposerChat Page { get; } = page;
         public Task<AuthenticationState> State { get; } = state;
         public IServiceScope ServiceScope { get; } = scope;
@@ -1076,21 +1441,145 @@ public sealed class ComposerCircuitFailClosedRegressionTests : IAsyncLifetime
         public Task PasteAsync(Stream content) => TrackStorage(renderer.Dispatcher.InvokeAsync(() =>
             Page.HandlePasteAsync(new FakeJSStreamReference(content), "image/png", 4)));
 
+        /// <summary>
+        /// CONTROLS THE INCIDENTAL SUBSCRIPTION PATHS of a replacement scenario: first DRAINS the callbacks the initial
+        /// render already queued (with no gate installed they run now, so they can neither take a hold armed for a
+        /// scenario path nor supersede a binding asserted later), then PARKS every LATER callback behind the page's
+        /// <see cref="ComposerChat.CallbackGate"/> so none of them can acquire, bind, drop or re-render until disposal
+        /// releases them.
+        /// <para>
+        /// EVERY PARKED INVOCATION IS TRACKED: the gate records the task of EACH invocation it holds, and
+        /// <see cref="DisposeAsync"/> joins all of them — <see cref="ComposerChat.LastCallbackCompletion"/> alone is
+        /// overwritten by each new callback and therefore aggregates nothing.
+        /// </para>
+        /// </summary>
+        public async Task ParkCallbacksAsync()
+        {
+            // DRAIN: everything queued so far runs to completion here (no gate is installed yet).
+            await renderer.Dispatcher.InvokeAsync(() => Page.LastCallbackCompletion);
+
+            var parked = _parkedRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Page.CallbackGate = body =>
+            {
+                var invocation = RunParkedAsync(parked.Task, body);
+                lock (_parkedCallbacks) _parkedCallbacks.Add(invocation);
+                return invocation;
+            };
+        }
+
+        /// <summary>One parked callback invocation: waits for the release latch, then runs its body.</summary>
+        private static async Task RunParkedAsync(Task release, Func<Task> body)
+        {
+            await release;
+            await body();
+        }
+
+        /// <summary>Rendezvous for the completed-before-disposal join probe; not a disposal join observation.</summary>
+        public async Task ReleaseAndCompleteParkedCallbacksAsync()
+        {
+            _parkedRelease?.TrySetResult();
+            Task[] parked;
+            lock (_parkedCallbacks) parked = [.. _parkedCallbacks];
+            await Task.WhenAll(parked).WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        }
+
+        /// <summary>How many parked invocations this helper is tracking (the ones cleanup must join).</summary>
+        public int ParkedCount { get { lock (_parkedCallbacks) return _parkedCallbacks.Count; } }
+
+        /// <summary>
+        /// Waits until at least <paramref name="count"/> invocations are parked. The queued bodies are dispatched
+        /// on the renderer's dispatcher, so the count grows there — this waits on the SAME dispatcher, which
+        /// serializes it with the queuing, so no polling of private state is needed.
+        /// </summary>
+        public async Task WaitForParkedCountAsync(int count)
+        {
+            await renderer.Dispatcher.InvokeAsync(async () =>
+            {
+                // The dispatcher is the serialization point: the queued bodies are already registered by the
+                // time this continuation runs, because each Raise() ran ON the dispatcher too.
+                while (ParkedCount < count)
+                    await Task.Yield();
+            });
+        }
+
+        /// <summary>
+        /// How many parked invocations cleanup actually JOINED. It must equal <see cref="ParkedCount"/>:
+        /// a cleanup that joined only the page's <c>LastCallbackCompletion</c> would leave the EARLIER
+        /// invocations un-awaited (and their faults unobserved).
+        /// </summary>
+        public int JoinedParkedCount { get; private set; }
+
+        /// <summary>
+        /// The terminal states are SECONDARY evidence only: releasing the shared latch can complete all tasks
+        /// even if cleanup never awaits them. JoinedParkedCount observes the individual awaits instead.
+        /// </summary>
+        public TaskStatus[] ParkedStatuses()
+        {
+            lock (_parkedCallbacks) return [.. _parkedCallbacks.Select(t => t.Status)];
+        }
+
         public async ValueTask DisposeAsync()
         {
-            var failures = new List<Exception>();
-            async Task Step(Func<Task> action)
+            if (_disposed) return;
+            _disposed = true;
+
+            async Task<bool> Step(Func<Task> action)
             {
-                try { await action(); }
-                catch (Exception ex) { failures.Add(ex); }
+                try { await action(); return true; }
+                catch (Exception ex) { _cleanupFailures.Add(ex); return false; }
             }
-            releaseGates();
+
+            // FAILURE-SAFE RELEASE, in a finally-shaped sequence: the parked callbacks are released FIRST (so no
+            // invocation stays blocked), then every hold/gate is released, then each tracked task is joined.
+            _parkedRelease?.TrySetResult();
+            await Step(() => { releaseGates(); return Task.CompletedTask; });
             foreach (var write in _storageWrites)
                 await Step(() => write.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
+
+            // JOIN EVERY PARKED INVOCATION, not only the last one the page recorded.
+            Task[] parked;
+            lock (_parkedCallbacks) parked = [.. _parkedCallbacks];
+            foreach (var invocation in parked)
+            {
+                var joined = await Step(() => invocation.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
+                // A FAULTED invocation was still JOINED (awaited to its end); only a wait that TIMED OUT means
+                // the invocation was not joined.
+                if (joined || invocation.IsCompleted)
+                    JoinedParkedCount++;
+            }
             await Step(() => Page.LastCallbackCompletion.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
             await Step(() => renderer.DisposeAsync().AsTask());
             await Step(() => { ServiceScope.Dispose(); return Task.CompletedTask; });
-            if (failures.Count > 0) throw new AggregateException("Retained circuit cleanup failed", failures);
+
+            // NEVER THROW FROM THIS FINALLY: a cleanup exception here would replace the scenario failure.
+            // Every fault is retained and reported by the owning test's xUnit IAsyncLifetime.DisposeAsync.
+        }
+
+        private readonly List<Exception> _cleanupFailures = [];
+        private int _reportedCleanupFailures;
+
+        public IReadOnlyList<Exception> CleanupFailures => _cleanupFailures;
+
+        public Exception[] TakeUnreportedCleanupFailures()
+        {
+            var pending = _cleanupFailures.Skip(_reportedCleanupFailures).ToArray();
+            _reportedCleanupFailures = _cleanupFailures.Count;
+            return pending;
+        }
+
+        /// <summary>An earlier write fault lets the exceptional-path row pin that later joins still execute.</summary>
+        public void TrackFaultingWrite(Exception fault) => TrackStorage(Task.FromException(fault));
+
+        /// <summary>
+        /// TEST SEAM for the cleanup-fault path: tracks one more parked invocation, on the SAME release latch and
+        /// through the SAME tracking list as every real parked callback, whose body FAULTS with
+        /// <paramref name="fault"/> once released — i.e. a cleanup-time fault that cleanup must observe by joining it.
+        /// </summary>
+        public void ParkFaultingInvocation(Exception fault)
+        {
+            var release = (_parkedRelease ?? throw new InvalidOperationException("ParkCallbacksAsync was not called.")).Task;
+            var invocation = RunParkedAsync(release, () => throw fault);
+            lock (_parkedCallbacks) _parkedCallbacks.Add(invocation);
         }
     }
 
