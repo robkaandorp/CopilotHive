@@ -281,6 +281,43 @@ public sealed class GoalIssueFacadeAuthorizationTests : IDisposable
             Assert.Empty(store.GoalUpdates);
             Assert.Equal(0, store.ReleaseReads);
             Assert.Equal(0, store.GetAllCalls);
+
+            // THE COMPLETE OBSERVATION: not one IGoalStore method of ANY kind was invoked — including
+            // the attach-release RELEASE lookup (GetReleaseAsync), which none of the specific
+            // counters above can see.
+            Assert.Empty(store.AllCalls);
+        }
+    }
+
+    /// <summary>
+    /// THE OBSERVATION CONTROL for the zero-store-work assertion above: the SAME recorder DOES see the
+    /// attach-release release lookup (<c>GetReleaseAsync</c>) and the goal read when the caller is
+    /// AUTHORIZED, and sees the release lookup ALONE when the release is missing. So the refusal test's
+    /// <c>Assert.Empty(store.AllCalls)</c> cannot pass merely because the recorder is blind to that
+    /// method: an implementation that moved the lookup ahead of the gate (still answering Forbidden)
+    /// would leave <c>GetReleaseAsync</c> in <c>AllCalls</c> and fail
+    /// <see cref="EveryGoalMutation_RefusesViewerAndMember_BeforeAnyStoreWork"/>.
+    /// </summary>
+    [Fact]
+    public async Task AttachRelease_AuthorizedCaller_RecorderObservesTheReleaseLookup()
+    {
+        await SeedAllRolesAsync();
+        var operatorUser = Principal(OperatorId);
+
+        using (var store = new RecordingGoalStore())
+        {
+            var result = await GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()], withRelease: true)
+                .AttachReleaseAsync("goal-1", "rel-1", operatorUser);
+            Assert.True(result.Success, result.Error ?? "an Operator must be allowed to attach a release");
+            Assert.Equal(["GetReleaseAsync", "GetGoalAsync", "UpdateGoalAsync"], store.AllCalls);
+        }
+
+        using (var store = new RecordingGoalStore())
+        {
+            var result = await GoalFacadeFor(HiveAuthMode.AuthenticationEnabled, store, [DraftGoal()])
+                .AttachReleaseAsync("goal-1", "missing-release", operatorUser);
+            Assert.Equal(FacadeErrorKind.NotFound, result.Kind);
+            Assert.Equal(["GetReleaseAsync"], store.AllCalls);
         }
     }
 
@@ -816,6 +853,14 @@ public sealed class GoalIssueFacadeAuthorizationTests : IDisposable
 
         public string Name => "recording-goal-store";
 
+        /// <summary>
+        /// EVERY <see cref="IGoalStore"/> method the facade invoked, by name, in call order. This is
+        /// the complete observation surface: a refused operation must leave it EMPTY, so a store call
+        /// moved ahead of the authorization gate (the attach-release RELEASE lookup included) is seen
+        /// even when the operation still ends in Forbidden.
+        /// </summary>
+        public List<string> AllCalls { get; } = [];
+
         /// <summary>Goal IDs passed to <see cref="GetGoalAsync"/>, in call order.</summary>
         public List<string> ReadCalls { get; } = [];
 
@@ -843,24 +888,28 @@ public sealed class GoalIssueFacadeAuthorizationTests : IDisposable
 
         public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default)
         {
+            AllCalls.Add("GetAllGoalsAsync");
             GetAllCalls++;
             return Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.ToList());
         }
 
         public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default)
         {
+            AllCalls.Add("GetGoalAsync");
             ReadCalls.Add(goalId);
             return Task.FromResult(_goals.TryGetValue(goalId, out var goal) ? goal : null);
         }
 
         public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default)
         {
+            AllCalls.Add("CreateGoalAsync");
             _goals[goal.Id] = goal;
             return Task.FromResult(goal);
         }
 
         public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default)
         {
+            AllCalls.Add("UpdateGoalAsync");
             GoalUpdates.Add(goal);
             _goals[goal.Id] = goal;
             return Task.CompletedTask;
@@ -868,31 +917,48 @@ public sealed class GoalIssueFacadeAuthorizationTests : IDisposable
 
         public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default)
         {
+            AllCalls.Add("DeleteGoalAsync");
             DeleteCalls.Add(goalId);
             return Task.FromResult(_goals.Remove(goalId));
         }
 
         public Task<IReadOnlyList<Goal>> SearchGoalsAsync(
-            string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<Goal>>(
+            string query, GoalStatus? statusFilter = null, CancellationToken ct = default)
+        {
+            AllCalls.Add("SearchGoalsAsync");
+            return Task.FromResult<IReadOnlyList<Goal>>(
                 _goals.Values.Where(g => g.Id.Contains(query, StringComparison.OrdinalIgnoreCase)).ToList());
+        }
 
-        public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.Where(g => g.Status == status).ToList());
+        public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default)
+        {
+            AllCalls.Add("GetGoalsByStatusAsync");
+            return Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.Where(g => g.Status == status).ToList());
+        }
 
-        public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default)
+        {
+            AllCalls.Add("AddIterationAsync");
+            return Task.CompletedTask;
+        }
 
-        public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<IterationSummary>>(
+        public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default)
+        {
+            AllCalls.Add("GetIterationsAsync");
+            return Task.FromResult<IReadOnlyList<IterationSummary>>(
                 _goals.TryGetValue(goalId, out var goal) ? goal.IterationSummaries : []);
+        }
 
-        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<Goal>>([]);
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
+        {
+            AllCalls.Add("GetPendingGoalsAsync");
+            return Task.FromResult<IReadOnlyList<Goal>>([]);
+        }
 
         public Task UpdateGoalStatusAsync(
             string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
         {
+            AllCalls.Add("UpdateGoalStatusAsync");
             StatusUpdates.Add((goalId, status));
             if (_goals.TryGetValue(goalId, out var goal))
                 goal.Status = status;
@@ -901,43 +967,68 @@ public sealed class GoalIssueFacadeAuthorizationTests : IDisposable
 
         public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default)
         {
+            AllCalls.Add("CreateReleaseAsync");
             _releases[release.Id] = release;
             return Task.FromResult(release);
         }
 
-        public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
-            Task.FromResult(_releases.TryGetValue(releaseId, out var release) ? release : null);
+        public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default)
+        {
+            AllCalls.Add("GetReleaseAsync");
+            return Task.FromResult(_releases.TryGetValue(releaseId, out var release) ? release : null);
+        }
 
         public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default)
         {
+            AllCalls.Add("GetReleasesAsync");
             ReleaseReads++;
             return Task.FromResult<IReadOnlyList<Release>>(_releases.Values.ToList());
         }
 
-        public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => Task.CompletedTask;
+        public Task UpdateReleaseAsync(Release release, CancellationToken ct = default)
+        {
+            AllCalls.Add("UpdateReleaseAsync");
+            return Task.CompletedTask;
+        }
 
-        public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default)
+        {
+            AllCalls.Add("UpdateReleaseAsync");
+            return Task.CompletedTask;
+        }
 
-        public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
-            Task.FromResult(false);
+        public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default)
+        {
+            AllCalls.Add("DeleteReleaseAsync");
+            return Task.FromResult(false);
+        }
 
-        public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<Goal>>([]);
+        public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default)
+        {
+            AllCalls.Add("GetGoalsByReleaseAsync");
+            return Task.FromResult<IReadOnlyList<Goal>>([]);
+        }
 
         public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(
-            string goalId, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+            string goalId, CancellationToken ct = default)
+        {
+            AllCalls.Add("GetPipelineConversationAsync");
+            return Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+        }
 
         public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default)
         {
+            AllCalls.Add("ResetGoalIterationDataAsync");
             ResetCalls.Add(goalId);
             return Task.CompletedTask;
         }
 
         public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(
-            int? limit = null, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
+            int? limit = null, CancellationToken ct = default)
+        {
+            AllCalls.Add("GetAllClarificationsAsync");
+            return Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
+        }
 
         public void Dispose()
         {

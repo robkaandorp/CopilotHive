@@ -222,6 +222,16 @@ public sealed class GoalIssuePagesAuthorizationMigrationTests
         Assert.Contains("_allGoals = []", clear, StringComparison.Ordinal);
         Assert.Contains("_filtered = []", clear, StringComparison.Ordinal);
         Assert.Contains("_goalStatusById = new()", clear, StringComparison.Ordinal);
+
+        // The release selector renders values DERIVED from these two, so a denied refresh must empty
+        // them too (previously loaded release IDs/tags must not stay visible) — and WITHOUT any
+        // store reread on the denial path.
+        Assert.Contains("_allReleases = []", clear, StringComparison.Ordinal);
+        Assert.Contains("_releaseStatusById = new()", clear, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetReleasesAsync", clear, StringComparison.Ordinal);
+        var denial = load[..load.IndexOf("_allGoals = goalsResult", StringComparison.Ordinal)];
+        Assert.DoesNotContain("GetReleasesAsync", denial, StringComparison.Ordinal);
+
         Assert.Contains("_approveErrors.Clear()", clear, StringComparison.Ordinal);
         Assert.Contains("_revertErrors.Clear()", clear, StringComparison.Ordinal);
         Assert.Contains("_retryErrors.Clear()", clear, StringComparison.Ordinal);

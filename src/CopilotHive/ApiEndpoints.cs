@@ -5,6 +5,7 @@ using CopilotHive.Goals;
 using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Authentication;
@@ -79,6 +80,78 @@ public static class ApiEndpoints
     }
 
     /// <summary>
+    /// Endpoint metadata marking a goal/issue MUTATING route that must be authorized BEFORE the
+    /// minimal-API pipeline binds or parses its request (route values, query string, typed JSON body).
+    /// </summary>
+    /// <param name="Capability">The capability the route's operation requires.</param>
+    /// <param name="Operation">The operation name (denial log context only).</param>
+    internal sealed record PreBindingAuthorization(HiveCapability Capability, string Operation);
+
+    /// <summary>Application-property key that makes the pre-binding middleware registration idempotent.</summary>
+    private const string PreBindingMiddlewareKey = "CopilotHive.GoalIssuePreBindingAuthorization";
+
+    /// <summary>
+    /// Registers (once per application) the PRE-BINDING AUTHORIZATION middleware for the covered
+    /// goal/issue mutating routes.
+    /// <para>
+    /// WHY MIDDLEWARE: in minimal APIs, parameter binding — including typed JSON body deserialization
+    /// and enum conversion — runs BEFORE any endpoint filter and before the handler, so a facade-level
+    /// gate alone would let a malformed body answer 400 for a caller who is not allowed to learn
+    /// anything about the schema. Middleware runs after routing has selected the endpoint but before
+    /// the endpoint delegate binds anything, so it can refuse first.
+    /// </para>
+    /// <para>
+    /// ORDER: it is registered from the route-mapping methods, which <c>Program.cs</c> calls AFTER
+    /// <c>UseAuthentication</c>/<c>UseAuthorization</c>, so an anonymous caller is still challenged
+    /// with the path-aware 401 (no redirect) by the fallback policy before this runs. For an
+    /// authenticated caller it performs ONE FRESH <see cref="HivePrincipalResolver"/> resolution per
+    /// request through the single <see cref="FacadeAuthorization"/> seam (nothing is cached across
+    /// requests) and answers 403 with the same <c>{ error }</c> body the facade mapping uses. An
+    /// allowed caller passes through to the unchanged binding and handler, whose facade gate re-checks
+    /// (defence in depth), so authorized-caller behaviour — including 400 for invalid input — is
+    /// untouched. Cancellation propagates and is never turned into a denial.
+    /// </para>
+    /// </summary>
+    /// <param name="app">The web application to register the middleware on.</param>
+    private static void EnsurePreBindingAuthorization(WebApplication app)
+    {
+        var properties = ((IApplicationBuilder)app).Properties;
+        if (properties.ContainsKey(PreBindingMiddlewareKey))
+            return;
+        properties[PreBindingMiddlewareKey] = true;
+
+        app.Use(async (context, next) =>
+        {
+            var gate = context.GetEndpoint()?.Metadata.GetMetadata<PreBindingAuthorization>();
+            if (gate is null)
+            {
+                await next(context);
+                return;
+            }
+
+            var services = context.RequestServices;
+            var allowed = await FacadeAuthorization.IsAllowedAsync(
+                services.GetRequiredService<HivePrincipalResolver>(),
+                services.GetRequiredService<HivePolicy>(),
+                context.User,
+                gate.Capability,
+                services.GetRequiredService<ILoggerFactory>().CreateLogger(nameof(ApiEndpoints)),
+                gate.Operation,
+                context.RequestAborted);
+
+            if (!allowed)
+            {
+                await Results.Json(
+                    new { error = FacadeAuthorization.ForbiddenMessage },
+                    statusCode: StatusCodes.Status403Forbidden).ExecuteAsync(context);
+                return;
+            }
+
+            await next(context);
+        });
+    }
+
+    /// <summary>
     /// Registers the goals REST API endpoints under <c>/api/goals</c>.
     /// </summary>
     /// <remarks>
@@ -94,6 +167,7 @@ public static class ApiEndpoints
     {
         // ── Goals REST API ───────────────────────────────────────────────────────
         var goalsApi = app.MapGroup("/api/goals");
+        EnsurePreBindingAuthorization(app);
 
         // IDENTITY IS PER REQUEST: each covered handler forwards the request's authenticated
         // principal (HttpContext.User) to the facade, which re-resolves the caller's CURRENT
@@ -147,7 +221,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.status"));
 
         goalsApi.MapDelete("/{id}", async (string id, HttpContext context, [FromServices] IGoalFacade facade) =>
         {
@@ -155,7 +230,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.NoContent()
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.delete"));
 
         goalsApi.MapPost("/{id}/cancel", async (string id, HttpContext context, [FromServices] IGoalFacade facade) =>
         {
@@ -163,7 +239,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.cancel"));
 
         goalsApi.MapPost("/{id}/extend-iterations", async (string id, ExtendIterationsRequest request,
             HttpContext context, [FromServices] IGoalFacade facade, CancellationToken ct) =>
@@ -177,7 +254,8 @@ public static class ApiEndpoints
             return result.Kind == FacadeErrorKind.ServiceUnavailable
                 ? Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.extend-iterations"));
 
         goalsApi.MapGet("/search", async (string q, string? status, HttpContext context,
             [FromServices] IGoalFacade facade, CancellationToken ct) =>
@@ -195,7 +273,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.release"));
 
         goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update,
             HttpContext context, [FromServices] IGoalFacade facade) =>
@@ -204,7 +283,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.review-status"));
 
         goalsApi.MapPost("/{goalId}/review", async (string goalId, HttpContext context,
             [FromServices] IGoalFacade facade, CancellationToken ct) =>
@@ -213,7 +293,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapGoalFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "goals.review"));
     }
 
     /// <summary>
@@ -398,6 +479,7 @@ public static class ApiEndpoints
     {
         // ── Issues REST API ─────────────────────────────────────────────────────
         var issuesApi = app.MapGroup("/api/issues");
+        EnsurePreBindingAuthorization(app);
 
         // IDENTITY IS PER REQUEST: each handler forwards the request's authenticated principal
         // (HttpContext.User) to the facade, which re-resolves the caller's CURRENT role/enabled state.
@@ -433,7 +515,8 @@ public static class ApiEndpoints
             if (result.Success)
                 return Results.Created($"/api/issues/{Uri.EscapeDataString(result.Value!.Id)}", result.Value);
             return MapIssueFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.InteractiveMember, "issues.create"));
 
         issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, HttpContext context,
             [FromServices] IIssueFacade facade, CancellationToken ct) =>
@@ -442,7 +525,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.Ok(result.Value)
                 : MapIssueFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "issues.update"));
 
         issuesApi.MapDelete("/{id}", async (string id, HttpContext context,
             [FromServices] IIssueFacade facade, CancellationToken ct) =>
@@ -451,7 +535,8 @@ public static class ApiEndpoints
             return result.Success
                 ? Results.NoContent()
                 : MapIssueFacadeError(result.Kind, result.Error);
-        });
+        })
+            .WithMetadata(new PreBindingAuthorization(HiveCapability.ExecutionOperator, "issues.delete"));
     }
 
     /// <summary>

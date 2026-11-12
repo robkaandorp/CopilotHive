@@ -275,6 +275,10 @@ else if (_loaded)
         _allGoals = [];
         _filtered = [];
         _goalStatusById = new();
+        // The release selector renders values DERIVED from these two, so previously loaded release
+        // IDs/tags must be emptied too. Clearing is local only — no store reread on the denial path.
+        _allReleases = [];
+        _releaseStatusById = new();
         _approveErrors.Clear();
         _revertErrors.Clear();
         _retryErrors.Clear();
