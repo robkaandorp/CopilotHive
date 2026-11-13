@@ -477,13 +477,19 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
         try
         {
             await subject.InitializeAsync();
-            System.Data.Common.DbConnection directoryConnection;
             using (var directoryDb = subject._auth.Directory.CreateDbContext())
+            using (var siblingDb = subject._auth.Directory.CreateDbContext())
             {
                 Assert.Equal(2, directoryDb.Users.Count());
-                directoryConnection = directoryDb.Database.GetDbConnection();
+
+                // The directory never shares one connection instance between contexts: each context
+                // OWNS its own connection (that is what lets two contexts initialise concurrently),
+                // while both still read the SAME live in-memory database.
+                Assert.NotSame(
+                    directoryDb.Database.GetDbConnection(),
+                    siblingDb.Database.GetDbConnection());
+                Assert.Equal(2, siblingDb.Users.Count());
             }
-            Assert.Equal(System.Data.ConnectionState.Open, directoryConnection.State);
             owned = new WiringFixture(
                 users: subject._auth.Directory.Service, stateDir: subject._dir,
                 configureServices: services => services.AddSingleton(_ => providerDisposal),
@@ -547,9 +553,10 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
             Assert.True(providerDisposal.Completed.Task.IsCompletedSuccessfully);
             Assert.Throws<ObjectDisposedException>(() => owned.Provider.GetRequiredService<UserService>());
             Assert.Throws<ObjectDisposedException>(() => subject._goalDb.Users.Count());
-            // SqliteConnection can reopen after Dispose; inspect its actual closed state without
-            // reopening the in-memory directory (which would create a fresh, empty database).
-            Assert.Equal(System.Data.ConnectionState.Closed, directoryConnection.State);
+            // The directory is CLOSED once cleanup ran: a fresh context is REJECTED instead of quietly
+            // reopening (with a named shared-cache database a new connection would create a fresh,
+            // empty database, so a post-disposal read would answer "no such account").
+            Assert.Throws<ObjectDisposedException>(() => subject._auth.Directory.CreateDbContext());
             Assert.False(Directory.Exists(subject._dir), "class state cleanup must run after a failed gate check");
         }
         catch (Exception ex) { primary = ExceptionDispatchInfo.Capture(ex); }

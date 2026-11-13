@@ -15,15 +15,55 @@ namespace CopilotHive.Tests.Security;
 /// A REAL user directory (SQLite in-memory, the production <see cref="UserService"/> over the
 /// production EF model) plus the primitives under test, so every security test exercises the exact
 /// directory reads the resolver is required to use — no mocked identity source.
+/// <para>
+/// ONE NAMED SHARED-CACHE DATABASE, A KEEPER CONNECTION, AND A FRESH CONNECTION PER CONTEXT. Each
+/// directory instance creates its own uniquely named in-memory database
+/// (<c>hive-security-users-{guid}</c>) and holds a KEEPER connection open for its whole life, so the
+/// data survives between contexts while every <see cref="CopilotHiveDbContext"/> opens its OWN
+/// connection to that same named database.
+/// </para>
+/// <para>
+/// WHY NOT ONE SHARED <see cref="SqliteConnection"/> (the previous shape): EF's SQLite provider
+/// registers its scalar functions on the connection while it initialises it
+/// (<c>SqliteRelationalConnection.InitializeDbConnection</c> → <c>SqliteConnection.CreateFunction</c>),
+/// so two contexts created CONCURRENTLY over one connection race inside SQLite and one of them fails
+/// with <c>SQLite Error 5: 'database is locked'</c>. One connection per context removes the shared
+/// initialization: every context initialises its own connection, and only the DATA is shared — the
+/// shape <c>ComposerTestUserDirectory</c> already proved.
+/// </para>
+/// <para>
+/// DISPOSAL IS A LATCH, NOT A RESET: <see cref="Dispose"/> is idempotent and closes the keeper, and
+/// <see cref="CreateDbContext"/> REJECTS with <see cref="ObjectDisposedException"/> once disposed. It
+/// must reject rather than silently reopen, because with a NAMED shared-cache database a fresh
+/// connection would quietly create a new, EMPTY database — a directory that answers "no such account"
+/// instead of "the directory is unreadable". The rejection is what keeps the
+/// unreadable-directory contract honest: the production resolver's broad non-cancellation catch
+/// classifies it as <see cref="PrincipalRefusalReason.DirectoryFailure"/>.
+/// </para>
 /// </summary>
 internal sealed class HiveSecurityTestDirectory : IDisposable
 {
-    private readonly SqliteConnection _connection;
+    /// <summary>The unique shared-cache in-memory database name; one per directory instance.</summary>
+    private readonly string _databaseName = $"hive-security-users-{Guid.NewGuid():N}";
+
+    /// <summary>
+    /// Holds the shared-cache database alive for the directory's whole life. Every context opens its
+    /// own connection to the same named database; this one exists purely so the database is not
+    /// dropped between them.
+    /// </summary>
+    private readonly SqliteConnection _keeper;
+
+    /// <summary>
+    /// The disposal latch: 0 while the directory is live, 1 once <see cref="Dispose"/> ran. One
+    /// exchange makes disposal idempotent (a repeated or concurrent dispose closes the keeper at most
+    /// once) and the volatile read makes the post-disposal rejection visible to every thread.
+    /// </summary>
+    private int _disposed;
 
     internal HiveSecurityTestDirectory()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
+        _keeper = new SqliteConnection(ConnectionString);
+        _keeper.Open();
 
         using var ctx = CreateDbContext();
         ctx.Database.EnsureCreated();
@@ -46,10 +86,29 @@ internal sealed class HiveSecurityTestDirectory : IDisposable
     internal CircuitUserPrincipalAccessor Accessor(HiveAuthMode mode) =>
         new(Resolver(mode), new HivePolicy());
 
+    /// <summary>
+    /// The connection string shared by the keeper and every context: the SAME named shared-cache
+    /// in-memory database, with <c>Pooling=False</c> so no pooled handle silently outlives the
+    /// connection that opened it (which would keep the database alive past the keeper).
+    /// </summary>
+    private string ConnectionString =>
+        $"Data Source={_databaseName};Mode=Memory;Cache=Shared;Pooling=False";
+
+    /// <summary>
+    /// A FRESH context over its OWN connection to the shared-cache database. The connection is owned
+    /// by the context (so it closes with it) and is never shared with another context — which is what
+    /// lets contexts initialise concurrently.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The directory has been disposed.</exception>
     internal CopilotHiveDbContext CreateDbContext()
     {
+        // REJECT, never silently reopen: a fresh connection to a named shared-cache database would
+        // create a new EMPTY database, so a post-disposal read would answer "no such account"
+        // instead of "the directory is unreadable".
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
         var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
-            .UseSqlite(_connection)
+            .UseSqlite(ConnectionString)
             .Options;
         return new CopilotHiveDbContext(options);
     }
@@ -148,9 +207,21 @@ internal sealed class HiveSecurityTestDirectory : IDisposable
 
     private IDbContextFactory<CopilotHiveDbContext> Factory => new FactoryImpl(this);
 
-    public void Dispose() => _connection.Dispose();
+    /// <summary>
+    /// Idempotent: the FIRST dispose closes the keeper (dropping the database only once every other
+    /// context connection is closed too) and latches the directory closed; later calls do nothing.
+    /// </summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
 
-    /// <summary>An <see cref="IDbContextFactory{TContext}"/> over the shared open connection.</summary>
+        _keeper.Dispose();
+    }
+
+    /// <summary>An <see cref="IDbContextFactory{TContext}"/> handing out ONE FRESH CONNECTION per context.</summary>
     private sealed class FactoryImpl(HiveSecurityTestDirectory owner)
         : IDbContextFactory<CopilotHiveDbContext>
     {
