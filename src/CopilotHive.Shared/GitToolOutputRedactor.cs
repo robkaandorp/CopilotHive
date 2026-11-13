@@ -173,7 +173,9 @@ public static class GitToolOutputRedactor
 
     /// <summary>
     /// Applies the inventory: raw, one-level percent-encoded and standard-base64 forms of every
-    /// eligible value, longest value first so a secret that CONTAINS another is removed whole.
+    /// eligible value. All forms are matched against the original text and overlapping matches are
+    /// merged, so a secret that CONTAINS another (or an encoded variant that merely STARTS with
+    /// another value) is removed whole whatever order the values arrive in.
     /// </summary>
     private static string RedactKnownSecrets(string text, IEnumerable<string?>? knownSecrets)
     {
@@ -192,28 +194,106 @@ public static class GitToolOutputRedactor
         if (eligible.Count == 0)
             return text;
 
-        eligible.Sort(static (left, right) => right.Length.CompareTo(left.Length));
+        // ORDER-INDEPENDENT by construction. Every form of every value is matched against the
+        // ORIGINAL text, the matched spans are merged, and each merged span is replaced exactly
+        // once. No pass ever sees another pass's output, so one value's replacement can never
+        // destroy a prefix of a DIFFERENT value's longer (encoded) variant and strand its tail.
+        // Any sequence of per-value passes has that flaw whatever order it runs in: sorting by raw
+        // length, running base64 first, or re-scanning only moves WHICH pair of values collides.
+        var forms = eligible.Select(static secret => new InventoryForms(secret)).ToList();
+        var spans = CollectInventorySpans(text, forms);
+        return spans.Count == 0 ? text : ReplaceSpans(text, spans);
+    }
 
-        var redacted = text;
-        foreach (var secret in eligible)
+    /// <summary>
+    /// The matchable forms of one inventory value: its raw text, its one-level percent-encoded
+    /// readings, and its standard padded / unpadded base64.
+    /// </summary>
+    private sealed class InventoryForms(string secret)
+    {
+        /// <summary>The raw value (also the form the percent-aware matcher starts from).</summary>
+        public string Secret { get; } = secret;
+
+        /// <summary>Whether the percent-aware matcher applies (single-byte characters only).</summary>
+        public bool PercentAware { get; } = !secret.Any(static c => c > 0x7F);
+
+        /// <summary>The padded and, when different, unpadded standard-base64 spellings.</summary>
+        public IReadOnlyList<string> Base64 { get; } = StandardBase64Forms(secret);
+    }
+
+    /// <summary>
+    /// Finds, at EVERY position, the extent of every form of every inventory value that matches
+    /// there, in ascending start order.
+    /// </summary>
+    /// <remarks>
+    /// All candidates at a position are kept rather than only the longest: the union taken by
+    /// <see cref="ReplaceSpans"/> makes the LONGEST single-layer variant win at each position
+    /// regardless of which inventory entry it belongs to. A shorter raw match of one value inside
+    /// another value's encoded variant merges into it instead of pre-empting it.
+    /// </remarks>
+    private static List<(int Start, int End)> CollectInventorySpans(string text, List<InventoryForms> forms)
+    {
+        var spans = new List<(int Start, int End)>();
+        for (var index = 0; index < text.Length; index++)
         {
-            // Precedence principle: a LONGER encoded form of the value must win over a shorter raw
-            // PREFIX of it, otherwise the raw match fires first and strands the encoded tail.
-            //  * base64 first — a value that is itself valid base64 ("Vm0wd2Qy") has a base64 form
-            //    ("Vm0wd2QyUXk=") that STARTS with the raw value; replacing raw first would leave
-            //    "UXk=" behind. The padded form is replaced before the unpadded one for the same
-            //    reason ("=" would otherwise be stranded).
-            //  * then the percent-aware pass, which also matches the raw form and prefers a longer
-            //    "%25" reading over a literal '%' (a value ending in '%' against "...%25").
-            //  * the plain raw replacement last only mops up what the percent-aware pass cannot
-            //    decode (non-ASCII values are skipped there).
-            foreach (var encoded in StandardBase64Forms(secret))
-                redacted = redacted.Replace(encoded, Placeholder, StringComparison.Ordinal);
-            redacted = ReplacePercentEncoded(redacted, secret);
-            redacted = redacted.Replace(secret, Placeholder, StringComparison.Ordinal);
+            foreach (var form in forms)
+            {
+                if (text.AsSpan(index).StartsWith(form.Secret, StringComparison.Ordinal))
+                    spans.Add((index, index + form.Secret.Length));
+
+                foreach (var encoded in form.Base64)
+                {
+                    if (text.AsSpan(index).StartsWith(encoded, StringComparison.Ordinal))
+                        spans.Add((index, index + encoded.Length));
+                }
+
+                // Fast path: only a literal first character or a leading escape can start a match.
+                if (form.PercentAware
+                    && (text[index] == form.Secret[0] || text[index] == '%')
+                    && TryMatchPercentEncoded(text, index, form.Secret, out var percentEnd))
+                {
+                    spans.Add((index, percentEnd));
+                }
+            }
         }
 
-        return redacted;
+        return spans;
+    }
+
+    /// <summary>
+    /// Replaces each union of overlapping spans with ONE <see cref="Placeholder"/>. Spans that merely
+    /// touch (one ends where the next starts) stay separate, so two adjacent secrets keep two
+    /// placeholders.
+    /// </summary>
+    private static string ReplaceSpans(string text, List<(int Start, int End)> spans)
+    {
+        // Spans arrive in ascending Start order, so a single sweep merges them.
+        var builder = new StringBuilder(text.Length);
+        var copied = 0;
+        var mergedStart = spans[0].Start;
+        var mergedEnd = spans[0].End;
+
+        for (var i = 1; i <= spans.Count; i++)
+        {
+            if (i < spans.Count && spans[i].Start < mergedEnd)
+            {
+                mergedEnd = Math.Max(mergedEnd, spans[i].End);
+                continue;
+            }
+
+            builder.Append(text, copied, mergedStart - copied);
+            builder.Append(Placeholder);
+            copied = mergedEnd;
+
+            if (i < spans.Count)
+            {
+                mergedStart = spans[i].Start;
+                mergedEnd = spans[i].End;
+            }
+        }
+
+        builder.Append(text, copied, text.Length - copied);
+        return builder.ToString();
     }
 
     /// <summary>
@@ -231,9 +311,9 @@ public static class GitToolOutputRedactor
     }
 
     /// <summary>
-    /// Replaces every occurrence of <paramref name="secret"/> in which EACH character may appear
-    /// either literally or as a ONE-LEVEL UTF-8 percent escape (<c>%XX</c>, hex digits in either
-    /// case).
+    /// Attempts to match <paramref name="secret"/> at <paramref name="start"/>, allowing every
+    /// character to be either literal or a single one-level percent escape of that character.
+    /// Used by <see cref="CollectInventorySpans"/> for values made of single-byte characters only.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -248,46 +328,9 @@ public static class GitToolOutputRedactor
     /// <para>
     /// The scan compares one expected BYTE against one text character, which is exact only for
     /// single-byte (ASCII) characters. A value with any non-ASCII character is left to the raw and
-    /// base64 replacements rather than matched approximately.
+    /// base64 matches rather than matched approximately.
     /// </para>
     /// </remarks>
-    private static string ReplacePercentEncoded(string text, string secret)
-    {
-        if (secret.Any(static c => c > 0x7F))
-            return text;
-
-        StringBuilder? builder = null;
-        var copied = 0;
-        var index = 0;
-
-        while (index < text.Length)
-        {
-            // Fast path: only a literal first character or a leading escape can start a match.
-            if ((text[index] == secret[0] || text[index] == '%')
-                && TryMatchPercentEncoded(text, index, secret, out var end))
-            {
-                builder ??= new StringBuilder(text.Length);
-                builder.Append(text, copied, index - copied);
-                builder.Append(Placeholder);
-                copied = end;
-                index = end;
-                continue;
-            }
-
-            index++;
-        }
-
-        if (builder is null)
-            return text;
-
-        builder.Append(text, copied, text.Length - copied);
-        return builder.ToString();
-    }
-
-    /// <summary>
-    /// Attempts to match <paramref name="secret"/> at <paramref name="start"/>, allowing every
-    /// character to be either literal or a single one-level percent escape of that character.
-    /// </summary>
     private static bool TryMatchPercentEncoded(string text, int start, string secret, out int end)
     {
         // Only a '%' in the secret itself is ambiguous: in the text it may appear as a literal '%'
