@@ -1,8 +1,22 @@
 @inherits LayoutComponentBase
+@using System.Security.Claims
 @using CopilotHive.Orchestration
+@using CopilotHive.Services
 @inject CopilotHive.Dashboard.PageHeaderState PageHeader
 @inject CopilotHive.Dashboard.DashboardStateService DashboardState
+@* The clarification queue is injected ONLY as this layout's refresh EVENT SOURCE (OnChanged). It is
+   never read for data: every pending request and the badge count come from the AUTHORIZED
+   IClarificationFacade below, which re-resolves this circuit user's current role/enabled state on
+   every call. *@
 @inject CopilotHive.Orchestration.ClarificationQueueService ClarificationQueue
+@* THE AUTHORIZED CLARIFICATION BOUNDARY: the two reads require SharedRead and answering requires
+   ExecutionOperator. No direct ClarificationQueueService data read and no direct queue mutation
+   anywhere in this layout. *@
+@inject IClarificationFacade ClarificationFacade
+@* The SCOPED per-circuit accessor, used by the single ComponentActingUser seam to obtain the identity
+   handed to every facade call (and to observe the circuit's identity). It is never captured by a
+   singleton. *@
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @implements IDisposable
 
 <div class="hive-layout">
@@ -35,6 +49,14 @@
             <button class="chat-action-btn" @onclick="CloseDrawer">✕ Close</button>
         </div>
         <div class="clarification-drawer-body">
+            @* THE ANSWER ERROR: the facade's OWN sanitized message (for a refusal exactly
+               FacadeAuthorization.ForbiddenMessage, never a raw exception). It never replaces the
+               pending list — a failed answer keeps the last authorized read on screen. *@
+            @if (_answerError is not null)
+            {
+                <div class="chat-status chat-status-error clarification-answer-error">@_answerError</div>
+            }
+
             @foreach (var req in _pendingClarifications)
             {
                 <div class="clarification-item">
@@ -83,7 +105,50 @@
     private bool _drawerOpen;
     private readonly Dictionary<string, string> _clarificationAnswers = new();
 
-    protected override void OnInitialized()
+    /// <summary>
+    /// The facade's sanitized message for the LAST failed answer, or <c>null</c>. It is cleared when
+    /// the next answer attempt starts or when an answer succeeds — a failed answer never clears it by
+    /// clearing anything else, and no raw exception text ever reaches it.
+    /// </summary>
+    private string? _answerError;
+
+    /// <summary>
+    /// Monotonic generation of the refresh in flight. A refresh only publishes its result when it is
+    /// still the newest one, so an OVERLAPPING refresh (the queue's <c>OnChanged</c> can fire while a
+    /// previous read is still awaiting, and the facade re-derives authorization on every call) can
+    /// never overwrite newer state with older content.
+    /// </summary>
+    private int _refreshGeneration;
+
+    /// <summary>
+    /// Set by <see cref="Dispose"/>: an in-flight refresh that completes afterwards writes nothing and
+    /// never calls <see cref="ComponentBase.StateHasChanged"/> on a torn-down component.
+    /// </summary>
+    private bool _disposed;
+
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to every identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator (which holds every
+    /// capability), so the legacy single-operator installation is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. This is also the layout's MINIMAL circuit
+    /// identity acquisition: the scoped
+    /// <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/> is observed from the same
+    /// cascading state (idempotent, and never a second resolution path).
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
+    protected override async Task OnInitializedAsync()
     {
         _version = DashboardState.GetVersion();
         _isBeta = _version.Contains("-beta", StringComparison.OrdinalIgnoreCase)
@@ -92,28 +157,97 @@
                   || _version.StartsWith("0.");
         PageHeader.OnChanged += HandleTitleChanged;
         ClarificationQueue.OnChanged += HandleClarificationChanged;
-        RefreshClarifications();
+
+        // THE FIRST AUTHORIZED READ: the pending clarifications come from the facade, exactly like
+        // every later refresh — there is no direct-queue path, not even for the initial render.
+        await RefreshClarificationsAsync();
     }
 
-    private void HandleClarificationChanged()
+    /// <summary>
+    /// The queue's synchronous <c>Action</c> notification. It carries NO data and grants nothing: it
+    /// only schedules a refresh, which re-resolves this circuit user's authorization from scratch. The
+    /// work is dispatched onto the renderer so the layout's state is only ever touched on the
+    /// dispatcher, and the component is re-rendered explicitly — a service callback is NOT a component
+    /// event handler, so the framework will not schedule a render on our behalf.
+    /// </summary>
+    private void HandleClarificationChanged() => _ = InvokeAsync(RefreshAndRenderAsync);
+
+    /// <summary>Runs one refresh and re-renders, unless the layout has already been disposed.</summary>
+    private async Task RefreshAndRenderAsync()
     {
-        InvokeAsync(() =>
+        await RefreshClarificationsAsync();
+
+        if (_disposed) return;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Re-reads the pending clarifications through the authorized facade.
+    /// <para>
+    /// FRESH AUTHORIZATION EVERY TIME: both reads carry this circuit's identity, and the facade
+    /// re-resolves the caller's CURRENT role/enabled state on each call, so a disabled or signed-out
+    /// account loses the content on its very next refresh.
+    /// </para>
+    /// <para>
+    /// DENIAL CLEARS THE LOADED CONTENT: a <see cref="FacadeErrorKind.Forbidden"/> read (or any other
+    /// non-success answer) clears the pending list, the badge count and the retained drafts together —
+    /// and there is deliberately NO fallback to reading the queue directly. Any non-success is treated
+    /// the same way because these two reads have no other failure mode: fail closed beats rendering a
+    /// half-refreshed surface.
+    /// </para>
+    /// <para>
+    /// OVERLAP-SAFE: the generation guard means only the newest refresh publishes, so two
+    /// notifications in flight cannot interleave their results, and a refresh that completes after
+    /// disposal writes nothing and never re-renders a torn-down component.
+    /// </para>
+    /// </summary>
+    private async Task RefreshClarificationsAsync()
+    {
+        if (_disposed) return;
+
+        var generation = ++_refreshGeneration;
+
+        // ONE identity acquisition per refresh, reused by both reads: it is an IDENTITY only, and each
+        // facade call still re-resolves current stored state on its own.
+        var actingUser = await ActingUserAsync();
+
+        var requests = await ClarificationFacade.GetPendingHumanRequestsAsync(actingUser, CancellationToken.None);
+        var count = await ClarificationFacade.GetPendingHumanCountAsync(actingUser, CancellationToken.None);
+
+        // A newer refresh (or disposal) superseded this one: publish nothing.
+        if (_disposed || generation != _refreshGeneration)
+            return;
+
+        if (!requests.Success || !count.Success)
         {
-            RefreshClarifications();
-            StateHasChanged();
-        });
-    }
+            ClearLoadedClarifications();
+            return;
+        }
 
-    private void RefreshClarifications()
-    {
-        _pendingClarifications = ClarificationQueue.GetPendingHumanRequests().ToList();
-        _pendingClarificationCount = _pendingClarifications.Count;
+        _pendingClarifications = (requests.Value ?? []).ToList();
+        _pendingClarificationCount = count.Value;
         if (_pendingClarificationCount == 0) _drawerOpen = false;
-        // Ensure answer inputs exist for all pending requests
+
+        // Ensure answer inputs exist for all pending requests (the textarea binds the indexer). The
+        // existing draft text of a still-pending request is PRESERVED — TryAdd never overwrites it.
         foreach (var req in _pendingClarifications)
         {
             _clarificationAnswers.TryAdd(req.Id, "");
         }
+    }
+
+    /// <summary>
+    /// THE DENY CLEAR: drops every piece of loaded clarification content — the pending list, the badge
+    /// count and the retained drafts — so a later refusal cannot leave a previously authorized surface
+    /// rendered. It clears nothing else (the version/beta footer and the page header are unrelated to
+    /// the clarification boundary).
+    /// </summary>
+    private void ClearLoadedClarifications()
+    {
+        _pendingClarifications = [];
+        _pendingClarificationCount = 0;
+        _clarificationAnswers.Clear();
+        _drawerOpen = false;
     }
 
     private void OpenDrawer()
@@ -132,15 +266,58 @@
         return answer ?? "";
     }
 
-    private void SubmitClarificationAnswer(string requestId)
+    /// <summary>
+    /// Submits one human answer THROUGH the authorized facade (which requires
+    /// <see cref="CopilotHive.Security.HiveCapability.ExecutionOperator"/> and re-resolves the caller's
+    /// current state BEFORE the queue is touched).
+    /// <para>
+    /// THE DRAFT IS REMOVED ONLY ON SUCCESS. A <see cref="FacadeErrorKind.BadRequest"/> (blank
+    /// answer), a <see cref="FacadeErrorKind.NotFound"/> (the request is gone) and a
+    /// <see cref="FacadeErrorKind.Forbidden"/> (insufficient role, including an Operator demoted to
+    /// Member/Viewer) each RETAIN the typed draft, show the facade's sanitized message and leave the
+    /// loaded pending list and count exactly as the last authorized read left them — a demotion that
+    /// only denies answering must not also blank the reads.
+    /// </para>
+    /// <para>
+    /// CANCELLATION IS NOT AN ERROR AND IS NOT SWALLOWED: nothing here catches an
+    /// <see cref="OperationCanceledException"/>, so it propagates to the renderer as the caller's own
+    /// cancellation and the draft is left in place.
+    /// </para>
+    /// </summary>
+    private async Task SubmitClarificationAnswer(string requestId)
     {
         if (!_clarificationAnswers.TryGetValue(requestId, out var answer) ||
             string.IsNullOrWhiteSpace(answer))
             return;
 
-        ClarificationQueue.SubmitAnswer(requestId, answer.Trim(), "human");
+        // A new attempt supersedes the previous message.
+        _answerError = null;
+
+        var submitted = await ClarificationFacade.SubmitAnswerAsync(
+            requestId, answer.Trim(), await ActingUserAsync(), CancellationToken.None);
+
+        if (!submitted.Success)
+        {
+            // RETAIN the draft and everything already loaded; surface only the facade's own text.
+            _answerError = submitted.Error;
+            if (_disposed) return;
+            StateHasChanged();
+            return;
+        }
+
+        // SUCCESS is the ONLY path that consumes the draft. The answered row leaves the rendered list,
+        // and the count follows it, in the SAME synchronous step that removes its draft: the markup
+        // binds `_clarificationAnswers[req.Id]` for every listed row, so a row must never stay listed
+        // without its draft key across the awaited re-read below (an event-triggered render in that
+        // window would otherwise throw KeyNotFoundException). The authorized re-read then replaces
+        // the list/count with the facade's current answer.
+        if (_pendingClarifications.RemoveAll(r => r.Id == requestId) > 0)
+            _pendingClarificationCount = Math.Max(0, _pendingClarificationCount - 1);
+        if (_pendingClarificationCount == 0) _drawerOpen = false;
         _clarificationAnswers.Remove(requestId);
-        RefreshClarifications();
+        await RefreshClarificationsAsync();
+
+        if (_disposed) return;
         StateHasChanged();
     }
 
@@ -148,6 +325,7 @@
 
     public void Dispose()
     {
+        _disposed = true;
         PageHeader.OnChanged -= HandleTitleChanged;
         ClarificationQueue.OnChanged -= HandleClarificationChanged;
     }
