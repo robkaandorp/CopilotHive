@@ -115,6 +115,13 @@ public sealed class OpenModeUiToleranceTests : IDisposable
 
         // The accessor is still uninitialised — open mode never seeds it.
         Assert.False(accessor.IsInitialized);
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+
+        // The open-mode answer comes from the EXPLICIT mode the accessor reports; with no accessor the
+        // mode is unknown and the same question is DENIED (a missing cascade alone is not open mode).
+        Assert.False(accessor.AuthEnabled);
+        Assert.False(await ComponentActingUser.IsAllowedAsync(
+            null, accessor: null, HiveCapability.GlobalAdmin, Ct));
     }
 
     /// <summary>

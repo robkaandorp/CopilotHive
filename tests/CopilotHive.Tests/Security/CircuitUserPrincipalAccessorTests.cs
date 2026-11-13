@@ -156,6 +156,111 @@ public sealed class CircuitUserPrincipalAccessorTests
     }
 
     /// <summary>
+    /// A CLEAR IS RECORDED AND PERMANENT: it is distinguishable from never-initialised, and a later
+    /// <c>Initialize</c> (even with the very same identity) restores nothing.
+    /// </summary>
+    [Fact]
+    public async Task Clear_IsRecordedAsSignedOut_AndIsPermanent()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var never = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        accessor.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        Assert.Equal(CircuitIdentityState.Uninitialized, never.IdentityState);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.NotNull(accessor.EstablishedIdentity);
+
+        accessor.Clear();
+
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.True(accessor.IsInvalidated);
+        Assert.False(never.IsInvalidated);
+        Assert.Null(accessor.EstablishedIdentity);
+
+        accessor.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.False(accessor.IsInitialized);
+        Assert.False((await accessor.GetPrincipalAsync(Ct)).IsResolved);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+    }
+
+    /// <summary>
+    /// A DIFFERENT identity observed after initialisation PERMANENTLY invalidates the accessor: the
+    /// replacement is not adopted and the original is not restored. The SAME identity is idempotent.
+    /// </summary>
+    [Fact]
+    public async Task Observe_ADifferentIdentity_PermanentlyInvalidates_AndTheSameIdentityIsIdempotent()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        await directory.SeedActivatedAccountAsync("2", UserRole.Admin, username: "second");
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        var one = HiveSecurityTestDirectory.GitHubPrincipal("1");
+
+        Assert.Same(one, accessor.Observe(StateOf(one)));
+        Assert.NotNull(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+
+        // Neither B nor A is accepted afterwards, and Clear cannot resurrect or downgrade the state.
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+        Assert.Null(accessor.Observe(StateOf(one)));
+        accessor.Clear();
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+        Assert.Equal(
+            PrincipalRefusalReason.AccessorNotInitialized,
+            (await accessor.GetPrincipalAsync(Ct)).RefusalReason);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+    }
+
+    /// <summary>
+    /// An explicitly SIGNED-OUT state observed after an established identity is a sign-out: permanent,
+    /// and the later identity A is not restored. NO authorization cache: a demotion still lands
+    /// immediately for an initialised accessor.
+    /// </summary>
+    [Fact]
+    public async Task Observe_SignedOutAfterEstablished_IsPermanent_ButAnEstablishedAccessorStillReResolves()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        var one = HiveSecurityTestDirectory.GitHubPrincipal("1");
+        accessor.Observe(StateOf(one));
+        Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        await directory.SetRoleAsync("1", UserRole.Viewer);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.AnonymousPrincipal())));
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.Observe(StateOf(one)));
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+    }
+
+    /// <summary>
+    /// A signed-out state as the FIRST observation is recorded as an initialised anonymous identity
+    /// and is refused as unauthenticated; a later real identity is then a REPLACEMENT, not an adoption.
+    /// </summary>
+    [Fact]
+    public async Task Observe_SignedOutFirst_ThenAnIdentity_IsNeverAdopted()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.AnonymousPrincipal()));
+        Assert.Null(accessor.EstablishedIdentity);
+        Assert.Equal(PrincipalRefusalReason.Unauthenticated, (await accessor.GetPrincipalAsync(Ct)).RefusalReason);
+
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+        Assert.True(accessor.IsInvalidated);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+    }
+
+    /// <summary>
     /// A SIGNED-OUT state is accepted by the explicit initialiser and still fails closed: an
     /// unauthenticated supplied state is refused as unauthenticated, never as the local operator.
     /// </summary>

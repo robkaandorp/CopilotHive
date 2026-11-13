@@ -140,9 +140,11 @@ public interface IComposerRuntimeAccessor
 /// <item>
 /// <see cref="AcquireForCircuitAsync"/> / <see cref="ConnectForCircuitAsync"/> take the OPTIONAL
 /// cascading <see cref="AuthenticationState"/> (absent in open mode) and initialise the scoped
-/// circuit accessor ONCE through the shared <see cref="ComponentActingUser.AcquireAsync"/> helper —
-/// no component, route or layout is wired to them in this slice, so an un-initialised accessor keeps
-/// refusing while authentication is enabled (fail-closed).
+/// circuit accessor through the shared <see cref="ComponentActingUser.AcquireAsync"/> helper. A
+/// DIFFERENT identity or a signed-out state observed after an identity was established permanently
+/// invalidates the circuit (denied, no principal; recovery needs a new scope), and a missing cascade
+/// is served only by an already established, non-invalidated identity — otherwise, while
+/// authentication is enabled, it is denied (fail-closed).
 /// </item>
 /// </list>
 /// In both paths the RESOLVER-PRODUCED <see cref="ActingUserPrincipal"/> travels UNCHANGED into the
@@ -232,9 +234,9 @@ public sealed class ComposerRuntimeAccessor : IComposerRuntimeAccessor
 
     /// <summary>
     /// Resolves the CURRENT circuit's user and returns their per-user runtime, creating it on first
-    /// use. The circuit accessor is initialised at most ONCE per circuit from the supplied cascading
-    /// state; a missing cascade (open mode) leaves it un-initialised, which the accessor handles
-    /// exactly as it does today.
+    /// use. The supplied cascading state is observed on the circuit accessor: a different identity or a
+    /// sign-out permanently invalidates the circuit (denied, no runtime); a missing cascade never
+    /// initialises it and is served only by an established, non-invalidated identity.
     /// </summary>
     /// <param name="authenticationState">The cascading authentication state, or <c>null</c> when there is none.</param>
     /// <param name="ct">Caller cancellation; it propagates and is never converted into a denial.</param>
@@ -278,17 +280,31 @@ public sealed class ComposerRuntimeAccessor : IComposerRuntimeAccessor
     }
 
     /// <summary>
-    /// The CIRCUIT identity path: initialises the scoped accessor at most ONCE from the optional
-    /// cascading state through the shared helper, then re-resolves the current principal and requires
-    /// <see cref="HiveCapability.InteractiveMember"/>. With no cascade (open mode) the accessor stays
-    /// un-initialised and answers from the explicit open-mode decision inside the resolver.
+    /// The CIRCUIT identity path: OBSERVES the optional cascading state on the scoped accessor through
+    /// the shared helper (the ONE place the circuit identity state machine is applied), then
+    /// re-resolves the current principal and requires <see cref="HiveCapability.InteractiveMember"/>.
+    /// <para>
+    /// While authentication is enabled, the identity the helper yields IS the gate: a <c>null</c>
+    /// identity means no identity was established (a missing cascade never creates one) or the circuit
+    /// was permanently invalidated (sign-out / a different identity), and the operation is denied with
+    /// NO principal and no manager call — it never falls through to re-reading the accessor, so an
+    /// invalidated identity can never be restored. For an established identity the accessor re-resolves
+    /// its own recorded identity freshly from the directory and refuses if an invalidation lands while
+    /// that read is in flight. In explicit open mode there is no per-circuit identity; the resolver
+    /// answers with the local operator exactly as before.
+    /// </para>
     /// </summary>
     private async Task<ActingUserPrincipal?> AuthorizeCircuitAsync(
         Task<AuthenticationState>? authenticationState, string operation, CancellationToken ct)
     {
-        // Initialisation only: the helper stores the claims IDENTITY once per circuit and returns it,
-        // but nothing is authorised from that value — the resolution below re-reads stored state.
-        _ = await ComponentActingUser.AcquireAsync(authenticationState, _circuitAccessor).ConfigureAwait(false);
+        var identity = await ComponentActingUser.AcquireAsync(authenticationState, _circuitAccessor)
+            .ConfigureAwait(false);
+
+        if (identity is null && _circuitAccessor.AuthEnabled)
+        {
+            LogDenial(operation, "no valid circuit identity is established (never established, or permanently invalidated)");
+            return null;
+        }
 
         var resolution = await _circuitAccessor.GetPrincipalAsync(ct).ConfigureAwait(false);
         return AllowsRuntime(resolution, operation);

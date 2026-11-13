@@ -684,15 +684,19 @@ public sealed class HiveAuthorizationAcceptanceMatrixTests
         // a stale identity can never be replayed by a later path that reads it.
         Assert.Null(RetainedClaimsPrincipal(firstCircuit));
 
-        // A cleared circuit holds no identity at all: re-initialising it with the SECOND circuit's
-        // identity must resolve THAT identity, never the one it was cleared from.
+        // A cleared circuit is PERMANENTLY signed out: re-initialising it (even with the SECOND
+        // circuit's identity) adopts nothing and keeps refusing — recovery needs a NEW accessor.
         firstCircuit.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2")));
-        Assert.Equal("2", (await firstCircuit.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        Assert.False((await firstCircuit.GetPrincipalAsync(Ct)).IsResolved);
+        Assert.Equal(
+            PrincipalRefusalReason.AccessorNotInitialized,
+            (await firstCircuit.GetPrincipalAsync(Ct)).RefusalReason);
+        Assert.Equal(CircuitIdentityState.SignedOut, firstCircuit.IdentityState);
 
-        // ...and re-initialising with an identity that does not exist fails closed rather than
-        // falling back to the account it was cleared from.
-        firstCircuit.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("999")));
-        var afterUnknown = await firstCircuit.GetPrincipalAsync(Ct);
+        // ...and a NEW accessor initialised with an identity that does not exist fails closed.
+        var freshCircuit = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        freshCircuit.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("999")));
+        var afterUnknown = await freshCircuit.GetPrincipalAsync(Ct);
         Assert.False(afterUnknown.IsResolved);
         Assert.Null(afterUnknown.Principal);
         Assert.Equal(PrincipalRefusalReason.UnknownAccount, afterUnknown.RefusalReason);
