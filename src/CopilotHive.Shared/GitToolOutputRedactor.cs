@@ -274,26 +274,54 @@ public static class GitToolOutputRedactor
     /// </summary>
     private static bool TryMatchPercentEncoded(string text, int start, string secret, out int end)
     {
-        var position = start;
-        foreach (var expected in secret)
+        // Only a '%' in the secret itself is ambiguous: in the text it may appear as a literal '%'
+        // or as the one-level escape "%25". Every other character has exactly one possible form
+        // (a literal can never begin an escape, and an escape never equals a non-'%' literal), so
+        // the matcher only ever needs to BACKTRACK at a '%'.
+        return TryMatchPercentEncodedFrom(text, start, secret, 0, out end);
+    }
+
+    /// <summary>
+    /// Matches <paramref name="secret"/> from character <paramref name="index"/> onward at
+    /// <paramref name="position"/>, trying the literal form first and — for a <c>%</c> only — the
+    /// one-level escape <c>%25</c> when the literal form leads to a dead end.
+    /// </summary>
+    private static bool TryMatchPercentEncodedFrom(string text, int position, string secret, int index, out int end)
+    {
+        for (; index < secret.Length; index++)
         {
-            if (position < text.Length && text[position] == expected)
+            var expected = secret[index];
+            var literal = position < text.Length && text[position] == expected;
+            var escaped = position + 2 < text.Length
+                && text[position] == '%'
+                && TryParseHexDigit(text[position + 1], out var high)
+                && TryParseHexDigit(text[position + 2], out var low)
+                && (byte)((high << 4) | low) == (byte)expected;
+
+            if (literal && escaped)
+            {
+                // Only reachable for expected == '%' with "%25" in the text: take the literal
+                // first, and fall back to the escape if the remainder cannot match.
+                if (TryMatchPercentEncodedFrom(text, position + 1, secret, index + 1, out end))
+                    return true;
+
+                position += 3;
+                continue;
+            }
+
+            if (literal)
             {
                 position++;
                 continue;
             }
 
-            if (position + 2 < text.Length
-                && text[position] == '%'
-                && TryParseHexDigit(text[position + 1], out var high)
-                && TryParseHexDigit(text[position + 2], out var low)
-                && (byte)((high << 4) | low) == (byte)expected)
+            if (escaped)
             {
                 position += 3;
                 continue;
             }
 
-            end = start;
+            end = position;
             return false;
         }
 
@@ -548,7 +576,12 @@ public static class GitToolOutputRedactor
         var lineEnd = valueEnd;
         while (true)
         {
+            // Trailing horizontal whitespace after a segment must not hide the fold that follows;
+            // it is skipped for RECOGNITION only — it is never part of a redacted range, so the
+            // surrounding text and every line break stay byte-for-byte as they were.
             var next = lineEnd;
+            while (next < text.Length && IsHorizontalSpace(text[next]))
+                next++;
             if (next < text.Length && text[next] == '\r')
                 next++;
             if (next >= text.Length || text[next] != '\n')
@@ -561,6 +594,13 @@ public static class GitToolOutputRedactor
             if (next == indentedStart)
                 break;
 
+            // A continuation line that is itself an Authorization header is a NEW header, not a
+            // value segment of this one: header recognition takes priority, so it is left for the
+            // caller's scan to find (and to redact with its own scheme) instead of being consumed
+            // here as a "credential" word.
+            if (IsAuthorizationHeaderStart(text, next))
+                break;
+
             var continuationEnd = ScanCredentialToken(text, next);
             if (continuationEnd == next)
                 break;
@@ -570,6 +610,22 @@ public static class GitToolOutputRedactor
         }
 
         return segments;
+    }
+
+    /// <summary>
+    /// Whether an <c>Authorization</c> header name followed by <c>:</c> (horizontal whitespace
+    /// allowed before it) starts at <paramref name="index"/>.
+    /// </summary>
+    private static bool IsAuthorizationHeaderStart(string text, int index)
+    {
+        if (!text.AsSpan(index).StartsWith(AuthorizationHeaderName, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var cursor = index + AuthorizationHeaderName.Length;
+        while (cursor < text.Length && IsHorizontalSpace(text[cursor]))
+            cursor++;
+
+        return cursor < text.Length && text[cursor] == ':';
     }
 
     /// <summary>
@@ -607,6 +663,16 @@ public static class GitToolOutputRedactor
                 continue;
             }
 
+            // The "value" is itself a credential assignment (`credential: password: SECRET`):
+            // consuming it as this assignment's value would redact only the inner KEYWORD and leave
+            // the real secret behind. Leave the outer name alone and let the scan reach the inner
+            // assignment, which redacts the actual value. Chained nesting resolves the same way.
+            if (IsNestedAssignment(text, value))
+            {
+                index += nameLength;
+                continue;
+            }
+
             // A value starting inside an earlier redaction would splice the text twice.
             if (value.Start < copied)
             {
@@ -626,6 +692,27 @@ public static class GitToolOutputRedactor
 
         builder.Append(text, copied, text.Length - copied);
         return builder.ToString();
+    }
+
+    /// <summary>
+    /// Whether <paramref name="value"/> consists of NOTHING but another credential name (with at
+    /// most one trailing <c>=</c> / <c>:</c>) that itself has an assigned value after it — i.e. the
+    /// outer assignment's "value" is really the start of a nested assignment.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately exact: <c>password = token=SECRET</c> has the value <c>token=SECRET</c>, which
+    /// is more than a bare name, so it stays a single redaction of the whole value.
+    /// </remarks>
+    private static bool IsNestedAssignment(string text, (int Start, int End) value)
+    {
+        if (!TryMatchAssignmentName(text, value.Start, out var innerNameLength))
+            return false;
+
+        var afterName = value.Start + innerNameLength;
+        if (afterName < value.End && text[afterName] is '=' or ':')
+            afterName++;
+
+        return afterName == value.End && FindAssignedValue(text, value.Start + innerNameLength) is not null;
     }
 
     /// <summary>
@@ -761,12 +848,36 @@ public static class GitToolOutputRedactor
     private static bool IsCredentialTokenCharacter(char c) =>
         IsAlphaNumeric(c) || c is '-' or '.' or '_' or '~' or '+' or '/' or '=' or '%';
 
-    /// <summary>Scans a run of <see cref="IsCredentialTokenCharacter"/> characters.</summary>
+    /// <summary>
+    /// Scans a run of <see cref="IsCredentialTokenCharacter"/> characters, treating an already
+    /// substituted <see cref="Placeholder"/> as part of the run.
+    /// </summary>
+    /// <remarks>
+    /// The inventory layer runs first and leaves <c>[redacted]</c> inside a header value. Because
+    /// <c>[</c> is not a token character, a scan that stopped there would end the header's value
+    /// early (or reject the header outright) and expose every LATER folded segment. Consuming the
+    /// placeholder keeps the two layers from blinding each other; re-redacting it is idempotent.
+    /// </remarks>
     private static int ScanCredentialToken(string text, int start)
     {
         var end = start;
-        while (end < text.Length && IsCredentialTokenCharacter(text[end]))
-            end++;
+        while (end < text.Length)
+        {
+            if (IsCredentialTokenCharacter(text[end]))
+            {
+                end++;
+                continue;
+            }
+
+            if (text.AsSpan(end).StartsWith(Placeholder, StringComparison.Ordinal))
+            {
+                end += Placeholder.Length;
+                continue;
+            }
+
+            break;
+        }
+
         return end;
     }
 
