@@ -406,6 +406,114 @@ public sealed class WorkerTargetTransportIntegrationTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Executor_CoderHandoff_FinalCommitReachableFromFreshCloneAndFetchAndHelperRemoved()
+    {
+        RequireLinux();
+        var bare = CreateBare();
+        await using var server = new GitProxy(bare, Token);
+        InstallNetworkEnvironment(server.Port);
+        InstallWrapper();
+        var runner = new TaskExecutorTests.MockAgentRunner
+        {
+            PromptResponder = (_, dir, _) =>
+            {
+                // Two commits: the handoff must carry the FINAL commit, not merely the first one.
+                for (var i = 1; i <= 2; ++i)
+                {
+                    File.WriteAllText(Path.Combine(dir, "handoff.txt"), "handoff-" + i);
+                    Setup(dir, "add", "handoff.txt");
+                    Setup(dir, "commit", "-m", "handoff " + i);
+                }
+                return Task.FromResult("committed handoff");
+            },
+        };
+        var result = await new TaskExecutor(runner).ExecuteAsync(TaskFor(Token), Ct);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.True(result.GitStatus!.Pushed, result.Output);
+        var finalHead = Raw(Path.Combine(_root, "target"), "rev-parse", "HEAD").Stdout.Trim();
+        Assert.Equal("handoff 2", Raw(Path.Combine(_root, "target"), "log", "-1", "--format=%s").Stdout.Trim());
+
+        // Fresh clone of the feature branch — what the Testing phase receives.
+        var fresh = Path.Combine(_root, "fresh-clone");
+        Setup(_root, "clone", "--branch", "feature", bare, fresh);
+        Assert.Equal(finalHead, Raw(fresh, "rev-parse", "HEAD").Stdout.Trim());
+        Assert.Equal("handoff-2", File.ReadAllText(Path.Combine(fresh, "handoff.txt")));
+
+        // Fresh fetch into an empty repository resolves the same commit.
+        var fetched = Path.Combine(_root, "fresh-fetch");
+        Directory.CreateDirectory(fetched);
+        Setup(fetched, "init", "-b", "scratch");
+        Setup(fetched, "fetch", bare, "refs/heads/feature");
+        Assert.Equal(finalHead, Raw(fetched, "rev-parse", "FETCH_HEAD").Stdout.Trim());
+
+        var push = Assert.Single(LaunchBlocks(), b => b.StartsWith("push\n"));
+        var helper = Value(push, "askpass");
+        Assert.NotEmpty(helper);
+        _helperDirs.Add(Path.GetDirectoryName(helper)!);
+        Assert.False(Directory.Exists(Path.GetDirectoryName(helper)), "Helper directory survived the handoff.");
+        AssertHelpersGone();
+        AssertNoSecrets(result.Output, string.Join('\n', result.Metrics!.Issues));
+        AssertNoSecretsOnDisk();
+    }
+
+    [Fact]
+    public async Task Executor_PushAcceptedButBranchNotOnRemote_FailsBeforeTestingAndRemovesHelper()
+    {
+        RequireLinux();
+        var bare = CreateBare();
+        // The server ACCEPTS the push (exit 0) but the branch never persists: only the remote
+        // verification can catch this, and it must fail the task instead of reporting success.
+        WriteExecutable(Path.Combine(bare, "hooks", "post-receive"),
+            "#!/bin/sh\nwhile read old new ref; do git update-ref -d \"$ref\"; done\n");
+        await using var server = new GitProxy(bare, Token);
+        InstallNetworkEnvironment(server.Port);
+        InstallWrapper();
+        var runner = new TaskExecutorTests.MockAgentRunner
+        {
+            PromptResponder = (_, dir, _) =>
+            {
+                File.WriteAllText(Path.Combine(dir, "lost.txt"), "lost");
+                Setup(dir, "add", "lost.txt");
+                Setup(dir, "commit", "-m", "lost");
+                return Task.FromResult("committed");
+            },
+            WorkerReportToReturn = new WorkerReport { TaskVerdict = TaskVerdict.Pass, Summary = "done", Issues = [] },
+        };
+        var result = await new TaskExecutor(runner).ExecuteAsync(TaskFor(Token), Ct);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("Push verification failed") && i.Contains("remote head is missing"));
+        Assert.NotEqual(0, Raw(bare, "rev-parse", "--verify", "refs/heads/feature").ExitCode);
+        AssertHelpersGone();
+        AssertNoSecrets(result.Output, string.Join('\n', result.Metrics.Issues));
+        AssertNoSecretsOnDisk();
+    }
+
+    [Fact]
+    public async Task Script_BuiltFromCrlfTemplate_IsLfAndExecutable()
+    {
+        RequireLinux();
+        var crlf = WorkerGitAskpassHelper.ScriptTemplate.ReplaceLineEndings("\r\n");
+        var content = WorkerGitAskpassHelper.BuildScriptContent(crlf, CredentialName);
+        Assert.DoesNotContain('\r', content);
+        Assert.StartsWith("#!/bin/sh\n", content);
+
+        var script = Path.Combine(_root, "crlf-askpass.sh");
+        WriteExecutable(script, content);
+        using var p = new Process { StartInfo = new ProcessStartInfo(script) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false } };
+        p.StartInfo.ArgumentList.Add("Password for 'https://x-access-token@github.com': ");
+        p.StartInfo.Environment[CredentialName] = Token;
+        p.Start();
+        var stdout = await p.StandardOutput.ReadToEndAsync(Ct);
+        await p.WaitForExitAsync(Ct);
+        Assert.Equal(0, p.ExitCode);
+        Assert.Equal(Token, stdout);
+    }
+
+    [Fact]
     public async Task ConfigSeam_ServiceWrittenHelper_AuthenticatesRealCloneFetchPushAndSuppressesInheritedHelpers()
     {
         RequireLinux();

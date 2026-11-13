@@ -104,7 +104,7 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     internal const string UsernamePrincipal = "x-access-token";
 
     /// <summary>
-    /// The placeholder inside <see cref="ScriptTemplate"/> that <see cref="BuildScriptContent"/>
+    /// The placeholder inside <see cref="ScriptTemplate"/> that <see cref="BuildScriptContent(string)"/>
     /// substitutes a CHILD-ONLY credential variable name for.
     /// </summary>
     internal const string CredentialEnvPlaceholder = "@@CREDENTIAL_ENV@@";
@@ -198,8 +198,24 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(credentialEnvName);
 
-        return ScriptTemplate.Replace(
-            CredentialEnvPlaceholder, credentialEnvName, StringComparison.Ordinal);
+        // The raw literal inherits the SOURCE FILE's line endings; a CRLF checkout (Windows
+        // core.autocrlf) would yield "#!/bin/sh\r", which Linux cannot exec ("No such file or
+        // directory"). Force LF so the script is valid regardless of how the source was checked out.
+        return BuildScriptContent(ScriptTemplate, credentialEnvName);
+    }
+
+    /// <summary>
+    /// Substitutes <paramref name="credentialEnvName"/> into <paramref name="template"/> and
+    /// normalizes every line ending to LF.
+    /// </summary>
+    internal static string BuildScriptContent(string template, string credentialEnvName)
+    {
+        ArgumentNullException.ThrowIfNull(template);
+        ArgumentException.ThrowIfNullOrWhiteSpace(credentialEnvName);
+
+        return template
+            .Replace(CredentialEnvPlaceholder, credentialEnvName, StringComparison.Ordinal)
+            .ReplaceLineEndings("\n");
     }
 
     /// <summary>The TARGET-repository helper script.</summary>

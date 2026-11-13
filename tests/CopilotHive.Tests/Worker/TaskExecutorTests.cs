@@ -604,6 +604,42 @@ public sealed class TaskExecutorTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_CoderPassButPushFails_ReturnsFailedBeforeTesting()
+    {
+        var git = new MockGitOperations
+        {
+            PushShouldFail = true,
+            PushErrorMessage = "Push verification failed for branch 'feature-branch': remote head is missing but local HEAD is abc",
+            FilesChanged = 5
+        };
+        var agentRunner = new MockAgentRunner();
+        agentRunner.WorkerReportToReturn = new WorkerReport
+        {
+            TaskVerdict = TaskVerdict.Pass,
+            Summary = "Implemented feature",
+            Issues = [],
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-task-push-handoff",
+            GoalId = "goal-push-handoff",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+            BranchInfo = new BranchSpec { Action = BranchAction.Create, BaseBranch = "main", FeatureBranch = "feature-branch" }
+        };
+
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("Push verification failed"));
+    }
+
+    [Fact]
     public async Task ExecuteAsync_MultiplePushErrors_AllIncludedInOutput()
     {
         // Arrange - simulate push failing for multiple repos

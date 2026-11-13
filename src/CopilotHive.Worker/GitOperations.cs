@@ -389,6 +389,38 @@ public static class GitOperations
             repoDir, ["push", "origin", branch, "--force"], ct, credentialTransport);
         if (exitCode != 0)
             throw Fail($"Failed to push branch '{branch}': {stderr.Trim()}");
+
+        // Handoff verification: the NEXT phase receives a fresh clone of the remote branch, so a
+        // push that "succeeded" without the final commit landing must fail here, not downstream.
+        // Uses the SAME live transport, so credentials remain valid for the verification too.
+        var (headExit, headOut, headErr) = await RunTokenizedGitCommandAsync(
+            repoDir, ["rev-parse", "HEAD"], ct, credentialTransport: null);
+        if (headExit != 0)
+            throw Fail($"Push verification failed for branch '{branch}': cannot resolve local HEAD: {headErr.Trim()}");
+        var localHead = headOut.Trim();
+
+        var (lsExit, lsOut, lsErr) = await RunTokenizedGitCommandAsync(
+            repoDir, ["ls-remote", "origin", $"refs/heads/{branch}"], ct, credentialTransport);
+        if (lsExit != 0)
+            throw Fail($"Push verification failed for branch '{branch}': ls-remote failed: {lsErr.Trim()}");
+
+        var remoteHead = ParseLsRemoteSha(lsOut, $"refs/heads/{branch}");
+        if (!string.Equals(remoteHead, localHead, StringComparison.OrdinalIgnoreCase))
+            throw Fail(
+                $"Push verification failed for branch '{branch}': remote head is " +
+                $"{remoteHead ?? "missing"} but local HEAD is {localHead}");
+    }
+
+    /// <summary>Returns the SHA <c>git ls-remote</c> reports for exactly <paramref name="refName"/>, or <c>null</c>.</summary>
+    internal static string? ParseLsRemoteSha(string lsRemoteOutput, string refName)
+    {
+        foreach (var line in lsRemoteOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = line.Split('\t', 2);
+            if (parts.Length == 2 && string.Equals(parts[1], refName, StringComparison.Ordinal))
+                return parts[0];
+        }
+        return null;
     }
 
     /// <summary>

@@ -59,6 +59,23 @@ public sealed class WorkerGitAskpassHelperTests : IDisposable
     }
 
     /// <summary>
+    /// A CRLF source checkout must not produce "#!/bin/sh\r", which Linux cannot exec.
+    /// </summary>
+    [Fact]
+    public void BuildScriptContent_CrlfTemplate_ProducesLfOnlyScript()
+    {
+        var crlf = WorkerGitAskpassHelper.ScriptTemplate.ReplaceLineEndings("\r\n");
+
+        var content = WorkerGitAskpassHelper.BuildScriptContent(crlf, "SOME_CREDENTIAL");
+        var production = WorkerGitAskpassHelper.BuildScriptContent("SOME_CREDENTIAL");
+
+        Assert.DoesNotContain('\r', content);
+        Assert.DoesNotContain('\r', production);
+        Assert.StartsWith("#!/bin/sh\n", production);
+        Assert.Equal(production, content);
+    }
+
+    /// <summary>
     /// The script's BYTES carry no secret: the credential is read from the CHILD-ONLY environment
     /// variable at invocation time, so the same script serves every operation.
     /// </summary>

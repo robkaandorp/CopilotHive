@@ -761,6 +761,10 @@ public sealed class TaskExecutor(
                             pushed = true;
                             _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
                         }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                        {
+                            throw;
+                        }
                         catch (Exception ex)
                         {
                             // A push failure message embeds git's stderr, which echoes the
@@ -912,6 +916,22 @@ public sealed class TaskExecutor(
             if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
             {
                 await SaveSessionAsync(task.SessionId, ct);
+            }
+
+            // A failed or unverified feature-branch handoff means the next phase would clone a
+            // branch WITHOUT this work. Fail loudly here instead of reporting the agent's verdict.
+            if (pushErrors.Count > 0)
+            {
+                metrics = metrics with { Verdict = "FAIL" };
+                return new TaskResult
+                {
+                    TaskId = task.TaskId,
+                    Status = TaskOutcome.Failed,
+                    Output = copilotOutput,
+                    GitStatus = finalization.PublishedSummary ?? aggregatedStatus ?? new GitChangeSummary(),
+                    Metrics = metrics,
+                    IterationStartSha = iterationStartSha,
+                };
             }
 
             return new TaskResult
