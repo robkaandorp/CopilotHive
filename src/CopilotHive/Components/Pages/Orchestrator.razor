@@ -308,6 +308,14 @@ else
 
     /// <summary>
     /// Re-reads every operational projection through the authorized facade.
+    /// <para>
+    /// A DENIED reflection CLEARS its field. Each of these fields was populated by an AUTHORIZED
+    /// read, so a later refresh that the facade now refuses (the account was disabled or demoted
+    /// between two renders) must not keep showing the earlier projection: the page re-renders as if
+    /// it had never read anything, exactly like a first render for an unauthorized caller. Every
+    /// facade-populated projection field below is therefore assigned on BOTH outcomes — the success
+    /// value, or the empty/absent state — rather than only on success.
+    /// </para>
     /// </summary>
     private async Task RefreshAsync()
     {
@@ -317,8 +325,7 @@ else
 
         var info = await OperationalFacade.GetOrchestratorInfoAsync(
             await ActingUserAsync(), CancellationToken.None);
-        if (info.Success && info.Value is not null)
-            _info = info.Value;
+        _info = info.Success && info.Value is not null ? info.Value : new OrchestratorInfo();
 
         var sessions = await OperationalFacade.GetSharedLlmSessionsAsync(
             await ActingUserAsync(), CancellationToken.None);
