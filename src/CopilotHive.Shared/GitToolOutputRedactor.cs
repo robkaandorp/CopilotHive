@@ -81,6 +81,9 @@ public static class GitToolOutputRedactor
     /// <summary>The HTTP header whose credential value is redacted, including its folded form.</summary>
     private const string AuthorizationHeaderName = "Authorization";
 
+    /// <summary>The proxy variant of <see cref="AuthorizationHeaderName"/>, redacted the same way.</summary>
+    private const string ProxyAuthorizationHeaderName = "Proxy-Authorization";
+
     /// <summary>The <c>Basic</c> authorization scheme name.</summary>
     private const string BasicScheme = "Basic";
 
@@ -194,8 +197,13 @@ public static class GitToolOutputRedactor
         var redacted = text;
         foreach (var secret in eligible)
         {
-            redacted = redacted.Replace(secret, Placeholder, StringComparison.Ordinal);
+            // The percent-aware pass runs FIRST because it also matches the raw form: a plain
+            // replacement first would fire on a raw PREFIX of a longer one-level encoding (a value
+            // ending in '%' against text "...%25") and leave the escape tail ("25") behind. The raw
+            // replacement afterwards only mops up what the percent-aware pass cannot decode
+            // (non-ASCII values are skipped there).
             redacted = ReplacePercentEncoded(redacted, secret);
+            redacted = redacted.Replace(secret, Placeholder, StringComparison.Ordinal);
             foreach (var encoded in StandardBase64Forms(secret))
                 redacted = redacted.Replace(encoded, Placeholder, StringComparison.Ordinal);
         }
@@ -300,12 +308,14 @@ public static class GitToolOutputRedactor
 
             if (literal && escaped)
             {
-                // Only reachable for expected == '%' with "%25" in the text: take the literal
-                // first, and fall back to the escape if the remainder cannot match.
-                if (TryMatchPercentEncodedFrom(text, position + 1, secret, index + 1, out end))
+                // Only reachable for expected == '%' with "%25" in the text. Prefer the ESCAPE: it
+                // is the longer reading, so a value that ends in '%' is removed WHOLE instead of
+                // leaving the "25" of its own escape behind. Fall back to the literal reading if the
+                // remainder cannot match after the escape.
+                if (TryMatchPercentEncodedFrom(text, position + 3, secret, index + 1, out end))
                     return true;
 
-                position += 3;
+                position++;
                 continue;
             }
 
@@ -613,15 +623,21 @@ public static class GitToolOutputRedactor
     }
 
     /// <summary>
-    /// Whether an <c>Authorization</c> header name followed by <c>:</c> (horizontal whitespace
-    /// allowed before it) starts at <paramref name="index"/>.
+    /// Whether an <c>Authorization</c> or <c>Proxy-Authorization</c> header name followed by
+    /// <c>:</c> (horizontal whitespace allowed before it) starts at <paramref name="index"/>.
     /// </summary>
     private static bool IsAuthorizationHeaderStart(string text, int index)
     {
-        if (!text.AsSpan(index).StartsWith(AuthorizationHeaderName, StringComparison.OrdinalIgnoreCase))
+        var span = text.AsSpan(index);
+        var nameLength = 0;
+        if (span.StartsWith(ProxyAuthorizationHeaderName, StringComparison.OrdinalIgnoreCase))
+            nameLength = ProxyAuthorizationHeaderName.Length;
+        else if (span.StartsWith(AuthorizationHeaderName, StringComparison.OrdinalIgnoreCase))
+            nameLength = AuthorizationHeaderName.Length;
+        else
             return false;
 
-        var cursor = index + AuthorizationHeaderName.Length;
+        var cursor = index + nameLength;
         while (cursor < text.Length && IsHorizontalSpace(text[cursor]))
             cursor++;
 
