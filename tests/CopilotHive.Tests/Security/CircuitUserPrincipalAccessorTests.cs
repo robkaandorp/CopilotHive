@@ -184,6 +184,14 @@ public sealed class CircuitUserPrincipalAccessorTests
         Assert.False(accessor.IsInitialized);
         Assert.False((await accessor.GetPrincipalAsync(Ct)).IsResolved);
         Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+
+        // Explicit reauthentication requires a NEW scope/accessor, never revival of this circuit.
+        var reauthenticated = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        Assert.NotSame(accessor, reauthenticated);
+        reauthenticated.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        Assert.Equal("1", (await reauthenticated.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        Assert.True(await reauthenticated.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
     }
 
     /// <summary>
@@ -215,6 +223,13 @@ public sealed class CircuitUserPrincipalAccessorTests
             PrincipalRefusalReason.AccessorNotInitialized,
             (await accessor.GetPrincipalAsync(Ct)).RefusalReason);
         Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+
+        var reauthenticated = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        Assert.NotSame(accessor, reauthenticated);
+        reauthenticated.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2")));
+        Assert.Equal("2", (await reauthenticated.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        Assert.True(await reauthenticated.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
     }
 
     /// <summary>

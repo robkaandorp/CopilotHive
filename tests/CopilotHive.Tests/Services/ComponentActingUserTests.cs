@@ -23,9 +23,8 @@ namespace CopilotHive.Tests.Services;
 /// <item><b>OPEN MODE TOLERANCE</b> — with NO cascading authentication state at all (the host
 /// registers no authentication services), the helper must NOT throw and must yield the null
 /// identity that the facade turns into the local operator;</item>
-/// <item><b>CASCADE INITIALISATION</b> — with a cascade, the scoped accessor is initialised from
-/// the circuit's <see cref="AuthenticationState"/>, exactly once, and never with a fabricated
-/// state;</item>
+/// <item><b>CASCADE OBSERVATION</b> — a first cascade establishes the scoped identity; later
+/// sign-out/replacement permanently invalidates it, with no fabricated state;</item>
 /// <item><b>THE CAPABILITY QUESTION</b> — the question is answered against CURRENT stored state,
 /// so a demotion or a disablement between two questions is reflected immediately.</item>
 /// </list>
@@ -323,19 +322,29 @@ public sealed class ComponentActingUserTests : IDisposable
         Assert.NotNull(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
 
         var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor);
-        Assert.False(stale.IsCompleted); // parked on the gate: the await has not resumed.
+        var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor).AsTask();
+        try
+        {
+            Assert.False(stale.IsCompleted); // parked on the gate: the await has not resumed.
+            // Another call observes the explicit sign-out while the stale task is parked.
+            Assert.Null(await ComponentActingUser.AcquireAsync(SignedOut(), accessor));
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
 
-        // Another call observes the explicit sign-out while the stale task is parked.
-        Assert.Null(await ComponentActingUser.AcquireAsync(SignedOut(), accessor));
-        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
-
-        gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
-
-        Assert.Null(await stale);
-        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
-        Assert.Null(accessor.EstablishedIdentity);
-        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+            Assert.Null(await stale.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+            Assert.Null(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+            Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+            Assert.Null((await accessor.GetPrincipalAsync(Ct)).Principal);
+            Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+            Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
+        }
+        finally
+        {
+            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            await stale;
+        }
     }
 
     /// <summary>
@@ -349,16 +358,43 @@ public sealed class ComponentActingUserTests : IDisposable
         var accessor = Accessor();
 
         var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor);
-        Assert.False(stale.IsCompleted);
+        var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor).AsTask();
+        try
+        {
+            Assert.False(stale.IsCompleted);
+            accessor.Clear();
+            gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
 
-        accessor.Clear();
-        gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await stale.WaitAsync(Ct));
+            Assert.False(accessor.IsInitialized);
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+            Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
+        }
+        finally
+        {
+            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            await stale;
+        }
+    }
 
-        Assert.Null(await stale);
-        Assert.False(accessor.IsInitialized);
-        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
-        Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
+    [Fact]
+    public async Task ChildBeforeParent_FirstCascadeAcquisitionEstablishes_ParentObservesSameIdentity()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+
+        var childIdentity = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+        Assert.NotNull(childIdentity);
+        Assert.Same(childIdentity, accessor.EstablishedIdentity);
+        var parentIdentity = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+
+        Assert.Equal(AdminId, parentIdentity!.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+        Assert.Same(childIdentity, accessor.EstablishedIdentity);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.False(accessor.IsInvalidated);
+        Assert.True(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(AdminId, (await accessor.GetPrincipalAsync(Ct)).Principal!.GitHubId);
     }
 
     // ── The capability question reflects CURRENT stored state ────────────────
@@ -380,6 +416,11 @@ public sealed class ComponentActingUserTests : IDisposable
         await _auth.SetRoleAsync(AdminId, UserRole.Viewer);
 
         Assert.False(await ComponentActingUser.IsAllowedAsync(state, accessor, HiveCapability.GlobalAdmin, Ct));
+        var current = await accessor.GetPrincipalAsync(Ct);
+        Assert.True(current.IsResolved); // Demotion is not sign-out: identity remains, role changes.
+        Assert.Equal(AdminId, current.Principal!.GitHubId);
+        Assert.Equal(UserRole.Viewer, current.Principal.Role);
+        Assert.True(await ComponentActingUser.IsAllowedAsync(state, accessor, HiveCapability.SharedRead, Ct));
     }
 
     /// <summary>
@@ -398,6 +439,9 @@ public sealed class ComponentActingUserTests : IDisposable
         await _auth.SetEnabledAsync(AdminId, enabled: false);
 
         Assert.False(await ComponentActingUser.IsAllowedAsync(state, accessor, HiveCapability.GlobalAdmin, Ct));
+        var current = await accessor.GetPrincipalAsync(Ct);
+        Assert.Null(current.Principal);
+        Assert.Equal(PrincipalRefusalReason.DisabledAccount, current.RefusalReason);
     }
 
     /// <summary>
