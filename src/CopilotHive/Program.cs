@@ -992,6 +992,22 @@ public sealed class Program
             // Dashboard: Blazor Server + real-time state aggregation
             builder.Services.AddSingleton<DashboardNotifier>();
             builder.Services.AddSingleton<DashboardStateService>();
+
+            // Operational facade: ALWAYS registered so the Orchestrator component resolves it
+            // unconditionally. AUTHORIZATION is part of every operation (the stateless resolver +
+            // policy singletons, never the scoped circuit accessor): resetting the master Brain
+            // session needs ExecutionOperator and the shared read projections need SharedRead, and
+            // each call re-resolves the caller's CURRENT role/enabled state BEFORE any service work.
+            // DashboardStateService and LlmSessionRegistry stay trusted internal services with their
+            // public APIs unchanged — this facade only delegates, and its shared session projection
+            // removes Composer sessions through the ONE filter the /api/sessions route also uses.
+            builder.Services.AddSingleton<IOperationalFacade>(sp => new OperationalFacade(
+                sp.GetRequiredService<DashboardStateService>(),
+                sp.GetRequiredService<LlmSessionRegistry>(),
+                sp.GetRequiredService<HivePrincipalResolver>(),
+                sp.GetRequiredService<HivePolicy>(),
+                sp.GetRequiredService<ILogger<OperationalFacade>>()));
+
             builder.Services.AddScoped<PageHeaderState>();
             builder.Services.AddScoped<GoalsFilterState>();
             builder.Services.AddRazorComponents().AddInteractiveServerComponents();

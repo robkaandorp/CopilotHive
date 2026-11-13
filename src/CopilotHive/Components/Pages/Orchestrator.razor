@@ -1,13 +1,27 @@
 @page "/orchestrator"
+@using System.Security.Claims
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using CopilotHive.Orchestration
+@using CopilotHive.Services
+@using Microsoft.AspNetCore.Components.Authorization
 @implements IDisposable
+@* The dashboard state service is injected ONLY as the page's refresh EVENT SOURCE
+   (OnStateChanged). Every operational READ and the one operational MUTATION go through the
+   authorized IOperationalFacade below, which re-resolves this circuit user's current role/enabled
+   state on every call. *@
 @inject DashboardStateService State
+@* THE AUTHORIZED OPERATIONAL BOUNDARY: shared-read projections (requires SharedRead) and the
+   Brain session reset (requires ExecutionOperator). No direct DashboardStateService read/mutation
+   and no direct LlmSessionRegistry.GetAll in this page. *@
+@inject IOperationalFacade OperationalFacade
 @inject IJSRuntime JS
 @inject IGoalStore GoalStore
 @inject PageHeaderState PageHeader
-@inject CopilotHive.Dashboard.LlmSessionRegistry SessionRegistry
+@* The SCOPED per-circuit accessor, used by the single ComponentActingUser seam to obtain the
+   identity handed to every facade call (and to initialise the accessor once per circuit). It is
+   never captured by a singleton. *@
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 
 <div class="cards">
     <div class="card">
@@ -121,49 +135,11 @@ else
     <p style="color:var(--text-muted)">Brain not connected.</p>
 }
 
-<h2 style="margin-top:1.5rem">Composer</h2>
-@if (_composerStats is not null)
-{
-    <div class="cards">
-        <div class="card">
-            <div class="label">Context</div>
-            <div class="value" style="color:@ComposerContextColor">@FormatTokens(_composerStats.ContextTokens)</div>
-            <div style="font-size:0.75rem;color:var(--text-muted)">
-                @_composerStats.ContextUsagePercent% of @FormatTokens(_composerStats.MaxContextTokens)
-            </div>
-        </div>
-        <div class="card">
-            <div class="label">Messages</div>
-            <div class="value">@_composerStats.MessageCount</div>
-        </div>
-        <div class="card">
-            <div class="label">Max Steps</div>
-            <div class="value">@_composerStats.MaxSteps</div>
-        </div>
-    </div>
-
-    <div class="cards" style="margin-top:0.5rem">
-        <div class="card">
-            <div class="label">Cumulative Input</div>
-            <div class="value" style="font-size:1rem">@FormatTokens(_composerStats.CumulativeInputTokens)</div>
-        </div>
-        <div class="card">
-            <div class="label">Cumulative Output</div>
-            <div class="value" style="font-size:1rem">@FormatTokens(_composerStats.CumulativeOutputTokens)</div>
-        </div>
-    </div>
-
-    <div style="margin-top:1rem;background:var(--surface);border-radius:8px;padding:0.75rem 1rem">
-        <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Context Usage</div>
-        <div style="background:var(--bg);border-radius:4px;height:1.25rem;overflow:hidden">
-            <div style="width:@(_composerStats.ContextUsagePercent)%;height:100%;background:@ComposerContextColor;transition:width 0.3s"></div>
-        </div>
-    </div>
-}
-else
-{
-    <p style="color:var(--text-muted)">Composer not connected.</p>
-}
+@* The per-user Composer usage section that used to live here is GONE, deliberately: Composer
+   statistics (DashboardStateService.GetComposerStats) are a user's PRIVATE usage, so they are not
+   part of any shared-read projection and this shared page must not read them directly from the
+   trusted dashboard service. A user's own usage is rendered by the Composer's own per-circuit
+   runtime binding (ComposerChat), which is private to that circuit. *@
 
 @if (_llmSessions.Count > 0)
 {
@@ -284,16 +260,43 @@ else
 
 @code {
     private BrainStats? _stats;
-    private BrainStats? _composerStats;
     private OrchestratorInfo _info = new();
     private bool _resettingBrain;
     private IReadOnlyList<(string GoalId, PersistedClarification Clarification)> _clarifications = [];
     private List<CopilotHive.Dashboard.LlmSessionInfo> _llmSessions = [];
 
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to every identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator (which holds every
+    /// capability), so the legacy single-operator installation is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call. This is also the page's MINIMAL circuit
+    /// identity acquisition: the scoped
+    /// <see cref="CopilotHive.Security.CircuitUserPrincipalAccessor"/> is initialised from the same
+    /// cascading state exactly once per circuit.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("🎵 Orchestrator");
-        Refresh();
+
+        // AUTHORIZED SHARED READS: the Brain stats, the orchestrator info and the sanitized
+        // non-Composer session list all come from IOperationalFacade, which re-resolves this circuit
+        // user's CURRENT role/enabled state on every call and requires shared read. A denial leaves
+        // the page's EXISTING surfaces in place ("Brain not connected.", no session table) rather
+        // than throwing out of the renderer; denial UI is a separate phase.
+        await RefreshAsync();
         State.OnStateChanged += RefreshState;
         await LoadClarificationsAsync();
     }
@@ -303,24 +306,30 @@ else
         _clarifications = await GoalStore.GetAllClarificationsAsync();
     }
 
-    private void Refresh()
+    /// <summary>
+    /// Re-reads every operational projection through the authorized facade.
+    /// </summary>
+    private async Task RefreshAsync()
     {
-        _stats = State.GetBrainStats();
-        _composerStats = State.GetComposerStats();
-        _info = State.GetOrchestratorInfo();
-        _llmSessions = SessionRegistry.GetAll().OrderByDescending(s => s.LastActivity).ToList();
+        var brain = await OperationalFacade.GetBrainStatsAsync(
+            await ActingUserAsync(), CancellationToken.None);
+        _stats = brain.Success ? brain.Value : null;
+
+        var info = await OperationalFacade.GetOrchestratorInfoAsync(
+            await ActingUserAsync(), CancellationToken.None);
+        if (info.Success && info.Value is not null)
+            _info = info.Value;
+
+        var sessions = await OperationalFacade.GetSharedLlmSessionsAsync(
+            await ActingUserAsync(), CancellationToken.None);
+        _llmSessions = sessions.Success && sessions.Value is not null
+            ? sessions.Value.OrderByDescending(s => s.LastActivity).ToList()
+            : [];
     }
 
-    private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+    private void RefreshState() => InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); });
 
     private string ContextColor => _stats?.ContextUsagePercent switch
-    {
-        >= 80 => "var(--red)",
-        >= 50 => "var(--accent)",
-        _ => "var(--green)",
-    };
-
-    private string ComposerContextColor => _composerStats?.ContextUsagePercent switch
     {
         >= 80 => "var(--red)",
         >= 50 => "var(--accent)",
@@ -333,8 +342,6 @@ else
         >= 1_000 => $"{(tokens / 1_000.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}k",
         _ => tokens.ToString(System.Globalization.CultureInfo.InvariantCulture),
     };
-
-    private static string FormatTokens(int tokens) => FormatTokens((long)tokens);
 
     private static string FormatUptime(TimeSpan ts) => ts.TotalHours >= 1
         ? $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s"
@@ -379,8 +386,16 @@ else
         StateHasChanged();
         try
         {
-            await State.ResetBrainSessionAsync();
-            Refresh();
+            // AUTHORIZED MUTATION: the reset goes through IOperationalFacade, which re-resolves this
+            // circuit user's CURRENT role/enabled state and requires ExecutionOperator BEFORE the
+            // Brain is touched — so a Viewer, a Member, a disabled or an unknown account is refused
+            // here and the master session is left alone. The confirm flow, the busy state and the
+            // refresh are unchanged from the direct-service version; deliberately no new denial UI in
+            // this slice (a refusal simply leaves the session untouched and the page re-reads the
+            // unchanged state through the same authorized projections).
+            await OperationalFacade.ResetBrainSessionAsync(
+                await ActingUserAsync(), CancellationToken.None);
+            await RefreshAsync();
         }
         finally
         {

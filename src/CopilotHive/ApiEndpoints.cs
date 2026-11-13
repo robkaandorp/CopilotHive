@@ -817,9 +817,12 @@ public static class ApiEndpoints
     /// </para>
     /// <para>
     /// The route reports SHARED EXECUTION sessions only: <see cref="Dashboard.LlmSessionType.Composer"/>
-    /// entries are excluded, because a Composer session is per-user private metadata. The filter lives
-    /// HERE, at the endpoint, and <see cref="Dashboard.LlmSessionRegistry.GetAll"/> keeps its
-    /// unchanged semantics (the dashboard renders Composer entries).
+    /// entries are excluded, because a Composer session is per-user private metadata. The exclusion is
+    /// <see cref="SharedSessionProjection.SharedOnly"/> — THE ONE shared filter, also used by
+    /// <see cref="IOperationalFacade.GetSharedLlmSessionsAsync"/> — so this route and the Orchestrator
+    /// page's projection cannot drift apart. <see cref="Dashboard.LlmSessionRegistry.GetAll"/> keeps
+    /// its unchanged semantics (internal callers and the Composer's own surfaces still see every
+    /// entry).
     /// </para>
     /// </remarks>
     /// <param name="app">The web application to register routes on.</param>
@@ -853,9 +856,7 @@ public static class ApiEndpoints
                     statusCode: StatusCodes.Status403Forbidden);
             }
 
-            return Results.Ok(registry.GetAll()
-                .Where(session => session.SessionType != LlmSessionType.Composer)
-                .ToList());
+            return Results.Ok(SharedSessionProjection.SharedOnly(registry.GetAll()));
         });
     }
 
