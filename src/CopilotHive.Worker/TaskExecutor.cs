@@ -49,24 +49,19 @@ public sealed class TaskExecutor(
     /// <para>
     /// <b>The askpass content contract.</b> For an eligible transport command the seam injects
     /// <c>GITHUB_CONFIG_REPO_TOKEN</c> plus <c>GIT_ASKPASS</c> (pointing at the credential
-    /// helper path supplied to its constructor). The helper script implements git's
-    /// <c>$1</c>-prompt protocol and is TOKEN-FREE — the credential is read from the
-    /// environment at invocation time, so the script itself may be written to disk with no
-    /// secret in it:
+    /// helper path supplied to its constructor). The helper script is
+    /// <see cref="WorkerGitAskpassHelper.ConfigRepoScriptContent"/> — the SAME destination-bound,
+    /// TOKEN-FREE contract the target-repository transport runs (see
+    /// <see cref="WorkerGitAskpassHelper.ScriptContent"/>), parameterized only by the child-only
+    /// variable that carries the credential. It therefore answers ONLY a prompt naming an eligible
+    /// effective HTTPS <c>github.com:443</c> destination and fails closed for every other host,
+    /// scheme, port and ambiguous shape; the credential is read from the environment at invocation
+    /// time, so the script itself is written to disk with no secret in it.
     /// </para>
-    /// <code>
-    /// #!/bin/sh
-    /// case "$1" in
-    ///   *sername*) printf '%s' "x-access-token" ;;
-    ///   *) printf '%s' "$GITHUB_CONFIG_REPO_TOKEN" ;;
-    /// esac
-    /// </code>
     /// <para>
-    /// git invokes the helper once per prompt, passing the prompt text as <c>$1</c>: a
-    /// username prompt (matching <c>*sername*</c>) answers with the fixed
-    /// <c>x-access-token</c> principal, and every other prompt (the password) answers with the
-    /// environment-supplied token. This contract is DOCUMENTED here only — this slice neither
-    /// writes the script nor provisions a placeholder for it.
+    /// The script text is deliberately NOT reproduced here: <see cref="WorkerGitAskpassHelper"/>
+    /// is its single documented home, so this comment cannot drift out of date the way an inlined
+    /// copy would.
     /// </para>
     /// </remarks>
     private readonly ConfigRepoGitOperations? _configRepoSeam;

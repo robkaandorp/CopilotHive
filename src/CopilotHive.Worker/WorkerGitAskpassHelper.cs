@@ -348,6 +348,53 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(credentialEnvName);
         ArgumentNullException.ThrowIfNull(credential);
 
+        return BuildSuppressedChildEnvironment(scriptPath, credentialEnvName, credential);
+    }
+
+    /// <summary>
+    /// The CREDENTIAL-FREE counterpart of <see cref="BuildCredentialChildEnvironment"/>: the SAME
+    /// suppression envelope — every credential-bearing inherited channel scrubbed (including
+    /// <c>SSH_ASKPASS</c> and this helper's own credential variables), <c>GIT_TERMINAL_PROMPT=0</c>,
+    /// <c>GCM_INTERACTIVE=never</c>, the inherited <c>credential.helper</c> reset appended after the
+    /// inherited indexed entries, and the inherited legacy <c>GIT_CONFIG_PARAMETERS</c> replaced —
+    /// with NO credential injected and NO <c>GIT_ASKPASS</c> installed.
+    /// </summary>
+    /// <remarks>
+    /// It exists so a credential-free launch carries strictly FEWER inherited channels than before
+    /// rather than a weaker scrub: an unauthenticated git child must be unable to select, or persist,
+    /// a credential from an ambient helper (a global/config-file helper, an indexed
+    /// <c>GIT_CONFIG_COUNT</c> entry, or an inherited <c>GIT_CONFIG_PARAMETERS</c> entry) and must
+    /// never receive a stale credential variable left in the worker's own environment.
+    /// </remarks>
+    /// <returns>The complete environment to hand the child process.</returns>
+    internal static IReadOnlyDictionary<string, string?> BuildCredentialFreeChildEnvironment() =>
+        BuildSuppressedChildEnvironment(scriptPath: null, credentialEnvName: null, credential: null);
+
+    /// <summary>
+    /// THE one suppression core both child-environment builders share. The credential arguments are
+    /// OPTIONAL and all-or-nothing: when <paramref name="credential"/> is <c>null</c> the launch is
+    /// CREDENTIAL-FREE (no <c>GIT_ASKPASS</c>, no credential variable) while keeping the identical
+    /// scrub and helper suppression; otherwise the operation-scoped askpass wiring is installed.
+    /// </summary>
+    /// <remarks>
+    /// Keeping ONE implementation is what makes a weaker credential-free envelope impossible: the
+    /// suppression channels are stated once, so the authenticated and unauthenticated launches can
+    /// never drift apart.
+    /// </remarks>
+    /// <param name="scriptPath">The token-free helper script's path, or <c>null</c> when credential-free.</param>
+    /// <param name="credentialEnvName">The CHILD-ONLY credential variable, or <c>null</c> when credential-free.</param>
+    /// <param name="credential">The resolved credential, or <c>null</c> for a credential-free launch.</param>
+    private static IReadOnlyDictionary<string, string?> BuildSuppressedChildEnvironment(
+        string? scriptPath, string? credentialEnvName, string? credential)
+    {
+        var authenticated = credential is not null;
+        if (authenticated && (scriptPath is null || credentialEnvName is null))
+        {
+            throw new ArgumentException(
+                "An authenticated child environment requires the helper script path and the "
+                + "credential variable name.");
+        }
+
         var environment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
         {
@@ -360,8 +407,13 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
 
         environment[PromptDisabledEnvName] = "0";
         environment[GcmInteractiveEnvName] = GcmInteractiveNever;
-        environment[AskpassEnvName] = scriptPath;
-        environment[credentialEnvName] = credential;
+
+        // The credential wiring is the ONLY difference between the two launches.
+        if (authenticated)
+        {
+            environment[AskpassEnvName] = scriptPath!;
+            environment[credentialEnvName!] = credential!;
+        }
 
         // APPEND to whatever indexed environment-config entries the host already supplied, so the
         // resets below come after them and no inherited indexed helper can be selected.

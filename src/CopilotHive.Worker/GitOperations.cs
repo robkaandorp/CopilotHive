@@ -682,20 +682,29 @@ public static class GitOperations
     }
 
     /// <summary>
-    /// The credential-FREE child environment: the scrubbed inherited environment plus
-    /// <c>GIT_TERMINAL_PROMPT=0</c>. This is the tokenized counterpart of the legacy factory path's
-    /// env treatment, so both launch forms agree on what a credential-free child may see.
+    /// The credential-FREE child environment: the SAME suppression envelope as the authenticated
+    /// builder (<see cref="WorkerGitAskpassHelper.BuildCredentialChildEnvironment"/>) with NO
+    /// credential injected and NO <c>GIT_ASKPASS</c> installed.
     /// </summary>
-    internal static IReadOnlyDictionary<string, string?> BuildCredentialFreeChildEnv()
-    {
-        var scrubbed = SanitizeChildEnv(SnapshotCurrentProcessEnv());
-        var env = new Dictionary<string, string?>(scrubbed)
-        {
-            ["GIT_TERMINAL_PROMPT"] = "0",
-        };
-
-        return env;
-    }
+    /// <remarks>
+    /// <para>
+    /// It delegates to the shared core rather than to the legacy five-name
+    /// <see cref="SanitizeChildEnv"/> scrub, because a credential-free launch must carry strictly
+    /// FEWER inherited channels than before, not a weaker scrub. The legacy scrub omits
+    /// <c>SSH_ASKPASS</c> and this helper's own credential variables, and it neither resets the
+    /// inherited <c>credential.helper</c> list nor replaces the inherited legacy
+    /// <c>GIT_CONFIG_PARAMETERS</c> — so an ambient helper (global/config-file, indexed
+    /// <c>GIT_CONFIG_COUNT</c>, or <c>GIT_CONFIG_PARAMETERS</c>) could still be SELECTED by an
+    /// unauthenticated git challenge and could release its own ambient credential to the challenged
+    /// destination. Delegating makes the two launches impossible to drift apart.
+    /// </para>
+    /// <para>
+    /// <c>GIT_TERMINAL_PROMPT=0</c> and <c>GCM_INTERACTIVE=never</c> are set; no
+    /// <c>credential.interactive</c> is written anywhere.
+    /// </para>
+    /// </remarks>
+    internal static IReadOnlyDictionary<string, string?> BuildCredentialFreeChildEnv() =>
+        WorkerGitAskpassHelper.BuildCredentialFreeChildEnvironment();
 
     /// <summary>
     /// The SINGLE launch implementation for git processes. Both the legacy opaque-argument path
