@@ -42,7 +42,12 @@ internal sealed class RecordingClarificationFacade : IClarificationFacade
         ClaimsPrincipal? actingUser, CancellationToken ct)
     {
         ActingUsers.Add(actingUser);
-        return Task.FromResult(_history!(actingUser, ct));
+        var answer = _history!(actingUser, ct);
+        var hold = Interlocked.Exchange(ref _armedHistory, null);
+        if (hold is null) return Task.FromResult(answer);
+        hold.Answer = answer;
+        hold.Entered.TrySetResult();
+        return hold.Completion.Task;
     }
 
     public Task<FacadeResult<IReadOnlyList<ClarificationRequest>>> GetAllRequestsAsync(
@@ -63,6 +68,33 @@ internal sealed class RecordingClarificationFacade : IClarificationFacade
         string id, string answer, ClaimsPrincipal? actingUser, CancellationToken ct) =>
         Task.FromResult(new FacadeResult<ClarificationAnswerResult>(
             false, null, "not used by the page", FacadeErrorKind.NotFound));
+
+    private HistoryHold? _armedHistory;
+    private readonly List<HistoryHold> _historyHolds = [];
+
+    internal HistoryHold ArmHistory()
+    {
+        var hold = new HistoryHold();
+        _historyHolds.Add(hold);
+        _armedHistory = hold;
+        return hold;
+    }
+
+    internal void ReleaseHistoryHolds()
+    {
+        foreach (var hold in _historyHolds) hold.Release();
+    }
+
+    internal sealed class HistoryHold
+    {
+        internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource<FacadeResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>> Completion { get; } = new();
+        internal FacadeResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>? Answer { get; set; }
+        internal void Release()
+        {
+            if (Answer is not null) Completion.TrySetResult(Answer);
+        }
+    }
 
     /// <summary>The shared denial answer the real facades produce.</summary>
     internal static FacadeResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> Denied() =>

@@ -75,7 +75,7 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
         RequestedAt = new DateTime(2024, 7, 1, 14, 23, 45, DateTimeKind.Utc),
     };
 
-    private async Task<Circuit> RenderAsync(bool open = false)
+    private async Task<Circuit> RenderAsync(bool open = false, bool isolateQueueEvents = false)
     {
         var mode = open ? HiveAuthMode.Open : HiveAuthMode.AuthenticationEnabled;
         var queue = new ClarificationQueueService();
@@ -87,7 +87,9 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
             new DashboardLogSink(), new ProgressLog());
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddSingleton(queue);
+        // The success-window rows isolate the queue event source from the real data queue. This
+        // prevents an incidental OnChanged refresh from consuming the POST-SUCCESS refresh gate.
+        services.AddSingleton(isolateQueueEvents ? new ClarificationQueueService() : queue);
         services.AddSingleton(dashboard);
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton<NavigationManager>(new Navigation());
@@ -203,6 +205,57 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
         Assert.DoesNotContain(Question, html, StringComparison.Ordinal);
         Assert.DoesNotContain("clarification-answer-error", html, StringComparison.Ordinal);
         Assert.True(c.Facade.RequestCalls.Count >= 2);
+        Assert.Equal(Draft, c.Queue.GetRequest(RequestId)!.Answer);
+        Assert.Equal("human", c.Queue.GetRequest(RequestId)!.ResolvedBy);
+    }
+
+    [Fact]
+    public async Task SubmitAnswer_EventCallback_HeldPostSuccessRefresh_KeepsImmediateRenderConsistent()
+    {
+        await using var c = await RenderAsync(isolateQueueEvents: true);
+        c.Queue.Enqueue(Request("remaining", "REMAINING-ROW-CONTROL"));
+        await c.SetDraftAsync(Draft);
+        await AssertPopulatedAsync(c, count: 2);
+        var instance = c.Page;
+        var hold = c.Facade.ArmCount();
+        var submit = c.SubmitEventAsync(); // production-rendered EventCallback; owned before assertions
+        await Task.WhenAny(hold.Entered.Task, submit).WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        if (submit.IsFaulted) await submit; // surface an immediate renderer failure, not a gate timeout
+        Assert.True(hold.Entered.Task.IsCompletedSuccessfully);
+        // This dispatcher invocation runs after IHandleEvent's immediate StateHasChanged. No gate
+        // is released here: we inspect the actual intermediate render with the refresh STILL parked.
+        await c.DispatchAsync(() => { });
+        Assert.False(submit.IsCompleted);
+        Assert.Same(instance, c.Page);
+        Assert.Equal(Draft, c.Queue.GetRequest(RequestId)!.Answer);
+        Assert.Equal("human", c.Queue.GetRequest(RequestId)!.ResolvedBy);
+        var immediate = await c.HtmlAsync();
+        Assert.DoesNotContain(Question, immediate, StringComparison.Ordinal);
+        Assert.DoesNotContain(Draft, immediate, StringComparison.Ordinal);
+        Assert.Contains("REMAINING-ROW-CONTROL", immediate, StringComparison.Ordinal);
+        Assert.Contains("header-bell-badge\">1</span>", immediate, StringComparison.Ordinal);
+        Assert.False(c.Drafts.ContainsKey(RequestId));
+        Assert.Equal(1, c.Count);
+        Assert.Equal("remaining", Assert.Single(c.Pending).Id);
+        Assert.All(c.Pending, row => Assert.True(c.Drafts.ContainsKey(row.Id)));
+        await c.ReleaseAsync(hold);
+        await submit;
+        Assert.DoesNotContain(Question, await c.HtmlAsync(), StringComparison.Ordinal);
+        await AssertPopulatedAsync(c, "REMAINING-ROW-CONTROL");
+        Assert.All(c.Pending, row => Assert.True(c.Drafts.ContainsKey(row.Id)));
+    }
+
+    [Fact]
+    public async Task SubmitAnswer_EventCallback_UngatedSuccessControl_RemovesAnsweredRow()
+    {
+        await using var c = await RenderAsync(isolateQueueEvents: true);
+        await c.SetDraftAsync(Draft);
+        await c.SubmitEventAsync();
+        Assert.Empty(c.Pending);
+        Assert.Equal(0, c.Count);
+        Assert.False(c.Drafts.ContainsKey(RequestId));
+        Assert.DoesNotContain(Question, await c.HtmlAsync(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Draft, await c.HtmlAsync(), StringComparison.Ordinal);
         Assert.Equal(Draft, c.Queue.GetRequest(RequestId)!.Answer);
         Assert.Equal("human", c.Queue.GetRequest(RequestId)!.ResolvedBy);
     }
@@ -465,9 +518,43 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
         private readonly List<Task> _tasks = [];
         private readonly HashSet<Task> _observed = [];
         internal int JoinedTasks { get; private set; }
-        internal Task Track(Task task) { _tasks.Add(task); return task; }
+        internal Task Track(Task task) { lock (_tasks) _tasks.Add(task); return task; }
         internal void Observed(Task task) => _observed.Add(task);
         internal Task SubmitAsync() => InvokeAsync("SubmitClarificationAnswer", RequestId);
+        internal Task SubmitEventAsync() => Track(renderer.Dispatcher.InvokeAsync(() =>
+        {
+            // Obtain the actual production onclick EventCallback, NOT by invoking or binding
+            // SubmitClarificationAnswer reflectively. Keep its MainLayout receiver and handler; add
+            // task ownership around that handler so even an IHandleEvent immediate-render exception
+            // cannot strand the already-started post-success refresh outside our cleanup boundary.
+#pragma warning disable BL0006 // Intentional inspection of the production render tree in a regression test.
+            using var builder = new Microsoft.AspNetCore.Components.Rendering.RenderTreeBuilder();
+            var render = typeof(MainLayout).GetMethod("BuildRenderTree", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .CreateDelegate<Action<Microsoft.AspNetCore.Components.Rendering.RenderTreeBuilder>>(Page);
+            render(builder);
+            var frames = builder.GetFrames();
+            var submitButton = false;
+            for (var i = 0; i < frames.Count; i++)
+            {
+                var frame = frames.Array[i];
+                if (frame.FrameType == Microsoft.AspNetCore.Components.RenderTree.RenderTreeFrameType.Element)
+                    submitButton = false;
+                if (frame.FrameType != Microsoft.AspNetCore.Components.RenderTree.RenderTreeFrameType.Attribute) continue;
+                if (frame.AttributeName == "class" && Equals(frame.AttributeValue, "chat-send clarification-submit-btn"))
+                    submitButton = true;
+                if (!submitButton || frame.AttributeName != "onclick") continue;
+                var callback = Assert.IsType<EventCallback>(frame.AttributeValue);
+                var receiver = typeof(EventCallback).GetField("Receiver", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                Assert.NotNull(receiver);
+                Assert.Same(Page, receiver.GetValue(callback));
+                var handlerField = typeof(EventCallback).GetField("Delegate", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                Assert.NotNull(handlerField);
+                var handler = Assert.IsType<Func<Task>>(handlerField.GetValue(callback));
+                return EventCallback.Factory.Create(Page, (Func<Task>)(() => Track(handler()))).InvokeAsync();
+            }
+#pragma warning restore BL0006
+            throw new InvalidOperationException("The real layout rendered no submit callback.");
+        }));
         internal Task InvokeAsync(string name, params object?[] args) => Track(renderer.Dispatcher.InvokeAsync(async () =>
         {
             var method = typeof(MainLayout).GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -502,7 +589,9 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
             async Task Step(Func<Task> action) { try { await action(); } catch (Exception ex) { _cleanup.Add(ex); } }
             // Release on dispatcher, join all started tasks, THEN renderer/scope/provider/directory.
             await Step(() => DispatchAsync(facade.ReleaseAll));
-            foreach (var task in _tasks)
+            Task[] tasks;
+            lock (_tasks) tasks = _tasks.ToArray();
+            foreach (var task in tasks)
             {
                 try { await task.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None); }
                 catch (Exception ex) { if (!_observed.Contains(task)) _cleanup.Add(ex); }
