@@ -197,15 +197,20 @@ public static class GitToolOutputRedactor
         var redacted = text;
         foreach (var secret in eligible)
         {
-            // The percent-aware pass runs FIRST because it also matches the raw form: a plain
-            // replacement first would fire on a raw PREFIX of a longer one-level encoding (a value
-            // ending in '%' against text "...%25") and leave the escape tail ("25") behind. The raw
-            // replacement afterwards only mops up what the percent-aware pass cannot decode
-            // (non-ASCII values are skipped there).
-            redacted = ReplacePercentEncoded(redacted, secret);
-            redacted = redacted.Replace(secret, Placeholder, StringComparison.Ordinal);
+            // Precedence principle: a LONGER encoded form of the value must win over a shorter raw
+            // PREFIX of it, otherwise the raw match fires first and strands the encoded tail.
+            //  * base64 first — a value that is itself valid base64 ("Vm0wd2Qy") has a base64 form
+            //    ("Vm0wd2QyUXk=") that STARTS with the raw value; replacing raw first would leave
+            //    "UXk=" behind. The padded form is replaced before the unpadded one for the same
+            //    reason ("=" would otherwise be stranded).
+            //  * then the percent-aware pass, which also matches the raw form and prefers a longer
+            //    "%25" reading over a literal '%' (a value ending in '%' against "...%25").
+            //  * the plain raw replacement last only mops up what the percent-aware pass cannot
+            //    decode (non-ASCII values are skipped there).
             foreach (var encoded in StandardBase64Forms(secret))
                 redacted = redacted.Replace(encoded, Placeholder, StringComparison.Ordinal);
+            redacted = ReplacePercentEncoded(redacted, secret);
+            redacted = redacted.Replace(secret, Placeholder, StringComparison.Ordinal);
         }
 
         return redacted;
@@ -232,10 +237,13 @@ public static class GitToolOutputRedactor
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Matching is a single forward pass that consumes each expected character or escape exactly
-    /// once, so no recursive decoding can occur: <c>%255F</c> decodes to <c>%5F</c> — the byte of
-    /// <c>%</c>, not of the escaped character — and therefore never matches the character whose
-    /// escape it is a fragment of.
+    /// Matching walks the value once, consuming each expected character as a literal or as exactly
+    /// ONE escape, so no recursive decoding can occur: <c>%255F</c> decodes to <c>%5F</c> — the
+    /// byte of <c>%</c>, not of the escaped character — and therefore never matches the character
+    /// whose escape it is a fragment of. The only point where the reading is ambiguous is a
+    /// <c>%</c> in the value itself (the text may hold a literal <c>%</c> or its escape
+    /// <c>%25</c>); there the matcher BACKTRACKS, preferring the longer escape reading and falling
+    /// back to the literal one when the remainder cannot match.
     /// </para>
     /// <para>
     /// The scan compares one expected BYTE against one text character, which is exact only for
@@ -285,14 +293,17 @@ public static class GitToolOutputRedactor
         // Only a '%' in the secret itself is ambiguous: in the text it may appear as a literal '%'
         // or as the one-level escape "%25". Every other character has exactly one possible form
         // (a literal can never begin an escape, and an escape never equals a non-'%' literal), so
-        // the matcher only ever needs to BACKTRACK at a '%'.
+        // the matcher only ever needs to BACKTRACK at a '%'. At that point the escape reading is
+        // tried FIRST (it is the longer one) with the literal reading as the fallback.
         return TryMatchPercentEncodedFrom(text, start, secret, 0, out end);
     }
 
     /// <summary>
     /// Matches <paramref name="secret"/> from character <paramref name="index"/> onward at
-    /// <paramref name="position"/>, trying the literal form first and — for a <c>%</c> only — the
-    /// one-level escape <c>%25</c> when the literal form leads to a dead end.
+    /// <paramref name="position"/>. Every character has exactly one reading except a <c>%</c> that
+    /// is present both as a literal and as the start of <c>%25</c>: there the one-level escape is
+    /// preferred (it is the longer reading) and the literal is the fallback when the remainder of
+    /// the value cannot match after the escape.
     /// </summary>
     private static bool TryMatchPercentEncodedFrom(string text, int position, string secret, int index, out int end)
     {
@@ -408,8 +419,15 @@ public static class GitToolOutputRedactor
         // The host runs up to the ':' separator and must be non-empty and followed by a path.
         var hostStart = at + 1;
         var hostEnd = hostStart;
-        while (hostEnd < text.Length && IsHostCharacter(text[hostEnd]))
-            hostEnd++;
+        while (hostEnd < text.Length)
+        {
+            if (IsHostCharacter(text[hostEnd]))
+                hostEnd++;
+            else if (StartsWithPlaceholder(text, hostEnd))
+                hostEnd += Placeholder.Length;
+            else
+                break;
+        }
 
         if (hostEnd == hostStart || hostEnd >= text.Length || text[hostEnd] != ':')
             return false;
@@ -420,8 +438,15 @@ public static class GitToolOutputRedactor
         // INSIDE the run and the password is what follows it.
         var userEnd = at;
         var userStart = userEnd;
-        while (userStart > 0 && IsScpUserInfoCharacter(text[userStart - 1]))
-            userStart--;
+        while (userStart > 0)
+        {
+            if (IsScpUserInfoCharacter(text[userStart - 1]))
+                userStart--;
+            else if (EndsWithPlaceholder(text, userStart))
+                userStart -= Placeholder.Length;
+            else
+                break;
+        }
         if (userStart == userEnd)
             return false;
 
@@ -460,8 +485,15 @@ public static class GitToolOutputRedactor
 
             var authorityStart = index + SshScheme.Length;
             var authorityEnd = authorityStart;
-            while (authorityEnd < text.Length && IsAuthorityCharacter(text[authorityEnd]))
-                authorityEnd++;
+            while (authorityEnd < text.Length)
+            {
+                if (IsAuthorityCharacter(text[authorityEnd]))
+                    authorityEnd++;
+                else if (StartsWithPlaceholder(text, authorityEnd))
+                    authorityEnd += Placeholder.Length;
+                else
+                    break;
+            }
 
             if (authorityEnd > authorityStart)
             {
@@ -806,6 +838,28 @@ public static class GitToolOutputRedactor
     }
 
     // ── Shared character and scheme helpers ───────────────────────────────────
+
+    /// <summary>
+    /// Whether an already-substituted <see cref="Placeholder"/> starts at <paramref name="index"/>.
+    /// </summary>
+    /// <remarks>
+    /// The inventory layer runs before the structural layer and leaves <c>[redacted]</c> inside
+    /// the text. Because <c>[</c> and <c>]</c> are not authority, host or userinfo characters, a
+    /// scan that stopped there would end an SSH/scp credential run early and strand the structural
+    /// password. Treating the placeholder as part of the run keeps the two layers from blinding
+    /// each other (the same principle <see cref="ScanCredentialToken"/> applies to headers).
+    /// </remarks>
+    private static bool StartsWithPlaceholder(string text, int index) =>
+        text.AsSpan(index).StartsWith(Placeholder, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Whether an already-substituted <see cref="Placeholder"/> ends exactly at
+    /// <paramref name="end"/> (exclusive) — the backwards counterpart of
+    /// <see cref="StartsWithPlaceholder"/> for the scp userinfo scan.
+    /// </summary>
+    private static bool EndsWithPlaceholder(string text, int end) =>
+        end >= Placeholder.Length
+        && text.AsSpan(end - Placeholder.Length, Placeholder.Length).SequenceEqual(Placeholder);
 
     /// <summary>
     /// Returns the length of the <c>ssh://</c> scheme at <paramref name="index"/>, or 0 when no
