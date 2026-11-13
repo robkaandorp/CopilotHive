@@ -249,6 +249,16 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
         ("credential.helper", string.Empty),
     ];
 
+    /// <summary>
+    /// The EXTRA reset a CREDENTIAL-FREE launch appends: an empty <c>core.askPass</c> disables a
+    /// CONFIGURED askpass program (global/system/local config or an inherited indexed entry). An
+    /// authenticated launch needs no such reset because its <c>GIT_ASKPASS</c> override outranks
+    /// <c>core.askPass</c>; a credential-free launch installs no <c>GIT_ASKPASS</c>, so without this
+    /// reset git would still run the ambient program and release ITS credential to whatever
+    /// destination challenged. It is expressed in the same two channels as the helper reset.
+    /// </summary>
+    private static readonly (string Key, string Value) CredentialFreeOnlyEntry = ("core.askPass", string.Empty);
+
     private int _disposed;
 
     private WorkerGitAskpassHelper(string directoryPath, string scriptPath)
@@ -357,7 +367,9 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     /// <c>SSH_ASKPASS</c> and this helper's own credential variables), <c>GIT_TERMINAL_PROMPT=0</c>,
     /// <c>GCM_INTERACTIVE=never</c>, the inherited <c>credential.helper</c> reset appended after the
     /// inherited indexed entries, and the inherited legacy <c>GIT_CONFIG_PARAMETERS</c> replaced —
-    /// with NO credential injected and NO <c>GIT_ASKPASS</c> installed.
+    /// plus an empty <c>core.askPass</c> reset in those same two channels (no <c>GIT_ASKPASS</c>
+    /// override exists to outrank a configured askpass program) — with NO credential injected and NO
+    /// <c>GIT_ASKPASS</c> installed.
     /// </summary>
     /// <remarks>
     /// It exists so a credential-free launch carries strictly FEWER inherited channels than before
@@ -417,8 +429,13 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
 
         // APPEND to whatever indexed environment-config entries the host already supplied, so the
         // resets below come after them and no inherited indexed helper can be selected.
+        // A credential-free launch has no GIT_ASKPASS override, so it also resets core.askPass.
+        var entries = authenticated
+            ? OperationConfigEntries
+            : [.. OperationConfigEntries, CredentialFreeOnlyEntry];
+
         var index = ParseInheritedConfigCount(environment);
-        foreach (var (key, value) in OperationConfigEntries)
+        foreach (var (key, value) in entries)
         {
             environment[$"GIT_CONFIG_KEY_{index.ToString(CultureInfo.InvariantCulture)}"] = key;
             environment[$"GIT_CONFIG_VALUE_{index.ToString(CultureInfo.InvariantCulture)}"] = value;
@@ -435,7 +452,7 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
         // lives in this child's environment only — no persistent or global git configuration is
         // touched.
         environment[ConfigParametersEnvName] = string.Join(
-            ' ', OperationConfigEntries.Select(e => $"'{e.Key}={e.Value}'"));
+            ' ', entries.Select(e => $"'{e.Key}={e.Value}'"));
 
         return environment;
     }

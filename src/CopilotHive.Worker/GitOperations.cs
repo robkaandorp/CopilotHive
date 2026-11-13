@@ -644,15 +644,20 @@ public static class GitOperations
     /// list is never touched by the credential, and nothing is added to the worker's own environment.
     /// </para>
     /// <para>
-    /// With a <c>null</c> transport the launch keeps the existing contract exactly: the scrubbed
-    /// inherited environment plus <c>GIT_TERMINAL_PROMPT=0</c>, decided by the legacy factory path
-    /// (a single-element <see cref="GitProcessRequest.Args"/>).
+    /// With a <c>null</c> transport the launch is CREDENTIAL-FREE but NOT given the legacy
+    /// five-name scrub: its environment is <see cref="BuildCredentialFreeChildEnv"/>, i.e. the SAME
+    /// suppression envelope as the authenticated launch minus any credential — every inherited
+    /// credential channel scrubbed (including <c>SSH_ASKPASS</c> and the helper's own credential
+    /// variables), <c>GIT_TERMINAL_PROMPT=0</c>, an empty <c>credential.helper</c> reset appended
+    /// after inherited indexed entries, the inherited <c>GIT_CONFIG_PARAMETERS</c> replaced, and
+    /// additionally an empty <c>core.askPass</c> reset in both of those channels (a credential-free
+    /// launch has no <c>GIT_ASKPASS</c> override to outrank a configured askpass program).
     /// </para>
     /// <para>
     /// The tokenized form hands its environment VERBATIM to
-    /// <see cref="CreateProcessStartInfo"/>; credential-free tokenized launches therefore build their
-    /// environment through <see cref="BuildCredentialFreeChildEnv"/> so the scrub and the forced
-    /// <c>GIT_TERMINAL_PROMPT=0</c> are applied identically on both forms.
+    /// <see cref="CreateProcessStartInfo"/>. Only the LEGACY opaque-string
+    /// <see cref="RunGitCommandAsync"/> form (local, non-network commands) still goes through the
+    /// five-name <see cref="SanitizeChildEnv"/> scrub plus <c>GIT_TERMINAL_PROMPT=0</c>.
     /// </para>
     /// </remarks>
     /// <param name="workDir">The working directory for the child process.</param>
