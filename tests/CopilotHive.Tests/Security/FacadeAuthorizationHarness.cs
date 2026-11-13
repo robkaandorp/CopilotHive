@@ -53,6 +53,23 @@ internal sealed class FacadeAuthorizationHarness : IDisposable
     internal ComposerFacade ComposerFacade(Composer? composer, HiveAuthMode mode) =>
         new(composer, Resolver(mode), Policy, NullLogger<ComposerFacade>.Instance);
 
+    /// <summary>
+    /// The production OPERATIONAL facade over this directory's resolver for <paramref name="mode"/>.
+    /// <para>
+    /// The caller supplies the trusted services (the dashboard state service and the LLM session
+    /// registry), so the test owns their state and can observe a real delegation — for example the
+    /// Brain reset actually reaching the Brain behind the dashboard service.
+    /// </para>
+    /// </summary>
+    /// <param name="mode">The explicit authentication mode the resolver answers in.</param>
+    /// <param name="dashboard">The trusted dashboard state service the facade delegates to.</param>
+    /// <param name="registry">The trusted LLM session registry the facade projects from.</param>
+    internal OperationalFacade OperationalFacade(
+        HiveAuthMode mode,
+        CopilotHive.Dashboard.DashboardStateService dashboard,
+        CopilotHive.Dashboard.LlmSessionRegistry registry) =>
+        new(dashboard, registry, Resolver(mode), Policy, NullLogger<OperationalFacade>.Instance);
+
     /// <summary>The production config facade over this directory's resolver for <paramref name="mode"/>.</summary>
     internal ConfigFacade ConfigFacade(
         CopilotHive.Configuration.HiveConfigFile? config,
