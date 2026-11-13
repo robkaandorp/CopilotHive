@@ -7558,6 +7558,388 @@ public sealed class ComposerToolTests : IDisposable
             Task.FromResult(new List<string>());
     }
 
+    // ── git tools — the central credential-redaction output boundary ──
+
+    /// <summary>
+    /// A NON-origin remote stays on the local runner, so its failure comes back through
+    /// <c>RunGitAsync</c>'s non-zero-exit message: git echoes the credential-bearing remote URL in
+    /// its stderr, and the returned error string must not carry it.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_NonOriginRemoteFailure_RedactsTheCredentialGitEchoedInStderr()
+    {
+        const string Token = "gho_non_origin_stderr_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+            // A port nothing listens on: the fetch fails fast and git reports the URL verbatim.
+            AddNamedRemote(tmpDir, "upstream",
+                $"https://x-access-token:{Token}@127.0.0.1:1/acme/widgets.git");
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "upstream", cancellationToken: ct);
+
+            Assert.DoesNotContain(Token, result);
+            Assert.DoesNotContain("x-access-token", result);
+            Assert.Contains("failed", result, StringComparison.OrdinalIgnoreCase);
+            // The non-origin remote never reached the manager's credentialed path.
+            Assert.Empty(manager.FetchCalls);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// <c>git show</c> output is repo content: a committed token assignment is model-visible text
+    /// and must be redacted like any other output surface.
+    /// </summary>
+    [Fact]
+    public async Task GitShow_CommittedTokenAssignment_IsRedactedInTheOutput()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoDir = Path.Combine(tmpDir, "repos", "test-repo");
+            await File.WriteAllTextAsync(
+                Path.Combine(repoDir, "secrets.txt"),
+                "GITHUB_TOKEN=gho_committed_secret_value\nurl=https://user:pw@example.com/x.git\n",
+                ct);
+            RunPlainGit(repoDir, "add", "secrets.txt");
+            RunPlainGit(repoDir, "-c", "commit.gpgsign=false", "commit", "-m", "add config sample");
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitShowAsync("test-repo", "HEAD", cancellationToken: ct);
+
+            Assert.DoesNotContain("gho_committed_secret_value", result);
+            Assert.DoesNotContain("user:pw", result);
+            Assert.Contains("GITHUB_TOKEN=[redacted]", result);
+            Assert.Contains("https://example.com/x.git", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>The same boundary applies to <c>git blame</c>, which prints file CONTENT.</summary>
+    [Fact]
+    public async Task GitBlame_FileWithTokenAssignment_IsRedactedInTheOutput()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoDir = Path.Combine(tmpDir, "repos", "test-repo");
+            await File.WriteAllTextAsync(
+                Path.Combine(repoDir, "README.md"),
+                "token = ghp_blamed_config_secret\n",
+                ct);
+            RunPlainGit(repoDir, "add", "README.md");
+            RunPlainGit(repoDir, "-c", "commit.gpgsign=false", "commit", "-m", "sample");
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitBlameAsync("test-repo", "README.md", cancellationToken: ct);
+
+            Assert.DoesNotContain("ghp_blamed_config_secret", result);
+            Assert.Contains("[redacted]", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The check-ref-format rejection is RAW validation data inside
+    /// <see cref="Composer.ValidateCheckRefFormatResult"/>; the <c>git_fetch</c> boundary is where
+    /// it becomes tool output, so git's rejection (which quotes the caller's branch verbatim) must
+    /// arrive redacted.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_BranchRejectedByGit_RedactsTheCredentialInTheRejection()
+    {
+        const string Token = "gho_branch_rejection_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+
+            // ':' is not legal in a ref name, so git rejects the branch and echoes it — userinfo
+            // and all — in its stderr. No '@{' and no leading '-', so the tool's own pre-checks do
+            // not fire and the rejection really comes from check-ref-format.
+            var branch = $"https://x-access-token:{Token}@github.com/acme/widgets.git";
+
+            var result = await composer.GitFetchAsync("test-repo", branch: branch, cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.DoesNotContain(Token, result);
+            Assert.DoesNotContain("x-access-token", result);
+            Assert.Empty(manager.FetchCalls);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The truncation notice counts the REDACTED output's lines: redaction happens immediately
+    /// after reading, before the split, so no secret-bearing line is counted or dropped unredacted.
+    /// </summary>
+    [Fact]
+    public async Task GitShow_TruncatedOutput_ReportsTheRedactedLineCountAndCarriesNoCredential()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoDir = Path.Combine(tmpDir, "repos", "test-repo");
+
+            const int ContentLines = 40;
+            var content = string.Join(
+                '\n',
+                Enumerable.Range(1, ContentLines).Select(i =>
+                    i == 1 ? "GH_TOKEN=gho_truncation_secret_value" : $"line {i} of content"));
+            await File.WriteAllTextAsync(Path.Combine(repoDir, "many.txt"), content + "\n", ct);
+            RunPlainGit(repoDir, "add", "many.txt");
+            RunPlainGit(repoDir, "-c", "commit.gpgsign=false", "commit", "-m", "many lines");
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            const int MaxLines = 30;
+            var result = await composer.GitShowAsync(
+                "test-repo", "HEAD", max_lines: MaxLines, cancellationToken: ct);
+
+            Assert.DoesNotContain("gho_truncation_secret_value", result);
+            // The secret sits on the first content line, well inside the retained prefix — so it
+            // survives truncation only if it was never redacted.
+            Assert.Contains("GH_TOKEN=[redacted]", result);
+            Assert.Contains("... (truncated,", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>A LOCAL cancellation keeps propagating as cancellation rather than becoming output.</summary>
+    [Fact]
+    public async Task GitLog_CancelledBeforeRun_PropagatesTheCallersCancellation()
+    {
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            using var cts = new CancellationTokenSource();
+            await cts.CancelAsync();
+
+            var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => composer.GitLogAsync("test-repo", cancellationToken: cts.Token));
+
+            Assert.Equal(cts.Token, ex.CancellationToken);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// An exception escaping a git tool's own work (here a clone-path resolution failure) is
+    /// classified: the tool returns a credential-free error string instead of throwing, and the
+    /// exception text — which embeds a token — never reaches the model.
+    /// </summary>
+    [Fact]
+    public async Task GitLog_ClonePathResolutionThrows_ReturnsAClassifiedCredentialFreeError()
+    {
+        const string Token = "gho_exception_payload_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            var manager = new ThrowingClonePathRepoManager(
+                tmpDir,
+                _ => { },
+                new InvalidOperationException(
+                    $"cannot resolve https://x-access-token:{Token}@github.com/acme/w.git (bare {Token})"));
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: manager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitLogAsync("test-repo", cancellationToken: ct);
+
+            Assert.DoesNotContain(Token, result);
+            Assert.DoesNotContain("x-access-token", result);
+            Assert.Contains(nameof(InvalidOperationException), result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The non-zero-exit FAILURE message embeds the joined argument list, which is model-visible
+    /// too. A ref the tool passes through — here a URL-shaped branch git cannot resolve — is echoed
+    /// back by that message, so the credential must be gone from BOTH the echoed args and git's
+    /// stderr.
+    /// </summary>
+    [Fact]
+    public async Task GitLog_UnresolvableUrlShapedBranch_RedactsTheEchoedArgumentsAndStderr()
+    {
+        const string Token = "gho_echoed_args_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // Not a leading '-', so the tool's own option-injection guard does not fire; git then
+            // rejects it as an unknown revision and the tool reports the whole invocation.
+            var branch = $"https://x-access-token:{Token}@github.com/acme/widgets.git";
+
+            var result = await composer.GitLogAsync("test-repo", branch: branch, cancellationToken: ct);
+
+            Assert.Contains("failed (exit", result);
+            Assert.DoesNotContain(Token, result);
+            Assert.DoesNotContain("x-access-token", result);
+            // The invocation is still reported, so the failure stays diagnosable.
+            Assert.Contains("git log", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The same classification applies to <c>git_fetch</c>'s local probe phase, and a CANCELLATION
+    /// raised there still propagates unchanged instead of being classified.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_ProbePhaseFailure_IsClassifiedAndCancellationStillPropagates()
+    {
+        const string Token = "gho_fetch_probe_payload_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+
+            // The seam observes the CALLER's token first — exactly like a real resolver that does
+            // I/O — so a cancellation is raised as cancellation rather than as the failure.
+            var manager = new ThrowingClonePathRepoManager(
+                tmpDir,
+                path => cts.Token.ThrowIfCancellationRequested(),
+                new InvalidOperationException($"probe failed with {Token}"));
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: manager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: cts.Token);
+
+            Assert.DoesNotContain(Token, result);
+            Assert.Contains(nameof(InvalidOperationException), result);
+
+            // Cancellation is never classified into tool output.
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => composer.GitFetchAsync("test-repo", cancellationToken: cts.Token));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// A manager whose clone-path resolution can THROW — the escape hatch for exercising the
+    /// tools' failure classification on demand (production managers resolve a path and do not
+    /// throw). The supplied observer runs first, so a test can model a resolver that observes
+    /// cancellation before doing anything else.
+    /// </summary>
+    private sealed class ThrowingClonePathRepoManager(
+        string workDirectory, Action<string> observe, Exception failure) : IBrainRepoManager
+    {
+        public string WorkDirectory { get; } = workDirectory;
+
+        public string GetClonePath(string repoName)
+        {
+            observe(repoName);
+            throw failure;
+        }
+
+        public Task<BrainFetchResult> FetchOriginAsync(
+            string repoName, string? branch = null, CancellationToken ct = default) =>
+            Task.FromResult(new BrainFetchResult(true, string.Empty, null));
+
+        public Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            throw failure;
+        public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+            throw failure;
+        public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+            throw failure;
+        public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) => throw failure;
+        public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+            throw failure;
+        public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+            throw failure;
+        public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) => throw failure;
+        public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) => throw failure;
+    }
+
     // ── system prompt — repo injection ──
 
     [Fact]

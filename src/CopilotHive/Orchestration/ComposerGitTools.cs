@@ -14,16 +14,49 @@ public sealed partial class Composer
     /// Returns an error string if the repo manager is unavailable or the repo is not found.
     /// Output is truncated to <paramref name="maxLines"/> lines with a notice when truncated.
     /// </summary>
+    /// <remarks>
+    /// This is the raw-output surface of the git tools, so EVERYTHING it returns is model-visible
+    /// and passes through <see cref="RedactGitOutput"/>: the success output (redacted BEFORE it is
+    /// split and truncated, so the truncation notice counts the redacted output's lines), the
+    /// non-zero-exit failure message (whose embedded stderr AND echoed argument list are both
+    /// model-visible), and a failure that escapes the process/filesystem work, which is converted
+    /// into a classified, credential-free error instead of propagating. A LOCAL cancellation is
+    /// never classified — it propagates unchanged.
+    /// </remarks>
     /// <param name="repoName">Short name of the cloned repository.</param>
     /// <param name="args">Git arguments to pass via <see cref="System.Diagnostics.ProcessStartInfo.ArgumentList"/>.</param>
     /// <param name="maxLines">Maximum lines to return before truncating.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>Git command output, or an error message string.</returns>
+    /// <returns>Redacted git command output, or a redacted error message string.</returns>
     private async Task<string> RunGitAsync(
         string repoName, string[] args, int maxLines = 500, CancellationToken ct = default)
     {
+        try
+        {
+            return await RunGitCoreAsync(repoName, args, maxLines, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // A LOCAL cancellation belongs to the caller and keeps its identity: it is never
+            // converted into tool output.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return DescribeGitToolFailure(ex);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="RunGitAsync"/>'s work, with the caller-facing failure boundary kept OUTSIDE it so
+    /// every step — path resolution, the repository guards, and the process run — shares one
+    /// classified, credential-free failure surface.
+    /// </summary>
+    private async Task<string> RunGitCoreAsync(
+        string repoName, string[] args, int maxLines, CancellationToken ct)
+    {
         if (_repoManager is null)
-            return "Git tools are not available — no repository manager configured.";
+            return RedactGitOutput("Git tools are not available — no repository manager configured.");
 
         var clonePath = _repoManager.GetClonePath(repoName);
 
@@ -33,7 +66,7 @@ public sealed partial class Composer
         if (!resolvedPath.StartsWith(expectedReposDir + Path.DirectorySeparatorChar, StringComparison.Ordinal)
             && !string.Equals(resolvedPath, expectedReposDir, StringComparison.Ordinal))
         {
-            return $"Repository '{repoName}' is not within the managed repos directory. Access denied.";
+            return RedactGitOutput($"Repository '{repoName}' is not within the managed repos directory. Access denied.");
         }
 
         if (!Directory.Exists(Path.Combine(clonePath, ".git")))
@@ -47,7 +80,7 @@ public sealed partial class Composer
                     .ToList()
                 : [];
             var list = available.Count > 0 ? string.Join(", ", available) : "(none)";
-            return $"Repository '{repoName}' not found. Available: {list}";
+            return RedactGitOutput($"Repository '{repoName}' not found. Available: {list}");
         }
 
         var psi = new System.Diagnostics.ProcessStartInfo(GitExecutable)
@@ -72,11 +105,19 @@ public sealed partial class Composer
 
         if (process.ExitCode != 0)
         {
+            // The failure text is one string handed to the model, and it embeds BOTH git's stderr
+            // and the argument list this tool passed — so the whole message is redacted.
             var stderr = stderrTask.Result;
-            return $"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderr}";
+            return RedactGitOutput(
+                $"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderr}");
         }
 
-        var output = stdoutTask.Result;
+        // Redaction happens immediately after reading and BEFORE truncation: the text that is
+        // truncated, and the total line count reported in the truncation notice, therefore both
+        // describe the REDACTED output rather than secret-bearing raw output. The transform is
+        // documented never to add or remove a line break (asserted directly in
+        // GitToolOutputRedactorTests), which is what makes the reported count stable.
+        var output = RedactGitOutput(stdoutTask.Result);
         var lines = output.Split('\n');
         if (lines.Length <= maxLines)
             return output;
@@ -89,6 +130,12 @@ public sealed partial class Composer
     /// Runs a git command in <paramref name="workDir"/> and returns the raw result without
     /// throwing for non-zero exit codes. Used for internal validation queries.
     /// </summary>
+    /// <remarks>
+    /// The result is INTERNAL validation data and is deliberately kept raw here. A caller that
+    /// surfaces any part of it to the model (for example the remote-listing stderr that
+    /// <see cref="GitFetchAsync"/> returns) is responsible for the redaction, which is why every
+    /// such caller runs the text through <see cref="RedactGitOutput"/>.
+    /// </remarks>
     private static async Task<(int ExitCode, string Stdout, string Stderr)> TryRunGitAsync(
         string workDir, string[] args, CancellationToken ct)
     {
@@ -125,6 +172,11 @@ public sealed partial class Composer
     /// Extracted as a pure function (no process spawning) so the equality-guard behavior can be
     /// unit-tested directly with synthetic exit codes/output, without needing to fake or spawn a
     /// git executable.
+    /// <para>
+    /// The returned string is RAW validation data: it quotes the caller's branch verbatim and
+    /// embeds git's stderr. It stays internal until <see cref="GitFetchAsync"/> turns it into tool
+    /// output, and that boundary is where it is redacted.
+    /// </para>
     /// </remarks>
     internal static string? ValidateCheckRefFormatResult(string branch, int exitCode, string stdout, string stderr)
     {
@@ -136,6 +188,67 @@ public sealed partial class Composer
             return $"❌ Invalid branch '{branch}': branch name was normalized to '{normalizedBranch}' — use the exact branch name.";
 
         return null;
+    }
+
+    // ── Central credential-redaction boundary ──
+
+    /// <summary>
+    /// The ONE credential-redaction transform for text about to become model-visible git tool
+    /// output. Every string these tools return passes through it: raw git stdout, the failure
+    /// message's stderr and echoed arguments, a validation rejection that quotes caller input, and
+    /// a classified exception summary.
+    /// </summary>
+    /// <remarks>
+    /// The transform itself lives in <see cref="GitToolOutputRedactor"/> so it is composed with —
+    /// never reimplemented next to — the shared URL grammar. This method only supplies the
+    /// KNOWN-SECRET INVENTORY, which is read FRESH on every operation: a value that changes
+    /// between calls must neither keep being redacted from a stale copy nor escape because of one.
+    /// </remarks>
+    /// <param name="text">The model-visible text. May be null or empty.</param>
+    /// <returns>The text with every recognized credential replaced by the shared placeholder.</returns>
+    private string RedactGitOutput(string? text) =>
+        GitToolOutputRedactor.Redact(text, GitToolSecretInventory());
+
+    /// <summary>
+    /// The known-secret inventory this Composer can name: the API key captured at construction
+    /// (its value at that moment — rotation is NOT tracked) plus the current value of each
+    /// credential environment variable, read fresh by every call.
+    /// </summary>
+    /// <remarks>
+    /// No configuration-file token field is assumed. Values shorter than
+    /// <see cref="GitToolOutputRedactor.MinimumInventoryValueLength"/> are ignored by the transform
+    /// itself, because replacing a one- or two-character value would rewrite ordinary output.
+    /// </remarks>
+    private IEnumerable<string?> GitToolSecretInventory()
+    {
+        yield return _ollamaApiKey;
+
+        foreach (var value in GitToolOutputRedactor.ReadEnvironmentSecrets())
+            yield return value;
+    }
+
+    /// <summary>
+    /// Classifies an exception that escaped git-tool work into credential-free, model-visible text.
+    /// </summary>
+    /// <remarks>
+    /// The exception MESSAGE is never echoed. A clone path, a remote URL, or a process error can
+    /// carry a credential the Composer does not know (it holds no inventory of a manager's selected
+    /// token), and a structural scanner cannot recognize a BARE token in arbitrary prose, so only
+    /// the exception TYPE name is reported: a type name is structurally incapable of carrying a
+    /// credential and still tells the model what kind of failure occurred. The redacted message is
+    /// written to the orchestrator log instead, where it stays diagnosable.
+    /// </remarks>
+    /// <param name="ex">The escaping exception.</param>
+    /// <returns>A redacted, classified tool error string.</returns>
+    private string DescribeGitToolFailure(Exception ex)
+    {
+        _logger.LogWarning(
+            "Git tool failure ({ExceptionType}): {RedactedMessage}",
+            ex.GetType().Name,
+            LogSanitizer.SanitizeText(RedactGitOutput(ex.Message)));
+
+        return RedactGitOutput(
+            $"❌ git tool failed ({ex.GetType().Name}). See the orchestrator logs for details.");
     }
 
     [Description("View commit history for a repository.")]
@@ -150,11 +263,11 @@ public sealed partial class Composer
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(repository))
-            return "❌ repository is required.";
+            return RedactGitOutput("❌ repository is required.");
 
         var validFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "oneline", "short", "full" };
         if (!validFormats.Contains(format))
-            return $"❌ Invalid format '{format}'. Must be one of: oneline, short, full.";
+            return RedactGitOutput($"❌ Invalid format '{format}'. Must be one of: oneline, short, full.");
 
         var args = new List<string> { "log", $"--max-count={max_count}" };
 
@@ -178,7 +291,7 @@ public sealed partial class Composer
         if (!string.IsNullOrWhiteSpace(branch))
         {
             if (branch.StartsWith('-'))
-                return $"❌ Invalid branch '{branch}': branch names cannot start with '-'.";
+                return RedactGitOutput($"❌ Invalid branch '{branch}': branch names cannot start with '-'.");
             args.Add(branch);
         }
 
@@ -202,15 +315,15 @@ public sealed partial class Composer
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(repository))
-            return "❌ repository is required.";
+            return RedactGitOutput("❌ repository is required.");
         if (string.IsNullOrWhiteSpace(ref1))
-            return "❌ ref1 is required.";
+            return RedactGitOutput("❌ ref1 is required.");
 
         // SECURITY: Prevent git option injection for refs
         if (ref1.StartsWith('-'))
-            return $"❌ Invalid ref '{ref1}': refs cannot start with '-'.";
+            return RedactGitOutput($"❌ Invalid ref '{ref1}': refs cannot start with '-'.");
         if (!string.IsNullOrWhiteSpace(ref2) && ref2.StartsWith('-'))
-            return $"❌ Invalid ref '{ref2}': refs cannot start with '-'.";
+            return RedactGitOutput($"❌ Invalid ref '{ref2}': refs cannot start with '-'.");
 
         var args = new List<string> { "diff" };
 
@@ -241,13 +354,13 @@ public sealed partial class Composer
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(repository))
-            return "❌ repository is required.";
+            return RedactGitOutput("❌ repository is required.");
         if (string.IsNullOrWhiteSpace(@ref))
-            return "❌ ref is required.";
+            return RedactGitOutput("❌ ref is required.");
 
         // SECURITY: Prevent git option injection for ref
         if (@ref.StartsWith('-'))
-            return $"❌ Invalid ref '{@ref}': refs cannot start with '-'.";
+            return RedactGitOutput($"❌ Invalid ref '{@ref}': refs cannot start with '-'.");
 
         var args = new List<string> { "show" };
 
@@ -273,7 +386,7 @@ public sealed partial class Composer
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(repository))
-            return "❌ repository is required.";
+            return RedactGitOutput("❌ repository is required.");
 
         var args = new List<string> { "branch", "--list" };
 
@@ -284,7 +397,7 @@ public sealed partial class Composer
         if (!string.IsNullOrWhiteSpace(pattern))
         {
             if (pattern.StartsWith('-'))
-                return $"❌ Invalid pattern '{pattern}': patterns cannot start with '-'.";
+                return RedactGitOutput($"❌ Invalid pattern '{pattern}': patterns cannot start with '-'.");
             args.Add(pattern);
         }
 
@@ -300,9 +413,9 @@ public sealed partial class Composer
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(repository))
-            return "❌ repository is required.";
+            return RedactGitOutput("❌ repository is required.");
         if (string.IsNullOrWhiteSpace(path))
-            return "❌ path is required.";
+            return RedactGitOutput("❌ path is required.");
 
         var args = new List<string> { "blame" };
 
@@ -331,17 +444,17 @@ public sealed partial class Composer
             return deny_git_fetch;
 
         if (_repoManager is null)
-            return "Git tools are not available — no repository manager configured.";
+            return RedactGitOutput("Git tools are not available — no repository manager configured.");
 
         // SECURITY: Validate repository name to prevent path traversal / option injection.
         if (string.IsNullOrWhiteSpace(repository))
-            return "❌ repository is required.";
+            return RedactGitOutput("❌ repository is required.");
         if (repository.Contains('/') || repository.Contains('\\'))
-            return $"❌ Invalid repository name '{repository}': repository names cannot contain path separators.";
+            return RedactGitOutput($"❌ Invalid repository name '{repository}': repository names cannot contain path separators.");
         if (repository.Contains(".."))
-            return $"❌ Invalid repository name '{repository}': repository names cannot contain '..'.";
+            return RedactGitOutput($"❌ Invalid repository name '{repository}': repository names cannot contain '..'.");
         if (repository.StartsWith('-'))
-            return $"❌ Invalid repository name '{repository}': repository names cannot start with '-'.";
+            return RedactGitOutput($"❌ Invalid repository name '{repository}': repository names cannot start with '-'.");
 
         // Default the remote to origin when not specified.
         if (string.IsNullOrWhiteSpace(remote))
@@ -349,39 +462,59 @@ public sealed partial class Composer
 
         // SECURITY: Validate remote to prevent option injection, URL/transport abuse, and refspec injection.
         if (remote.StartsWith('-'))
-            return $"❌ Invalid remote '{remote}': remote names cannot start with '-'.";
+            return RedactGitOutput($"❌ Invalid remote '{remote}': remote names cannot start with '-'.");
         if (remote.Contains("://") || remote.StartsWith("git@") || remote.StartsWith("ssh://"))
-            return $"❌ Invalid remote '{remote}': remote must be a configured remote name, not a URL.";
+            return RedactGitOutput($"❌ Invalid remote '{remote}': remote must be a configured remote name, not a URL.");
         if (remote.Contains("::"))
-            return $"❌ Invalid remote '{remote}': remote names cannot contain '::'.";
+            return RedactGitOutput($"❌ Invalid remote '{remote}': remote names cannot contain '::'.");
         if (remote.Contains(':') || remote.Contains('+'))
-            return $"❌ Invalid remote '{remote}': remote names cannot contain ':' or '+'.";
+            return RedactGitOutput($"❌ Invalid remote '{remote}': remote names cannot contain ':' or '+'.");
 
-        var clonePath = _repoManager.GetClonePath(repository);
-
-        // Verify the remote is actually configured for this repository.
-        var (remoteExit, remoteStdout, remoteStderr) = await TryRunGitAsync(clonePath, ["remote"], cancellationToken);
-        if (remoteExit != 0)
-            return $"git remote failed (exit {remoteExit}): {remoteStderr}";
-
-        var configuredRemotes = remoteStdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(r => r.Trim())
-            .ToList();
-        if (!configuredRemotes.Contains(remote))
-            return $"❌ Remote '{remote}' is not configured for repository '{repository}'.";
-
-        // Validate branch (if specified) to prevent option injection and refspec abuse.
-        if (!string.IsNullOrWhiteSpace(branch))
+        // The probe reads git's own output and touches the filesystem, so it runs INSIDE the tool's
+        // failure boundary: whatever it surfaces — the remote-listing stderr and the check-ref-format
+        // rejection included — is redacted before it can become tool output, and a failure that
+        // escapes (a process/filesystem error) is classified instead of thrown. Cancellation is
+        // never classified.
+        try
         {
-            if (branch.Contains("@{"))
-                return $"❌ Invalid branch '{branch}': branch names cannot contain '@{{'.";
+            var clonePath = _repoManager.GetClonePath(repository);
 
-            var (refExit, refStdout, refStderr) = await TryRunGitAsync(
-                clonePath, ["check-ref-format", "--branch", branch], cancellationToken);
-            var rejection = ValidateCheckRefFormatResult(branch, refExit, refStdout, refStderr);
-            if (rejection is not null)
-                return rejection;
+            // Verify the remote is actually configured for this repository.
+            var (remoteExit, remoteStdout, remoteStderr) = await TryRunGitAsync(clonePath, ["remote"], cancellationToken);
+            if (remoteExit != 0)
+                return RedactGitOutput($"git remote failed (exit {remoteExit}): {remoteStderr}");
+
+            var configuredRemotes = remoteStdout
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(r => r.Trim())
+                .ToList();
+            if (!configuredRemotes.Contains(remote))
+                return RedactGitOutput($"❌ Remote '{remote}' is not configured for repository '{repository}'.");
+
+            // Validate branch (if specified) to prevent option injection and refspec abuse.
+            if (!string.IsNullOrWhiteSpace(branch))
+            {
+                if (branch.Contains("@{"))
+                    return RedactGitOutput($"❌ Invalid branch '{branch}': branch names cannot contain '@{{'.");
+
+                var (refExit, refStdout, refStderr) = await TryRunGitAsync(
+                    clonePath, ["check-ref-format", "--branch", branch], cancellationToken);
+
+                // The pure validator returns RAW validation data; it becomes tool output HERE, so
+                // this is the boundary where its rejection is redacted.
+                var rejection = ValidateCheckRefFormatResult(branch, refExit, refStdout, refStderr);
+                if (rejection is not null)
+                    return RedactGitOutput(rejection);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // A LOCAL cancellation keeps its identity and propagates unchanged.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return DescribeGitToolFailure(ex);
         }
 
         // ORIGIN goes through the manager's LOCKED refresh+fetch so the stored OAuth admin
@@ -401,7 +534,7 @@ public sealed partial class Composer
             {
                 // The manager applies its own repo/branch validation. Surface a rejection as a
                 // tool ERROR STRING — this tool never throws for bad input.
-                return $"❌ {GitUrlRedactor.Redact(ex.Message)}";
+                return RedactGitOutput($"❌ {ex.Message}");
             }
             catch (OperationCanceledException ex)
             {
@@ -425,17 +558,18 @@ public sealed partial class Composer
                 // still tells the model what kind of failure occurred. The real
                 // BrainRepoManager already sanitizes what it throws; this boundary additionally
                 // contains any other IBrainRepoManager implementation.
-                return $"git fetch {remote} failed ({ex.GetType().Name}). "
-                     + "See the orchestrator logs for details.";
+                return RedactGitOutput(
+                    $"git fetch {remote} failed ({ex.GetType().Name}). "
+                    + "See the orchestrator logs for details.");
             }
 
             if (!fetch.Success)
-                return fetch.Error ?? $"git fetch {remote} failed.";
+                return RedactGitOutput(fetch.Error ?? $"git fetch {remote} failed.");
 
             if (string.IsNullOrWhiteSpace(fetch.Output))
-                return $"Fetched from {remote}. Use git_branch or git_show to inspect fetched refs.";
+                return RedactGitOutput($"Fetched from {remote}. Use git_branch or git_show to inspect fetched refs.");
 
-            return fetch.Output;
+            return RedactGitOutput(fetch.Output);
         }
 
         string[] args = !string.IsNullOrWhiteSpace(branch)
@@ -449,7 +583,7 @@ public sealed partial class Composer
             return result;
 
         if (string.IsNullOrWhiteSpace(result))
-            return $"Fetched from {remote}. Use git_branch or git_show to inspect fetched refs.";
+            return RedactGitOutput($"Fetched from {remote}. Use git_branch or git_show to inspect fetched refs.");
 
         return result;
     }
