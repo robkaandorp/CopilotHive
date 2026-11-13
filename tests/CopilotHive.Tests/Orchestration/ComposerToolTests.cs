@@ -24,7 +24,8 @@ namespace CopilotHive.Tests.Orchestration;
 /// Tests for the Composer's goal management tools.
 /// Uses an in-memory SQLite goal store to verify tool behaviour.
 /// </summary>
-public sealed class ComposerToolTests : IDisposable
+[Collection(GitOutputInventoryCollection.Name)]
+public sealed partial class ComposerToolTests : IDisposable
 {
     private readonly CopilotHiveDbContext _dbContext;
     private readonly GoalStore _store;

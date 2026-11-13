@@ -9,6 +9,7 @@ namespace CopilotHive.Tests;
 /// Every vector is pure text in, pure text out: no live credentials, no network, no timing. The
 /// Tester phase owns the adversarial/coverage battery; these pin the transform's contract.
 /// </summary>
+[Collection(GitOutputInventoryCollection.Name)]
 public sealed class GitToolOutputRedactorTests
 {
     // ── Null / empty / unchanged ─────────────────────────────────────────────
