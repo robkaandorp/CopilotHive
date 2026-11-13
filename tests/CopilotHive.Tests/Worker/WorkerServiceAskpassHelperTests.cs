@@ -23,8 +23,11 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
     /// <summary>An ELIGIBLE (HTTPS github.com:443) config repo URL — its own sanitized form.</summary>
     private const string EligibleUrl = "https://github.com/org/config-repo.git";
 
-    /// <summary>The env variable the helper script reads the credential from.</summary>
-    private const string CredentialEnvName = "GITHUB_CONFIG_REPO_TOKEN";
+    /// <summary>
+    /// The env variable the helper script reads the credential from — the SHARED contract's
+    /// config-repo variable, so a drift between script and injection fails here.
+    /// </summary>
+    private const string CredentialEnvName = WorkerGitAskpassHelper.ConfigRepoCredentialEnvName;
 
     /// <summary>The fixed principal a USERNAME prompt must be answered with.</summary>
     private const string UsernamePrincipal = "x-access-token";
@@ -37,15 +40,19 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
         UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
 
     /// <summary>
-    /// The EXACT expected helper-script text: git's <c>$1</c>-prompt protocol, TOKEN-FREE (the
-    /// password branch references the environment variable rather than embedding a secret).
+    /// The EXACT expected helper-script text: the SHARED destination-bound contract
+    /// (<see cref="WorkerGitAskpassHelper.ConfigRepoScriptContent"/>) — TOKEN-FREE (the password
+    /// branch references the environment variable rather than embedding a secret) and answering ONLY
+    /// an eligible effective HTTPS <c>github.com:443</c> destination.
     /// </summary>
-    private const string ExpectedScriptText =
-        "#!/bin/sh\n"
-        + "case \"$1\" in\n"
-        + "  *sername*) printf '%s' \"x-access-token\" ;;\n"
-        + "  *) printf '%s' \"$GITHUB_CONFIG_REPO_TOKEN\" ;;\n"
-        + "esac\n";
+    private static string ExpectedScriptText => WorkerGitAskpassHelper.ConfigRepoScriptContent;
+
+    /// <summary>The prompt an ELIGIBLE (github.com, implicit 443) challenge renders.</summary>
+    private const string EligibleGithubPasswordPrompt = "Password for 'https://github.com': ";
+
+    /// <summary>The prompt an ELIGIBLE explicit-<c>:443</c> challenge renders.</summary>
+    private const string EligibleGithubExplicitPortPasswordPrompt =
+        "Password for 'https://github.com:443': ";
 
     private readonly StringWriter _stdOut = new();
     private readonly StringWriter _stdErr = new();
@@ -288,10 +295,12 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
 
     /// <summary>
     /// LINUX-GATED — the ACTUAL written script, executed by <c>/bin/sh</c>, implements git's
-    /// <c>$1</c>-prompt protocol: a USERNAME prompt is answered with the fixed
-    /// <c>x-access-token</c> principal and a PASSWORD prompt with the value supplied through the
+    /// <c>$1</c>-prompt protocol through the SHARED destination-bound contract: a USERNAME prompt
+    /// naming an eligible destination is answered with the fixed <c>x-access-token</c> principal and
+    /// the matching PASSWORD prompt with the value supplied through the
     /// <c>GITHUB_CONFIG_REPO_TOKEN</c> CHILD environment variable — with no trailing newline in
-    /// either answer (git reads the raw stdout).
+    /// either answer (git reads the raw stdout) — while every OTHER destination and every ambiguous
+    /// prompt shape is REFUSED with empty output.
     /// </summary>
     /// <remarks>
     /// The script is run IN PLACE, while the seam still owns it, so this asserts the real bytes
@@ -313,7 +322,9 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
         string? helperDir = null;
         ShellAnswer? usernameAnswer = null;
         ShellAnswer? passwordAnswer = null;
-        ShellAnswer? emptyPromptAnswer = null;
+        ShellAnswer? explicitPortAnswer = null;
+        ShellAnswer? nonEligibleAnswer = null;
+        ShellAnswer? ambiguousAnswer = null;
 
         var runner = new CallbackAgentRunner(() =>
         {
@@ -321,8 +332,15 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
             var scriptPath = Path.Combine(helperDir, ScriptName);
 
             usernameAnswer = RunScript(scriptPath, "Username for 'https://github.com': ", token);
-            passwordAnswer = RunScript(scriptPath, "Password for 'https://github.com': ", token);
-            emptyPromptAnswer = RunScript(scriptPath, "", token);
+            passwordAnswer = RunScript(scriptPath, EligibleGithubPasswordPrompt, token);
+            explicitPortAnswer = RunScript(
+                scriptPath, EligibleGithubExplicitPortPasswordPrompt, token);
+
+            // NONELIGIBLE destinations and ambiguous shapes are refused — the host binding this
+            // slice exists for. Every one of them gets EMPTY output and a non-zero exit.
+            nonEligibleAnswer = RunScript(scriptPath, "Password for 'https://gitlab.com': ", token);
+            ambiguousAnswer = RunScript(
+                scriptPath, "Password for 'https://github.com/x@gitlab.com': ", token);
         });
 
         using var service = WorkerServiceConfigRepoHarness.BuildService(runner, ConfigRepoDir);
@@ -338,21 +356,30 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
 
         Assert.NotNull(usernameAnswer);
         Assert.NotNull(passwordAnswer);
-        Assert.NotNull(emptyPromptAnswer);
+        Assert.NotNull(explicitPortAnswer);
+        Assert.NotNull(nonEligibleAnswer);
+        Assert.NotNull(ambiguousAnswer);
 
-        // The USERNAME branch — the `*sername*` case, matching both "Username" and "username".
+        // The USERNAME branch answers the fixed, non-secret principal.
         Assert.Equal(0, usernameAnswer!.ExitCode);
         Assert.Equal(UsernamePrincipal, usernameAnswer.Stdout);
 
-        // The PASSWORD branch — the catch-all case, answering with the CHILD env value.
+        // The PASSWORD branch answers with the CHILD env value for the eligible destination …
         Assert.Equal(0, passwordAnswer!.ExitCode);
         Assert.Equal(token, passwordAnswer.Stdout);
+
+        // … including an EXPLICIT :443, which is eligible by the effective-port rule.
+        Assert.Equal(0, explicitPortAnswer!.ExitCode);
+        Assert.Equal(token, explicitPortAnswer.Stdout);
 
         // The two branches are genuinely different answers.
         Assert.NotEqual(usernameAnswer.Stdout, passwordAnswer.Stdout);
 
-        // Any other prompt (including an empty one) falls to the same catch-all.
-        Assert.Equal(token, emptyPromptAnswer!.Stdout);
+        // A NONELIGIBLE host and an AMBIGUOUS (forged-userinfo) shape are both REFUSED.
+        Assert.NotEqual(0, nonEligibleAnswer!.ExitCode);
+        Assert.Equal("", nonEligibleAnswer.Stdout);
+        Assert.NotEqual(0, ambiguousAnswer!.ExitCode);
+        Assert.Equal("", ambiguousAnswer.Stdout);
     }
 
     /// <summary>
@@ -379,7 +406,7 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
         {
             if (helperDir is null) return;
             var scriptPath = Path.Combine(helperDir, ScriptName);
-            passwordAnswer = RunScript(scriptPath, "Password for 'https://github.com': ", token: null);
+            passwordAnswer = RunScript(scriptPath, EligibleGithubPasswordPrompt, token: null);
             usernameAnswer = RunScript(scriptPath, "Username for 'https://github.com': ", token: null);
         });
 
@@ -454,7 +481,7 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
         Assert.DoesNotContain("ghp_", text, StringComparison.Ordinal);
 
         // The password branch references the ENVIRONMENT instead — the un-expanded form.
-        Assert.Contains("\"$" + CredentialEnvName + "\"", text, StringComparison.Ordinal);
+        Assert.Contains("\"${" + CredentialEnvName + "}\"", text, StringComparison.Ordinal);
 
         // The username branch carries the fixed, non-secret principal.
         Assert.Contains(UsernamePrincipal, text, StringComparison.Ordinal);
@@ -560,7 +587,7 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
         Assert.Equal(ExpectedScriptText, helperText);
         Assert.DoesNotContain(credential, helperText, StringComparison.Ordinal);
         Assert.DoesNotContain("ghp_", helperText, StringComparison.Ordinal);
-        Assert.Contains("\"$" + CredentialEnvName + "\"", helperText, StringComparison.Ordinal);
+        Assert.Contains("\"${" + CredentialEnvName + "}\"", helperText, StringComparison.Ordinal);
 
         // ── (3) The credential appears ONLY in GITHUB_CONFIG_REPO_TOKEN, on that ONE launch ──
         Assert.Equal([CredentialEnvName], clone.EnvNamesContaining(credential));
@@ -628,7 +655,7 @@ public sealed class WorkerServiceAskpassHelperTests : IDisposable
 
                 if (askpass is not null && File.Exists(askpass))
                 {
-                    passwordAnswer = RunScript(askpass, "Password for 'https://github.com': ", token);
+                    passwordAnswer = RunScript(askpass, EligibleGithubPasswordPrompt, token);
                     usernameAnswer = RunScript(askpass, "Username for 'https://github.com': ", token);
                 }
             }

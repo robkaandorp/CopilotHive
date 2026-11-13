@@ -37,12 +37,23 @@ public static class GitOperations
     /// <param name="url">Remote URL of the repository to clone.</param>
     /// <param name="targetDir">Local path where the repository will be cloned.</param>
     /// <param name="ct">Cancellation token.</param>
-    public static async Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct)
+    /// <param name="credentialTransport">
+    /// The operation-scoped credential transport, or <c>null</c> for an UNCREDENTIALED clone. When
+    /// non-null the credential reaches git ONLY through the child environment; the argument list
+    /// carries <paramref name="url"/> exactly as given, so a sanitized URL here means the cloned
+    /// repository's persisted <c>origin</c> is credential-free by construction.
+    /// </param>
+    public static async Task CloneRepositoryAsync(
+        string url,
+        string targetDir,
+        CancellationToken ct,
+        IWorkerGitCredentialTransport? credentialTransport = null)
     {
-        var (exitCode, _, stderr) = await RunGitCommandAsync(
+        var (exitCode, _, stderr) = await RunTokenizedGitCommandAsync(
             Path.GetDirectoryName(targetDir) ?? ".",
-            $"clone {url} {Path.GetFileName(targetDir)}",
-            ct);
+            ["clone", url, Path.GetFileName(targetDir)],
+            ct,
+            credentialTransport);
         if (exitCode != 0)
             throw Fail($"Failed to clone '{url}': {stderr.Trim()}");
 
@@ -124,8 +135,15 @@ public static class GitOperations
     /// <param name="branchName">Name of the new branch to create.</param>
     /// <param name="baseBranch">The branch to base the new branch on.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <param name="credentialTransport">
+    /// The operation-scoped credential transport used for the internal base-branch FETCH, or
+    /// <c>null</c> when the assignment carries no credential (the fetch then runs unauthenticated,
+    /// exactly as before). Only that one network launch releases the credential; every other command
+    /// here is LOCAL.
+    /// </param>
     public static async Task CreateBranchAsync(
-        string repoDir, string branchName, string baseBranch, CancellationToken ct)
+        string repoDir, string branchName, string baseBranch, CancellationToken ct,
+        IWorkerGitCredentialTransport? credentialTransport = null)
     {
         var (exitCode1, _, _) = await RunGitCommandAsync(repoDir, $"checkout {baseBranch}", ct);
         if (exitCode1 != 0)
@@ -142,8 +160,22 @@ public static class GitOperations
             }
 
             // Non-empty repo: base branch not available locally — try fetching from origin.
-            var (fetchExit, _, _) = await RunGitCommandAsync(
-                repoDir, $"fetch origin {baseBranch}", ct);
+            //
+            // ORIGIN REPAIR FIRST (the config seam's set-url precedent): a credentialed FETCH must not
+            // run against a pre-existing credential-bearing origin, so the persisted origin is repaired
+            // to the operation's sanitized URL BEFORE the network command. The repair is credential-free
+            // and REFUSES a mismatch (never rewriting a different destination); a failed repair aborts
+            // the fetch rather than proceeding unproven.
+            if (credentialTransport is not null)
+            {
+                var originError = await EnsureCredentialFreeOriginAsync(
+                    repoDir, credentialTransport.SanitizedOriginUrl, ct);
+                if (originError is not null)
+                    throw Fail(originError);
+            }
+
+            var (fetchExit, _, _) = await RunTokenizedGitCommandAsync(
+                repoDir, ["fetch", "origin", baseBranch], ct, credentialTransport);
 
             if (fetchExit == 0)
             {
@@ -183,15 +215,178 @@ public static class GitOperations
     }
 
     /// <summary>
+    /// THE PRE-NETWORK ORIGIN REPAIR for a credentialed launch: inspects the persisted <c>origin</c> and,
+    /// when it is the SAME repository but still carries a credential, rewrites it to
+    /// <paramref name="sanitizedOriginUrl"/> with <c>git remote set-url</c> — the config seam's
+    /// <c>EnsureOriginAsync</c> repair precedent, applied worker-side.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The repair is CREDENTIAL-FREE (its argument list carries only the sanitized URL) and it runs
+    /// BEFORE the network command, so a host-injected credential origin — e.g. one left by an earlier
+    /// build that still cloned with a tokenized URL — is gone before any transport happens, and stays
+    /// sanitized after a later failure or cancellation.
+    /// </para>
+    /// <para>
+    /// EQUIVALENCE IS REQUIRED. The origin is repaired only when it names the SAME destination as the
+    /// sanitized origin; a persisted origin that points at a DIFFERENT repository is a destination
+    /// mismatch, and it is REFUSED rather than silently rewritten — a working tree must never be
+    /// redirected at another repository, and a credential must never be released to a destination the
+    /// operation did not establish.
+    /// </para>
+    /// <para>
+    /// An ABSENT origin is ADDED with the sanitized URL; any other inspection failure cannot establish
+    /// the destination policy and is therefore a refusal.
+    /// </para>
+    /// </remarks>
+    /// <returns><c>null</c> when the origin is verified credential-free, or the fixed failure message.</returns>
+    private static async Task<string?> EnsureCredentialFreeOriginAsync(
+        string repoDir, string sanitizedOriginUrl, CancellationToken ct)
+    {
+        var (inspectExit, inspectStdout, _) = await RunGitCommandAsync(
+            repoDir, "remote get-url origin", ct);
+
+        if (inspectExit != 0)
+        {
+            // No origin at all: ADD the sanitized one. Any other inspection failure cannot establish the
+            // destination policy, so it is a refusal rather than a guess.
+            var (addExit, _, _) = await RunTokenizedGitCommandAsync(
+                repoDir, ["remote", "add", "origin", sanitizedOriginUrl], ct);
+            return addExit == 0 ? null : OriginNotRepairable;
+        }
+
+        var origin = inspectStdout.Trim();
+        if (origin.Length == 0)
+            return OriginNotRepairable;
+
+        // EQUIVALENCE over the CREDENTIAL-FREE forms. A persisted origin that names a different
+        // repository is a mismatch and is REFUSED — never rewritten — so a working tree can never be
+        // redirected at another destination and no credential is released to one.
+        if (!IsSameEligibleDestination(origin, sanitizedOriginUrl))
+            return OriginMismatch;
+
+        // Already credential-free: leave it exactly as it is.
+        if (string.Equals(GitUrlRedactor.Redact(origin), origin, StringComparison.Ordinal))
+            return null;
+
+        var (setExit, _, _) = await RunTokenizedGitCommandAsync(
+            repoDir, ["remote", "set-url", "origin", sanitizedOriginUrl], ct);
+        return setExit == 0 ? null : OriginNotRepairable;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="origin"/> names the SAME eligible destination as
+    /// <paramref name="sanitizedOriginUrl"/>, IGNORING any credential in either: equal scheme
+    /// (case-insensitively), equal host (case-insensitively), equal effective port and equal path
+    /// (case-SENSITIVELY, with one trailing <c>.git</c> and trailing separators ignored). Query and
+    /// fragment must be absent from both.
+    /// </summary>
+    private static bool IsSameEligibleDestination(string origin, string sanitizedOriginUrl)
+    {
+        var credentialFree = GitUrlRedactor.Redact(origin);
+
+        if (!Uri.TryCreate(credentialFree, UriKind.Absolute, out var originUri))
+            return false;
+
+        if (!Uri.TryCreate(sanitizedOriginUrl, UriKind.Absolute, out var targetUri))
+            return false;
+
+        if (!string.Equals(originUri.Scheme, targetUri.Scheme, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!string.Equals(originUri.Host, targetUri.Host, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (originUri.Port != targetUri.Port)
+            return false;
+
+        if (!string.IsNullOrEmpty(originUri.Query) || !string.IsNullOrEmpty(originUri.Fragment))
+            return false;
+
+        return string.Equals(
+            NormalizeDestinationPath(originUri), NormalizeDestinationPath(targetUri), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The path comparison form for <see cref="IsSameEligibleDestination"/>: one trailing <c>.git</c>
+    /// (case-SENSITIVELY) and every trailing <c>/</c> removed.
+    /// </summary>
+    private static string NormalizeDestinationPath(Uri uri)
+    {
+        var path = uri.AbsolutePath.TrimEnd('/');
+        if (path.EndsWith(".git", StringComparison.Ordinal))
+            path = path[..^4];
+
+        return path;
+    }
+
+    /// <summary>The fixed refusal for an origin that is not equivalent to the operation's destination.</summary>
+    private const string OriginMismatch =
+        "Refusing the credentialed git operation: the repository origin is not the credential-free "
+        + "destination this operation established.";
+
+    /// <summary>The fixed refusal for an origin that could not be inspected or repaired.</summary>
+    private const string OriginNotRepairable =
+        "Refusing the credentialed git operation: the repository origin could not be verified or "
+        + "repaired to the credential-free URL.";
+
+    /// <summary>
     /// Force-pushes the specified branch to the remote origin.
     /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="branch">Name of the branch to push.</param>
     /// <param name="ct">Cancellation token.</param>
-    public static async Task PushBranchAsync(string repoDir, string branch, CancellationToken ct)
+    public static Task PushBranchAsync(string repoDir, string branch, CancellationToken ct) =>
+        PushBranchCoreAsync(repoDir, branch, ct, credentialTransport: null);
+
+    /// <summary>
+    /// Force-pushes the specified branch to the remote origin, releasing the operation's credential
+    /// through the git CHILD ENVIRONMENT only.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Origin repair FIRST.</b> Before the credentialed push runs, the persisted <c>origin</c> is
+    /// verified and — when it names the SAME destination but still carries a credential — rewritten to
+    /// <see cref="IWorkerGitCredentialTransport.SanitizedOriginUrl"/> with <c>git remote set-url</c>, the
+    /// config seam's precedent. That is what removes a credential a PREVIOUS build left in
+    /// <c>.git/config</c>, so no host-injected credential origin survives into a network operation. A
+    /// push that then fails or is cancelled leaves the SANITIZED origin in place: a stale tokenized
+    /// origin is never restored, because the credential never needed to be in it.
+    /// </para>
+    /// <para>
+    /// A persisted origin that names a DIFFERENT destination is REFUSED before any network command and
+    /// is never rewritten. Every repair/inspection subprocess is CREDENTIAL-FREE: its argument list
+    /// carries only the sanitized URL.
+    /// </para>
+    /// </remarks>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="branch">Name of the branch to push.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="credentialTransport">
+    /// The operation-scoped credential transport, or <c>null</c> for an uncredentialed push.
+    /// </param>
+    public static Task PushBranchAsync(
+        string repoDir, string branch, CancellationToken ct,
+        IWorkerGitCredentialTransport? credentialTransport) =>
+        PushBranchCoreAsync(repoDir, branch, ct, credentialTransport);
+
+    private static async Task PushBranchCoreAsync(
+        string repoDir, string branch, CancellationToken ct,
+        IWorkerGitCredentialTransport? credentialTransport)
     {
-        var (exitCode, _, stderr) = await RunGitCommandAsync(repoDir, $"push origin {branch} --force", ct);
+        if (credentialTransport is not null)
+        {
+            // Equivalence-guarded repair: a credential-bearing origin for THIS destination is rewritten
+            // to the sanitized URL; a DIFFERENT destination is refused, never rewritten.
+            var originError = await EnsureCredentialFreeOriginAsync(
+                repoDir, credentialTransport.SanitizedOriginUrl, ct);
+            if (originError is not null)
+                throw Fail(originError);
+        }
+
+        var (exitCode, _, stderr) = await RunTokenizedGitCommandAsync(
+            repoDir, ["push", "origin", branch, "--force"], ct, credentialTransport);
         if (exitCode != 0)
             throw Fail($"Failed to push branch '{branch}': {stderr.Trim()}");
     }
@@ -411,7 +606,7 @@ public static class GitOperations
     /// Snapshots the CURRENT process environment without mutating it, narrowing the non-generic
     /// bound collection down to string keys and <c>string?</c> values.
     /// </summary>
-    private static IReadOnlyDictionary<string, string?> SnapshotCurrentProcessEnv()
+    private static Dictionary<string, string?> SnapshotCurrentProcessEnv()
     {
         var snapshot = new Dictionary<string, string?>();
         foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
@@ -437,8 +632,89 @@ public static class GitOperations
     }
 
     /// <summary>
+    /// Run a TOKENIZED git command — one element per argument, no quoting, nothing re-parsed — and
+    /// return (exitCode, stdout, stderr).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the ONLY launch form that can carry a credential. When
+    /// <paramref name="credentialTransport"/> is non-null the child environment is the transport's
+    /// COMPLETE environment: every inherited credential channel scrubbed, the operation-scoped
+    /// askpass wiring installed, and the credential present in a CHILD-ONLY variable. The argument
+    /// list is never touched by the credential, and nothing is added to the worker's own environment.
+    /// </para>
+    /// <para>
+    /// With a <c>null</c> transport the launch is CREDENTIAL-FREE but NOT given the legacy
+    /// five-name scrub: its environment is <see cref="BuildCredentialFreeChildEnv"/>, i.e. the SAME
+    /// suppression envelope as the authenticated launch minus any credential — every inherited
+    /// credential channel scrubbed (including <c>SSH_ASKPASS</c> and the helper's own credential
+    /// variables), <c>GIT_TERMINAL_PROMPT=0</c>, an empty <c>credential.helper</c> reset appended
+    /// after inherited indexed entries, the inherited <c>GIT_CONFIG_PARAMETERS</c> replaced, and
+    /// additionally an empty <c>core.askPass</c> reset in both of those channels (a credential-free
+    /// launch has no <c>GIT_ASKPASS</c> override to outrank a configured askpass program).
+    /// </para>
+    /// <para>
+    /// The tokenized form hands its environment VERBATIM to
+    /// <see cref="CreateProcessStartInfo"/>. Only the LEGACY opaque-string
+    /// <see cref="RunGitCommandAsync"/> form (local, non-network commands) still goes through the
+    /// five-name <see cref="SanitizeChildEnv"/> scrub plus <c>GIT_TERMINAL_PROMPT=0</c>.
+    /// </para>
+    /// </remarks>
+    /// <param name="workDir">The working directory for the child process.</param>
+    /// <param name="tokenizedArgs">One element per git argument, in order.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="credentialTransport">
+    /// The credential transport, or <c>null</c> for a credential-free launch.
+    /// </param>
+    public static async Task<(int ExitCode, string Stdout, string Stderr)> RunTokenizedGitCommandAsync(
+        string workDir,
+        IReadOnlyList<string> tokenizedArgs,
+        CancellationToken ct,
+        IWorkerGitCredentialTransport? credentialTransport = null)
+    {
+        ArgumentNullException.ThrowIfNull(tokenizedArgs);
+
+        var request = credentialTransport is null
+            ? new GitProcessRequest(
+                "git", Array.Empty<string>(), workDir, BuildCredentialFreeChildEnv(),
+                TokenizedArgs: tokenizedArgs)
+            : new GitProcessRequest(
+                "git", Array.Empty<string>(), workDir,
+                credentialTransport.BuildChildEnvironment(), TokenizedArgs: tokenizedArgs);
+
+        var result = await ExecuteProcessAsync(request, ct);
+        return (result.ExitCode, result.Stdout, result.Stderr);
+    }
+
+    /// <summary>
+    /// The credential-FREE child environment: the SAME suppression envelope as the authenticated
+    /// builder (<see cref="WorkerGitAskpassHelper.BuildCredentialChildEnvironment"/>) with NO
+    /// credential injected and NO <c>GIT_ASKPASS</c> installed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It delegates to the shared core rather than to the legacy five-name
+    /// <see cref="SanitizeChildEnv"/> scrub, because a credential-free launch must carry strictly
+    /// FEWER inherited channels than before, not a weaker scrub. The legacy scrub omits
+    /// <c>SSH_ASKPASS</c> and this helper's own credential variables, and it neither resets the
+    /// inherited <c>credential.helper</c> list nor replaces the inherited legacy
+    /// <c>GIT_CONFIG_PARAMETERS</c> — so an ambient helper (global/config-file, indexed
+    /// <c>GIT_CONFIG_COUNT</c>, or <c>GIT_CONFIG_PARAMETERS</c>) could still be SELECTED by an
+    /// unauthenticated git challenge and could release its own ambient credential to the challenged
+    /// destination. Delegating makes the two launches impossible to drift apart.
+    /// </para>
+    /// <para>
+    /// <c>GIT_TERMINAL_PROMPT=0</c> and <c>GCM_INTERACTIVE=never</c> are set; no
+    /// <c>credential.interactive</c> is written anywhere.
+    /// </para>
+    /// </remarks>
+    internal static IReadOnlyDictionary<string, string?> BuildCredentialFreeChildEnv() =>
+        WorkerGitAskpassHelper.BuildCredentialFreeChildEnvironment();
+
+    /// <summary>
     /// The SINGLE launch implementation for git processes. Both the legacy opaque-argument path
-    /// (<see cref="RunGitCommandAsync"/>) and the tokenized path route through here.
+    /// (<see cref="RunGitCommandAsync"/>) and the tokenized path
+    /// (<see cref="RunTokenizedGitCommandAsync"/>) route through here.
     /// </summary>
     /// <remarks>
     /// <para>

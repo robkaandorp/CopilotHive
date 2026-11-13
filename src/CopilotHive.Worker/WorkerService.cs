@@ -631,17 +631,14 @@ public sealed class WorkerService(
     private const string AskpassScriptName = "askpass.sh";
 
     /// <summary>
-    /// The EXACT askpass helper script. It implements git's <c>$1</c>-prompt protocol and is
-    /// TOKEN-FREE: a username prompt (matching <c>*sername*</c>) answers with the fixed
-    /// <c>x-access-token</c> principal, every other prompt reads the credential from the
-    /// environment variable the seam injects for the final, credential-carrying launch.
+    /// The EXACT config-repo askpass helper script: <see cref="WorkerGitAskpassHelper.ConfigRepoScriptContent"/>,
+    /// i.e. the SAME destination-bound contract the target-repository transport uses, with the
+    /// credential read from the config seam's own CHILD-ONLY variable. It is TOKEN-FREE, answers
+    /// ONLY a challenge naming an eligible effective HTTPS <c>github.com:443</c> destination, and
+    /// fails closed for every other host, scheme, port and ambiguous prompt shape — so the config
+    /// seam can no longer hand its credential to whatever host git asks about.
     /// </summary>
-    private const string AskpassScriptContent =
-        "#!/bin/sh\n"
-        + "case \"$1\" in\n"
-        + "  *sername*) printf '%s' \"x-access-token\" ;;\n"
-        + "  *) printf '%s' \"$GITHUB_CONFIG_REPO_TOKEN\" ;;\n"
-        + "esac\n";
+    internal static string AskpassScriptContent => WorkerGitAskpassHelper.ConfigRepoScriptContent;
 
     #region Service lifecycle guard (Idle / Running / Disposed)
 

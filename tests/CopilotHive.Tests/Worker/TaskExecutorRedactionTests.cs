@@ -10,11 +10,13 @@ namespace CopilotHive.Tests.Worker;
 /// <summary>
 /// Flow B of the credential-URL redaction goal: the worker's task repositories.
 /// <para>
-/// <see cref="TaskExecutor"/> logs <c>repo.Url</c> before cloning, renders several git exception
-/// messages into logs, and STORES push failures into the task result that travels back to the
-/// orchestrator. A fake <see cref="IGitOperations"/> feeds credential-bearing text into each of
-/// those boundaries and asserts (a) the RAW url still reaches the git layer and (b) no captured
-/// log line or task-result field carries the credential. No process, no network, no timing.
+/// <see cref="TaskExecutor"/> SPLITS each assignment URL before any process launch — the credential
+/// never reaches a git argv, only a child-only environment variable — and it logs the credential-free
+/// form, renders several git exception messages into logs, and STORES push failures into the task
+/// result that travels back to the orchestrator. A fake <see cref="IGitOperations"/> records exactly
+/// what each boundary received, and every assertion checks (a) no credential-bearing URL reached the
+/// git layer and (b) no captured log line or task-result field carries the credential. No process, no
+/// network, no timing.
 /// </para>
 /// </summary>
 [Collection("ConsoleOutput")]
@@ -56,17 +58,28 @@ public sealed class TaskExecutorRedactionTests : IDisposable
     // ── Fakes ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// A fully scriptable <see cref="IGitOperations"/> that records what it was handed.
+    /// A fully scriptable <see cref="IGitOperations"/> that records what it was handed, including the
+    /// operation-scoped credential transport of every credentialed launch.
     /// </summary>
     private sealed class FakeGit : IGitOperations
     {
-        /// <summary>Every URL passed to <see cref="CloneRepositoryAsync"/>, in order.</summary>
+        /// <summary>Every URL passed to <see cref="CloneRepositoryAsync(string, string, CancellationToken)"/>, in order.</summary>
         public List<string> ClonedUrls { get; } = [];
 
-        /// <summary>Exception thrown by <see cref="CheckoutBranchAsync"/>, or null.</summary>
+        /// <summary>
+        /// The credential transport handed to each credentialed clone, in order — <c>null</c> entries
+        /// are real values too (an uncredentialed launch records a null), so the list length matches
+        /// <see cref="ClonedUrls"/>.
+        /// </summary>
+        public List<IWorkerGitCredentialTransport?> CloneTransports { get; } = [];
+
+        /// <summary>The credential transport handed to each push, in order.</summary>
+        public List<IWorkerGitCredentialTransport?> PushTransports { get; } = [];
+
+        /// <summary>Exception thrown by <see cref="CheckoutBranchAsync(string, string, CancellationToken)"/>, or null.</summary>
         public Exception? CheckoutException { get; set; }
 
-        /// <summary>Exception thrown by <see cref="PushBranchAsync"/>, or null.</summary>
+        /// <summary>Exception thrown by <see cref="PushBranchAsync(string, string, CancellationToken, IWorkerGitCredentialTransport?)"/>, or null.</summary>
         public Exception? PushException { get; set; }
 
         /// <summary>Number of files reported as changed by <see cref="GetGitStatusAsync"/>.</summary>
@@ -82,8 +95,14 @@ public sealed class TaskExecutorRedactionTests : IDisposable
         public List<string> GitCommands { get; } = [];
 
         public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct)
+            => CloneRepositoryAsync(url, targetDir, ct, credentialTransport: null);
+
+        public Task CloneRepositoryAsync(
+            string url, string targetDir, CancellationToken ct,
+            IWorkerGitCredentialTransport? credentialTransport)
         {
             ClonedUrls.Add(url);
+            CloneTransports.Add(credentialTransport);
             return Task.CompletedTask;
         }
 
@@ -91,10 +110,23 @@ public sealed class TaskExecutorRedactionTests : IDisposable
             => CheckoutException is { } ex ? throw ex : Task.CompletedTask;
 
         public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct)
+            => CreateBranchAsync(repoDir, branchName, baseBranch, ct, credentialTransport: null);
+
+        public Task CreateBranchAsync(
+            string repoDir, string branchName, string baseBranch, CancellationToken ct,
+            IWorkerGitCredentialTransport? credentialTransport)
             => Task.CompletedTask;
 
         public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct)
-            => PushException is { } ex ? throw ex : Task.CompletedTask;
+            => PushBranchAsync(repoDir, branch, ct, credentialTransport: null);
+
+        public Task PushBranchAsync(
+            string repoDir, string branch, CancellationToken ct,
+            IWorkerGitCredentialTransport? credentialTransport)
+        {
+            PushTransports.Add(credentialTransport);
+            return PushException is { } ex ? throw ex : Task.CompletedTask;
+        }
 
         public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
             => Task.FromResult(new GitChangeSummary
@@ -186,11 +218,14 @@ public sealed class TaskExecutorRedactionTests : IDisposable
     }
 
     /// <summary>
-    /// Redaction is a LOG concern only — the git layer still receives the raw credential URL, so
-    /// cloning keeps working.
+    /// THE CREDENTIAL SPLIT — redaction is no longer only a LOG concern. The raw assignment URL carries
+    /// the credential, but the executor splits it BEFORE any process launch: the git layer receives the
+    /// credential-FREE URL (so the credential is never on an argv, and the cloned repository's persisted
+    /// origin is credential-free by construction), and the credential travels through the
+    /// operation-scoped transport instead.
     /// </summary>
     [Fact]
-    public async Task ExecuteAsync_ClonesWithTheRawCredentialUrl()
+    public async Task ExecuteAsync_ClonesWithTheSanitizedUrl_NeverTheRawCredentialUrl()
     {
         var git = new FakeGit();
         var executor = new TaskExecutor(new StubAgentRunner(), gitOperations: git);
@@ -198,7 +233,17 @@ public sealed class TaskExecutorRedactionTests : IDisposable
         await executor.ExecuteAsync(
             BuildTask(CredentialUrl), TestContext.Current.CancellationToken);
 
-        Assert.Equal(CredentialUrl, Assert.Single(git.ClonedUrls));
+        Assert.Equal(RedactedUrl, Assert.Single(git.ClonedUrls));
+        Assert.DoesNotContain(Token, git.ClonedUrls[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("x-access-token", git.ClonedUrls[0], StringComparison.Ordinal);
+
+        // The credential did NOT disappear: it was handed to the transport, whose child environment is
+        // the only place it may appear.
+        var transport = Assert.Single(git.CloneTransports);
+        Assert.NotNull(transport);
+        Assert.Equal(RedactedUrl, transport!.SanitizedOriginUrl);
+        Assert.Equal(
+            Token, transport.BuildChildEnvironment()[WorkerGitAskpassHelper.CredentialEnvName]);
     }
 
     [Fact]
@@ -354,6 +399,10 @@ public sealed class TaskExecutorRedactionTests : IDisposable
     private sealed class ThrowingCloneGit(Exception failure) : IGitOperations
     {
         public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct)
+            => throw failure;
+        public Task CloneRepositoryAsync(
+            string url, string targetDir, CancellationToken ct,
+            IWorkerGitCredentialTransport? credentialTransport)
             => throw failure;
         public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct)
             => Task.CompletedTask;

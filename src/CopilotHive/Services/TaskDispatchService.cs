@@ -1274,9 +1274,21 @@ internal sealed class TaskDispatchService
     /// injecting <paramref name="credential"/> into every eligible one.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// REBUILD, NEVER APPEND: the injection always starts from
     /// <see cref="RepositoryConfig.Url"/>, so a credential is REPLACED rather than accumulated,
     /// and the configuration objects themselves are never written to.
+    /// </para>
+    /// <para>
+    /// <b>The credential-bearing URL is the HANDOFF, never the transport.</b> The assignment message
+    /// still carries the injected credential so the wire contract and in-memory handoff stay
+    /// compatible, but the WORKER is what ends the URL transport: <c>TaskExecutor</c> splits each URL
+    /// before it launches any process — git then receives the credential-free URL on its argv (so the
+    /// cloned repository's persisted <c>origin</c> is credential-free by construction) and the
+    /// credential only in a CHILD-ONLY environment variable consumed by an operation-scoped askpass
+    /// helper. Nothing is cached statically, and the credential is released only to an effective
+    /// HTTPS <c>github.com:443</c> destination.
+    /// </para>
     /// </remarks>
     /// <param name="repositoryConfigs">The resolved configuration entries.</param>
     /// <param name="credential">The assignment credential, or <c>null</c> when none resolved.</param>

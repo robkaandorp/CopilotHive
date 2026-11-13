@@ -49,24 +49,19 @@ public sealed class TaskExecutor(
     /// <para>
     /// <b>The askpass content contract.</b> For an eligible transport command the seam injects
     /// <c>GITHUB_CONFIG_REPO_TOKEN</c> plus <c>GIT_ASKPASS</c> (pointing at the credential
-    /// helper path supplied to its constructor). The helper script implements git's
-    /// <c>$1</c>-prompt protocol and is TOKEN-FREE — the credential is read from the
-    /// environment at invocation time, so the script itself may be written to disk with no
-    /// secret in it:
+    /// helper path supplied to its constructor). The helper script is
+    /// <see cref="WorkerGitAskpassHelper.ConfigRepoScriptContent"/> — the SAME destination-bound,
+    /// TOKEN-FREE contract the target-repository transport runs (see
+    /// <see cref="WorkerGitAskpassHelper.ScriptContent"/>), parameterized only by the child-only
+    /// variable that carries the credential. It therefore answers ONLY a prompt naming an eligible
+    /// effective HTTPS <c>github.com:443</c> destination and fails closed for every other host,
+    /// scheme, port and ambiguous shape; the credential is read from the environment at invocation
+    /// time, so the script itself is written to disk with no secret in it.
     /// </para>
-    /// <code>
-    /// #!/bin/sh
-    /// case "$1" in
-    ///   *sername*) printf '%s' "x-access-token" ;;
-    ///   *) printf '%s' "$GITHUB_CONFIG_REPO_TOKEN" ;;
-    /// esac
-    /// </code>
     /// <para>
-    /// git invokes the helper once per prompt, passing the prompt text as <c>$1</c>: a
-    /// username prompt (matching <c>*sername*</c>) answers with the fixed
-    /// <c>x-access-token</c> principal, and every other prompt (the password) answers with the
-    /// environment-supplied token. This contract is DOCUMENTED here only — this slice neither
-    /// writes the script nor provisions a placeholder for it.
+    /// The script text is deliberately NOT reproduced here: <see cref="WorkerGitAskpassHelper"/>
+    /// is its single documented home, so this comment cannot drift out of date the way an inlined
+    /// copy would.
     /// </para>
     /// </remarks>
     private readonly ConfigRepoGitOperations? _configRepoSeam;
@@ -334,6 +329,14 @@ public sealed class TaskExecutor(
             await LoadSessionAsync(task.SessionId, ct);
         }
 
+        // THE PER-ASSIGNMENT CREDENTIAL TRANSPORTS. Filled by the credential split below and
+        // disposed in the `finally` at the end of this method on success, failure AND cancellation.
+        // They are LOCAL to this execution: no static cache, no shared mutable credential state, so
+        // two concurrent assignments can never observe each other's credential, and no helper
+        // directory outlives the assignment.
+        var credentialTransports =
+            new Dictionary<string, WorkerGitCredentialTransport?>(StringComparer.Ordinal);
+
         try
         {
             var isImprover = task.Role == WorkerRole.Improver;
@@ -352,11 +355,33 @@ public sealed class TaskExecutor(
                     if (Directory.Exists(targetDir))
                         await _git.ForceDeleteDirectoryAsync(targetDir);
 
-                    // The clone URL carries credentials (the orchestrator injects a token into it),
-                    // so the log gets the credential-free form. The RAW url is still what is handed
-                    // to the git clone below — redaction is a log-construction concern only.
-                    _log.Info($"Cloning {repo.Name} from {GitUrlRedactor.Redact(repo.Url)}");
-                    await _git.CloneRepositoryAsync(repo.Url, targetDir, ct);
+                    // THE CREDENTIAL SPLIT — BEFORE any process launch. The assignment may still
+                    // carry the credential inside TargetRepository.Url (the wire/in-memory handoff is
+                    // deliberately unchanged), so each repository is split here into its
+                    // credential-free URL and an operation-scoped transport. From this point on no
+                    // git launch receives a credential-bearing URL: git gets the sanitized URL on its
+                    // argv (so the cloned repository's persisted origin is credential-free by
+                    // construction) and the credential only in a CHILD-ONLY environment variable.
+                    var (sanitizedUrl, credential, withheld) = TargetRepositoryCredential.Split(repo.Url);
+
+                    // A credential that was PRESENT but whose destination is not eligible is
+                    // WITHHELD: the URL is still sanitized and the launch still runs, unauthenticated
+                    // — so a local or non-GitHub repository stays usable and an authenticated one
+                    // fails with git's own (sanitized) error instead of releasing a token to a
+                    // destination that was never proven eligible.
+                    if (withheld)
+                    {
+                        _log.Warn(
+                            $"Withholding the repository credential for {repo.Name}: the destination is "
+                            + "not an eligible HTTPS github.com:443 URL. The operation runs unauthenticated.");
+                    }
+
+                    credentialTransports[repo.Name] =
+                        WorkerGitCredentialTransport.Create(credential, sanitizedUrl);
+
+                    _log.Info($"Cloning {repo.Name} from {sanitizedUrl}");
+                    await _git.CloneRepositoryAsync(
+                        sanitizedUrl, targetDir, ct, credentialTransports[repo.Name]);
 
                     // Handle branch operations
                     if (task.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
@@ -369,7 +394,9 @@ public sealed class TaskExecutor(
                         {
                             case BranchAction.Create:
                                 _log.Info($"Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
-                                await _git.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
+                                await _git.CreateBranchAsync(
+                                    targetDir, branchInfo.FeatureBranch, baseBranch, ct,
+                                    credentialTransports[repo.Name]);
                                 break;
 
                             case BranchAction.Checkout:
@@ -381,7 +408,9 @@ public sealed class TaskExecutor(
                                 catch (GitOperationException ex)
                                 {
                                     _log.Warn($"Checkout failed ({GitUrlRedactor.Redact(ex.Message)}), creating branch from {baseBranch}");
-                                    await _git.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
+                                    await _git.CreateBranchAsync(
+                                        targetDir, branchInfo.FeatureBranch, baseBranch, ct,
+                                        credentialTransports[repo.Name]);
                                 }
                                 break;
 
@@ -392,7 +421,18 @@ public sealed class TaskExecutor(
                         }
                     }
 
-                    repoDirectories.Add((repo, targetDir));
+                    // The collection keeps the SANITIZED repository, so no credential-bearing URL is
+                    // reachable from anything downstream of the split (only the transport's child
+                    // environment ever holds the secret).
+                    repoDirectories.Add((
+                        new TargetRepository
+                        {
+                            Name = repo.Name,
+                            Url = sanitizedUrl,
+                            DefaultBranch = repo.DefaultBranch,
+                            SpecificInstructions = repo.SpecificInstructions,
+                        },
+                        targetDir));
                 }
             }
             else
@@ -712,7 +752,12 @@ public sealed class TaskExecutor(
                     {
                         try
                         {
-                            await _git.PushBranchAsync(dir, bi.FeatureBranch, ct);
+                            // The credential travels ONLY through the transport's child environment.
+                            // A credential-free build (no transport) is an uncredentialed push, and a
+                            // withheld credential means this push runs unauthenticated — never with a
+                            // tokenized URL.
+                            credentialTransports.TryGetValue(repo.Name, out var pushTransport);
+                            await _git.PushBranchAsync(dir, bi.FeatureBranch, ct, pushTransport);
                             pushed = true;
                             _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
                         }
@@ -1001,6 +1046,16 @@ public sealed class TaskExecutor(
                     Issues = [safe],
                 },
             };
+        }
+        finally
+        {
+            // THE CREDENTIAL-TRANSPORT CLEANUP — on success, failure AND cancellation. Each transport
+            // deletes its own token-free helper directory (idempotent, best-effort, never throws), so
+            // no persistent helper is left behind and no global git configuration was ever written.
+            // The transports are disposed here rather than at each git call site because the helper
+            // serves the WHOLE assignment: the clone, the base-branch fetch and the push.
+            foreach (var transport in credentialTransports.Values)
+                transport?.Dispose();
         }
     }
 

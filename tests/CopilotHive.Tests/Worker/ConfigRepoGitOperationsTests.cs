@@ -234,21 +234,25 @@ public sealed class ConfigRepoGitOperationsTests
     }
 
     /// <summary>
-    /// Asserts an INJECTED request's environment equals the scrubbed inherited snapshot plus
-    /// <c>GIT_TERMINAL_PROMPT=0</c> plus EXACTLY the two post-scrub exceptions
-    /// (<c>GITHUB_CONFIG_REPO_TOKEN</c> and <c>GIT_ASKPASS</c>) with the expected values —
-    /// nothing else. The counted equality proves the injection is additive and complete: the
-    /// two variables were re-added AFTER the scrub (they are both in the scrubbed set) and no
-    /// other inherited credential variable survived.
+    /// Asserts an INJECTED request's environment equals the SAME complete operation-scoped
+    /// authenticated environment the target-repository transport builds
+    /// (<see cref="WorkerGitAskpassHelper.BuildCredentialChildEnvironment"/>): the scrubbed inherited
+    /// snapshot, <c>GIT_TERMINAL_PROMPT=0</c>, <c>GCM_INTERACTIVE=never</c>, the operation-scoped
+    /// <c>GIT_ASKPASS</c>, the credential in <c>GITHUB_CONFIG_REPO_TOKEN</c>, and the
+    /// inherited-helper suppression in BOTH precedence channels — nothing else.
     /// </summary>
+    /// <remarks>
+    /// The counted equality proves the injection is additive and complete: the credential variables
+    /// were re-added AFTER the scrub (both are in the scrubbed set), no other inherited credential
+    /// variable survived, and NO inherited <c>credential.helper</c> / askpass channel can select or
+    /// persist the credential.
+    /// </remarks>
     private static void AssertChildEnvWithCredential(
         GitProcessRequest request, string credential, string helperPath)
     {
-        var expected = new Dictionary<string, string?>(ExpectedChildEnv())
-        {
-            ["GITHUB_CONFIG_REPO_TOKEN"] = credential,
-            ["GIT_ASKPASS"] = helperPath,
-        };
+        var expected = new Dictionary<string, string?>(
+            WorkerGitAskpassHelper.BuildCredentialChildEnvironment(
+                helperPath, WorkerGitAskpassHelper.ConfigRepoCredentialEnvName, credential));
 
         Assert.Equal(expected.Count, request.Env.Count);
         foreach (var (key, value) in expected)
@@ -257,6 +261,16 @@ public sealed class ConfigRepoGitOperationsTests
         Assert.False(request.Env.ContainsKey("GH_TOKEN"));
         Assert.False(request.Env.ContainsKey("GITHUB_TOKEN"));
         Assert.Equal("0", request.Env["GIT_TERMINAL_PROMPT"]);
+
+        // The credential-carrying launch is the ONLY one that carries the suppression, and the
+        // suppression is what disables an inherited helper from selecting OR persisting it.
+        Assert.Equal(credential, request.Env[WorkerGitAskpassHelper.ConfigRepoCredentialEnvName]);
+        Assert.Equal(helperPath, request.Env["GIT_ASKPASS"]);
+        Assert.Equal(WorkerGitAskpassHelper.GcmInteractiveNever, request.Env["GCM_INTERACTIVE"]);
+        Assert.Equal("'credential.helper='", request.Env["GIT_CONFIG_PARAMETERS"]);
+        Assert.Equal("1", request.Env["GIT_CONFIG_COUNT"]);
+        Assert.Equal("credential.helper", request.Env["GIT_CONFIG_KEY_0"]);
+        Assert.Equal(string.Empty, request.Env["GIT_CONFIG_VALUE_0"]);
     }
 
     /// <summary>
