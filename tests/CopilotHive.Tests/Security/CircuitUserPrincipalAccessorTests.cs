@@ -1,9 +1,17 @@
 using System.Security.Claims;
 
+using System.Data.Common;
+
+using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Security;
 
@@ -340,5 +348,274 @@ public sealed class CircuitUserPrincipalAccessorTests
             () => new CircuitUserPrincipalAccessor(null!, new HivePolicy()));
         Assert.Throws<ArgumentNullException>(
             () => new CircuitUserPrincipalAccessor(directory.AuthEnabledResolver(), null!));
+    }
+
+    // ── Sign-out / replacement DURING a real directory resolution ────────────────────────────
+
+    /// <summary>
+    /// A REAL directory (SQLite in-memory + the production <see cref="UserService"/>/resolver/accessor)
+    /// whose FIRST armed <c>users</c> read is HELD inside an EF command interceptor
+    /// (<c>ReaderExecutingAsync</c>). The hold is therefore genuinely mid-directory-read: the resolver
+    /// has started its lookup, and has not yet produced a resolution. <see cref="Arrived"/> completes
+    /// only when the read is parked on the release gate; nothing is timing based.
+    /// </summary>
+    private sealed class HeldDirectoryRead : DbCommandInterceptor, IDisposable
+    {
+        private readonly SqliteConnection _connection = new("Data Source=:memory:");
+        private TaskCompletionSource _arrived = NewGate();
+        private TaskCompletionSource _release = NewGate();
+        private int _armed;
+
+        private static TaskCompletionSource NewGate() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal HeldDirectoryRead()
+        {
+            _connection.Open();
+            using var ctx = CreateDbContext();
+            ctx.Database.EnsureCreated();
+            Service = new UserService(new Factory(this), NullLogger<UserService>.Instance);
+        }
+
+        internal UserService Service { get; }
+
+        /// <summary>The text of the command that was parked (null until it arrived).</summary>
+        internal string? HeldCommandText { get; private set; }
+
+        /// <summary>Completes when the armed read is parked on the release gate.</summary>
+        internal Task Arrived => _arrived.Task;
+
+        internal CircuitUserPrincipalAccessor Accessor() =>
+            new(new HivePrincipalResolver(Service, HiveAuthMode.AuthenticationEnabled, NullLogger<HivePrincipalResolver>.Instance),
+                new HivePolicy());
+
+        internal async Task SeedAsync(string gitHubId, UserRole role)
+        {
+            await using var db = CreateDbContext();
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = gitHubId,
+                Username = "user-" + gitHubId,
+                AccessToken = "token-" + gitHubId,
+                Role = role,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Arms the hold with FRESH incomplete gates: the NEXT directory read parks until
+        /// <see cref="Release"/>. Must only be called while no read is parked.
+        /// </summary>
+        internal void Arm()
+        {
+            _arrived = NewGate();
+            _release = NewGate();
+            Volatile.Write(ref _armed, 1);
+        }
+
+        /// <summary>Opens the gate (idempotent).</summary>
+        internal void Release() => _release.TrySetResult();
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Exchange(ref _armed, 0) == 1)
+            {
+                HeldCommandText = command.CommandText;
+                _arrived.TrySetResult();
+                await _release.Task.ConfigureAwait(false);
+            }
+
+            return result;
+        }
+
+        private CopilotHiveDbContext CreateDbContext() =>
+            new(new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(_connection)
+                .AddInterceptors(this)
+                .Options);
+
+        public void Dispose() => _connection.Dispose();
+
+        private sealed class Factory(HeldDirectoryRead owner) : IDbContextFactory<CopilotHiveDbContext>
+        {
+            public CopilotHiveDbContext CreateDbContext() => owner.CreateDbContext();
+        }
+    }
+
+    /// <summary>
+    /// Starts <paramref name="question"/> on the accessor, then proves DETERMINISTICALLY that its
+    /// directory read is in flight: it waits for the hold's arrival signal (or the question finishing,
+    /// which would be a failure) and then positively asserts the read arrived on a <c>users</c> query
+    /// and the question has NOT completed.
+    /// </summary>
+    private static async Task<Task<T>> StartAndAwaitInFlightAsync<T>(HeldDirectoryRead directory, Func<Task<T>> question)
+    {
+        directory.Arm();
+        var task = question();
+        await Task.WhenAny(directory.Arrived, task);
+
+        Assert.True(directory.Arrived.IsCompleted, "the directory read must have started and parked");
+        Assert.False(task.IsCompleted, "the resolution must still be in flight while the read is held");
+        Assert.Contains("users", directory.HeldCommandText, StringComparison.OrdinalIgnoreCase);
+        return task;
+    }
+
+    /// <summary>
+    /// SIGN-OUT DURING A REAL DIRECTORY RESOLUTION (the post-directory-read guard): identity A is
+    /// established, the accessor's resolution is held MID-READ, an explicit sign-out is recorded on the
+    /// SAME accessor inside that window, and the gate is released. The directory read itself succeeds
+    /// (the account is enabled and valid), yet the resolution is REFUSED with no principal, the circuit
+    /// is terminally SignedOut and no identity remains.
+    /// </summary>
+    [Fact]
+    public async Task GetPrincipalAsync_SignOutDuringTheDirectoryRead_IsRefused_AndTheCircuitIsSignedOut()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        Assert.NotNull(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+
+        Task<PrincipalResolution>? resolving = null;
+        try
+        {
+            resolving = await StartAndAwaitInFlightAsync(directory, () => accessor.GetPrincipalAsync(Ct));
+
+            accessor.Clear(); // the sign-out lands INSIDE the in-flight resolution
+            directory.Release();
+            var resolution = await resolving;
+
+            Assert.False(resolution.IsResolved);
+            Assert.Null(resolution.Principal);
+            Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+        }
+        finally
+        {
+            directory.Release();
+            if (resolving is not null)
+                await resolving.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// The same window through the CAPABILITY question: a sign-out inside the in-flight directory read
+    /// must make <see cref="CircuitUserPrincipalAccessor.IsAllowedAsync"/> answer <c>false</c> even
+    /// though the account is an enabled Admin.
+    /// </summary>
+    [Fact]
+    public async Task IsAllowedAsync_SignOutDuringTheDirectoryRead_DeniesTheCapability()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        Task<bool>? asking = null;
+        try
+        {
+            asking = await StartAndAwaitInFlightAsync(
+                directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+
+            accessor.Clear();
+            directory.Release();
+
+            Assert.False(await asking);
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+        }
+        finally
+        {
+            directory.Release();
+            if (asking is not null)
+                await asking.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// REPLACEMENT DURING A REAL DIRECTORY RESOLUTION: a DIFFERENT identity B observed on the same
+    /// accessor inside the in-flight read permanently invalidates the circuit; the resolution that was
+    /// started for A is refused (B is not adopted, A is not served), and the state is IdentityReplaced.
+    /// </summary>
+    [Fact]
+    public async Task GetPrincipalAsync_ReplacementDuringTheDirectoryRead_IsRefused_AndTheCircuitIsReplaced()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        await directory.SeedAsync("2", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        Task<PrincipalResolution>? resolving = null;
+        try
+        {
+            resolving = await StartAndAwaitInFlightAsync(directory, () => accessor.GetPrincipalAsync(Ct));
+
+            Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+            directory.Release();
+            var resolution = await resolving;
+
+            Assert.False(resolution.IsResolved);
+            Assert.Null(resolution.Principal);
+            Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
+            Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+        }
+        finally
+        {
+            directory.Release();
+            if (resolving is not null)
+                await resolving.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// POSITIVE CONTROL on the SAME harness and the SAME hold: no sign-out/replacement inside the
+    /// window. The held resolution completes successfully with the A principal and the correct
+    /// capability answers — so the hold itself denies nothing and the regressions above are
+    /// discriminating, not vacuous.
+    /// </summary>
+    [Fact]
+    public async Task GetPrincipalAndIsAllowed_HeldDirectoryReadWithNoSignOut_CompleteSuccessfully()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        Task<PrincipalResolution>? resolving = null;
+        Task<bool>? asking = null;
+        try
+        {
+            resolving = await StartAndAwaitInFlightAsync(directory, () => accessor.GetPrincipalAsync(Ct));
+            directory.Release();
+            var resolution = await resolving;
+
+            Assert.True(resolution.IsResolved);
+            Assert.Equal("1", resolution.Principal!.GitHubId);
+            Assert.Equal(UserRole.Admin, resolution.Principal.Role);
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.NotNull(accessor.EstablishedIdentity);
+
+            // The capability question through the identical hold (a fresh arm of the same harness).
+            asking = await StartAndAwaitInFlightAsync(
+                directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+            directory.Release();
+            Assert.True(await asking);
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        }
+        finally
+        {
+            directory.Release();
+            if (resolving is not null)
+                await resolving.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            if (asking is not null)
+                await asking.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
     }
 }
