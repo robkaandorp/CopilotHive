@@ -67,11 +67,17 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// <summary>Stage 6e — the credential helper path is missing or its delegate failed.</summary>
     private const string HelperUnavailable = "Git credential helper path is not available.";
 
-    /// <summary>The env variable carrying the config-repo credential to the FINAL command.</summary>
-    private const string CredentialEnvName = "GITHUB_CONFIG_REPO_TOKEN";
+    /// <summary>
+    /// The env variable carrying the config-repo credential to the FINAL command. It IS the shared
+    /// helper contract's config-repo variable, so the script and the injection can never drift.
+    /// </summary>
+    private const string CredentialEnvName = WorkerGitAskpassHelper.ConfigRepoCredentialEnvName;
 
-    /// <summary>The env variable pointing git at the non-interactive credential helper.</summary>
-    private const string AskpassEnvName = "GIT_ASKPASS";
+    /// <summary>
+    /// The env variable pointing git at the non-interactive credential helper. It IS the shared
+    /// helper contract's variable.
+    /// </summary>
+    private const string AskpassEnvName = WorkerGitAskpassHelper.AskpassEnvName;
 
     /// <summary>The literal-redaction replacement for an ordinal credential occurrence.</summary>
     private const string RedactedPlaceholder = "[redacted]";
@@ -1460,23 +1466,31 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// The child environment for a git process launched by this seam: the SCRUBBED inherited
     /// environment (the shared five-variable <see cref="GitOperations.SanitizeChildEnv"/>)
     /// plus <c>GIT_TERMINAL_PROMPT=0</c>, and — ONLY for the FINAL command of an eligible
-    /// operation with a NON-WHITESPACE credential — <c>GITHUB_CONFIG_REPO_TOKEN</c> and
-    /// <c>GIT_ASKPASS</c>. Those two are the SOLE post-scrub exceptions and are added AFTER
-    /// the scrub. Every other launch (the origin inspection/add/set-url and the ref-validation
-    /// subprocess) is credential-free.
+    /// operation with a NON-WHITESPACE credential — the COMPLETE operation-scoped authenticated
+    /// environment from <see cref="WorkerGitAskpassHelper.BuildCredentialChildEnvironment"/>:
+    /// <c>GITHUB_CONFIG_REPO_TOKEN</c> plus <c>GIT_ASKPASS</c>, with the inherited credential-helper /
+    /// askpass suppression expressed in BOTH precedence channels (<c>GIT_CONFIG_COUNT</c> entries and
+    /// the replaced legacy <c>GIT_CONFIG_PARAMETERS</c>). That is the SAME environment builder the
+    /// target-repository transport uses, so inherited <c>store</c>/<c>GCM</c> helpers can neither
+    /// select nor persist this credential. No global or repository git configuration is written.
+    /// <para>
+    /// Every other launch (the origin inspection/add/set-url, the ref-validation subprocess and the
+    /// health probe) stays exactly as before: the scrubbed inherited environment plus
+    /// <c>GIT_TERMINAL_PROMPT=0</c>, and NO credential environment.
+    /// </para>
     /// </summary>
     private IReadOnlyDictionary<string, string?> BuildChildEnv(
         string? credential = null, string? helperPath = null)
     {
+        if (!string.IsNullOrWhiteSpace(credential) && !string.IsNullOrWhiteSpace(helperPath))
+        {
+            return WorkerGitAskpassHelper.BuildCredentialChildEnvironment(
+                helperPath, CredentialEnvName, credential);
+        }
+
         var sanitized = GitOperations.SanitizeChildEnv(SnapshotCurrentProcessEnv());
         var withPromptDisabled = new Dictionary<string, string?>(sanitized);
         withPromptDisabled["GIT_TERMINAL_PROMPT"] = "0";
-
-        if (!string.IsNullOrWhiteSpace(credential) && !string.IsNullOrWhiteSpace(helperPath))
-        {
-            withPromptDisabled[CredentialEnvName] = credential;
-            withPromptDisabled[AskpassEnvName] = helperPath;
-        }
 
         return withPromptDisabled;
     }

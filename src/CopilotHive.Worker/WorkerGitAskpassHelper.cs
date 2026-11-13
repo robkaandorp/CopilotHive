@@ -56,10 +56,17 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     internal const string ScriptFileName = "askpass.sh";
 
     /// <summary>
-    /// The CHILD-ONLY environment variable the script reads the credential from. It is set for
-    /// exactly one launch and never on the worker's own process environment.
+    /// The CHILD-ONLY environment variable the script reads the TARGET-repository credential from.
+    /// It is set for exactly one launch and never on the worker's own process environment.
     /// </summary>
     internal const string CredentialEnvName = "COPILOTHIVE_WORKER_GIT_ASKPASS_CREDENTIAL";
+
+    /// <summary>
+    /// The CHILD-ONLY environment variable the script reads the CONFIG-repository credential from.
+    /// It is the config seam's existing variable, kept VERBATIM so that flow's child environment is
+    /// unchanged; only the script's destination binding changes.
+    /// </summary>
+    internal const string ConfigRepoCredentialEnvName = "GITHUB_CONFIG_REPO_TOKEN";
 
     /// <summary>The variable git reads the helper script's path from.</summary>
     internal const string AskpassEnvName = "GIT_ASKPASS";
@@ -97,11 +104,26 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     internal const string UsernamePrincipal = "x-access-token";
 
     /// <summary>
-    /// The EXACT helper script. It implements git's <c>$1</c>-prompt protocol, is TOKEN-FREE, and
-    /// releases the credential ONLY for a challenge it can PROVE is for <c>https://github.com</c>
-    /// or <c>https://github.com:443</c>.
+    /// The placeholder inside <see cref="ScriptTemplate"/> that <see cref="BuildScriptContent"/>
+    /// substitutes a CHILD-ONLY credential variable name for.
+    /// </summary>
+    internal const string CredentialEnvPlaceholder = "@@CREDENTIAL_ENV@@";
+
+    /// <summary>
+    /// THE single helper-script TEMPLATE — the ONLY place this script's text exists. It implements
+    /// git's <c>$1</c>-prompt protocol, is TOKEN-FREE, and releases the credential ONLY for a
+    /// challenge it can PROVE is for <c>https://github.com</c> or <c>https://github.com:443</c>.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>ONE contract, two flows.</b> The prompt parsing, the destination binding and the refusal
+    /// behaviour live HERE and nowhere else: the target-repository transport
+    /// (<see cref="WorkerGitAskpassHelper"/>, <see cref="ScriptContent"/>) and the config-repository
+    /// seam (<see cref="WorkerService"/>'s assignment-scoped helper, consumed by
+    /// <see cref="ConfigRepoGitOperations"/>, <see cref="ConfigRepoScriptContent"/>) both run THIS
+    /// script. They differ only in WHICH child-only variable carries the credential, so no second,
+    /// weaker script can exist.
+    /// </para>
     /// <para>
     /// <b>Strict, fail-closed prompt parsing.</b> Git renders the challenged URL inside the prompt
     /// (<c>Username for 'https://github.com': </c>, <c>Password for 'https://x-access-token@github.com': </c>).
@@ -127,39 +149,64 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     /// alternate remote, or a redirect to a noneligible host still RUNS but receives no credential.
     /// </para>
     /// </remarks>
-    internal const string ScriptContent =
-        "#!/bin/sh\n"
-        + "# Answer ONLY a challenge for https://github.com or https://github.com:443; refuse anything\n"
-        + "# ambiguous. The destination binding is the whole point: no other prompt is ever answered.\n"
-        + "p=$1\n"
-        + "case \"$p\" in\n"
-        + "  \"Username for 'https://\"*\"': \") kind=u; rest=${p#\"Username for 'https://\"} ;;\n"
-        + "  \"Password for 'https://\"*\"': \") kind=p; rest=${p#\"Password for 'https://\"} ;;\n"
-        + "  *) exit 1 ;;\n"
-        + "esac\n"
-        + "rest=${rest%\"': \"}\n"
-        + "case \"$rest\" in\n"
-        + "  *\\'*) exit 1 ;;\n"
-        + "esac\n"
-        + "case \"$rest\" in\n"
-        + "  *@*@*) exit 1 ;;\n"
-        + "  *@*)\n"
-        + "    user=${rest%@*}\n"
-        + "    case \"$user\" in */*) exit 1 ;; esac\n"
-        + "    hostpart=${rest#*@} ;;\n"
-        + "  *) hostpart=$rest ;;\n"
-        + "esac\n"
-        + "host=${hostpart%%/*}\n"
-        + "host=$(printf '%s' \"$host\" | tr '[:upper:]' '[:lower:]')\n"
-        + $"case \"$host\" in\n  \"{EligibleHost}\") ;;\n"
-        + $"  \"{EligibleHostWithPort}\") ;;\n"
-        + "  *) exit 1 ;;\n"
-        + "esac\n"
-        + "if [ \"$kind\" = u ]; then\n"
-        + $"  printf '%s' \"{UsernamePrincipal}\"\n"
-        + "else\n"
-        + $"  printf '%s' \"${{{CredentialEnvName}}}\"\n"
-        + "fi\n";
+    internal const string ScriptTemplate =
+        """
+        #!/bin/sh
+        # Answer ONLY a challenge for https://github.com or https://github.com:443; refuse anything
+        # ambiguous. The destination binding is the whole point: no other prompt is ever answered.
+        p=$1
+        case "$p" in
+          "Username for 'https://"*"': ") kind=u; rest=${p#"Username for 'https://"} ;;
+          "Password for 'https://"*"': ") kind=p; rest=${p#"Password for 'https://"} ;;
+          *) exit 1 ;;
+        esac
+        rest=${rest%"': "}
+        case "$rest" in
+          *\'*) exit 1 ;;
+        esac
+        case "$rest" in
+          *@*@*) exit 1 ;;
+          *@*)
+            user=${rest%@*}
+            case "$user" in */*) exit 1 ;; esac
+            hostpart=${rest#*@} ;;
+          *) hostpart=$rest ;;
+        esac
+        host=${hostpart%%/*}
+        host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+        case "$host" in
+          "github.com")
+            ;;
+          "github.com:443")
+            ;;
+          *) exit 1 ;;
+        esac
+        if [ "$kind" = u ]; then
+          printf '%s' "x-access-token"
+        else
+          printf '%s' "${@@CREDENTIAL_ENV@@}"
+        fi
+        """ + "\n";
+
+    /// <summary>
+    /// The script for a given CHILD-ONLY credential variable: <see cref="ScriptTemplate"/> with
+    /// <see cref="CredentialEnvPlaceholder"/> replaced. This is the ONLY way a script is produced,
+    /// so both flows are byte-identical apart from the variable name.
+    /// </summary>
+    /// <param name="credentialEnvName">The CHILD-ONLY variable the password branch reads.</param>
+    internal static string BuildScriptContent(string credentialEnvName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(credentialEnvName);
+
+        return ScriptTemplate.Replace(
+            CredentialEnvPlaceholder, credentialEnvName, StringComparison.Ordinal);
+    }
+
+    /// <summary>The TARGET-repository helper script.</summary>
+    internal static string ScriptContent => BuildScriptContent(CredentialEnvName);
+
+    /// <summary>The CONFIG-repository helper script — the SAME contract, its own credential variable.</summary>
+    internal static string ConfigRepoScriptContent => BuildScriptContent(ConfigRepoCredentialEnvName);
 
     /// <summary>The private directory name prefix, so a leaked directory is identifiable.</summary>
     private const string DirectoryPrefix = "copilothive-target-askpass-";
@@ -280,8 +327,25 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
     /// </remarks>
     /// <param name="credential">The credential resolved for this operation.</param>
     /// <returns>The complete environment to hand the child process.</returns>
-    internal IReadOnlyDictionary<string, string?> BuildChildEnvironment(string credential)
+    internal IReadOnlyDictionary<string, string?> BuildChildEnvironment(string credential) =>
+        BuildCredentialChildEnvironment(ScriptPath, CredentialEnvName, credential);
+
+    /// <summary>
+    /// THE single authenticated-child environment builder, shared by the target-repository transport
+    /// and the config-repository seam: the current process environment with EVERY credential-bearing
+    /// channel scrubbed, plus <c>GIT_TERMINAL_PROMPT=0</c>, <c>GCM_INTERACTIVE=never</c>, the
+    /// operation-scoped <c>GIT_ASKPASS</c>, the credential in the caller's CHILD-ONLY variable, and
+    /// the inherited-helper suppression expressed in BOTH precedence channels.
+    /// </summary>
+    /// <param name="scriptPath">The token-free helper script's absolute path.</param>
+    /// <param name="credentialEnvName">The CHILD-ONLY variable the script reads the credential from.</param>
+    /// <param name="credential">The credential resolved for this operation.</param>
+    /// <returns>The complete environment to hand the child process.</returns>
+    internal static IReadOnlyDictionary<string, string?> BuildCredentialChildEnvironment(
+        string scriptPath, string credentialEnvName, string credential)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(scriptPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(credentialEnvName);
         ArgumentNullException.ThrowIfNull(credential);
 
         var environment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -296,8 +360,8 @@ internal sealed class WorkerGitAskpassHelper : IDisposable
 
         environment[PromptDisabledEnvName] = "0";
         environment[GcmInteractiveEnvName] = GcmInteractiveNever;
-        environment[AskpassEnvName] = ScriptPath;
-        environment[CredentialEnvName] = credential;
+        environment[AskpassEnvName] = scriptPath;
+        environment[credentialEnvName] = credential;
 
         // APPEND to whatever indexed environment-config entries the host already supplied, so the
         // resets below come after them and no inherited indexed helper can be selected.

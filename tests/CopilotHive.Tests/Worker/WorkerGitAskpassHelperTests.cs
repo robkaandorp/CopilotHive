@@ -435,6 +435,218 @@ public sealed class WorkerGitAskpassHelperTests : IDisposable
         Assert.DoesNotContain(Token, stderr, StringComparison.Ordinal);
     }
 
+    // ── ONE contract: the target-repo and config-repo scripts are the SAME script ─────
+
+    /// <summary>
+    /// The config-repository script and the target-repository script are BYTE-IDENTICAL apart from the
+    /// child-only variable the password branch reads — one destination-bound contract, two flows, so
+    /// neither can drift into a weaker script.
+    /// </summary>
+    [Fact]
+    public void Scripts_ShareOneContract_DifferingOnlyInTheCredentialVariable()
+    {
+        var target = WorkerGitAskpassHelper.ScriptContent;
+        var configRepo = WorkerGitAskpassHelper.ConfigRepoScriptContent;
+
+        Assert.NotEqual(target, configRepo);
+
+        Assert.Equal(
+            target.Replace(
+                WorkerGitAskpassHelper.CredentialEnvName, "PLACEHOLDER", StringComparison.Ordinal),
+            configRepo.Replace(
+                WorkerGitAskpassHelper.ConfigRepoCredentialEnvName, "PLACEHOLDER",
+                StringComparison.Ordinal));
+
+        // Both are token-free and both bind the release to the eligible destination.
+        foreach (var script in new[] { target, configRepo })
+        {
+            Assert.DoesNotContain(Token, script, StringComparison.Ordinal);
+            Assert.Contains("Username for 'https://", script, StringComparison.Ordinal);
+            Assert.Contains("Password for 'https://", script, StringComparison.Ordinal);
+            Assert.Contains("\"github.com\")", script, StringComparison.Ordinal);
+            Assert.Contains("\"github.com:443\")", script, StringComparison.Ordinal);
+            // The legacy unbound catch-all prompt is GONE from the shared contract.
+            Assert.DoesNotContain("*sername*", script, StringComparison.Ordinal);
+            Assert.Equal('\n', script[^1]);
+        }
+    }
+
+    /// <summary>
+    /// THE CONFIG-REPO HOST BINDING, proven by RUNNING the real config-repo script through a real
+    /// <c>/bin/sh</c>: only a prompt naming an eligible effective HTTPS <c>github.com:443</c>
+    /// destination releases the credential; every other host, scheme, port and ambiguous shape is
+    /// refused with empty output.
+    /// </summary>
+    [Theory]
+    // ELIGIBLE — implicit and explicit :443, with and without userinfo, any host case.
+    [InlineData("Password for 'https://github.com': ", true)]
+    [InlineData("Password for 'https://github.com:443': ", true)]
+    [InlineData("Password for 'https://x-access-token@github.com': ", true)]
+    [InlineData("Password for 'https://github.com/org/repo.git': ", true)]
+    [InlineData("Password for 'https://GitHub.COM': ", true)]
+    // NONELIGIBLE — a different host, a lookalike host, a non-443 port, a non-HTTPS scheme.
+    [InlineData("Password for 'https://gitlab.com': ", false)]
+    [InlineData("Password for 'https://github.com.evil.test': ", false)]
+    [InlineData("Password for 'https://evilgithub.com': ", false)]
+    [InlineData("Password for 'https://github.com:8443': ", false)]
+    [InlineData("Password for 'http://github.com': ", false)]
+    [InlineData("Password for 'ssh://git@github.com': ", false)]
+    [InlineData("Password for 'https://127.0.0.1:4242': ", false)]
+    // AMBIGUOUS / forged shapes (rendered when credential.sanitizePrompt=false).
+    [InlineData("Password for 'https://github.com'@gitlab.com': ", false)]
+    [InlineData("Password for 'https://github.com/@gitlab.com': ", false)]
+    [InlineData("Password for 'https://github.com/x@gitlab.com': ", false)]
+    [InlineData("Password for 'https://u@gitlab.com@github.com': ", false)]
+    [InlineData("Password: ", false)]
+    [InlineData("Password for 'https://github.com': trailing", false)]
+    [InlineData("", false)]
+    public void ConfigRepoScript_BindsReleaseToTheEligibleDestination(string prompt, bool eligible)
+    {
+        if (!OperatingSystem.IsLinux()) { Assert.Skip("Linux-only /bin/sh script."); return; }
+
+        var scriptPath = WriteScript(
+            WorkerGitAskpassHelper.ConfigRepoScriptContent, "config-repo-askpass.sh");
+
+        var (code, stdout) = RunScriptAt(
+            scriptPath,
+            new Dictionary<string, string?>
+            {
+                [WorkerGitAskpassHelper.ConfigRepoCredentialEnvName] = Token,
+            },
+            prompt);
+
+        if (eligible)
+        {
+            Assert.Equal(0, code);
+            Assert.Equal(Token, stdout);
+        }
+        else
+        {
+            Assert.NotEqual(0, code);
+            Assert.Equal(string.Empty, stdout);
+        }
+    }
+
+    /// <summary>
+    /// The config-repo script answers the USERNAME prompt of an eligible destination with the fixed
+    /// principal and reads the password LIVE from its own CHILD-ONLY variable — with no credential in
+    /// the child environment the answer is empty, which proves nothing is baked into the file.
+    /// </summary>
+    [Fact]
+    public void ConfigRepoScript_UsernameIsFixedAndPasswordIsReadLive()
+    {
+        if (!OperatingSystem.IsLinux()) { Assert.Skip("Linux-only /bin/sh script."); return; }
+
+        var scriptPath = WriteScript(
+            WorkerGitAskpassHelper.ConfigRepoScriptContent, "config-repo-askpass-live.sh");
+
+        var (usernameCode, username) = RunScriptAt(
+            scriptPath, new Dictionary<string, string?>(), "Username for 'https://github.com': ");
+        Assert.Equal(0, usernameCode);
+        Assert.Equal(WorkerGitAskpassHelper.UsernamePrincipal, username);
+
+        var (passwordCode, password) = RunScriptAt(
+            scriptPath, new Dictionary<string, string?>(), "Password for 'https://github.com': ");
+        Assert.Equal(0, passwordCode);
+        Assert.Empty(password);
+    }
+
+    /// <summary>
+    /// The CONFIG-REPO child environment is built by the SAME shared builder as the target-repo one:
+    /// every inherited credential channel scrubbed, the credential ONLY in the config seam's child-only
+    /// variable, and inherited-helper suppression present in BOTH precedence channels.
+    /// </summary>
+    [Fact]
+    public void ConfigRepoChildEnvironment_HasTheSameSuppressionAsTheTargetTransport()
+    {
+        using var helper = WorkerGitAskpassHelper.TryCreate();
+
+        var inherited = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = "inherited-gh",
+            ["GITHUB_CONFIG_REPO_TOKEN"] = "inherited-config",
+            ["GIT_ASKPASS"] = "/inherited/askpass",
+            ["GIT_CONFIG_PARAMETERS"] = "'credential.helper=store'",
+            ["GIT_CONFIG_COUNT"] = "1",
+            ["GIT_CONFIG_KEY_0"] = "credential.helper",
+            ["GIT_CONFIG_VALUE_0"] = "store",
+        };
+
+        var previous = new Dictionary<string, string?>(StringComparer.Ordinal);
+        IReadOnlyDictionary<string, string?> environment;
+        try
+        {
+            foreach (var (name, value) in inherited)
+            {
+                previous[name] = Environment.GetEnvironmentVariable(name);
+                Environment.SetEnvironmentVariable(name, value);
+            }
+
+            environment = WorkerGitAskpassHelper.BuildCredentialChildEnvironment(
+                helper!.ScriptPath,
+                WorkerGitAskpassHelper.ConfigRepoCredentialEnvName,
+                Token);
+        }
+        finally
+        {
+            foreach (var (name, value) in previous)
+                Environment.SetEnvironmentVariable(name, value);
+        }
+
+        Assert.False(environment.ContainsKey("GH_TOKEN"));
+        Assert.Equal(Token, environment[WorkerGitAskpassHelper.ConfigRepoCredentialEnvName]);
+        Assert.Equal(helper!.ScriptPath, environment[WorkerGitAskpassHelper.AskpassEnvName]);
+        Assert.Equal("0", environment[WorkerGitAskpassHelper.PromptDisabledEnvName]);
+        Assert.Equal(
+            WorkerGitAskpassHelper.GcmInteractiveNever,
+            environment[WorkerGitAskpassHelper.GcmInteractiveEnvName]);
+
+        // The inherited helper is neutralized in BOTH channels: the reset is appended after the
+        // inherited indexed entry, and the legacy channel is REPLACED.
+        Assert.Equal("2", environment[WorkerGitAskpassHelper.ConfigCountEnvName]);
+        Assert.Equal("store", environment["GIT_CONFIG_VALUE_0"]);
+        Assert.Equal("credential.helper", environment["GIT_CONFIG_KEY_1"]);
+        Assert.Equal(string.Empty, environment["GIT_CONFIG_VALUE_1"]);
+        Assert.Equal("'credential.helper='", environment[WorkerGitAskpassHelper.ConfigParametersEnvName]);
+
+        // Exactly ONE credential value in the whole block.
+        Assert.Single(environment.Values, v => v == Token);
+    }
+
+    /// <summary>
+    /// REAL GIT positive control for the config-repo variant: git's own <c>credential fill</c> for
+    /// <c>https://github.com</c> IS answered with the config seam's credential, while another host's
+    /// fill fails — so the refusals above are not an artefact of a script that never releases anything.
+    /// </summary>
+    [Fact]
+    public void RealCredentialFill_ConfigRepoScript_ReleasesForGitHubOnly()
+    {
+        if (!OperatingSystem.IsLinux()) { Assert.Skip("Linux-only /bin/sh script."); return; }
+
+        var scriptPath = WriteScript(
+            WorkerGitAskpassHelper.ConfigRepoScriptContent, "config-repo-fill.sh");
+
+        var env = new Dictionary<string, string?>(
+            WorkerGitAskpassHelper.BuildCredentialChildEnvironment(
+                scriptPath, WorkerGitAskpassHelper.ConfigRepoCredentialEnvName, Token))
+        {
+            ["HOME"] = _root,
+        };
+
+        var eligible = RunGitWithStdin(env, "protocol=https\nhost=github.com\n\n", "credential", "fill");
+        Assert.Equal(0, eligible.ExitCode);
+        Assert.Contains($"password={Token}", eligible.Stdout, StringComparison.Ordinal);
+
+        var explicitPort = RunGitWithStdin(
+            env, "protocol=https\nhost=github.com:443\n\n", "credential", "fill");
+        Assert.Equal(0, explicitPort.ExitCode);
+        Assert.Contains($"password={Token}", explicitPort.Stdout, StringComparison.Ordinal);
+
+        var other = RunGitWithStdin(env, "protocol=https\nhost=gitlab.com\n\n", "credential", "fill");
+        Assert.NotEqual(0, other.ExitCode);
+        Assert.DoesNotContain(Token, other.Stdout, StringComparison.Ordinal);
+    }
+
     // ── The transport scope: cleanup, isolation, fail-closed creation ────────
 
     /// <summary>The helper directory is gone after disposal, and disposal is idempotent.</summary>
@@ -877,6 +1089,33 @@ public sealed class WorkerGitAskpassHelperTests : IDisposable
         };
 
         var (code, stdout, _) = RunShell(helper.ScriptPath, env, prompt);
+        return (code, stdout);
+    }
+
+    /// <summary>
+    /// Writes a script produced by the shared contract to a fresh file in the test root and marks it
+    /// executable, so it can be run exactly as git would run it.
+    /// </summary>
+    private string WriteScript(string content, string fileName)
+    {
+        var path = Path.Combine(_root, $"{Guid.NewGuid():N}-{fileName}");
+
+        File.WriteAllText(path, content, new System.Text.UTF8Encoding(false));
+
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        return path;
+    }
+
+    /// <summary>Runs <paramref name="scriptPath"/> with a prompt, returning (exitCode, stdout).</summary>
+    private static (int ExitCode, string Stdout) RunScriptAt(
+        string scriptPath, IReadOnlyDictionary<string, string?> environment, string prompt)
+    {
+        var (code, stdout, _) = RunShell(scriptPath, environment, prompt);
         return (code, stdout);
     }
 

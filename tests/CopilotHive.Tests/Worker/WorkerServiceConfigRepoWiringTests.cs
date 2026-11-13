@@ -458,14 +458,25 @@ public sealed class WorkerServiceConfigRepoWiringTests : IDisposable
 
         Assert.NotNull(scriptBytes);
 
-        const string expected =
-            "#!/bin/sh\n"
-            + "case \"$1\" in\n"
-            + "  *sername*) printf '%s' \"x-access-token\" ;;\n"
-            + "  *) printf '%s' \"$GITHUB_CONFIG_REPO_TOKEN\" ;;\n"
-            + "esac\n";
+        // The written bytes are the SHARED destination-bound helper contract, parameterized for the
+        // config-repo credential variable — not a second, weaker script.
+        var expected = WorkerGitAskpassHelper.ConfigRepoScriptContent;
 
         Assert.Equal(new UTF8Encoding(false).GetBytes(expected), scriptBytes);
+
+        // … and that contract is the destination-bound one: the legacy catch-all prompt is GONE.
+        var text = Encoding.UTF8.GetString(scriptBytes!);
+        Assert.DoesNotContain("*sername*", text, StringComparison.Ordinal);
+        Assert.Contains("Username for 'https://", text, StringComparison.Ordinal);
+        Assert.Contains("Password for 'https://", text, StringComparison.Ordinal);
+        Assert.Contains("\"github.com:443\")", text, StringComparison.Ordinal);
+
+        // The script is token-free and reads the credential from the config seam's CHILD-ONLY variable.
+        Assert.Contains(
+            "\"${" + WorkerGitAskpassHelper.ConfigRepoCredentialEnvName + "}\"",
+            text,
+            StringComparison.Ordinal);
+        Assert.Contains("\"x-access-token\"", text, StringComparison.Ordinal);
 
         // Explicitly: no BOM, and the file ends with the newline.
         Assert.NotEqual(0xEF, scriptBytes![0]);
