@@ -2,6 +2,7 @@ using System.Security.Claims;
 
 using CopilotHive.Components;
 using CopilotHive.Dashboard;
+using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Security;
 using CopilotHive.Services;
@@ -119,13 +120,26 @@ public sealed class RoutesCircuitAccessorTests : IDisposable
     /// <summary>
     /// Everything the routed <c>/</c> page (Home) and its layout need, wired to the REAL production
     /// singleton types the app uses: the page injects the dashboard state service and its page-header
-    /// singleton; the layout injects the clarification queue; the nav menu's knowledge count reads
-    /// the same dashboard state.
+    /// singleton; the layout injects the clarification queue (its refresh EVENT SOURCE only) and the
+    /// AUTHORIZED <see cref="IClarificationFacade"/> every clarification read/answer goes through; the
+    /// nav menu's knowledge count reads the same dashboard state.
     /// </summary>
     private static void AddPageInfrastructure(ServiceCollection services)
     {
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton(new ClarificationQueueService());
+
+        // THE AUTHORIZED CLARIFICATION BOUNDARY the layout now depends on, over the production
+        // resolver/policy the caller registered (exactly as Program.cs wires it). The layout only uses
+        // the TRANSIENT queue operations, so a simple in-memory store satisfies the persisted-history
+        // dependency without adding behaviour this suite does not exercise.
+        services.AddSingleton<IGoalStore>(new InMemoryGoalStore());
+        services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(
+            sp.GetRequiredService<ClarificationQueueService>(),
+            sp.GetRequiredService<IGoalStore>(),
+            sp.GetRequiredService<HivePrincipalResolver>(),
+            sp.GetRequiredService<HivePolicy>(),
+            NullLogger<ClarificationFacade>.Instance));
 
         var dashboard = new DashboardStateService(
             new WorkerPool(),
