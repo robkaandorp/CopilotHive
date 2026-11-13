@@ -184,7 +184,9 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
         try
         {
             // RENDEZVOUS 1: every actor has created and initialised its own connection.
-            await Task.Run(() => allInitialized.Wait(HangGuard, Ct), Ct);
+            Assert.True(
+                await Task.Run(() => allInitialized.Wait(HangGuard, Ct), Ct),
+                "every actor must have initialised its own connection within the hang-guard");
 
             // No context shares a connection instance: the shared initialisation that used to race is
             // structurally impossible, not merely unlikely.
@@ -216,11 +218,14 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
         }
 
         // JOIN BOTH SIDES regardless of the outcome, so a failure on one side never leaves the other
-        // side running past the directory's disposal.
+        // side running past the disposal of the directory and the CountdownEvent. The gates are open
+        // here, so every task is unwinding; the joins are CANCELLATION-INDEPENDENT (an independent
+        // token, never the test token) so that test cancellation cannot itself abandon the actors
+        // while those scopes are being disposed. The wait stays bounded by the hang-guard.
         var joinFailures = new List<Exception>();
         try
         {
-            await Task.WhenAll(actors).WaitAsync(HangGuard, Ct);
+            await Task.WhenAll(actors).WaitAsync(HangGuard, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -229,7 +234,7 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
 
         try
         {
-            await testSide.WaitAsync(HangGuard, Ct);
+            await testSide.WaitAsync(HangGuard, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -314,7 +319,10 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
     [Fact]
     public async Task AfterDisposal_ContextCreationIsRejected_AndBothResolverPathsRefuseWithDirectoryFailure()
     {
-        var directory = new HiveSecurityTestDirectory();
+        // `using` makes disposal STRUCTURAL: a seed failure or a failing assertion still closes the
+        // keeper. The explicit Dispose calls below are part of the row's subject and stay safe because
+        // disposal is idempotent.
+        using var directory = new HiveSecurityTestDirectory();
         var original = await directory.SeedActivatedAccountAsync("9001", UserRole.Admin);
         var claimsResolver = directory.AuthEnabledResolver();
         var byUserIdResolver = directory.AuthEnabledResolver();
@@ -359,7 +367,10 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
     [Fact]
     public async Task DisposingTheDirectory_DoesNotDropTheDatabaseWhileAContextStillHoldsItsConnection()
     {
-        var directory = new HiveSecurityTestDirectory();
+        // `using` makes disposal STRUCTURAL: a seed failure or a failing assertion still closes the
+        // keeper. The explicit Dispose calls below are part of the row's subject and stay safe because
+        // disposal is idempotent.
+        using var directory = new HiveSecurityTestDirectory();
         await directory.SeedActivatedAccountAsync("8001", UserRole.Admin, username: "keeper-survivor");
 
         string connectionString;
@@ -412,7 +423,10 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
     [Fact]
     public async Task DisposingRepeatedly_IsSafe_KeepsTheRejection_AndLeavesTheNextDirectoryIndependent()
     {
-        var directory = new HiveSecurityTestDirectory();
+        // `using` makes disposal STRUCTURAL: a seed failure or a failing assertion still closes the
+        // keeper. The explicit Dispose calls below are part of the row's subject and stay safe because
+        // disposal is idempotent.
+        using var directory = new HiveSecurityTestDirectory();
         await directory.SeedActivatedAccountAsync("6001", UserRole.Admin);
 
         directory.Dispose();

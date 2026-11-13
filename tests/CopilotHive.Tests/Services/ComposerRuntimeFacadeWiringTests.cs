@@ -474,6 +474,7 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
         Composer? legacy = null;
         ExceptionDispatchInfo? primary = null;
         var cleanupFailures = new List<Exception>();
+        string? directoryConnectionString = null;
         try
         {
             await subject.InitializeAsync();
@@ -481,6 +482,13 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
             using (var siblingDb = subject._auth.Directory.CreateDbContext())
             {
                 Assert.Equal(2, directoryDb.Users.Count());
+
+                // Capture the ACTUAL named database BEFORE the contexts are disposed, so the cleanup
+                // below can be observed physically (a raw connection to this same name) rather than
+                // only through the directory's own disposal latch.
+                directoryConnectionString = directoryDb.Database.GetDbConnection().ConnectionString;
+                Assert.False(string.IsNullOrWhiteSpace(directoryConnectionString));
+                Assert.Contains("Pooling=False", directoryConnectionString, StringComparison.OrdinalIgnoreCase);
 
                 // The directory never shares one connection instance between contexts: each context
                 // OWNS its own connection (that is what lets two contexts initialise concurrently),
@@ -557,6 +565,26 @@ public sealed class ComposerRuntimeFacadeWiringTests : IAsyncLifetime
             // reopening (with a named shared-cache database a new connection would create a fresh,
             // empty database, so a post-disposal read would answer "no such account").
             Assert.Throws<ObjectDisposedException>(() => subject._auth.Directory.CreateDbContext());
+
+            // PHYSICAL RELEASE: the rejection above only proves the disposal latch is set. Probe the
+            // SAME named database through a raw, non-pooled connection: it must be GONE (a fresh, empty
+            // database with no users table), which holds only if the subject's own cleanup really closed
+            // the directory's keeper. This runs BEFORE the failure-safe fallback below, so it observes
+            // the subject's disposal and not the fallback's.
+            Assert.NotNull(directoryConnectionString);
+            await using (var probe = new Microsoft.Data.Sqlite.SqliteConnection(directoryConnectionString))
+            {
+                await probe.OpenAsync(Ct);
+                await using var probeCommand = probe.CreateCommand();
+                probeCommand.CommandText =
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'";
+                Assert.Equal(
+                    0L,
+                    Convert.ToInt64(
+                        await probeCommand.ExecuteScalarAsync(Ct),
+                        System.Globalization.CultureInfo.InvariantCulture));
+            }
+
             Assert.False(Directory.Exists(subject._dir), "class state cleanup must run after a failed gate check");
         }
         catch (Exception ex) { primary = ExceptionDispatchInfo.Capture(ex); }
