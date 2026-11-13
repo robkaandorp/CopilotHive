@@ -409,6 +409,7 @@ public sealed class CircuitUserPrincipalAccessorTests
         /// </summary>
         internal void Arm()
         {
+            HeldCommandText = null;
             _arrived = NewGate();
             _release = NewGate();
             Volatile.Write(ref _armed, 1);
@@ -448,21 +449,48 @@ public sealed class CircuitUserPrincipalAccessorTests
     }
 
     /// <summary>
-    /// Starts <paramref name="question"/> on the accessor, then proves DETERMINISTICALLY that its
-    /// directory read is in flight: it waits for the hold's arrival signal (or the question finishing,
-    /// which would be a failure) and then positively asserts the read arrived on a <c>users</c> query
-    /// and the question has NOT completed.
+    /// Owns the question BEFORE any throwing rendezvous assertion. The production reader is held
+    /// until arrival and pending-question assertions succeed, then <paramref name="whileHeld"/>
+    /// observes the invalidation inside that window. Every exit releases and joins the actual
+    /// question BEFORE the caller can dispose the directory, including failed arrival assertions.
     /// </summary>
-    private static async Task<Task<T>> StartAndAwaitInFlightAsync<T>(HeldDirectoryRead directory, Func<Task<T>> question)
+    private static async Task<T> RunHeldQuestionAsync<T>(
+        HeldDirectoryRead directory, Func<Task<T>> question, Action whileHeld)
     {
         directory.Arm();
         var task = question();
-        await Task.WhenAny(directory.Arrived, task);
+        Exception? primaryFailure = null;
+        try
+        {
+            await Task.WhenAny(directory.Arrived, task).WaitAsync(TestContext.Current.CancellationToken);
+            Assert.True(directory.Arrived.IsCompleted, "the directory read must have started and parked");
+            Assert.False(task.IsCompleted, "the resolution must still be in flight while the read is held");
+            Assert.Contains("FROM \"users\"", directory.HeldCommandText, StringComparison.Ordinal);
+            Assert.Contains("\"github_id\" =", directory.HeldCommandText, StringComparison.Ordinal);
 
-        Assert.True(directory.Arrived.IsCompleted, "the directory read must have started and parked");
-        Assert.False(task.IsCompleted, "the resolution must still be in flight while the read is held");
-        Assert.Contains("users", directory.HeldCommandText, StringComparison.OrdinalIgnoreCase);
-        return task;
+            whileHeld();
+            directory.Release();
+            return await task;
+        }
+        catch (Exception ex)
+        {
+            primaryFailure = ex;
+            throw;
+        }
+        finally
+        {
+            directory.Release();
+            try { await task; }
+            catch (Exception cleanupFailure)
+            {
+                if (primaryFailure is null)
+                    throw;
+                if (!ReferenceEquals(primaryFailure, cleanupFailure))
+                    throw new AggregateException("Held directory question failed during both assertion and cleanup.",
+                        primaryFailure, cleanupFailure);
+                // This is the same task fault already propagating from the primary await.
+            }
+        }
     }
 
     /// <summary>
@@ -480,27 +508,18 @@ public sealed class CircuitUserPrincipalAccessorTests
         var accessor = directory.Accessor();
         Assert.NotNull(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
 
-        Task<PrincipalResolution>? resolving = null;
-        try
+        var resolution = await RunHeldQuestionAsync(directory, () => accessor.GetPrincipalAsync(Ct), () =>
         {
-            resolving = await StartAndAwaitInFlightAsync(directory, () => accessor.GetPrincipalAsync(Ct));
-
             accessor.Clear(); // the sign-out lands INSIDE the in-flight resolution
-            directory.Release();
-            var resolution = await resolving;
-
-            Assert.False(resolution.IsResolved);
-            Assert.Null(resolution.Principal);
-            Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
             Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
             Assert.Null(accessor.EstablishedIdentity);
-        }
-        finally
-        {
-            directory.Release();
-            if (resolving is not null)
-                await resolving.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        }
+        });
+
+        Assert.False(resolution.IsResolved);
+        Assert.Null(resolution.Principal);
+        Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.EstablishedIdentity);
     }
 
     /// <summary>
@@ -516,25 +535,17 @@ public sealed class CircuitUserPrincipalAccessorTests
         var accessor = directory.Accessor();
         accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
 
-        Task<bool>? asking = null;
-        try
-        {
-            asking = await StartAndAwaitInFlightAsync(
-                directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        var allowed = await RunHeldQuestionAsync(
+            directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct), () =>
+            {
+                accessor.Clear();
+                Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+                Assert.Null(accessor.EstablishedIdentity);
+            });
 
-            accessor.Clear();
-            directory.Release();
-
-            Assert.False(await asking);
-            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
-            Assert.Null(accessor.EstablishedIdentity);
-        }
-        finally
-        {
-            directory.Release();
-            if (asking is not null)
-                await asking.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        }
+        Assert.False(allowed);
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.EstablishedIdentity);
     }
 
     /// <summary>
@@ -551,26 +562,50 @@ public sealed class CircuitUserPrincipalAccessorTests
         var accessor = directory.Accessor();
         accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
 
+        var resolution = await RunHeldQuestionAsync(directory, () => accessor.GetPrincipalAsync(Ct), () =>
+        {
+            Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+            Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+        });
+
+        Assert.False(resolution.IsResolved);
+        Assert.Null(resolution.Principal);
+        Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+        Assert.Null(accessor.EstablishedIdentity);
+    }
+
+    [Fact]
+    public async Task HeldDirectoryRead_FailedInFlightAssertion_ReleasesAndJoinsTheQuestion()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        var expected = new Xunit.Sdk.XunitException("Intentional in-window assertion failure for cleanup verification.");
         Task<PrincipalResolution>? resolving = null;
         try
         {
-            resolving = await StartAndAwaitInFlightAsync(directory, () => accessor.GetPrincipalAsync(Ct));
+            var failure = await Assert.ThrowsAsync<Xunit.Sdk.XunitException>(() => RunHeldQuestionAsync(
+                directory,
+                () => resolving = accessor.GetPrincipalAsync(Ct),
+                () => throw expected));
 
-            Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
-            directory.Release();
+            Assert.Same(expected, failure); // Cleanup must not replace the primary assertion.
+            Assert.NotNull(resolving);
+            Assert.True(resolving.IsCompletedSuccessfully, "the real directory question must be joined before rethrowing");
             var resolution = await resolving;
-
-            Assert.False(resolution.IsResolved);
-            Assert.Null(resolution.Principal);
-            Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
-            Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
-            Assert.Null(accessor.EstablishedIdentity);
+            Assert.True(resolution.IsResolved);
+            Assert.Equal("1", resolution.Principal!.GitHubId);
+            Assert.Equal(UserRole.Admin, resolution.Principal.Role);
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
         }
         finally
         {
+            // Safety boundary for this deliberate-failure control, even if the helper is regressed.
             directory.Release();
-            if (resolving is not null)
-                await resolving.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            if (resolving is not null) await resolving;
         }
     }
 
@@ -588,34 +623,18 @@ public sealed class CircuitUserPrincipalAccessorTests
         var accessor = directory.Accessor();
         accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
 
-        Task<PrincipalResolution>? resolving = null;
-        Task<bool>? asking = null;
-        try
-        {
-            resolving = await StartAndAwaitInFlightAsync(directory, () => accessor.GetPrincipalAsync(Ct));
-            directory.Release();
-            var resolution = await resolving;
+        var resolution = await RunHeldQuestionAsync(directory, () => accessor.GetPrincipalAsync(Ct), () => { });
 
-            Assert.True(resolution.IsResolved);
-            Assert.Equal("1", resolution.Principal!.GitHubId);
-            Assert.Equal(UserRole.Admin, resolution.Principal.Role);
-            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
-            Assert.NotNull(accessor.EstablishedIdentity);
+        Assert.True(resolution.IsResolved);
+        Assert.Equal("1", resolution.Principal!.GitHubId);
+        Assert.Equal(UserRole.Admin, resolution.Principal.Role);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.NotNull(accessor.EstablishedIdentity);
 
-            // The capability question through the identical hold (a fresh arm of the same harness).
-            asking = await StartAndAwaitInFlightAsync(
-                directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
-            directory.Release();
-            Assert.True(await asking);
-            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
-        }
-        finally
-        {
-            directory.Release();
-            if (resolving is not null)
-                await resolving.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            if (asking is not null)
-                await asking.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        }
+        // The capability question through the identical hold (a fresh arm of the same harness).
+        var allowed = await RunHeldQuestionAsync(
+            directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct), () => { });
+        Assert.True(allowed);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
     }
 }
