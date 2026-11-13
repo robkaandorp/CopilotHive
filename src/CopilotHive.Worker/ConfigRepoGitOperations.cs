@@ -1636,12 +1636,19 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// explicit non-443 port, and every ssh/scp/file/local-path form, is Branch B.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The host check is defence in depth: the sanitizer already rejects every https URL whose
     /// host is not <c>github.com</c>, so no sanitized value can reach this method with a
     /// different host. It is kept so eligibility remains self-contained and correct if the
     /// sanitizer's host policy ever widens.
+    /// </para>
+    /// <para>
+    /// It is <c>internal</c> so the WORKER's target-repository credential transport
+    /// (<see cref="TargetRepositoryCredential"/>) enforces the very same destination contract
+    /// rather than a second, potentially weaker one. Its logic is unchanged.
+    /// </para>
     /// </remarks>
-    private static bool IsEligibleTransportUrl(string sanitizedUrl)
+    internal static bool IsEligibleTransportUrl(string sanitizedUrl)
     {
         if (!Uri.TryCreate(sanitizedUrl, UriKind.Absolute, out var uri))
             return false;
