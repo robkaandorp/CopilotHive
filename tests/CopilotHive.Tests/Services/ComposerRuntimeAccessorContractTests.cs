@@ -22,7 +22,7 @@ using Xunit;
 namespace CopilotHive.Tests.Services;
 
 /// <summary>
-/// THE ACCESSOR CONTRACT, completed: the circuit identity is initialised ONCE through the shared
+/// THE ACCESSOR CONTRACT: the circuit identity is observed through the shared
 /// <see cref="ComponentActingUser.AcquireAsync"/> helper and never re-adopted, the
 /// <see cref="HiveCapability.InteractiveMember"/> check is RE-RUN on every operation (including the
 /// connect path), and the accessor never owns — let alone disposes — a runtime.
@@ -32,7 +32,7 @@ namespace CopilotHive.Tests.Services;
 /// the manager actually hands out.
 /// </para>
 /// </summary>
-public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisposable
+public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
 {
     private const string Model = "accessor-contract-model";
     private const string OriginalId = "accessor-original";
@@ -68,21 +68,15 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
         _viewerId = (await _auth.SeedAsync(ViewerId, UserRole.Viewer)).Id;
     }
 
-    // ── The circuit identity: initialised ONCE ───────────────────────────────────────────────
+    // ── The circuit identity: observed, permanently invalidated on replacement ───────────────
 
     /// <summary>
-    /// THE CIRCUIT IDENTITY IS INITIALISED EXACTLY ONCE: the second circuit operation, even when it
-    /// carries a DIFFERENT cascading identity, keeps the identity the accessor was seeded with —
-    /// so a later identity can never be adopted into an existing circuit.
-    /// <para>
-    /// This is the observable consequence of routing the initialisation through the shared
-    /// <see cref="ComponentActingUser.AcquireAsync"/> helper (which seeds only an UN-initialised
-    /// accessor). Without that rule the second call would silently re-point the circuit at another
-    /// account's runtime.
-    /// </para>
+    /// A LATER, DIFFERENT IDENTITY IS NEVER ADOPTED AND INVALIDATES THE CIRCUIT: the second circuit
+    /// operation carries a DIFFERENT cascading identity (B) and is denied with no runtime, and so is
+    /// every later operation — even one carrying the original identity A again.
     /// </summary>
     [Fact]
-    public async Task CircuitIdentity_IsInitialisedOnce_AndALaterIdentityIsNeverAdopted()
+    public async Task CircuitIdentity_ALaterIdentityIsNeverAdopted_AndPermanentlyInvalidates()
     {
         var (manager, accessor) = Build(officialProvider: "ollama-local");
 
@@ -91,16 +85,178 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
         Assert.NotNull(first.Runtime);
         Assert.Equal(_originalId, first.Runtime!.State.UserId);
 
-        // A DIFFERENT identity arrives on the next operation.
-        var second = await Acquire(accessor, CircuitState(MemberId));
+        // The SAME identity again is idempotent and served the same shared runtime.
+        var same = await Acquire(accessor, CircuitState(OriginalId));
+        Assert.Same(first.Runtime, same.Runtime);
 
-        Assert.True(second.IsAuthorized);
-        Assert.NotNull(second.Runtime);
-        // The circuit kept its ORIGINAL identity: the later identity was never adopted.
-        Assert.Equal(_originalId, second.Runtime!.State.UserId);
-        Assert.NotEqual(_memberId, second.Runtime.State.UserId);
-        // ...and it is the very same shared runtime, not a second one.
-        Assert.Same(first.Runtime, second.Runtime);
+        // A DIFFERENT identity arrives: denied, no runtime, nothing adopted.
+        var second = await Acquire(accessor, CircuitState(MemberId));
+        Assert.False(second.IsAuthorized);
+        Assert.Null(second.Runtime);
+        Assert.DoesNotContain(_memberId, ManagerEntries(manager));
+
+        // Permanent: A is not restored, on acquire OR connect, and a missing cascade does not help.
+        foreach (var state in new Task<AuthenticationState>?[] { CircuitState(OriginalId), CircuitState(MemberId), null })
+        {
+            var acquire = await Acquire(accessor, state);
+            Assert.False(acquire.IsAuthorized);
+            Assert.Null(acquire.Runtime);
+            Assert.Null(acquire.Result);
+            var connect = await ConnectCircuit(accessor, state);
+            Assert.False(connect.IsAuthorized);
+            Assert.Null(connect.Runtime);
+            Assert.Null(connect.Result);
+        }
+    }
+
+    /// <summary>
+    /// THE TRANSITIONS THAT INVALIDATE THE CIRCUIT deny runtime acquisition AND connection afterwards
+    /// (no principal, no manager outcome): A→sign-out→missing, A→sign-out→A, A→sign-out→B,
+    /// A→B→missing and A→B→A.
+    /// </summary>
+    [Theory]
+    [InlineData("A>signout>missing")]
+    [InlineData("A>signout>A")]
+    [InlineData("A>signout>B")]
+    [InlineData("A>B>missing")]
+    [InlineData("A>B>A")]
+    public async Task CircuitIdentity_AfterInvalidation_RuntimeAcquisitionAndConnectionDeny(string transition)
+    {
+        var circuit = NewCircuitAccessor();
+        var (manager, accessor) = Build(officialProvider: "ollama-local", circuit);
+        var steps = transition.Split('>');
+
+        Task<AuthenticationState>? StepState(string step) => step switch
+        {
+            "A" => CircuitState(OriginalId),
+            "B" => CircuitState(MemberId),
+            "signout" => Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Anonymous())),
+            "missing" => null,
+            _ => throw new InvalidOperationException(step),
+        };
+
+        var first = await Acquire(accessor, StepState(steps[0]));
+        Assert.True(first.IsAuthorized);
+        Assert.Equal(_originalId, first.Runtime!.State.UserId);
+        var connected = await ConnectCircuit(accessor, StepState(steps[0]));
+        Assert.True(connected.IsAuthorized);
+        Assert.Same(first.Runtime, connected.Runtime);
+        Assert.True(connected.Runtime!.Composer.IsConnected);
+        Assert.True(await ComponentActingUser.IsAllowedAsync(StepState("A"), circuit, HiveCapability.InteractiveMember, Ct));
+        Assert.Equal(OriginalId, (await circuit.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+
+        // The middle step is the observed invalidation itself: already denied.
+        Assert.False((await Acquire(accessor, StepState(steps[1]))).IsAuthorized);
+        var terminal = steps[1] == "signout" ? CircuitIdentityState.SignedOut : CircuitIdentityState.IdentityReplaced;
+        Assert.Equal(terminal, circuit.IdentityState);
+
+        // Every surface uses this SAME circuit, and every row pins stale A AND replacement B replay.
+        foreach (var step in new[] { steps[2], "A", "B", "missing" })
+        {
+            Assert.Null(await ComponentActingUser.AcquireAsync(StepState(step), circuit));
+            foreach (var capability in Enum.GetValues<HiveCapability>())
+            {
+                Assert.False(await ComponentActingUser.IsAllowedAsync(StepState(step), circuit, capability, Ct));
+                Assert.False(await circuit.IsAllowedAsync(capability, Ct));
+            }
+            var principal = await circuit.GetPrincipalAsync(Ct);
+            Assert.Null(principal.Principal);
+            Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, principal.RefusalReason);
+            AssertDenied(await Acquire(accessor, StepState(step)));
+            AssertDenied(await ConnectCircuit(accessor, StepState(step)));
+            Assert.Equal(terminal, circuit.IdentityState);
+            Assert.Null(circuit.EstablishedIdentity);
+            Assert.Equal(new[] { _originalId }, ManagerEntries(manager));
+        }
+    }
+
+    /// <summary>
+    /// A MISSING CASCADE NEVER INITIALISES: with authentication enabled and no identity ever
+    /// established, the circuit path denies (no runtime) and the accessor stays uninitialised; a later
+    /// cascade still establishes normally (child-before-parent ordering is safe).
+    /// </summary>
+    [Fact]
+    public async Task CircuitPath_MissingCascadeWithNoEstablishedIdentity_Denies_AndNeverInitialises()
+    {
+        var circuit = NewCircuitAccessor();
+        var (manager, accessor) = Build(officialProvider: "ollama-local", circuit);
+
+        var denied = await Acquire(accessor, (Task<AuthenticationState>?)null);
+        Assert.False(denied.IsAuthorized);
+        Assert.Null(denied.Runtime);
+        Assert.Equal(CircuitIdentityState.Uninitialized, circuit.IdentityState);
+        Assert.Empty(ManagerEntries(manager));
+
+        var parent = await Acquire(accessor, CircuitState(OriginalId));
+        Assert.True(parent.IsAuthorized);
+    }
+
+    /// <summary>
+    /// AN ESTABLISHED IDENTITY MAY SERVE A CASCADE-LESS ACQUISITION only without an observed
+    /// invalidation and only while a FRESH directory resolution still succeeds: a demotion/disablement
+    /// still denies, and a sign-out denies.
+    /// </summary>
+    [Fact]
+    public async Task CircuitPath_EstablishedIdentityServesACascadeLessAcquisition_OnlyWhileFreshAndNotInvalidated()
+    {
+        var (_, accessor) = Build(officialProvider: "ollama-local");
+
+        var first = await Acquire(accessor, CircuitState(OriginalId));
+        var cascadeLess = await Acquire(accessor, (Task<AuthenticationState>?)null);
+        Assert.True(cascadeLess.IsAuthorized);
+        Assert.Same(first.Runtime, cascadeLess.Runtime);
+
+        // Fresh resolution still governs: a demoted account is refused on the cascade-less call.
+        await _auth.SetRoleAsync(OriginalId, UserRole.Viewer);
+        Assert.False((await Acquire(accessor, (Task<AuthenticationState>?)null)).IsAuthorized);
+        await _auth.SetRoleAsync(OriginalId, UserRole.Member);
+        Assert.True((await Acquire(accessor, (Task<AuthenticationState>?)null)).IsAuthorized);
+
+        // Sign-out is observed: the cascade-less call no longer rides on the established identity.
+        var signedOut = Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Anonymous()));
+        Assert.False((await Acquire(accessor, signedOut)).IsAuthorized);
+        Assert.False((await Acquire(accessor, (Task<AuthenticationState>?)null)).IsAuthorized);
+    }
+
+    /// <summary>
+    /// OUT-OF-ORDER GUARD AT THE RUNTIME LEVEL: an acquisition gated on a cascading state for A resumes
+    /// AFTER a sign-out was observed and must be denied — no runtime, no restored identity. The gate is a
+    /// <see cref="TaskCompletionSource{TResult}"/> released only after the sign-out (no sleeps).
+    /// </summary>
+    [Fact]
+    public async Task CircuitPath_AStaleAcquisitionResumingAfterSignOut_IsDenied()
+    {
+        var circuit = NewCircuitAccessor();
+        var (manager, accessor) = Build(officialProvider: "ollama-local", circuit);
+
+        var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = Acquire(accessor, gate.Task);
+        try
+        {
+            Assert.False(stale.IsCompleted);
+            // Another call establishes A and then observes the sign-out while the stale task is parked.
+            Assert.True((await Acquire(accessor, CircuitState(OriginalId))).IsAuthorized);
+            var signOut = Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Anonymous()));
+            AssertDenied(await Acquire(accessor, signOut));
+            Assert.Equal(CircuitIdentityState.SignedOut, circuit.IdentityState);
+
+            gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            AssertDenied(await stale.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.SignedOut, circuit.IdentityState);
+            Assert.Null(circuit.EstablishedIdentity);
+            Assert.Null(await ComponentActingUser.AcquireAsync(CircuitState(OriginalId), circuit));
+            Assert.Null((await circuit.GetPrincipalAsync(Ct)).Principal);
+            Assert.False(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+            Assert.False(await ComponentActingUser.IsAllowedAsync(CircuitState(OriginalId), circuit, HiveCapability.InteractiveMember, Ct));
+            AssertDenied(await Acquire(accessor, (Task<AuthenticationState>?)null));
+            AssertDenied(await ConnectCircuit(accessor, CircuitState(OriginalId)));
+            Assert.Equal(new[] { _originalId }, ManagerEntries(manager)); // only pre-sign-out runtime exists
+        }
+        finally
+        {
+            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            await stale;
+        }
     }
 
     /// <summary>
@@ -358,6 +514,126 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
         }
     }
 
+    private static void AssertDenied(ComposerRuntimeAccess access)
+    {
+        Assert.False(access.IsAuthorized);
+        Assert.Null(access.Runtime);
+        Assert.Null(access.Result);
+        Assert.Equal(ComposerRuntimeStatus.Refused, access.Status);
+    }
+
+    [Theory]
+    [InlineData("demoted")]
+    [InlineData("disabled")]
+    public async Task CircuitPath_CascadeLessDirectoryChange_NextPrincipalCapabilityAcquireAndConnectAreFresh(string change)
+    {
+        var circuit = NewCircuitAccessor();
+        var (manager, accessor) = Build(officialProvider: "ollama-local", circuit);
+        var first = await Acquire(accessor, CircuitState(OriginalId));
+        Assert.True(first.IsAuthorized);
+        Assert.NotNull(first.Runtime);
+        Assert.Equal(_originalId, first.Runtime.State.UserId);
+        Assert.Same(first.Runtime, (await Acquire(accessor, (Task<AuthenticationState>?)null)).Runtime);
+        var connected = await ConnectCircuit(accessor, null);
+        Assert.True(connected.IsAuthorized);
+        Assert.Same(first.Runtime, connected.Runtime);
+        Assert.True(connected.Runtime!.Composer.IsConnected);
+        Assert.True(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+        var identity = circuit.EstablishedIdentity;
+        Assert.NotNull(identity);
+
+        if (change == "demoted") await _auth.SetRoleAsync(OriginalId, UserRole.Viewer);
+        else if (change == "disabled") await _auth.SetEnabledAsync(OriginalId, false);
+        else throw new InvalidOperationException(change);
+
+        // Claims are identity-only: unchanged claims are NOT an authorization grant.
+        Assert.Same(identity, await ComponentActingUser.AcquireAsync(null, circuit));
+        var fresh = await circuit.GetPrincipalAsync(Ct);
+        if (change == "demoted")
+        {
+            Assert.True(fresh.IsResolved);
+            Assert.Equal(UserRole.Viewer, fresh.Principal!.Role);
+            Assert.Equal(OriginalId, fresh.Principal.GitHubId);
+        }
+        else
+        {
+            Assert.Null(fresh.Principal);
+            Assert.Equal(PrincipalRefusalReason.DisabledAccount, fresh.RefusalReason);
+        }
+        Assert.False(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+        Assert.False(await ComponentActingUser.IsAllowedAsync(CircuitState(OriginalId), circuit, HiveCapability.InteractiveMember, Ct));
+        AssertDenied(await Acquire(accessor, (Task<AuthenticationState>?)null));
+        AssertDenied(await ConnectCircuit(accessor, null));
+        Assert.Equal(CircuitIdentityState.Initialized, circuit.IdentityState);
+        Assert.Equal(new[] { _originalId }, ManagerEntries(manager));
+
+        // Directory changes are transient; unlike sign-out, re-enablement can recover in this scope.
+        await _auth.SetRoleAsync(OriginalId, UserRole.Member);
+        await _auth.SetEnabledAsync(OriginalId, true);
+        Assert.True(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+        Assert.Same(first.Runtime, (await Acquire(accessor, (Task<AuthenticationState>?)null)).Runtime);
+        Assert.Same(first.Runtime, (await ConnectCircuit(accessor, null)).Runtime);
+    }
+
+    [Theory]
+    [InlineData("A>signout>missing", "demoted")]
+    [InlineData("A>signout>A", "demoted")]
+    [InlineData("A>signout>B", "demoted")]
+    [InlineData("A>B>missing", "demoted")]
+    [InlineData("A>B>A", "demoted")]
+    [InlineData("A>signout>missing", "disabled")]
+    [InlineData("A>signout>A", "disabled")]
+    [InlineData("A>signout>B", "disabled")]
+    [InlineData("A>B>missing", "disabled")]
+    [InlineData("A>B>A", "disabled")]
+    public async Task CircuitPath_DirectoryChangeAfterTerminalTransition_NeverReplaysCachedAuthorization(string transition, string change)
+    {
+        var circuit = NewCircuitAccessor();
+        var (_, accessor) = Build(officialProvider: "ollama-local", circuit);
+        Assert.True((await Acquire(accessor, CircuitState(OriginalId))).IsAuthorized);
+        Assert.True(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+        Assert.Equal(OriginalId, (await circuit.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+
+        var steps = transition.Split('>');
+        var invalidate = steps[1] == "signout"
+            ? Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Anonymous()))
+            : CircuitState(MemberId);
+        AssertDenied(await Acquire(accessor, invalidate));
+        var terminal = circuit.IdentityState;
+        Assert.True(circuit.IsInvalidated);
+
+        foreach (var id in new[] { OriginalId, MemberId })
+        {
+            if (change == "demoted") await _auth.SetRoleAsync(id, UserRole.Viewer);
+            else if (change == "disabled") await _auth.SetEnabledAsync(id, false);
+            else throw new InvalidOperationException(change);
+        }
+        var last = steps[2] == "missing" ? null : CircuitState(steps[2] == "A" ? OriginalId : MemberId);
+        Assert.Null(await ComponentActingUser.AcquireAsync(last, circuit));
+        Assert.Null((await circuit.GetPrincipalAsync(Ct)).Principal);
+        Assert.False(await circuit.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+        Assert.False(await ComponentActingUser.IsAllowedAsync(last, circuit, HiveCapability.InteractiveMember, Ct));
+        AssertDenied(await Acquire(accessor, last));
+        AssertDenied(await ConnectCircuit(accessor, last));
+
+        // Re-enabling/promoting both accounts must not turn terminal invalidation into transient denial.
+        foreach (var id in new[] { OriginalId, MemberId })
+        {
+            await _auth.SetRoleAsync(id, UserRole.Member);
+            await _auth.SetEnabledAsync(id, true);
+        }
+        foreach (var state in new Task<AuthenticationState>?[] { CircuitState(OriginalId), CircuitState(MemberId), null })
+        {
+            Assert.Null(await ComponentActingUser.AcquireAsync(state, circuit));
+            Assert.Null((await circuit.GetPrincipalAsync(Ct)).Principal);
+            Assert.False(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+            Assert.False(await ComponentActingUser.IsAllowedAsync(state, circuit, HiveCapability.InteractiveMember, Ct));
+            AssertDenied(await Acquire(accessor, state));
+            AssertDenied(await ConnectCircuit(accessor, state));
+            Assert.Equal(terminal, circuit.IdentityState);
+        }
+    }
+
     // ── Fixture ────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -366,6 +642,13 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
     /// </summary>
     private (ComposerRuntimeManager Manager, ComposerRuntimeAccessor Accessor) Build(
         string officialProvider, Func<bool>? tokenAvailable = null)
+        => Build(officialProvider, circuitAccessor: null, tokenAvailable);
+
+    private CircuitUserPrincipalAccessor NewCircuitAccessor() =>
+        new(_auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy);
+
+    private (ComposerRuntimeManager Manager, ComposerRuntimeAccessor Accessor) Build(
+        string officialProvider, CircuitUserPrincipalAccessor? circuitAccessor, Func<bool>? tokenAvailable = null)
     {
         var config = new HiveConfigFile
         {
@@ -407,7 +690,7 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
 
         var accessor = new ComposerRuntimeAccessor(
             manager,
-            new CircuitUserPrincipalAccessor(_resolver, _policy),
+            circuitAccessor ?? new CircuitUserPrincipalAccessor(_resolver, _policy),
             _resolver,
             _policy,
             NullLogger<ComposerRuntimeAccessor>.Instance);
@@ -422,8 +705,16 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
         return task;
     }
 
+    private Task<ComposerRuntimeAccess> ConnectCircuit(
+        ComposerRuntimeAccessor accessor, Task<AuthenticationState>? state)
+    {
+        var task = accessor.ConnectForCircuitAsync(state, Ct);
+        _requests.Add(task);
+        return task;
+    }
+
     private Task<ComposerRuntimeAccess> Acquire(
-        ComposerRuntimeAccessor accessor, Task<AuthenticationState> state)
+        ComposerRuntimeAccessor accessor, Task<AuthenticationState>? state)
     {
         var task = accessor.AcquireForCircuitAsync(state, Ct);
         _requests.Add(task);
@@ -470,22 +761,12 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime, IDisp
             await Step(() => provider.DisposeAsync().AsTask());
 
         await Step(() => { _goalDb.Dispose(); return Task.CompletedTask; });
+        // xUnit invokes DisposeAsync, not the synchronous Dispose, when both exist.
+        await Step(() => { _auth.Dispose(); return Task.CompletedTask; });
+        await Step(() => { if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true); return Task.CompletedTask; });
 
         if (failures.Count > 0)
             throw new AggregateException("Accessor contract test cleanup failed", failures);
     }
 
-    public void Dispose()
-    {
-        _auth.Dispose();
-        try
-        {
-            if (Directory.Exists(_dir))
-                Directory.Delete(_dir, recursive: true);
-        }
-        catch (IOException)
-        {
-            // Best-effort cleanup of the isolated state directory.
-        }
-    }
 }

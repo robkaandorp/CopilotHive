@@ -1,9 +1,17 @@
 using System.Security.Claims;
 
+using System.Data.Common;
+
+using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Security;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Security;
 
@@ -156,6 +164,126 @@ public sealed class CircuitUserPrincipalAccessorTests
     }
 
     /// <summary>
+    /// A CLEAR IS RECORDED AND PERMANENT: it is distinguishable from never-initialised, and a later
+    /// <c>Initialize</c> (even with the very same identity) restores nothing.
+    /// </summary>
+    [Fact]
+    public async Task Clear_IsRecordedAsSignedOut_AndIsPermanent()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var never = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        accessor.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        Assert.Equal(CircuitIdentityState.Uninitialized, never.IdentityState);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.NotNull(accessor.EstablishedIdentity);
+
+        accessor.Clear();
+
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.True(accessor.IsInvalidated);
+        Assert.False(never.IsInvalidated);
+        Assert.Null(accessor.EstablishedIdentity);
+
+        accessor.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.False(accessor.IsInitialized);
+        Assert.False((await accessor.GetPrincipalAsync(Ct)).IsResolved);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+
+        // Explicit reauthentication requires a NEW scope/accessor, never revival of this circuit.
+        var reauthenticated = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        Assert.NotSame(accessor, reauthenticated);
+        reauthenticated.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        Assert.Equal("1", (await reauthenticated.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        Assert.True(await reauthenticated.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+    }
+
+    /// <summary>
+    /// A DIFFERENT identity observed after initialisation PERMANENTLY invalidates the accessor: the
+    /// replacement is not adopted and the original is not restored. The SAME identity is idempotent.
+    /// </summary>
+    [Fact]
+    public async Task Observe_ADifferentIdentity_PermanentlyInvalidates_AndTheSameIdentityIsIdempotent()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        await directory.SeedActivatedAccountAsync("2", UserRole.Admin, username: "second");
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        var one = HiveSecurityTestDirectory.GitHubPrincipal("1");
+
+        Assert.Same(one, accessor.Observe(StateOf(one)));
+        Assert.NotNull(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+
+        // Neither B nor A is accepted afterwards, and Clear cannot resurrect or downgrade the state.
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+        Assert.Null(accessor.Observe(StateOf(one)));
+        accessor.Clear();
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+        Assert.Equal(
+            PrincipalRefusalReason.AccessorNotInitialized,
+            (await accessor.GetPrincipalAsync(Ct)).RefusalReason);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+
+        var reauthenticated = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        Assert.NotSame(accessor, reauthenticated);
+        reauthenticated.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2")));
+        Assert.Equal("2", (await reauthenticated.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        Assert.True(await reauthenticated.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+    }
+
+    /// <summary>
+    /// An explicitly SIGNED-OUT state observed after an established identity is a sign-out: permanent,
+    /// and the later identity A is not restored. NO authorization cache: a demotion still lands
+    /// immediately for an initialised accessor.
+    /// </summary>
+    [Fact]
+    public async Task Observe_SignedOutAfterEstablished_IsPermanent_ButAnEstablishedAccessorStillReResolves()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+        var one = HiveSecurityTestDirectory.GitHubPrincipal("1");
+        accessor.Observe(StateOf(one));
+        Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        await directory.SetRoleAsync("1", UserRole.Viewer);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.AnonymousPrincipal())));
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.Observe(StateOf(one)));
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+    }
+
+    /// <summary>
+    /// A signed-out state as the FIRST observation is recorded as an initialised anonymous identity
+    /// and is refused as unauthenticated; a later real identity is then a REPLACEMENT, not an adoption.
+    /// </summary>
+    [Fact]
+    public async Task Observe_SignedOutFirst_ThenAnIdentity_IsNeverAdopted()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.AnonymousPrincipal()));
+        Assert.Null(accessor.EstablishedIdentity);
+        Assert.Equal(PrincipalRefusalReason.Unauthenticated, (await accessor.GetPrincipalAsync(Ct)).RefusalReason);
+
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+        Assert.True(accessor.IsInvalidated);
+        Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+    }
+
+    /// <summary>
     /// A SIGNED-OUT state is accepted by the explicit initialiser and still fails closed: an
     /// unauthenticated supplied state is refused as unauthenticated, never as the local operator.
     /// </summary>
@@ -220,5 +348,293 @@ public sealed class CircuitUserPrincipalAccessorTests
             () => new CircuitUserPrincipalAccessor(null!, new HivePolicy()));
         Assert.Throws<ArgumentNullException>(
             () => new CircuitUserPrincipalAccessor(directory.AuthEnabledResolver(), null!));
+    }
+
+    // ── Sign-out / replacement DURING a real directory resolution ────────────────────────────
+
+    /// <summary>
+    /// A REAL directory (SQLite in-memory + the production <see cref="UserService"/>/resolver/accessor)
+    /// whose FIRST armed <c>users</c> read is HELD inside an EF command interceptor
+    /// (<c>ReaderExecutingAsync</c>). The hold is therefore genuinely mid-directory-read: the resolver
+    /// has started its lookup, and has not yet produced a resolution. <see cref="Arrived"/> completes
+    /// only when the read is parked on the release gate; nothing is timing based.
+    /// </summary>
+    private sealed class HeldDirectoryRead : DbCommandInterceptor, IDisposable
+    {
+        private readonly SqliteConnection _connection = new("Data Source=:memory:");
+        private TaskCompletionSource _arrived = NewGate();
+        private TaskCompletionSource _release = NewGate();
+        private int _armed;
+
+        private static TaskCompletionSource NewGate() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal HeldDirectoryRead()
+        {
+            _connection.Open();
+            using var ctx = CreateDbContext();
+            ctx.Database.EnsureCreated();
+            Service = new UserService(new Factory(this), NullLogger<UserService>.Instance);
+        }
+
+        internal UserService Service { get; }
+
+        /// <summary>The text of the command that was parked (null until it arrived).</summary>
+        internal string? HeldCommandText { get; private set; }
+
+        /// <summary>Completes when the armed read is parked on the release gate.</summary>
+        internal Task Arrived => _arrived.Task;
+
+        internal CircuitUserPrincipalAccessor Accessor() =>
+            new(new HivePrincipalResolver(Service, HiveAuthMode.AuthenticationEnabled, NullLogger<HivePrincipalResolver>.Instance),
+                new HivePolicy());
+
+        internal async Task SeedAsync(string gitHubId, UserRole role)
+        {
+            await using var db = CreateDbContext();
+            db.Users.Add(new UserEntity
+            {
+                GitHubId = gitHubId,
+                Username = "user-" + gitHubId,
+                AccessToken = "token-" + gitHubId,
+                Role = role,
+                Enabled = true,
+                CreatedAt = "2024-01-01T00:00:00.0000000Z",
+            });
+            await db.SaveChangesAsync(CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Arms the hold with FRESH incomplete gates: the NEXT directory read parks until
+        /// <see cref="Release"/>. Must only be called while no read is parked.
+        /// </summary>
+        internal void Arm()
+        {
+            HeldCommandText = null;
+            _arrived = NewGate();
+            _release = NewGate();
+            Volatile.Write(ref _armed, 1);
+        }
+
+        /// <summary>Opens the gate (idempotent).</summary>
+        internal void Release() => _release.TrySetResult();
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Exchange(ref _armed, 0) == 1)
+            {
+                HeldCommandText = command.CommandText;
+                _arrived.TrySetResult();
+                await _release.Task.ConfigureAwait(false);
+            }
+
+            return result;
+        }
+
+        private CopilotHiveDbContext CreateDbContext() =>
+            new(new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(_connection)
+                .AddInterceptors(this)
+                .Options);
+
+        public void Dispose() => _connection.Dispose();
+
+        private sealed class Factory(HeldDirectoryRead owner) : IDbContextFactory<CopilotHiveDbContext>
+        {
+            public CopilotHiveDbContext CreateDbContext() => owner.CreateDbContext();
+        }
+    }
+
+    /// <summary>
+    /// Owns the question BEFORE any throwing rendezvous assertion. The production reader is held
+    /// until arrival and pending-question assertions succeed, then <paramref name="whileHeld"/>
+    /// observes the invalidation inside that window. Every exit releases and joins the actual
+    /// question BEFORE the caller can dispose the directory, including failed arrival assertions.
+    /// </summary>
+    private static async Task<T> RunHeldQuestionAsync<T>(
+        HeldDirectoryRead directory, Func<Task<T>> question, Action whileHeld)
+    {
+        directory.Arm();
+        var task = question();
+        Exception? primaryFailure = null;
+        try
+        {
+            await Task.WhenAny(directory.Arrived, task).WaitAsync(TestContext.Current.CancellationToken);
+            Assert.True(directory.Arrived.IsCompleted, "the directory read must have started and parked");
+            Assert.False(task.IsCompleted, "the resolution must still be in flight while the read is held");
+            Assert.Contains("FROM \"users\"", directory.HeldCommandText, StringComparison.Ordinal);
+            Assert.Contains("\"github_id\" =", directory.HeldCommandText, StringComparison.Ordinal);
+
+            whileHeld();
+            directory.Release();
+            return await task;
+        }
+        catch (Exception ex)
+        {
+            primaryFailure = ex;
+            throw;
+        }
+        finally
+        {
+            directory.Release();
+            try { await task; }
+            catch (Exception cleanupFailure)
+            {
+                if (primaryFailure is null)
+                    throw;
+                if (!ReferenceEquals(primaryFailure, cleanupFailure))
+                    throw new AggregateException("Held directory question failed during both assertion and cleanup.",
+                        primaryFailure, cleanupFailure);
+                // This is the same task fault already propagating from the primary await.
+            }
+        }
+    }
+
+    /// <summary>
+    /// SIGN-OUT DURING A REAL DIRECTORY RESOLUTION (the post-directory-read guard): identity A is
+    /// established, the accessor's resolution is held MID-READ, an explicit sign-out is recorded on the
+    /// SAME accessor inside that window, and the gate is released. The directory read itself succeeds
+    /// (the account is enabled and valid), yet the resolution is REFUSED with no principal, the circuit
+    /// is terminally SignedOut and no identity remains.
+    /// </summary>
+    [Fact]
+    public async Task GetPrincipalAsync_SignOutDuringTheDirectoryRead_IsRefused_AndTheCircuitIsSignedOut()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        Assert.NotNull(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+
+        var resolution = await RunHeldQuestionAsync(directory, () => accessor.GetPrincipalAsync(Ct), () =>
+        {
+            accessor.Clear(); // the sign-out lands INSIDE the in-flight resolution
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+        });
+
+        Assert.False(resolution.IsResolved);
+        Assert.Null(resolution.Principal);
+        Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.EstablishedIdentity);
+    }
+
+    /// <summary>
+    /// The same window through the CAPABILITY question: a sign-out inside the in-flight directory read
+    /// must make <see cref="CircuitUserPrincipalAccessor.IsAllowedAsync"/> answer <c>false</c> even
+    /// though the account is an enabled Admin.
+    /// </summary>
+    [Fact]
+    public async Task IsAllowedAsync_SignOutDuringTheDirectoryRead_DeniesTheCapability()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        var allowed = await RunHeldQuestionAsync(
+            directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct), () =>
+            {
+                accessor.Clear();
+                Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+                Assert.Null(accessor.EstablishedIdentity);
+            });
+
+        Assert.False(allowed);
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.EstablishedIdentity);
+    }
+
+    /// <summary>
+    /// REPLACEMENT DURING A REAL DIRECTORY RESOLUTION: a DIFFERENT identity B observed on the same
+    /// accessor inside the in-flight read permanently invalidates the circuit; the resolution that was
+    /// started for A is refused (B is not adopted, A is not served), and the state is IdentityReplaced.
+    /// </summary>
+    [Fact]
+    public async Task GetPrincipalAsync_ReplacementDuringTheDirectoryRead_IsRefused_AndTheCircuitIsReplaced()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        await directory.SeedAsync("2", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        var resolution = await RunHeldQuestionAsync(directory, () => accessor.GetPrincipalAsync(Ct), () =>
+        {
+            Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("2"))));
+            Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+        });
+
+        Assert.False(resolution.IsResolved);
+        Assert.Null(resolution.Principal);
+        Assert.Equal(PrincipalRefusalReason.AccessorNotInitialized, resolution.RefusalReason);
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+        Assert.Null(accessor.EstablishedIdentity);
+    }
+
+    [Fact]
+    public async Task HeldDirectoryRead_FailedInFlightAssertion_ReleasesAndJoinsTheQuestion()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        var expected = new Xunit.Sdk.XunitException("Intentional in-window assertion failure for cleanup verification.");
+        Task<PrincipalResolution>? resolving = null;
+        try
+        {
+            var failure = await Assert.ThrowsAsync<Xunit.Sdk.XunitException>(() => RunHeldQuestionAsync(
+                directory,
+                () => resolving = accessor.GetPrincipalAsync(Ct),
+                () => throw expected));
+
+            Assert.Same(expected, failure); // Cleanup must not replace the primary assertion.
+            Assert.NotNull(resolving);
+            Assert.True(resolving.IsCompletedSuccessfully, "the real directory question must be joined before rethrowing");
+            var resolution = await resolving;
+            Assert.True(resolution.IsResolved);
+            Assert.Equal("1", resolution.Principal!.GitHubId);
+            Assert.Equal(UserRole.Admin, resolution.Principal.Role);
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        }
+        finally
+        {
+            // Safety boundary for this deliberate-failure control, even if the helper is regressed.
+            directory.Release();
+            if (resolving is not null) await resolving;
+        }
+    }
+
+    /// <summary>
+    /// POSITIVE CONTROL on the SAME harness and the SAME hold: no sign-out/replacement inside the
+    /// window. The held resolution completes successfully with the A principal and the correct
+    /// capability answers — so the hold itself denies nothing and the regressions above are
+    /// discriminating, not vacuous.
+    /// </summary>
+    [Fact]
+    public async Task GetPrincipalAndIsAllowed_HeldDirectoryReadWithNoSignOut_CompleteSuccessfully()
+    {
+        using var directory = new HeldDirectoryRead();
+        await directory.SeedAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor();
+        accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+
+        var resolution = await RunHeldQuestionAsync(directory, () => accessor.GetPrincipalAsync(Ct), () => { });
+
+        Assert.True(resolution.IsResolved);
+        Assert.Equal("1", resolution.Principal!.GitHubId);
+        Assert.Equal(UserRole.Admin, resolution.Principal.Role);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.NotNull(accessor.EstablishedIdentity);
+
+        // The capability question through the identical hold (a fresh arm of the same harness).
+        var allowed = await RunHeldQuestionAsync(
+            directory, () => accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct), () => { });
+        Assert.True(allowed);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
     }
 }

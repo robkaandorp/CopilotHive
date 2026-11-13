@@ -23,9 +23,8 @@ namespace CopilotHive.Tests.Services;
 /// <item><b>OPEN MODE TOLERANCE</b> — with NO cascading authentication state at all (the host
 /// registers no authentication services), the helper must NOT throw and must yield the null
 /// identity that the facade turns into the local operator;</item>
-/// <item><b>CASCADE INITIALISATION</b> — with a cascade, the scoped accessor is initialised from
-/// the circuit's <see cref="AuthenticationState"/>, exactly once, and never with a fabricated
-/// state;</item>
+/// <item><b>CASCADE OBSERVATION</b> — a first cascade establishes the scoped identity; later
+/// sign-out/replacement permanently invalidates it, with no fabricated state;</item>
 /// <item><b>THE CAPABILITY QUESTION</b> — the question is answered against CURRENT stored state,
 /// so a demotion or a disablement between two questions is reflected immediately.</item>
 /// </list>
@@ -119,14 +118,47 @@ public sealed class ComponentActingUserTests : IDisposable
     }
 
     /// <summary>
-    /// OPEN MODE TOLERANCE WITH A MISSING ACCESSOR: a page that somehow has no accessor must still
-    /// not throw — the capability question is answered from the open-mode decision alone.
+    /// UNKNOWN MODE DENIES (updated obsolete expectation): with NO cascade and NO accessor the mode
+    /// cannot be shown to be explicit open mode, so the capability question is DENIED. Previously this
+    /// answered <c>true</c> (a missing cascade was read as open mode).
     /// </summary>
     [Fact]
     public async Task OpenMode_NoCascadeAndNoAccessor_StillAnswersTheCapabilityQuestion()
     {
-        Assert.True(await ComponentActingUser.IsAllowedAsync(
+        Assert.False(await ComponentActingUser.IsAllowedAsync(
             null, accessor: null, HiveCapability.GlobalAdmin, Ct));
+    }
+
+    /// <summary>
+    /// UNKNOWN MODE DENIES (auth enabled): a missing cascade while authentication is enabled is NOT
+    /// open mode, so every capability is denied — and the accessor is never created/initialised.
+    /// </summary>
+    [Theory]
+    [InlineData(HiveCapability.SharedRead)]
+    [InlineData(HiveCapability.InteractiveMember)]
+    [InlineData(HiveCapability.ExecutionOperator)]
+    [InlineData(HiveCapability.GlobalAdmin)]
+    public async Task AuthEnabled_NoCascade_DeniesEveryCapability_AndNeverInitialisesTheAccessor(HiveCapability capability)
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor(HiveAuthMode.AuthenticationEnabled);
+
+        Assert.False(await ComponentActingUser.IsAllowedAsync(null, accessor, capability, Ct));
+
+        Assert.False(accessor.IsInitialized);
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+        Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+    }
+
+    /// <summary>EXPLICIT OPEN still answers true with no cascade (local-operator behaviour unchanged).</summary>
+    [Fact]
+    public async Task ExplicitOpen_NoCascade_StillAnswersTrue_WithoutInitialising()
+    {
+        var accessor = Accessor(HiveAuthMode.Open);
+
+        Assert.True(await ComponentActingUser.IsAllowedAsync(null, accessor, HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
     }
 
     // ── Cascade: identity acquisition and accessor initialisation ────────────
@@ -155,29 +187,214 @@ public sealed class ComponentActingUserTests : IDisposable
     }
 
     /// <summary>
-    /// THE ACCESSOR IS INITIALISED EXACTLY ONCE: a second acquisition must not re-initialise it.
-    /// <para>
-    /// The observable consequence: the accessor keeps the FIRST circuit identity. A component that
-    /// re-acquires on every render therefore cannot silently swap the circuit's user underneath the
-    /// accessor — the initialisation is a one-time act, and every question re-resolves from the
-    /// directory anyway.
-    /// </para>
+    /// THE SAME IDENTITY IS IDEMPOTENT, A DIFFERENT ONE IS NEVER ADOPTED: re-acquiring with the same
+    /// identity keeps serving it; acquiring with a DIFFERENT identity permanently invalidates the
+    /// circuit (the replacement is not adopted and the original is not restored).
     /// </summary>
     [Fact]
-    public async Task TheAccessorIsInitialisedOnlyOnce_AcrossRepeatedAcquisitions()
+    public async Task TheAccessorObservesTheSameIdentityIdempotently_AndADifferentOneInvalidates()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        await _auth.SeedAsync(MemberId, UserRole.Member);
+        var accessor = Accessor();
+
+        Assert.NotNull(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+        Assert.NotNull(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+        Assert.Equal(AdminId, (await accessor.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+
+        // A SECOND, different identity invalidates; it is not adopted.
+        Assert.Null(await ComponentActingUser.AcquireAsync(StateFor(MemberId), accessor));
+
+        Assert.Equal(CircuitIdentityState.IdentityReplaced, accessor.IdentityState);
+        Assert.False((await accessor.GetPrincipalAsync(Ct)).IsResolved);
+    }
+
+    // ── Permanent invalidation ───────────────────────────────────────────────
+
+    private static Task<AuthenticationState> SignedOut() =>
+        Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Anonymous()));
+
+    /// <summary>
+    /// The transitions that must permanently invalidate the circuit. Each ends with a final
+    /// acquisition (<c>null</c> = missing cascade) that must be denied for identity, capability and
+    /// principal resolution.
+    /// </summary>
+    public static TheoryData<string> InvalidatingTransitions() => new()
+    {
+        "A>signout>missing", "A>signout>A", "A>signout>B", "A>B>missing", "A>B>A",
+    };
+
+    private Task<AuthenticationState>? Step(string step) => step switch
+    {
+        "A" => StateFor(AdminId),
+        "B" => StateFor(MemberId),
+        "signout" => SignedOut(),
+        "missing" => null,
+        _ => throw new InvalidOperationException(step),
+    };
+
+    /// <summary>
+    /// PERMANENT INVALIDATION: after each transition, identity (<c>AcquireAsync</c>), capability
+    /// (<c>IsAllowedAsync</c>) and the accessor's principal all deny — nothing is restored from a
+    /// stale state and nothing is silently adopted.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(InvalidatingTransitions))]
+    public async Task APermanentlyInvalidatedCircuit_DeniesIdentityCapabilityAndPrincipal(string transition)
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        await _auth.SeedAsync(MemberId, UserRole.Admin);
+        var accessor = Accessor();
+        var steps = transition.Split('>');
+
+        Assert.NotNull(await ComponentActingUser.AcquireAsync(Step(steps[0]), accessor));
+        Assert.True(await ComponentActingUser.IsAllowedAsync(Step(steps[0]), accessor, HiveCapability.GlobalAdmin, Ct));
+
+        // The middle step is the observed invalidation, the last step is the attempted recovery.
+        Assert.Null(await ComponentActingUser.AcquireAsync(Step(steps[1]), accessor));
+        Assert.True(accessor.IsInvalidated);
+
+        Assert.Null(await ComponentActingUser.AcquireAsync(Step(steps[2]), accessor));
+        foreach (var capability in Enum.GetValues<HiveCapability>())
+        {
+            Assert.False(await ComponentActingUser.IsAllowedAsync(Step(steps[2]), accessor, capability, Ct));
+            Assert.False(await accessor.IsAllowedAsync(capability, Ct));
+        }
+
+        var resolution = await accessor.GetPrincipalAsync(Ct);
+        Assert.False(resolution.IsResolved);
+        Assert.Null(resolution.Principal);
+        Assert.Null(accessor.EstablishedIdentity);
+        Assert.True(accessor.IsInvalidated);
+    }
+
+    /// <summary>
+    /// A MISSING CASCADE AFTER AN ESTABLISHED IDENTITY is served the established identity ONLY while
+    /// no invalidation was observed — and it never initialises anything itself.
+    /// </summary>
+    [Fact]
+    public async Task EstablishedIdentity_ServesACascadeLessAcquisition_OnlyWithoutObservedInvalidation()
     {
         await _auth.SeedAsync(AdminId, UserRole.Admin);
         var accessor = Accessor();
 
-        await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
-        Assert.True(accessor.IsInitialized);
+        var established = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+        var cascadeLess = await ComponentActingUser.AcquireAsync(null, accessor);
 
-        // A SECOND, different identity must not replace the initialised circuit identity.
-        await ComponentActingUser.AcquireAsync(StateFor(MemberId), accessor);
+        Assert.NotNull(cascadeLess);
+        Assert.Same(established, cascadeLess);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
 
-        var resolution = await accessor.GetPrincipalAsync(Ct);
-        Assert.True(resolution.IsResolved);
-        Assert.Equal(AdminId, resolution.Principal!.GitHubId);
+        await ComponentActingUser.AcquireAsync(SignedOut(), accessor);
+
+        Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+    }
+
+    /// <summary>
+    /// A cascade-less acquisition before any identity was established yields nothing and the accessor
+    /// stays uninitialised (child-before-parent ordering is safe: the later cascade still works).
+    /// </summary>
+    [Fact]
+    public async Task ChildBeforeParent_CascadeLessAcquisitionIsSafe_AndALaterCascadeStillEstablishes()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+
+        Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+
+        Assert.NotNull(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+        Assert.True(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.GlobalAdmin, Ct));
+    }
+
+    /// <summary>
+    /// OUT-OF-ORDER GUARD: an acquisition task gated on a cascading state for A resumes AFTER another
+    /// call observed a sign-out. It must not initialise or restore identity. Deterministic: the gate is
+    /// a <see cref="TaskCompletionSource{TResult}"/> released only after the sign-out was observed.
+    /// </summary>
+    [Fact]
+    public async Task AStaleAcquisitionResumingAfterSignOut_DoesNotRestoreIdentity()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+
+        // Establish A, so the stale task below is the "A" observation of a live circuit.
+        Assert.NotNull(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+
+        var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor).AsTask();
+        try
+        {
+            Assert.False(stale.IsCompleted); // parked on the gate: the await has not resumed.
+            // Another call observes the explicit sign-out while the stale task is parked.
+            Assert.Null(await ComponentActingUser.AcquireAsync(SignedOut(), accessor));
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+
+            Assert.Null(await stale.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+            Assert.Null(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+            Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+            Assert.Null((await accessor.GetPrincipalAsync(Ct)).Principal);
+            Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+            Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
+        }
+        finally
+        {
+            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            await stale;
+        }
+    }
+
+    /// <summary>
+    /// OUT-OF-ORDER GUARD FOR AN UNINITIALISED CIRCUIT: a stale task that is the FIRST would-be
+    /// initialiser resumes after an explicit clear/sign-out and still writes nothing.
+    /// </summary>
+    [Fact]
+    public async Task AStaleFirstAcquisitionResumingAfterClear_DoesNotInitialise()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+
+        var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor).AsTask();
+        try
+        {
+            Assert.False(stale.IsCompleted);
+            accessor.Clear();
+            gate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+
+            Assert.Null(await stale.WaitAsync(Ct));
+            Assert.False(accessor.IsInitialized);
+            Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+            Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
+        }
+        finally
+        {
+            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            await stale;
+        }
+    }
+
+    [Fact]
+    public async Task ChildBeforeParent_FirstCascadeAcquisitionEstablishes_ParentObservesSameIdentity()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+
+        var childIdentity = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+        Assert.NotNull(childIdentity);
+        Assert.Same(childIdentity, accessor.EstablishedIdentity);
+        var parentIdentity = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+
+        Assert.Equal(AdminId, parentIdentity!.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+        Assert.Same(childIdentity, accessor.EstablishedIdentity);
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.False(accessor.IsInvalidated);
+        Assert.True(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(AdminId, (await accessor.GetPrincipalAsync(Ct)).Principal!.GitHubId);
     }
 
     // ── The capability question reflects CURRENT stored state ────────────────
@@ -199,6 +416,11 @@ public sealed class ComponentActingUserTests : IDisposable
         await _auth.SetRoleAsync(AdminId, UserRole.Viewer);
 
         Assert.False(await ComponentActingUser.IsAllowedAsync(state, accessor, HiveCapability.GlobalAdmin, Ct));
+        var current = await accessor.GetPrincipalAsync(Ct);
+        Assert.True(current.IsResolved); // Demotion is not sign-out: identity remains, role changes.
+        Assert.Equal(AdminId, current.Principal!.GitHubId);
+        Assert.Equal(UserRole.Viewer, current.Principal.Role);
+        Assert.True(await ComponentActingUser.IsAllowedAsync(state, accessor, HiveCapability.SharedRead, Ct));
     }
 
     /// <summary>
@@ -217,6 +439,9 @@ public sealed class ComponentActingUserTests : IDisposable
         await _auth.SetEnabledAsync(AdminId, enabled: false);
 
         Assert.False(await ComponentActingUser.IsAllowedAsync(state, accessor, HiveCapability.GlobalAdmin, Ct));
+        var current = await accessor.GetPrincipalAsync(Ct);
+        Assert.Null(current.Principal);
+        Assert.Equal(PrincipalRefusalReason.DisabledAccount, current.RefusalReason);
     }
 
     /// <summary>
