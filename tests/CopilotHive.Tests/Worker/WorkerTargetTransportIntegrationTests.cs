@@ -501,6 +501,252 @@ public sealed class WorkerTargetTransportIntegrationTests : IAsyncDisposable
         Assert.False(File.Exists(script));
     }
 
+    // core.askPass is a separate ambient credential source from credential.helper. These
+    // additions leave all 30 approved rows and their fixture helpers unchanged.
+    private const string AmbientAskPassCredential = "worker-core-askpass-ambient-secret";
+    private const string AmbientAskPassEnv = "TRANSPORT_TEST_AMBIENT_ASKPASS_CREDENTIAL";
+
+    [Theory]
+    [InlineData("global", "https://gitlab.com/org/repo.git")]
+    [InlineData("global", "https://github.com:8443/org/repo.git")]
+    [InlineData("indexed", "https://gitlab.com/org/repo.git")]
+    [InlineData("indexed", "https://github.com:8443/org/repo.git")]
+    [InlineData("parameters", "https://gitlab.com/org/repo.git")]
+    [InlineData("parameters", "https://github.com:8443/org/repo.git")]
+    public async Task Executor_InitiallyNoneligible_CoreAskPassNeverInvokedOrReleased(string channel, string url)
+    {
+        var bare = CreateBare();
+        await using var server = new GitProxy(bare, AmbientAskPassCredential) { RefuseAll = true };
+        InstallNetworkEnvironment(server.Port);
+        InstallCoreAskPassWrapper();
+        var (recorder, calls) = InstallAmbientCoreAskPass(channel);
+        var operations = new RecordingOperations();
+        var runner = new CallbackAgentRunner();
+        var result = await new TaskExecutor(runner, gitOperations: operations).ExecuteAsync(
+            TaskFor(Token) with
+            {
+                BranchInfo = null,
+                Repositories = [new TargetRepository { Name = "target", Url = url }],
+            }, Ct);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Equal(0, runner.PromptCount);
+        Assert.Equal(url, Assert.Single(operations.CloneUrls));
+        Assert.Null(Assert.Single(operations.CloneTransports));
+        Assert.Contains(nameof(GitOperationException), result.Output);
+        var clone = Assert.Single(LaunchBlocks(), b => b.StartsWith("clone\n"));
+        Assert.Equal("", Value(clone, "askpass"));
+        Assert.Equal("", Value(clone, "credential_present"));
+        Assert.Equal("", Value(clone, "ssh"));
+        Assert.Equal("", Value(clone, "interactive"));
+        var attempts = server.Snapshot();
+        Assert.NotEmpty(attempts); // an actual 401 challenge, not a pre-network refusal
+        Assert.All(attempts, r =>
+        {
+            Assert.Equal(new Uri(url).Authority, r.Host);
+            Assert.Equal(new Uri(url).Host + ":" + new Uri(url).Port, r.Destination);
+            Assert.Contains("service=git-upload-pack", r.Path);
+        });
+        AssertCoreAskPassSecretsAbsent(clone, result.Output, string.Join('\n', result.Metrics.Issues));
+        AssertNoSecretsOnDisk();
+        AssertCoreAskPassFilesContainNoSecrets();
+        Assert.Equal(AmbientAskPassCredential, Environment.GetEnvironmentVariable(AmbientAskPassEnv));
+        // Both observations independently discriminate the leak: calling the ambient program is
+        // forbidden even if git fails later; a credential on the wire is forbidden in its own right.
+        Assert.Multiple(
+            () => Assert.Empty(File.Exists(calls) ? File.ReadAllLines(calls) : []),
+            () => Assert.True(attempts.All(r => r.Authorization is null), "A noneligible destination received Authorization from ambient core.askPass."),
+            () => Assert.True(attempts.All(r => r.Password is null), "A noneligible destination received an ambient password."),
+            () => Assert.Equal("", Value(clone, "core_askpass")),
+            () => Assert.DoesNotContain(recorder, Value(clone, "parameters")));
+    }
+
+    /// <summary>
+    /// Same real git clone and challenged destination, but a deliberately pre-fix child envelope.
+    /// Proves both ambient prompt invocations and actual credential release; the server still
+    /// returns 401 so the control cannot pass through an unauthenticated/no-op success.
+    /// </summary>
+    [Theory]
+    [InlineData("global", "https://gitlab.com/org/repo.git")]
+    [InlineData("global", "https://github.com:8443/org/repo.git")]
+    [InlineData("indexed", "https://gitlab.com/org/repo.git")]
+    [InlineData("indexed", "https://github.com:8443/org/repo.git")]
+    [InlineData("parameters", "https://gitlab.com/org/repo.git")]
+    [InlineData("parameters", "https://github.com:8443/org/repo.git")]
+    public async Task CoreAskPass_AmbientControl_RealCloneReleasesWithoutSuppression(string channel, string url)
+    {
+        var bare = CreateBare();
+        await using var server = new GitProxy(bare, AmbientAskPassCredential) { RefuseAll = true };
+        InstallNetworkEnvironment(server.Port);
+        InstallCoreAskPassWrapper();
+        var (recorder, calls) = InstallAmbientCoreAskPass(channel);
+        var envelope = WithoutCoreAskPassReset(WorkerGitAskpassHelper.BuildCredentialFreeChildEnvironment());
+        if (channel == "parameters")
+        {
+            // PARAMETERS-only source is normally removed by whole-channel replacement, not by
+            // core.askPass=. Restore just that test source for its independent reachability control.
+            envelope["GIT_CONFIG_PARAMETERS"] = "'credential.helper=' 'core.askPass=" + recorder + "'";
+        }
+        var error = await Assert.ThrowsAsync<GitOperationException>(() =>
+            new DefaultGitOperations().CloneRepositoryAsync(url, Path.Combine(_root, "control"), Ct,
+                new CoreAskPassControlTransport(url, envelope)));
+        Assert.Contains("Failed to clone", error.Message);
+        var clone = Assert.Single(LaunchBlocks(), b => b.StartsWith("clone\n"));
+        Assert.Equal(recorder, Value(clone, "core_askpass"));
+        Assert.Equal("", Value(clone, "askpass"));
+        Assert.Equal("", Value(clone, "credential_present"));
+        Assert.Equal("", Value(clone, "interactive"));
+        Assert.True(File.Exists(calls), "The ambient askpass recorder was never invoked.");
+        var host = new Uri(url).Authority;
+        Assert.Equal(new[]
+        {
+            "Username for 'https://" + host + "': ",
+            "Password for 'https://ambient-user@" + host + "': ",
+        }, File.ReadAllLines(calls));
+        var attempts = server.Snapshot();
+        Assert.All(attempts, r => Assert.Equal(host, r.Host));
+        Assert.Contains(attempts, r => r.Authorization is null);
+        Assert.True(attempts.Any(r => r.Password == AmbientAskPassCredential && r.Destination == new Uri(url).Host + ":" + new Uri(url).Port),
+            "The ambient control must release its credential to the actual challenged destination.");
+        Assert.DoesNotContain(attempts, r => r.Password == Token || r.Password == OtherToken);
+        AssertCoreAskPassSecretsAbsent(clone, error.ToString(), File.ReadAllText(calls));
+        AssertNoSecretsOnDisk();
+        AssertCoreAskPassFilesContainNoSecrets();
+    }
+
+    [Theory]
+    [InlineData("global")]
+    [InlineData("indexed")]
+    [InlineData("parameters")]
+    public async Task Executor_AuthenticatedCoreAskPassControl_ReleasesOnlyAssignmentCredential(string channel)
+    {
+        var bare = CreateBare();
+        await using var server = new GitProxy(bare, Token, AmbientAskPassCredential);
+        InstallNetworkEnvironment(server.Port);
+        InstallCoreAskPassWrapper();
+        var (recorder, calls) = InstallAmbientCoreAskPass(channel);
+        var operations = new RecordingOperations();
+        var runner = new CallbackAgentRunner();
+        var result = await new TaskExecutor(runner, gitOperations: operations).ExecuteAsync(
+            TaskFor(Token) with { BranchInfo = null }, Ct);
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal(1, runner.PromptCount);
+        Assert.Equal("fixture payload", File.ReadAllText(Path.Combine(_root, "target", "seed.txt")));
+        Assert.Equal(Origin, Assert.Single(operations.CloneUrls));
+        Assert.NotNull(Assert.Single(operations.CloneTransports));
+        var clone = Assert.Single(LaunchBlocks(), b => b.StartsWith("clone\n"));
+        AssertProbe(clone, Assert.Single(operations.HelperPaths), Token);
+        // Authenticated indexed/global core.askPass remains configured: GIT_ASKPASS overrides it.
+        // PARAMETERS is replaced on both paths, so only that source disappears in this control.
+        Assert.Equal(channel == "parameters" ? "" : recorder, Value(clone, "core_askpass"));
+        Assert.DoesNotContain("'core.askPass='", Value(clone, "parameters"));
+        var attempts = server.Snapshot();
+        Assert.Contains(attempts, r => r.Authorization is null);
+        Assert.Contains(attempts, r => r.Password == Token && r.Destination == "github.com:443");
+        Assert.All(attempts, r =>
+        {
+            Assert.Equal("github.com", r.Host);
+            Assert.True(r.Password is null || r.Password == Token, "Only the assignment credential may be released.");
+        });
+        Assert.False(File.Exists(calls), "Authenticated git invoked ambient core.askPass instead of GIT_ASKPASS.");
+        Assert.Equal(Origin, Raw(Path.Combine(_root, "target"), "config", "--get", "remote.origin.url").Stdout.Trim());
+        AssertHelpersGone();
+        AssertCoreAskPassSecretsAbsent(clone, result.Output, string.Join('\n', result.Metrics!.Issues));
+        AssertNoSecretsOnDisk();
+        AssertCoreAskPassFilesContainNoSecrets();
+    }
+
+    private (string Recorder, string Calls) InstallAmbientCoreAskPass(string channel)
+    {
+        var recorder = Path.Combine(_root, "ambient-core-askpass.sh");
+        var calls = Path.Combine(_root, "ambient-core-askpass-calls.txt");
+        // Token-free program and evidence: the ambient fixture credential lives in the test's
+        // inherited env only. Prompt bytes are recorded, but neither the answer nor stdin is logged.
+        WriteExecutable(recorder, "#!/bin/sh\nprintf '%s\\n' \"$1\" >> " + ShellQuote(calls) +
+            "\ncase \"$1\" in *sername*) printf '%s' 'ambient-user' ;; *) printf '%s' \"$" + AmbientAskPassEnv + "\" ;; esac\n");
+        Set(AmbientAskPassEnv, AmbientAskPassCredential);
+        switch (channel)
+        {
+            case "global":
+                GlobalContent += "[core]\n\taskPass = " + recorder + "\n";
+                File.WriteAllText(_global, GlobalContent);
+                break;
+            case "indexed":
+                // The four existing entries are the fixture's network transport configuration.
+                Assert.Equal("4", Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT"));
+                Set("GIT_CONFIG_COUNT", "5");
+                Set("GIT_CONFIG_KEY_4", "core.askPass"); Set("GIT_CONFIG_VALUE_4", recorder);
+                break;
+            case "parameters":
+                Set("GIT_CONFIG_PARAMETERS", "'core.askPass=" + recorder + "'");
+                break;
+            default: throw new InvalidOperationException("Unknown ambient askpass channel.");
+        }
+        // Independent source premises: no row can silently rely on a different configured channel.
+        if (channel != "global") Assert.DoesNotContain("askPass", File.ReadAllText(_global));
+        if (channel != "indexed") Assert.Equal("4", Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT"));
+        if (channel != "parameters") Assert.Null(Environment.GetEnvironmentVariable("GIT_CONFIG_PARAMETERS"));
+        return (recorder, calls);
+    }
+
+    private void InstallCoreAskPassWrapper()
+    {
+        var bin = Path.Combine(_root, "bin");
+        Directory.CreateDirectory(bin);
+        // Preserve the approved probe. Add an independent read of git's effective core.askPass,
+        // inside the real alias child after git has applied BOTH environment precedence channels.
+        var probe = Probe + "; printf 'core_askpass=['; git config --get core.askPass; printf ']\\n'";
+        WriteExecutable(Path.Combine(bin, "git"), "#!/bin/sh\ncase \"$1\" in clone|fetch|push)\n" +
+            "{ printf '===CALL===\\n%s\\n' \"$1\"; printf 'argv=[%s]\\n' \"$@\"; " +
+            ShellQuote(_realGit) + " -c " + ShellQuote("alias.hiveprobe=" + probe) + " hiveprobe; } >> " + ShellQuote(_launchLog) +
+            "\n;; esac\nexec " + ShellQuote(_realGit) + " \"$@\"\n");
+        Set("PATH", bin + ":/usr/bin:/bin");
+    }
+
+    private static Dictionary<string, string?> WithoutCoreAskPassReset(IReadOnlyDictionary<string, string?> produced)
+    {
+        var env = new Dictionary<string, string?>(produced);
+        var count = int.Parse(env["GIT_CONFIG_COUNT"]!);
+        var entries = Enumerable.Range(0, count)
+            .Select(i => (Key: env["GIT_CONFIG_KEY_" + i], Value: env["GIT_CONFIG_VALUE_" + i]))
+            .Where(e => !(string.Equals(e.Key, "core.askPass", StringComparison.OrdinalIgnoreCase) && e.Value == ""))
+            .ToList();
+        for (var i = 0; i < count; ++i) { env.Remove("GIT_CONFIG_KEY_" + i); env.Remove("GIT_CONFIG_VALUE_" + i); }
+        for (var i = 0; i < entries.Count; ++i)
+        {
+            env["GIT_CONFIG_KEY_" + i] = entries[i].Key;
+            env["GIT_CONFIG_VALUE_" + i] = entries[i].Value;
+        }
+        env["GIT_CONFIG_COUNT"] = entries.Count.ToString();
+        env["GIT_CONFIG_PARAMETERS"] = "'credential.helper='";
+        return env;
+    }
+
+    /// <summary>Control only: a fixed pre-fix envelope, never a production credential transport.</summary>
+    private sealed class CoreAskPassControlTransport(string origin, IReadOnlyDictionary<string, string?> environment) : IWorkerGitCredentialTransport
+    {
+        public string SanitizedOriginUrl => origin;
+        public IReadOnlyDictionary<string, string?> BuildChildEnvironment() => environment;
+    }
+
+    private static void AssertCoreAskPassSecretsAbsent(params string[] values)
+    {
+        AssertNoSecrets(values);
+        foreach (var value in values)
+        {
+            Assert.DoesNotContain(AmbientAskPassCredential, value);
+            Assert.DoesNotContain(Convert.ToBase64String(Encoding.UTF8.GetBytes("ambient-user:" + AmbientAskPassCredential)), value);
+        }
+    }
+
+    private void AssertCoreAskPassFilesContainNoSecrets()
+    {
+        AssertCoreAskPassSecretsAbsent(_output.ToString());
+        foreach (var file in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
+            AssertCoreAskPassSecretsAbsent(Encoding.UTF8.GetString(File.ReadAllBytes(file)));
+    }
+
     private ConfigRepoGitOperations CreateServiceSeam(WorkerService service, out string script)
     {
         string? dir = null;
