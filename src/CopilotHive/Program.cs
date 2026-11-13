@@ -691,11 +691,15 @@ public sealed class Program
 
             // Clarification API adapter: ALWAYS registered so the clarification endpoints resolve it
             // unconditionally. AUTHORIZATION is part of every operation (stateless resolver + policy,
-            // never the scoped circuit accessor): the three reads need SharedRead and answering needs
-            // ExecutionOperator. The ClarificationQueueService itself is unchanged, so the internal
-            // Composer / ClarificationHandler callers keep working exactly as before.
+            // never the scoped circuit accessor): the three queue reads and the persisted-history read
+            // need SharedRead and answering needs ExecutionOperator. The ClarificationQueueService and
+            // the IGoalStore are unchanged, so the internal Composer / ClarificationHandler callers keep
+            // working exactly as before and the persisted history is read through the store itself. The
+            // factory is lazy, so the IClarificationFacade singleton never forces the goal store to be
+            // constructed earlier than it already was.
             builder.Services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(
                 sp.GetRequiredService<ClarificationQueueService>(),
+                sp.GetRequiredService<IGoalStore>(),
                 sp.GetRequiredService<HivePrincipalResolver>(),
                 sp.GetRequiredService<HivePolicy>(),
                 sp.GetRequiredService<ILogger<ClarificationFacade>>()));

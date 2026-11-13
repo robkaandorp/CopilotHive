@@ -1,5 +1,6 @@
 using System.Security.Claims;
 
+using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Security;
 
@@ -8,7 +9,10 @@ namespace CopilotHive.Services;
 /// <summary>
 /// THE AUTHORIZED API ADAPTER over <see cref="ClarificationQueueService"/>: the four
 /// <c>/api/clarifications</c> routes delegate here instead of reaching into the queue, so each
-/// request's identity is authorized BEFORE the queue is read or mutated.
+/// request's identity is authorized BEFORE the queue is read or mutated. It is ALSO the authorized
+/// read of the PERSISTED clarification history (the aggregate
+/// <see cref="IGoalStore.GetAllClarificationsAsync"/> projection the Orchestrator page renders),
+/// which is a different thing from the transient queue and is served by its own operation.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -27,6 +31,13 @@ namespace CopilotHive.Services;
 /// whose other callers — <c>ClarificationHandler</c> and the Composer's own
 /// <c>"composer"</c>-attributed answers — keep working without modification. This adapter is the
 /// USER-FACING boundary only; it does not claim to protect those internal callers.
+/// </para>
+/// <para>
+/// PERSISTED HISTORY IS A SEPARATE READ, NOT A QUEUE REPLACEMENT.
+/// <see cref="GetPersistedHistoryAsync"/> reads the durable clarification records stored with the
+/// goal iterations through the authorized facade — the projection the Orchestrator page renders —
+/// and requires <see cref="HiveCapability.SharedRead"/> exactly like the queue reads. The three
+/// transient queue operations keep their meaning and their callers; neither replaces the other.
 /// </para>
 /// </remarks>
 public interface IClarificationFacade
@@ -67,6 +78,26 @@ public interface IClarificationFacade
     Task<FacadeResult<int>> GetPendingHumanCountAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
+    /// Reads the PERSISTED clarification history: every clarification recorded with a goal
+    /// iteration, paired with the goal it belongs to, most recent first.
+    /// <para>
+    /// This is the durable history, NOT the transient in-memory queue: the two queue reads above
+    /// answer "what is waiting for a human right now", while this operation answers "what has ever
+    /// been asked and answered" and delegates to
+    /// <see cref="IGoalStore.GetAllClarificationsAsync(int?, CancellationToken)"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token forwarded to the store read; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the store's own persisted history projection, or
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.SharedRead"/>.
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>> GetPersistedHistoryAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
     /// Submits a HUMAN answer to a clarification request.
     /// </summary>
     /// <param name="id">The clarification request ID.</param>
@@ -92,8 +123,10 @@ public sealed record ClarificationAnswerResult(string Message);
 
 /// <summary>
 /// Default implementation of <see cref="IClarificationFacade"/> delegating to the unchanged
-/// <see cref="ClarificationQueueService"/>. The queue, the stateless principal resolver and the pure
-/// policy evaluator are all required dependencies, so there is no unauthenticated construction.
+/// <see cref="ClarificationQueueService"/> (the transient queue) and to the unchanged
+/// <see cref="IGoalStore"/> (the persisted clarification history). The queue, the goal store, the
+/// stateless principal resolver and the pure policy evaluator are all required dependencies, so
+/// there is no unauthenticated construction.
 /// </summary>
 public sealed class ClarificationFacade : IClarificationFacade
 {
@@ -101,6 +134,7 @@ public sealed class ClarificationFacade : IClarificationFacade
     private const string HumanResolver = "human";
 
     private readonly ClarificationQueueService _queue;
+    private readonly IGoalStore _goals;
     private readonly HivePrincipalResolver _resolver;
     private readonly HivePolicy _policy;
     private readonly ILogger<ClarificationFacade> _log;
@@ -109,6 +143,10 @@ public sealed class ClarificationFacade : IClarificationFacade
     /// Initialises a new <see cref="ClarificationFacade"/>.
     /// </summary>
     /// <param name="queue">The trusted clarification queue (required, unchanged).</param>
+    /// <param name="goals">
+    /// The trusted goal store the persisted clarification history is read from (required, unchanged).
+    /// It supplies ONLY the persisted-history operation; the queue operations never touch it.
+    /// </param>
     /// <param name="resolver">
     /// The stateless principal resolver every operation re-resolves through (required). It is
     /// required so there is no unauthenticated construction: the resolver and the policy are
@@ -119,11 +157,13 @@ public sealed class ClarificationFacade : IClarificationFacade
     /// <exception cref="ArgumentNullException">A required dependency is null.</exception>
     public ClarificationFacade(
         ClarificationQueueService queue,
+        IGoalStore goals,
         HivePrincipalResolver resolver,
         HivePolicy policy,
         ILogger<ClarificationFacade> log)
     {
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
+        _goals = goals ?? throw new ArgumentNullException(nameof(goals));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _log = log ?? throw new ArgumentNullException(nameof(log));
@@ -176,6 +216,22 @@ public sealed class ClarificationFacade : IClarificationFacade
 
         return new(true, new ClarificationAnswerResult($"Answer submitted for clarification '{id}'."),
             null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>> GetPersistedHistoryAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST: a denied caller never reaches the goal store, so the persisted
+        // history of other people's goals is never read for an unauthorized caller.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetPersistedHistoryAsync), ct))
+            return Forbidden<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>();
+
+        // Delegation verbatim, with the caller's token forwarded: cancellation propagates as the
+        // caller's own OperationCanceledException and is never converted into a denial.
+        var history = await _goals.GetAllClarificationsAsync(limit: null, ct: ct);
+
+        return new(true, history, null, FacadeErrorKind.None);
     }
 
     // ── Authorization + shared results ──────────────────────────────────────

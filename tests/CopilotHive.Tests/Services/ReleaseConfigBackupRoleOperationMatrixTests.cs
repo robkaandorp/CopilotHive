@@ -287,6 +287,7 @@ public sealed class ReleaseConfigBackupRoleOperationMatrixTests : IDisposable
 
         var facade = new ClarificationFacade(
             queue,
+            new InMemoryGoalStore(),
             _auth.Resolver(HiveAuthMode.AuthenticationEnabled),
             _auth.Policy,
             NullLogger<ClarificationFacade>.Instance);

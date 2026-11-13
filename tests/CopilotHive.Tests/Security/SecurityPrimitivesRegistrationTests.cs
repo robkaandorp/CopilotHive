@@ -170,10 +170,15 @@ public sealed class SecurityPrimitivesRegistrationTests
         // "Services/BackupFacade.cs" and — for the release/config/backup/clarification/session routes
         // only — "ApiEndpoints.cs". The remaining ApiEndpoints boundaries (health, the gRPC service,
         // the Composer hub's own routes) are still not in scope.
+        //
+        // REMOVED FROM THIS LIST BY THE CIRCUIT/MAINLAYOUT AUTHORIZATION INTEGRATION SLICE:
+        // "Components/Routes.razor". The shared host now OBSERVES the circuit identity from the
+        // cascading AuthenticationState through the one ComponentActingUser seam and the SCOPED
+        // accessor, so it must name them. It deliberately still makes NO authorization decision, so
+        // the subset that matters for it is asserted separately right below.
         var boundaries = new[]
         {
             "Services/UserService.cs",
-            "Components/Routes.razor",
             "Components/Layout/NavMenu.razor",
             "Actors/ComposerActor.cs",
             "Persistence/Entities/UserEntity.cs",
@@ -203,6 +208,27 @@ public sealed class SecurityPrimitivesRegistrationTests
             {
                 Assert.DoesNotContain(primitive, body, StringComparison.Ordinal);
             }
+        }
+
+        // THE SHARED HOST STILL REACHES NONE OF THE ENFORCEMENT PRIMITIVES: it observes the circuit
+        // identity on the SCOPED accessor (the one ComponentActingUser seam) and makes no capability
+        // or policy decision of its own — those belong to the facades, which re-resolve current
+        // stored state per operation.
+        var routesBody = TestSourceScanner.StripNonCode(
+            File.ReadAllText(Path.Combine(src, "Components", "Routes.razor"))
+                .ReplaceLineEndings("\n"));
+
+        foreach (var enforcementPrimitive in new[]
+        {
+            "HivePrincipalResolver",
+            "HivePolicy",
+            "HiveCapability",
+            "ActingUserPrincipal",
+            "PrincipalResolution",
+            "ResolveAsync(",
+        })
+        {
+            Assert.DoesNotContain(enforcementPrimitive, routesBody, StringComparison.Ordinal);
         }
     }
 

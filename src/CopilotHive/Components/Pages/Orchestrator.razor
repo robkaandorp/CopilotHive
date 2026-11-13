@@ -15,8 +15,12 @@
    Brain session reset (requires ExecutionOperator). No direct DashboardStateService read/mutation
    and no direct LlmSessionRegistry.GetAll in this page. *@
 @inject IOperationalFacade OperationalFacade
+@* THE AUTHORIZED CLARIFICATION BOUNDARY: the page renders the PERSISTED clarification history
+   (the durable records stored with the goal iterations), which is read through the shared-read
+   facade operation — never straight from IGoalStore. The transient queue operations live on the
+   same facade but are NOT what this page displays. *@
+@inject IClarificationFacade ClarificationFacade
 @inject IJSRuntime JS
-@inject IGoalStore GoalStore
 @inject PageHeaderState PageHeader
 @* The SCOPED per-circuit accessor, used by the single ComponentActingUser seam to obtain the
    identity handed to every facade call (and to initialise the accessor once per circuit). It is
@@ -291,23 +295,18 @@ else
     {
         PageHeader.SetTitle("🎵 Orchestrator");
 
-        // AUTHORIZED SHARED READS: the Brain stats, the orchestrator info and the sanitized
-        // non-Composer session list all come from IOperationalFacade, which re-resolves this circuit
-        // user's CURRENT role/enabled state on every call and requires shared read. A denial leaves
-        // the page's EXISTING surfaces in place ("Brain not connected.", no session table) rather
-        // than throwing out of the renderer; denial UI is a separate phase.
+        // AUTHORIZED SHARED READS: the Brain stats, the orchestrator info, the sanitized
+        // non-Composer session list and the persisted clarification history all come from the
+        // authorized facades, which re-resolve this circuit user's CURRENT role/enabled state on
+        // every call and require shared read. A denial leaves the page's EXISTING surfaces in place
+        // ("Brain not connected.", no session table) rather than throwing out of the renderer;
+        // denial UI is a separate phase.
         await RefreshAsync();
         State.OnStateChanged += RefreshState;
-        await LoadClarificationsAsync();
-    }
-
-    private async Task LoadClarificationsAsync()
-    {
-        _clarifications = await GoalStore.GetAllClarificationsAsync();
     }
 
     /// <summary>
-    /// Re-reads every operational projection through the authorized facade.
+    /// Re-reads every operational projection through the authorized facades.
     /// <para>
     /// A DENIED reflection CLEARS its field. Each of these fields was populated by an AUTHORIZED
     /// read, so a later refresh that the facade now refuses (the account was disabled or demoted
@@ -315,6 +314,12 @@ else
     /// it had never read anything, exactly like a first render for an unauthorized caller. Every
     /// facade-populated projection field below is therefore assigned on BOTH outcomes — the success
     /// value, or the empty/absent state — rather than only on success.
+    /// </para>
+    /// <para>
+    /// The PERSISTED CLARIFICATION HISTORY is part of this refresh (and therefore of every reset /
+    /// event notification that reaches <see cref="RefreshState"/>), not just of the first render: it
+    /// is a facade-populated projection like the others, so a later SharedRead denial must clear it
+    /// and a later authorized refresh must repopulate it.
     /// </para>
     /// </summary>
     private async Task RefreshAsync()
@@ -331,6 +336,16 @@ else
             await ActingUserAsync(), CancellationToken.None);
         _llmSessions = sessions.Success && sessions.Value is not null
             ? sessions.Value.OrderByDescending(s => s.LastActivity).ToList()
+            : [];
+
+        // PERSISTED CLARIFICATION HISTORY, through the SINGLE new authorized facade operation:
+        // authorization runs first inside the facade, so a caller without SharedRead never reaches
+        // the goal store. Assigned on BOTH outcomes — "No clarifications recorded yet." on a
+        // refusal, exactly like a first render for an unauthorized caller.
+        var clarifications = await ClarificationFacade.GetPersistedHistoryAsync(
+            await ActingUserAsync(), CancellationToken.None);
+        _clarifications = clarifications.Success && clarifications.Value is not null
+            ? clarifications.Value
             : [];
     }
 

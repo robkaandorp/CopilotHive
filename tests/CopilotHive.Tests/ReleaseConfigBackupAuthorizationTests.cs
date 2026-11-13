@@ -609,7 +609,7 @@ public sealed class ReleaseConfigBackupAuthorizationTests : IDisposable
         queue.Enqueue(pending);
 
         var facade = new ClarificationFacade(
-            queue, _auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy,
+            queue, new InMemoryGoalStore(), _auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy,
             NullLogger<ClarificationFacade>.Instance);
 
         // ── Reads: every role that holds SharedRead. ──
@@ -689,7 +689,7 @@ public sealed class ReleaseConfigBackupAuthorizationTests : IDisposable
 
         // The facade is a SEPARATE, authorized adapter over the same queue.
         var facade = new ClarificationFacade(
-            queue, _auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy,
+            queue, new InMemoryGoalStore(), _auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy,
             NullLogger<ClarificationFacade>.Instance);
         await AssertForbiddenAsync(await facade.SubmitAnswerAsync("clar-composer", "x", null, Ct));
     }
@@ -735,7 +735,7 @@ public sealed class ReleaseConfigBackupAuthorizationTests : IDisposable
         builder.Services.AddSingleton<IReleaseFacade>(
             CreateReleaseFacade(store, HiveAuthMode.AuthenticationEnabled));
         builder.Services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(
-            queue, resolver, _auth.Policy, NullLogger<ClarificationFacade>.Instance));
+            queue, store, resolver, _auth.Policy, NullLogger<ClarificationFacade>.Instance));
         var app = builder.Build();
         // The production hubs forward HttpContext.User; this host sets a VIEWER identity on every
         // request (strictly weaker than the cookie handler — the facades still re-resolve).
@@ -875,7 +875,8 @@ public sealed class ReleaseConfigBackupAuthorizationTests : IDisposable
         builder.Services.AddSingleton<IReleaseFacade>(
             CreateReleaseFacade(store, HiveAuthMode.AuthenticationEnabled));
         builder.Services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(
-            new ClarificationQueueService(), resolver, _auth.Policy, NullLogger<ClarificationFacade>.Instance));
+            new ClarificationQueueService(), store, resolver, _auth.Policy,
+            NullLogger<ClarificationFacade>.Instance));
         var app = builder.Build();
         app.Use(async (context, next) =>
         {
@@ -1073,7 +1074,8 @@ public sealed class ReleaseConfigBackupAuthorizationTests : IDisposable
         }
 
         var clarificationFacade = new ClarificationFacade(
-            new ClarificationQueueService(), _auth.Resolver(HiveAuthMode.Open), _auth.Policy,
+            new ClarificationQueueService(), new InMemoryGoalStore(),
+            _auth.Resolver(HiveAuthMode.Open), _auth.Policy,
             NullLogger<ClarificationFacade>.Instance);
         Assert.True((await clarificationFacade.GetAllRequestsAsync(null, Ct)).Success);
     }

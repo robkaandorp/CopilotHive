@@ -1,5 +1,11 @@
 @using Microsoft.AspNetCore.Components.Routing
 @inject NavigationManager NavigationManager
+@* THE SHARED HOST'S CIRCUIT IDENTITY SEAM: the SCOPED per-circuit accessor every page derives its
+   identity from. It is observed here from the same cascading AuthenticationState, with the same one
+   ComponentActingUser helper the pages use, so the CIRCUIT's identity exists before the routed layout
+   and page ask for it. It is never captured by a singleton and holds no authorization truth of its
+   own (every capability question still re-resolves current stored state). *@
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 
 <Router AppAssembly="typeof(App).Assembly">
     <Found Context="routeData">
@@ -31,4 +37,35 @@
     private static readonly bool _authEnabled =
         !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID"))
         && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET"));
+
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to the same identity helper the pages
+    /// use. ABSENT in open mode — <c>Program.cs</c> registers
+    /// <c>AddCascadingAuthenticationState</c> only when authentication is enabled — so a missing
+    /// cascade is NEVER read as evidence of open mode: the helper answers from the explicit mode
+    /// (open mode returns a null identity, unknown mode returns whatever was already established and
+    /// otherwise denies, and nothing is fabricated).
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// OBSERVES this circuit's identity on the scoped accessor, exactly the way the pages do (the
+    /// one <c>ComponentActingUser</c> seam, never a second resolution path).
+    /// <para>
+    /// CHILD-ORDER SAFE: the observation is idempotent for the SAME identity, so it does not matter
+    /// whether the routed layout/page observes the state during ITS parameter set first and this
+    /// host second, or the other way round — both observe the SAME cascading state through the SAME
+    /// scoped accessor, so whichever runs first establishes the identity and the other is a no-op.
+    /// The hardened invalidation semantics are the accessor's: a sign-out or identity replacement
+    /// permanently invalidates the circuit instead of silently adopting the new identity.
+    /// </para>
+    /// <para>
+    /// The returned identity is deliberately not retained: this host makes no authorization
+    /// decision, and caching a principal here would be exactly the stale-authority bug the facades
+    /// exist to prevent. Nothing touches <c>HttpContext</c> and nothing is registered as a singleton.
+    /// </para>
+    /// </summary>
+    protected override async Task OnInitializedAsync() =>
+        _ = await CopilotHive.Services.ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
 }

@@ -201,6 +201,16 @@ public sealed class OrchestratorPageAuthorizedBehaviorTests : IDisposable
             sp.GetRequiredService<HivePolicy>(),
             NullLogger<OperationalFacade>.Instance));
 
+        // THE AUTHORIZED CLARIFICATION FACADE — the production type over the production queue, the
+        // seeded goal store and the production resolver/policy, exactly as Program.cs registers it.
+        // The page reads its persisted clarification history through this facade.
+        services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(
+            new ClarificationQueueService(),
+            sp.GetRequiredService<IGoalStore>(),
+            sp.GetRequiredService<HivePrincipalResolver>(),
+            sp.GetRequiredService<HivePolicy>(),
+            NullLogger<ClarificationFacade>.Instance));
+
         var provider = services.BuildServiceProvider(new ServiceProviderOptions
         {
             ValidateScopes = true,
