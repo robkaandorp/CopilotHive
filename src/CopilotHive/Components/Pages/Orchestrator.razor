@@ -267,6 +267,13 @@ else
     private OrchestratorInfo _info = new();
     private bool _resettingBrain;
     private IReadOnlyList<(string GoalId, PersistedClarification Clarification)> _clarifications = [];
+
+    /// <summary>
+    /// Monotonic generation of the persisted-clarification read most recently STARTED. Only the newest
+    /// read may publish <c>_clarifications</c>, so a held older result can never restore history that
+    /// a newer (for example Forbidden) refresh already cleared.
+    /// </summary>
+    private int _clarificationGeneration;
     private List<CopilotHive.Dashboard.LlmSessionInfo> _llmSessions = [];
 
     /// <summary>
@@ -342,8 +349,18 @@ else
         // authorization runs first inside the facade, so a caller without SharedRead never reaches
         // the goal store. Assigned on BOTH outcomes — "No clarifications recorded yet." on a
         // refusal, exactly like a first render for an unauthorized caller.
+        //
+        // PUBLICATION ORDER: the generation is taken when THIS read starts and the result is published
+        // only while it is still the newest. A refresh that started later has already published (or
+        // will publish) fresher state, so an older read that completes afterwards — including an older
+        // AUTHORIZED result completing after a newer Forbidden refresh cleared the history — must not
+        // overwrite it. Scoped to this projection only.
+        var generation = ++_clarificationGeneration;
         var clarifications = await ClarificationFacade.GetPersistedHistoryAsync(
             await ActingUserAsync(), CancellationToken.None);
+        if (generation != _clarificationGeneration)
+            return;
+
         _clarifications = clarifications.Success && clarifications.Value is not null
             ? clarifications.Value
             : [];

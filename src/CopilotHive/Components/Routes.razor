@@ -65,7 +65,15 @@
     /// decision, and caching a principal here would be exactly the stale-authority bug the facades
     /// exist to prevent. Nothing touches <c>HttpContext</c> and nothing is registered as a singleton.
     /// </para>
+    /// <para>
+    /// OBSERVED ON EVERY PARAMETER SET, NOT ONLY THE FIRST: the framework runs this on the initial set
+    /// AND whenever the cascading <see cref="AuthenticationState"/> value changes on this SAME host
+    /// instance (a sign-out, or a different account). Observing only at initialisation would leave the
+    /// accessor holding the original identity after such a change; observing here lets the accessor's
+    /// own state machine see the change (same identity: no-op; sign-out or a different identity:
+    /// permanent invalidation).
+    /// </para>
     /// </summary>
-    protected override async Task OnInitializedAsync() =>
+    protected override async Task OnParametersSetAsync() =>
         _ = await CopilotHive.Services.ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
 }

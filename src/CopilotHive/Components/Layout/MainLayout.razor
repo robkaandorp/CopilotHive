@@ -305,7 +305,15 @@
             return;
         }
 
-        // SUCCESS is the ONLY path that consumes the draft, then re-reads through the facade.
+        // SUCCESS is the ONLY path that consumes the draft. The answered row leaves the rendered list,
+        // and the count follows it, in the SAME synchronous step that removes its draft: the markup
+        // binds `_clarificationAnswers[req.Id]` for every listed row, so a row must never stay listed
+        // without its draft key across the awaited re-read below (an event-triggered render in that
+        // window would otherwise throw KeyNotFoundException). The authorized re-read then replaces
+        // the list/count with the facade's current answer.
+        if (_pendingClarifications.RemoveAll(r => r.Id == requestId) > 0)
+            _pendingClarificationCount = Math.Max(0, _pendingClarificationCount - 1);
+        if (_pendingClarificationCount == 0) _drawerOpen = false;
         _clarificationAnswers.Remove(requestId);
         await RefreshClarificationsAsync();
 
