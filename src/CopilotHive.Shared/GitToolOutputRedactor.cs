@@ -318,8 +318,10 @@ public static class GitToolOutputRedactor
     /// so the union with the other spans removes the value whole instead of leaving a tail.
     /// </para>
     /// <para>
-    /// Spans that mapping cannot place with certainty are dropped rather than widened, so ordinary
-    /// text next to a deleted run is never redacted by mistake; see <see cref="UrlRewriteAlignment"/>.
+    /// Where mapping cannot decide which of several equal characters the rewrite kept, it fails
+    /// TOWARD coverage of the known value — never toward a dropped byte of it — but only where a
+    /// matching character really lies inside the known value's extent, so ordinary text elsewhere is
+    /// not redacted by ambiguity alone; see <see cref="UrlRewriteAlignment"/>.
     /// </para>
     /// </remarks>
     private static void CollectOriginalTextSpans(
@@ -357,10 +359,18 @@ public static class GitToolOutputRedactor
     /// deleted (a kept character would have shown the sentinel).
     /// </para>
     /// <para>
-    /// Whatever stays ambiguous (a delimiter such as <c>&amp;</c>, a grammar-critical letter, or a
-    /// probe budget overrun) is mapped by the CERTAIN rule: a kept character belongs to a span only
-    /// when every possible placement lies inside it. That can leave one ambiguous delimiter of a span
-    /// unredacted; it can never damage text outside the span.
+    /// Whatever stays ambiguous (a delimiter such as <c>&amp;</c>, a grammar-critical letter, a region
+    /// no sentinel can be found for, or a probe budget overrun) FAILS CLOSED: a kept character joins a
+    /// known-value span when ANY character that could be it lies inside the span. The earlier rule —
+    /// join only when EVERY placement lies inside — dropped the first byte of a known host whenever
+    /// the equal character in the deleted userinfo sat outside the known extent, which leaks part of
+    /// a KNOWN secret. An engineering fallback is a cost, not a security contract: over-redacting one
+    /// ambiguous character is the sanctioned failure, under-redacting a known value is not.
+    /// </para>
+    /// <para>
+    /// The widening is driven by the known-value span, not by ambiguity: a candidate has to be an
+    /// actual equal character INSIDE the span. A known value that covers only deleted text (a
+    /// password) holds no such character, so the retained host beside it is left alone.
     /// </para>
     /// </remarks>
     private sealed class UrlRewriteAlignment
@@ -373,11 +383,21 @@ public static class GitToolOutputRedactor
 
         private const string SentinelPool = "QXZJKWVYqxzjkwvy0123456789ABCDEFGHILMNOPRSTUabcdefghilmnoprstu";
 
+        /// <summary>Most positions examined while deciding fail-closed membership in one mapping.</summary>
+        private const int MaxMapScan = 1_000_000;
+
+        /// <summary>Longest region a two-character sentinel is searched for (its bigram set is built in memory).</summary>
+        private const int MaxSentinelRegion = 100_000;
+
+        private readonly string _original;
+        private readonly string _rewritten;
         private readonly int[] _earliest;
         private readonly int[] _latest;
 
-        private UrlRewriteAlignment(int[] earliest, int[] latest)
+        private UrlRewriteAlignment(string original, string rewritten, int[] earliest, int[] latest)
         {
+            _original = original;
+            _rewritten = rewritten;
             _earliest = earliest;
             _latest = latest;
         }
@@ -396,19 +416,82 @@ public static class GitToolOutputRedactor
                 latest = exactLatest;
             }
 
-            return new UrlRewriteAlignment(earliest, latest);
+            return new UrlRewriteAlignment(original, rewritten, earliest, latest);
         }
 
         /// <summary>
         /// Maps the original-text span [<paramref name="start"/>, <paramref name="end"/>) onto the
-        /// rewritten text: the kept characters whose EVERY possible placement lies inside it.
+        /// rewritten text: every kept character that COULD be inside it, fail-closed.
         /// </summary>
+        /// <remarks>
+        /// A kept character is inside when it is placed there with certainty, or when it is ambiguous
+        /// and an equal character that could be it lies inside the span (see
+        /// <see cref="CouldBeInside"/>). Only the characters at the two ends of the span can be
+        /// ambiguous, so the result is the hull between the first and the last included character.
+        /// </remarks>
         /// <returns>The rewritten-text span, or <c>null</c> when no kept character qualifies.</returns>
         public (int Start, int End)? Map(int start, int end)
         {
-            var first = FirstAtLeast(_earliest, start);
-            var last = FirstAtLeast(_latest, end) - 1;
-            return first <= last ? (first, last + 1) : null;
+            // Every character whose possible placements intersect the span lies in [low, high].
+            var low = FirstAtLeast(_latest, start);
+            var high = FirstAtLeast(_earliest, end) - 1;
+            if (low > high)
+                return null;
+
+            var budget = MaxMapScan;
+            var first = -1;
+            for (var j = low; j <= high; j++)
+            {
+                if (CouldBeInside(j, start, end, ref budget))
+                {
+                    first = j;
+                    break;
+                }
+            }
+
+            if (first < 0)
+                return null;
+
+            var last = first;
+            for (var j = high; j > first; j--)
+            {
+                if (CouldBeInside(j, start, end, ref budget))
+                {
+                    last = j;
+                    break;
+                }
+            }
+
+            return (first, last + 1);
+        }
+
+        /// <summary>
+        /// Whether kept character <paramref name="j"/> is certainly, or possibly, inside
+        /// [<paramref name="start"/>, <paramref name="end"/>).
+        /// </summary>
+        /// <remarks>
+        /// Certain: every placement is inside. Possible: it is ambiguous and an EQUAL character lies
+        /// inside the span within its placement range. When the scan budget is spent the answer is
+        /// "inside" — the fail-closed direction.
+        /// </remarks>
+        private bool CouldBeInside(int j, int start, int end, ref int budget)
+        {
+            var earliest = _earliest[j];
+            var latest = _latest[j];
+            if (earliest >= start && latest < end)
+                return true;
+
+            var from = Math.Max(earliest, start);
+            var to = Math.Min(latest, end - 1);
+            for (var p = from; p <= to; p++)
+            {
+                if (--budget < 0)
+                    return true;
+                if (_original[p] == _rewritten[j])
+                    return true;
+            }
+
+            return false;
         }
 
         /// <summary>Index of the first element that is >= <paramref name="value"/> in a strictly ascending array.</summary>
@@ -496,18 +579,22 @@ public static class GitToolOutputRedactor
 
             var any = false;
             var regionRewrites = new Dictionary<int, string>();
+            var regionSentinels = new Dictionary<int, string?>();
             foreach (var position in candidates)
             {
                 var (regionStart, regionEnd) = RegionAround(starts, original.Length, position);
                 var region = original.Substring(regionStart, regionEnd - regionStart);
                 if (!regionRewrites.TryGetValue(regionStart, out var regionRewritten))
                     regionRewrites[regionStart] = regionRewritten = GitUrlRedactor.Redact(region) ?? string.Empty;
+                if (!regionSentinels.TryGetValue(regionStart, out var sentinel))
+                    regionSentinels[regionStart] = sentinel = FreshSentinel(region);
 
-                if (FreshSentinel(region) is not { } sentinel)
+                // No sentinel exists for this region: the character stays ambiguous and Map fails closed.
+                if (sentinel is null)
                     continue;
 
                 var index = position - regionStart;
-                var probe = string.Concat(region.AsSpan(0, index), sentinel.ToString(), region.AsSpan(index + 1));
+                var probe = string.Concat(region.AsSpan(0, index), sentinel, region.AsSpan(index + 1));
                 if (string.Equals(GitUrlRedactor.Redact(probe), regionRewritten, StringComparison.Ordinal))
                 {
                     deleted[position] = true;
@@ -565,13 +652,41 @@ public static class GitToolOutputRedactor
             return string.Equals(builder.ToString(), rewritten, StringComparison.Ordinal);
         }
 
-        /// <summary>An alphanumeric character that does not occur in <paramref name="region"/>, or <c>null</c>.</summary>
-        private static char? FreshSentinel(string region)
+        /// <summary>
+        /// A string of alphanumeric characters that does not occur in <paramref name="region"/>, or
+        /// <c>null</c> when none can be found.
+        /// </summary>
+        /// <remarks>
+        /// A single character is tried first. A region that contains EVERY alphanumeric (a path that
+        /// spells the alphabet) has none, so the source is made inexhaustible with two-character
+        /// sentinels: a region of n characters holds at most n - 1 distinct pairs, so a pair is absent
+        /// from any region shorter than the number of pairs. The sentinel only has to survive the
+        /// frozen redactor if the probed character was KEPT, and it is built from characters the
+        /// URL grammar accepts, so it never changes where a candidate ends.
+        /// </remarks>
+        private static string? FreshSentinel(string region)
         {
             foreach (var candidate in SentinelPool)
             {
                 if (region.IndexOf(candidate) < 0)
-                    return candidate;
+                    return candidate.ToString();
+            }
+
+            if (region.Length > MaxSentinelRegion)
+                return null;
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            for (var i = 0; i + 1 < region.Length; i++)
+                seen.Add(region.Substring(i, 2));
+
+            foreach (var first in SentinelPool)
+            {
+                foreach (var second in SentinelPool)
+                {
+                    var pair = string.Concat(first.ToString(), second.ToString());
+                    if (!seen.Contains(pair))
+                        return pair;
+                }
             }
 
             return null;
