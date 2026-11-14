@@ -17,16 +17,22 @@ namespace CopilotHive.Services;
 /// its reported total line count both describe the already-redacted output.
 /// </para>
 /// <para>
-/// <b>Two independent layers.</b>
+/// <b>Two span sources, one replacement.</b> Both sources only COLLECT the spans they recognise
+/// in the same unmodified text; the union of all spans is then replaced in a single pass. Neither
+/// source ever sees the other's output, so an inventory value that happens to coincide with a
+/// structural recognition marker (the header name <c>Authorization</c>, the assignment name
+/// <c>GITHUB_TOKEN</c>, the prefix <c>ssh://u:</c>) cannot erase the marker and hide the
+/// credential that follows it. Overlapping spans merge into one placeholder; spans that merely
+/// touch keep their own.
 /// </para>
 /// <list type="number">
 ///   <item>
 ///     <description>
-///     <b>Known-secret inventory.</b> Values the Composer itself holds are replaced verbatim,
+///     <b>Known-secret inventory.</b> Values the Composer itself holds are matched verbatim,
 ///     together with their one-level percent-encoded and standard-base64 forms. Only values of at
 ///     least <see cref="MinimumInventoryValueLength"/> characters participate: a one- or
 ///     two-character "secret" would match ordinary text everywhere and destroy the output for no
-///     security benefit. Shorter structural credentials are still removed by layer 2.
+///     security benefit. Shorter structural credentials are still removed by the structural source.
 ///     </description>
 ///   </item>
 ///   <item>
@@ -162,25 +168,58 @@ public static class GitToolOutputRedactor
         if (string.IsNullOrEmpty(text))
             return text ?? string.Empty;
 
-        // Layer 1 runs FIRST. Exact replacement removes a WHOLE inventory value, so a structural
-        // pass can never leave a fraction of a known secret behind by redacting part of it (for
-        // example a secret that itself contains '@' or ':').
-        var redacted = RedactKnownSecrets(text, knownSecrets);
-        return RedactStructuralPatterns(redacted);
+        // ONE span-union pass over ONE text, so neither layer's output can blind the other.
+        //
+        // The inventory layer used to run first and hand the structural layer text in which a
+        // matched value had already become "[redacted]". When an inventory value coincided with a
+        // structural MARKER (the header name "Authorization", the assignment name "GITHUB_TOKEN",
+        // the "ssh://u:" prefix) the marker was destroyed and the credential that followed it
+        // escaped entirely. Running the layers the other way round is no fix: a structural pass
+        // would then redact a fraction of an inventory value and the whole-value match would be
+        // lost. Instead every layer only COLLECTS spans against the same unmodified text; the
+        // union is replaced once.
+        //
+        // The composed GitUrlRedactor runs first because it is the one pass that rewrites text
+        // rather than reporting spans (it deletes userinfo and token parameters and is not
+        // modified here). It must still precede the assignment pass: that pass would otherwise
+        // claim `token=abc&ref=topic` inside a URL query and swallow the parameters the URL
+        // grammar keeps. It only DELETES credential text, so it cannot manufacture a marker.
+        var current = GitUrlRedactor.Redact(text) ?? string.Empty;
+
+        var spans = new List<(int Start, int End)>();
+        var forms = BuildInventoryForms(knownSecrets);
+        if (forms.Count > 0)
+            spans.AddRange(CollectInventorySpans(current, forms));
+
+        CollectScpStylePasswordSpans(current, spans);
+        CollectSshUrlPasswordSpans(current, spans);
+        CollectAuthorizationHeaderSpans(current, spans);
+        CollectSecretAssignmentSpans(current, spans);
+
+        if (spans.Count == 0)
+            return current;
+
+        // ReplaceSpans merges in a single ascending sweep; touching spans stay distinct.
+        spans.Sort(static (left, right) =>
+            left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.End.CompareTo(right.End));
+        return ReplaceSpans(current, spans);
     }
 
-    // ── Layer 1: the known-secret inventory ───────────────────────────────────
+    // ── Span source 1: the known-secret inventory ─────────────────────────────
 
     /// <summary>
-    /// Applies the inventory: raw, one-level percent-encoded and standard-base64 forms of every
-    /// eligible value. All forms are matched against the original text and overlapping matches are
-    /// merged, so a secret that CONTAINS another (or an encoded variant that merely STARTS with
-    /// another value) is removed whole whatever order the values arrive in.
+    /// Builds the matchable forms of every eligible inventory value (raw, one-level percent
+    /// escapes, standard padded / unpadded base64). The spans they match are collected by
+    /// <see cref="CollectInventorySpans"/> against the original text and merged with the
+    /// structural spans, so a secret that CONTAINS another (or an encoded variant that merely
+    /// STARTS with another value) is removed whole whatever order the values arrive in.
     /// </summary>
-    private static string RedactKnownSecrets(string text, IEnumerable<string?>? knownSecrets)
+    /// <returns>The forms, or an empty list when there is no eligible value.</returns>
+    private static List<InventoryForms> BuildInventoryForms(IEnumerable<string?>? knownSecrets)
     {
+        var forms = new List<InventoryForms>();
         if (knownSecrets is null)
-            return text;
+            return forms;
 
         var eligible = new List<string>();
         foreach (var candidate in knownSecrets)
@@ -191,18 +230,14 @@ public static class GitToolOutputRedactor
                 eligible.Add(candidate);
         }
 
-        if (eligible.Count == 0)
-            return text;
-
         // ORDER-INDEPENDENT by construction. Every form of every value is matched against the
-        // ORIGINAL text, the matched spans are merged, and each merged span is replaced exactly
-        // once. No pass ever sees another pass's output, so one value's replacement can never
-        // destroy a prefix of a DIFFERENT value's longer (encoded) variant and strand its tail.
-        // Any sequence of per-value passes has that flaw whatever order it runs in: sorting by raw
-        // length, running base64 first, or re-scanning only moves WHICH pair of values collides.
-        var forms = eligible.Select(static secret => new InventoryForms(secret)).ToList();
-        var spans = CollectInventorySpans(text, forms);
-        return spans.Count == 0 ? text : ReplaceSpans(text, spans);
+        // ORIGINAL text and the matched spans are merged, so no pass ever sees another pass's
+        // output. Any sequence of per-value replacement passes lets one value's replacement
+        // destroy a prefix of a DIFFERENT value's longer (encoded) variant and strand its tail,
+        // whatever order it runs in: sorting by raw length, running base64 first, or re-scanning
+        // only moves WHICH pair of values collides.
+        forms.AddRange(eligible.Select(static secret => new InventoryForms(secret)));
+        return forms;
     }
 
     /// <summary>
@@ -393,26 +428,11 @@ public static class GitToolOutputRedactor
         return true;
     }
 
-    // ── Layer 2: structural patterns ──────────────────────────────────────────
+    // ── Span source 2: structural patterns ────────────────────────────────────
 
     /// <summary>
-    /// Applies every structural pattern, in an order where each pass can only make the following
-    /// pass's input safer: scp-style and SSH passwords first, then the composed
-    /// <see cref="GitUrlRedactor"/> grammar over the remaining URLs, then authorization headers,
-    /// then name/value assignments last (an assignment value may itself have been a URL).
-    /// </summary>
-    private static string RedactStructuralPatterns(string text)
-    {
-        var redacted = RedactScpStylePasswords(text);
-        redacted = RedactSshUrlPasswords(redacted);
-        redacted = GitUrlRedactor.Redact(redacted) ?? string.Empty;
-        redacted = RedactAuthorizationHeaders(redacted);
-        return RedactSecretAssignments(redacted);
-    }
-
-    /// <summary>
-    /// Redacts the PASSWORD of an scp-style remote (<c>user:password@host:path</c>), keeping the
-    /// user name and the host:path form intact.
+    /// Collects the span of the PASSWORD of every scp-style remote (<c>user:password@host:path</c>),
+    /// keeping the user name and the host:path form intact.
     /// </summary>
     /// <remarks>
     /// A form without a password — <c>git@host:path</c> or <c>user@host:path</c> — never matches,
@@ -420,33 +440,23 @@ public static class GitToolOutputRedactor
     /// on its left and a non-empty password on its right. The host must itself be followed by
     /// <c>:</c>, which is what distinguishes the scp form from a URL authority.
     /// </remarks>
-    private static string RedactScpStylePasswords(string text)
+    private static void CollectScpStylePasswordSpans(string text, List<(int Start, int End)> spans)
     {
-        StringBuilder? builder = null;
-        var copied = 0;
+        var lastEnd = 0;
         var at = text.IndexOf('@');
 
         while (at >= 0)
         {
-            // A match that starts before the last redaction would rewrite text already replaced, so
-            // an overlapping candidate is skipped rather than spliced twice.
+            // A candidate that starts inside the previous one would claim the same text twice.
             if (TryFindScpPassword(text, at, out var passwordStart, out var passwordEnd)
-                && passwordStart >= copied)
+                && passwordStart >= lastEnd)
             {
-                builder ??= new StringBuilder(text.Length);
-                builder.Append(text, copied, passwordStart - copied);
-                builder.Append(Placeholder);
-                copied = passwordEnd;
+                spans.Add((passwordStart, passwordEnd));
+                lastEnd = passwordEnd;
             }
 
             at = text.IndexOf('@', at + 1);
         }
-
-        if (builder is null)
-            return text;
-
-        builder.Append(text, copied, text.Length - copied);
-        return builder.ToString();
     }
 
     /// <summary>
@@ -505,17 +515,16 @@ public static class GitToolOutputRedactor
     }
 
     /// <summary>
-    /// Redacts the PASSWORD userinfo of an <c>ssh://</c> URL
+    /// Collects the span of the PASSWORD userinfo of every <c>ssh://</c> URL
     /// (<c>ssh://user:password@host[:port]/path</c>), keeping the user name.
     /// </summary>
     /// <remarks>
     /// A URL with no userinfo (<c>ssh://host/path</c>, so a port's <c>:</c> is not a credential) or
     /// with a password-less userinfo (<c>ssh://git@host/path</c>) is returned unchanged.
     /// </remarks>
-    private static string RedactSshUrlPasswords(string text)
+    private static void CollectSshUrlPasswordSpans(string text, List<(int Start, int End)> spans)
     {
-        StringBuilder? builder = null;
-        var copied = 0;
+        var lastEnd = 0;
         var index = 0;
 
         while (index < text.Length)
@@ -545,29 +554,22 @@ public static class GitToolOutputRedactor
                 {
                     var separator = text.IndexOf(':', authorityStart, lastAt - authorityStart);
                     if (separator >= authorityStart && separator + 1 < lastAt
-                        && separator + 1 >= copied)
+                        && separator + 1 >= lastEnd)
                     {
-                        builder ??= new StringBuilder(text.Length);
-                        builder.Append(text, copied, separator + 1 - copied);
-                        builder.Append(Placeholder);
-                        copied = lastAt;
+                        spans.Add((separator + 1, lastAt));
+                        lastEnd = lastAt;
                     }
                 }
             }
 
             index = Math.Max(authorityEnd, index + SshScheme.Length);
         }
-
-        if (builder is null)
-            return text;
-
-        builder.Append(text, copied, text.Length - copied);
-        return builder.ToString();
     }
 
     /// <summary>
-    /// Redacts the credential value of an <c>Authorization</c> (and, at its own name boundary,
-    /// <c>Proxy-Authorization</c>) header whose scheme is <c>Basic</c> or <c>Bearer</c>.
+    /// Collects the spans of the credential value of every <c>Authorization</c> (and, at its own
+    /// name boundary, <c>Proxy-Authorization</c>) header whose scheme is <c>Basic</c> or
+    /// <c>Bearer</c>.
     /// </summary>
     /// <remarks>
     /// Git and credential helpers print headers verbatim, and a long value is often FOLDED across
@@ -575,10 +577,9 @@ public static class GitToolOutputRedactor
     /// redacted in place, so the line breaks and indentation — and therefore the total line count a
     /// caller reports after truncation — are preserved exactly.
     /// </remarks>
-    private static string RedactAuthorizationHeaders(string text)
+    private static void CollectAuthorizationHeaderSpans(string text, List<(int Start, int End)> spans)
     {
-        StringBuilder? builder = null;
-        var copied = 0;
+        var lastEnd = 0;
         var index = 0;
 
         while (index < text.Length)
@@ -597,26 +598,14 @@ public static class GitToolOutputRedactor
             if (FindAuthorizationValueSegments(text, match + AuthorizationHeaderName.Length) is not { Count: > 0 } segments)
                 continue;
 
-            // A candidate starting inside a value already redacted would splice text twice.
-            if (segments[0].Start < copied)
+            // A candidate starting inside a value already claimed would claim the text twice.
+            if (segments[0].Start < lastEnd)
                 continue;
 
-            builder ??= new StringBuilder(text.Length);
-            foreach (var (start, end) in segments)
-            {
-                builder.Append(text, copied, start - copied);
-                builder.Append(Placeholder);
-                copied = end;
-            }
-
-            index = segments[^1].End;
+            spans.AddRange(segments);
+            lastEnd = segments[^1].End;
+            index = lastEnd;
         }
-
-        if (builder is null)
-            return text;
-
-        builder.Append(text, copied, text.Length - copied);
-        return builder.ToString();
     }
 
     /// <summary>
@@ -720,7 +709,7 @@ public static class GitToolOutputRedactor
     }
 
     /// <summary>
-    /// Redacts the value of every credential-named assignment: the four inventory environment
+    /// Collects the span of the value of every credential-named assignment: the four inventory environment
     /// variables and generic git-config style <c>token = …</c> / <c>credential: …</c> output.
     /// </summary>
     /// <remarks>
@@ -734,10 +723,9 @@ public static class GitToolOutputRedactor
     /// permanent exposure, so the ambiguous case resolves toward redaction.
     /// </para>
     /// </remarks>
-    private static string RedactSecretAssignments(string text)
+    private static void CollectSecretAssignmentSpans(string text, List<(int Start, int End)> spans)
     {
-        StringBuilder? builder = null;
-        var copied = 0;
+        var lastEnd = 0;
         var index = 0;
 
         while (index < text.Length)
@@ -764,25 +752,17 @@ public static class GitToolOutputRedactor
                 continue;
             }
 
-            // A value starting inside an earlier redaction would splice the text twice.
-            if (value.Start < copied)
+            // A value starting inside an earlier claim would claim the text twice.
+            if (value.Start < lastEnd)
             {
                 index = Math.Max(value.End, index + nameLength);
                 continue;
             }
 
-            builder ??= new StringBuilder(text.Length);
-            builder.Append(text, copied, value.Start - copied);
-            builder.Append(Placeholder);
-            copied = value.End;
+            spans.Add(value);
+            lastEnd = value.End;
             index = value.End;
         }
-
-        if (builder is null)
-            return text;
-
-        builder.Append(text, copied, text.Length - copied);
-        return builder.ToString();
     }
 
     /// <summary>
@@ -886,11 +866,15 @@ public static class GitToolOutputRedactor
     /// Whether an already-substituted <see cref="Placeholder"/> starts at <paramref name="index"/>.
     /// </summary>
     /// <remarks>
-    /// The inventory layer runs before the structural layer and leaves <c>[redacted]</c> inside
-    /// the text. Because <c>[</c> and <c>]</c> are not authority, host or userinfo characters, a
-    /// scan that stopped there would end an SSH/scp credential run early and strand the structural
-    /// password. Treating the placeholder as part of the run keeps the two layers from blinding
-    /// each other (the same principle <see cref="ScanCredentialToken"/> applies to headers).
+    /// The text this transform receives may ALREADY contain <c>[redacted]</c> — output that an
+    /// earlier boundary (the repository manager's own redaction) has substituted, or a value the
+    /// operator literally logged. Because <c>[</c> and <c>]</c> are not authority, host or
+    /// userinfo characters, a scan that stopped there would end an SSH/scp credential run early
+    /// and strand the structural password. Treating the placeholder as part of the run keeps such
+    /// text from blinding the scan (the same principle <see cref="ScanCredentialToken"/> applies to
+    /// headers). The inventory source no longer produces placeholders ahead of the structural
+    /// scans — both collect spans from the same unmodified text — so this is about pre-redacted
+    /// INPUT only.
     /// </remarks>
     private static bool StartsWithPlaceholder(string text, int index) =>
         text.AsSpan(index).StartsWith(Placeholder, StringComparison.Ordinal);
@@ -966,10 +950,11 @@ public static class GitToolOutputRedactor
     /// substituted <see cref="Placeholder"/> as part of the run.
     /// </summary>
     /// <remarks>
-    /// The inventory layer runs first and leaves <c>[redacted]</c> inside a header value. Because
-    /// <c>[</c> is not a token character, a scan that stopped there would end the header's value
-    /// early (or reject the header outright) and expose every LATER folded segment. Consuming the
-    /// placeholder keeps the two layers from blinding each other; re-redacting it is idempotent.
+    /// The input may already contain <c>[redacted]</c> inside a header value (output an earlier
+    /// boundary redacted). Because <c>[</c> is not a token character, a scan that stopped there
+    /// would end the header's value early (or reject the header outright) and expose every LATER
+    /// folded segment. Consuming the placeholder keeps pre-redacted input from blinding the scan;
+    /// re-redacting it is idempotent.
     /// </remarks>
     private static int ScanCredentialToken(string text, int start)
     {
