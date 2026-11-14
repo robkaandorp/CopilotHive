@@ -4,7 +4,6 @@
 @using CopilotHive.Goals
 @using CopilotHive.Services
 @using Microsoft.AspNetCore.Components.Authorization
-@inject IGoalStore GoalStore
 @inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject NavigationManager Nav
 @inject IReleaseFacade ReleaseFacade
@@ -29,12 +28,22 @@
         }
     </select>
 
-    <span class="filter-count">@_filtered.Count release(s)</span>
+    @if (string.IsNullOrEmpty(_loadError))
+    {
+        <span class="filter-count">@_filtered.Count release(s)</span>
+    }
 
     <button class="approve-btn" style="margin-left:auto" @onclick="() => _showCreateForm = !_showCreateForm">
         + New Release
     </button>
 </div>
+
+<!-- Load failure / denial: a refused or failed read is surfaced as a SAFE message and NOTHING that
+     was previously loaded is presented — no release card, no group, no scope count. -->
+@if (!string.IsNullOrEmpty(_loadError))
+{
+    <p class="error-msg" style="margin-top:1rem">@_loadError</p>
+}
 
 <!-- Inline Create Form -->
 @if (_showCreateForm)
@@ -171,16 +180,43 @@ else if (_loaded)
     private string _repoFilter = "";
     private string _statusFilter = "";
     private bool _loaded;
+    private string? _loadError;
     private bool _showCreateForm;
     private string _createVersion = "";
     private string _createRepo = "";
     private string? _createError;
 
+    /// <summary>
+    /// The SANITIZED page error for a THROWN release-LIST read. A thrown store/facade exception's own
+    /// message is never rendered — it can carry internal detail — so the page reports only that the read
+    /// failed. Distinct from the goals text so the failing read site is identifiable.
+    /// </summary>
+    private const string ReleaseListReadFailureMessage = "Releases could not be loaded.";
+
+    /// <summary>The SANITIZED page error for a THROWN goal-by-release read.</summary>
+    private const string ReleaseGoalsReadFailureMessage = "Release goals could not be loaded.";
+
+    /// <summary>
+    /// Monotonic generation of the release/goal read most recently STARTED. Only the newest read may
+    /// publish <c>_allReleases</c> / <c>_goalsByRelease</c> / <c>_goalCountsByRelease</c>, so an older
+    /// AUTHORIZED read that completes late can never restore content a newer denied or failed read
+    /// already cleared.
+    /// </summary>
+    private int _loadGeneration;
+
     /// <summary>Repo-group keys whose older releases are currently expanded.</summary>
     private readonly HashSet<string> _expandedGroups = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Expands/collapses one repo-group's older releases. While the page is in its DENIED/FAILED state
+    /// there is no group to expand, so the callback returns without retaining anything — the one place a
+    /// post-denial callback could otherwise leave expansion state behind.
+    /// </summary>
     private void ToggleGroup(string groupKey)
     {
+        if (!string.IsNullOrEmpty(_loadError))
+            return;
+
         if (!_expandedGroups.Add(groupKey))
             _expandedGroups.Remove(groupKey);
     }
@@ -199,54 +235,167 @@ else if (_loaded)
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("📦 Releases");
-        _allReleases = (await GoalStore.GetReleasesAsync()).ToList();
-        await LoadGoalCountsAsync();
-        _loaded = true;
-        ApplyFilters();
+        await LoadAsync();
     }
 
     /// <summary>
-    /// Loads each release's goals through the AUTHORIZED <see cref="IReleaseFacade.GetGoalsByReleaseAsync"/>
-    /// read, which re-resolves this circuit user's CURRENT role/enabled state and requires shared read.
-    /// A direct <c>GoalStore.GetGoalsByReleaseAsync</c> read here would be an identity-free bypass of
-    /// the covered release-read surface. The release LIST read in
-    /// <see cref="OnInitializedAsync"/> stays a direct <c>GoalStore.GetReleasesAsync</c> call — the
-    /// goal's explicit, documented exception.
+    /// Loads the release list AND every release's goals through the AUTHORIZED
+    /// <see cref="IReleaseFacade"/> reads. Both re-resolve this circuit user's CURRENT role/enabled
+    /// state and require shared read, so neither may be replaced by a direct <c>IGoalStore</c> read —
+    /// that would be an identity-free bypass of the covered release-read surface. The
+    /// configured-repository create dropdown comes from the in-memory <c>HiveConfig</c> and
+    /// deliberately NOT from a <c>GlobalAdmin</c> config read, so an ordinary shared-read release view
+    /// keeps working.
     /// <para>
-    /// A denied (or otherwise failed) read leaves that release at the empty state the page ALREADY
-    /// renders for a release with no goals, so a refusal never throws out of the renderer and never
-    /// fabricates counts.
+    /// PUBLICATION IS ATOMIC AND GENERATION-GUARDED: every value is accumulated in LOCALS and
+    /// published only when EVERY read succeeded; the generation is taken when this read STARTS and is
+    /// re-checked after each await, so a stale (older) completion returns without publishing anything
+    /// and cannot overwrite newer state.
+    /// </para>
+    /// <para>
+    /// A DENIED, FAILED OR THROWN READ CLEARS EVERYTHING (see <see cref="ClearReleaseState"/>): the release
+    /// list, the FILTERED view, the per-release goals, the per-release scope counts, the expanded-group set
+    /// and BOTH filter selections are emptied and a safe error/denial message is surfaced. The page
+    /// therefore renders NO retained card, NO group and NO fabricated <c>(0, 0, 0)</c> scope count — and
+    /// never the "No releases found." empty state — for a denial, a failure or a THROWN read.
+    /// </para>
+    /// <para>
+    /// A THROWN read from EITHER site is handled by <see cref="FailLoad"/>: the generation is re-checked so
+    /// a stale throw cannot overwrite a newer load's state, and only the SANITIZED constant is published —
+    /// never the exception's own message.
     /// </para>
     /// </summary>
-    private async Task LoadGoalCountsAsync()
+    private async Task LoadAsync()
     {
-        foreach (var release in _allReleases)
-        {
-            var result = await ReleaseFacade.GetGoalsByReleaseAsync(
-                release.Id, await ActingUserAsync(), CancellationToken.None);
+        var generation = Interlocked.Increment(ref _loadGeneration);
 
-            if (!result.Success || result.Value is null)
+        FacadeResult<IReadOnlyList<ReleaseDto>> releasesResult;
+        try
+        {
+            releasesResult = await ReleaseFacade.GetReleasesAsync(
+                await ActingUserAsync(), CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is the CALLER'S outcome, never a load failure: it is not converted into one.
+            throw;
+        }
+        catch (Exception)
+        {
+            // A THROWN read is a failure like any other. The generation decides WHO may publish (so a stale
+            // throw cannot clobber newer state) and the message is a fixed SANITIZED constant — the
+            // exception's own text can carry store/SQL/path detail and is never rendered.
+            FailLoad(generation, ReleaseListReadFailureMessage);
+            return;
+        }
+
+        if (generation != _loadGeneration)
+            return; // stale — a newer read owns the published state
+
+        if (!releasesResult.Success || releasesResult.Value is null)
+        {
+            ClearReleaseState();
+            _loadError = releasesResult.Error ?? ReleaseListReadFailureMessage;
+            return;
+        }
+
+        var goalsByRelease = new Dictionary<string, IReadOnlyList<Goal>>();
+        var goalCountsByRelease = new Dictionary<string, (int Breaking, int Feature, int Patch)>();
+        foreach (var release in releasesResult.Value)
+        {
+            FacadeResult<IReadOnlyList<Goal>> goalsResult;
+            try
             {
-                // NON-CRASHING, MINIMAL: a denied (or otherwise failed) read keeps this release at the
-                // page's EXISTING empty default — the same state it already renders for a release with
-                // no goals — instead of throwing out of the renderer. Deliberately no new error UI, no
-                // denial-state machinery and no reuse of the create-form's _createError field: denial
-                // handling/redesign is a separate phase.
-                _goalsByRelease[release.Id] = [];
-                _goalCountsByRelease[release.Id] = (0, 0, 0);
-                continue;
+                goalsResult = await ReleaseFacade.GetGoalsByReleaseAsync(
+                    release.Id, await ActingUserAsync(), CancellationToken.None);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                FailLoad(generation, ReleaseGoalsReadFailureMessage);
+                return;
             }
 
-            var goals = result.Value;
-            _goalsByRelease[release.Id] = goals;
-            _goalCountsByRelease[release.Id] = (
+            if (generation != _loadGeneration)
+                return; // stale — a newer read owns the published state
+
+            if (!goalsResult.Success || goalsResult.Value is null)
+            {
+                ClearReleaseState();
+                _loadError = goalsResult.Error ?? ReleaseGoalsReadFailureMessage;
+                return;
+            }
+
+            var goals = goalsResult.Value;
+            goalsByRelease[release.Id] = goals;
+            goalCountsByRelease[release.Id] = (
                 Breaking: goals.Count(g => g.Scope == GoalScope.Breaking),
                 Feature: goals.Count(g => g.Scope == GoalScope.Feature),
                 Patch: goals.Count(g => g.Scope == GoalScope.Patch)
             );
         }
+
+        // PUBLISH — reached only when EVERY read succeeded.
+        _allReleases = releasesResult.Value.Select(ToDomainRelease).ToList();
+        _goalsByRelease = goalsByRelease;
+        _goalCountsByRelease = goalCountsByRelease;
+        _loadError = null;
+        _loaded = true;
+        ApplyFilters();
     }
 
+    /// <summary>
+    /// Applies ONE THROWN read failure to the page. Only the load generation that is STILL ACTIVE may
+    /// clear the retained state and publish the message, so a stale read that throws after a newer load
+    /// already published (a refusal, or another denial) leaves that newer state and message untouched.
+    /// <para>
+    /// The message is a fixed SANITIZED constant, never the exception's own text: a store/facade exception
+    /// can carry internal detail (SQL, paths, connection data) that must not reach the UI.
+    /// </para>
+    /// </summary>
+    /// <param name="generation">The generation the failing read belongs to.</param>
+    /// <param name="message">The sanitized page error to surface.</param>
+    private void FailLoad(int generation, string message)
+    {
+        if (generation != _loadGeneration)
+            return; // stale — a newer load owns the published state and its message
+
+        ClearReleaseState();
+        _loadError = message;
+    }
+
+    /// <summary>
+    /// Clears EVERYTHING this page previously loaded from the release surface: the release list, the
+    /// filter-derived view, the per-release goals, the per-release scope counts, the repo names derived
+    /// from the list, the expanded-group set AND the two filter selections. Called on a denied, failed or
+    /// THROWN read so nothing retained can be presented; clearing is LOCAL only — there is no fallback
+    /// store read on the denial path.
+    /// <para>
+    /// THE FILTER SELECTIONS ARE PART OF THE RETAINED STATE. Leaving them set would keep a stale selection
+    /// visible in the controls AND constrain a LATER authorized refresh to the old selection, so a page
+    /// that recovered would silently show a filtered subset of the releases it just read.
+    /// </para>
+    /// </summary>
+    private void ClearReleaseState()
+    {
+        _allReleases = [];
+        _filtered = [];
+        _goalsByRelease = new();
+        _goalCountsByRelease = new();
+        _expandedGroups.Clear();
+        _loaded = false;
+        _repoFilter = "";
+        _statusFilter = "";
+    }
+
+    /// <summary>
+    /// Re-derives the filtered view from <c>_allReleases</c> — the SINGLE source the denied/failed path
+    /// clears — so a filter callback after a denial has nothing retained to resurrect: the derived view
+    /// it produces is empty because its input is empty.
+    /// </summary>
     private void ApplyFilters()
     {
         // A filter change re-scopes every group, so all groups return to collapsed.
@@ -263,6 +412,10 @@ else if (_loaded)
         _filtered = query.OrderByDescending(r => r.CreatedAt).ToList();
     }
 
+    /// <summary>
+    /// Groups the FILTERED view — which is itself derived from <c>_allReleases</c> — so a grouping call
+    /// after a denial returns no group: there is no retained release left to group.
+    /// </summary>
     private IEnumerable<IGrouping<string, Release>> GetGroupedReleases()
     {
         // When a repo filter is active, each release must only appear under the filtered

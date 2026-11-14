@@ -2,7 +2,6 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using Markdig
-@inject IGoalStore GoalStore
 @inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject IJSRuntime JS
 @inject NavigationManager Nav
@@ -13,7 +12,13 @@
 @using Microsoft.AspNetCore.Components.Authorization
 @using System.Security.Claims
 
-@if (_release is not null)
+@* A DENIED OR FAILED READ is surfaced as a SAFE message and presents NOTHING that was previously
+   loaded. "Release not found." below stays the NOT-FOUND answer only. *@
+@if (!string.IsNullOrEmpty(_loadError))
+{
+    <p class="error-msg" style="margin-top:1rem">@_loadError</p>
+}
+else if (_release is not null)
 {
     <!-- Header -->
     <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
@@ -330,6 +335,34 @@ else if (_loaded)
     private string? _deleteError;
 
     /// <summary>
+    /// A SAFE error/denial message for the INITIAL load. Empty while the release rendered normally and
+    /// for a genuine <see cref="FacadeErrorKind.NotFound"/> (which keeps the page's own
+    /// "Release not found." message); populated with the facade's sanitized text for a refusal or any
+    /// other failed read, in which case NOTHING previously loaded is presented.
+    /// </summary>
+    private string? _loadError;
+
+    /// <summary>
+    /// The SANITIZED page error for a THROWN release-DETAIL read. A thrown store/facade exception's own
+    /// message is never rendered — it can carry internal detail — so the page reports only that the read
+    /// failed. Distinct from the goals text so the failing read site is identifiable.
+    /// </summary>
+    private const string ReleaseReadFailureMessage = "The release could not be loaded.";
+
+    /// <summary>The SANITIZED page error for a THROWN goal-by-release read.</summary>
+    private const string ReleaseGoalsReadFailureMessage = "The release's goals could not be loaded.";
+
+    /// <summary>
+    /// Monotonic generation of the detail read most recently STARTED. Only the newest read may publish
+    /// the loaded state, so an older AUTHORIZED read that completes late can never restore content a
+    /// newer denied/failed read (or a newer route parameter) already cleared.
+    /// </summary>
+    private int _loadGeneration;
+
+    /// <summary>The release id the CURRENT load was started for, so a parameter reload is detected.</summary>
+    private string? _loadedReleaseId;
+
+    /// <summary>
     /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
     /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
     /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
@@ -350,45 +383,220 @@ else if (_loaded)
     private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
         ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
 
-    protected override async Task OnInitializedAsync()
+    /// <summary>
+    /// Loads on the FIRST parameter set and again whenever the route parameter changes, so a
+    /// navigation from one release to another (or any reload that sets a different <see cref="ReleaseId"/>)
+    /// starts from a CLEARED page rather than the previously loaded release, its goals, its validation
+    /// and execution results and its edit state.
+    /// </summary>
+    protected override async Task OnParametersSetAsync()
     {
+        if (_loadedReleaseId is not null && string.Equals(_loadedReleaseId, ReleaseId, StringComparison.Ordinal))
+            return; // same release — the loaded state belongs to it
+
+        await LoadAsync();
+    }
+
+    /// <summary>
+    /// Loads this release and its goals through the AUTHORIZED <see cref="IReleaseFacade"/> reads, both
+    /// of which re-resolve this circuit user's CURRENT role/enabled state and require shared read. A
+    /// direct <c>IGoalStore</c> read would be an identity-free bypass of the covered release-read
+    /// surface, and the configured-repository display comes from the in-memory <c>HiveConfig</c> — no
+    /// <c>GlobalAdmin</c> config read is added to this shared-read page.
+    /// <para>
+    /// EVERY PREVIOUSLY RETAINED VALUE IS CLEARED FIRST (see <see cref="ClearDetailState"/>), so a
+    /// parameter reload never renders the previous release while the new reads are in flight.
+    /// </para>
+    /// <para>
+    /// A DENIED OR FAILED READ CLEARS EVERYTHING AGAIN and surfaces a SAFE error/denial message — never
+    /// the misleading "Release not found." text, and never the retained release, goals or edit state.
+    /// "Release not found." is kept for a genuine <see cref="FacadeErrorKind.NotFound"/>.
+    /// </para>
+    /// <para>
+    /// THE SHARED HEADER IS CLEARED BEFORE THE AWAIT (see <see cref="SetNeutralHeader"/>), so a pending
+    /// A → B reload never shows the previous release's tag, and a THROWN read from EITHER site is handled by
+    /// <see cref="FailLoad"/>: the generation is re-checked so a stale throw cannot overwrite a newer load,
+    /// and only the SANITIZED constant is published — never the exception's own message.
+    /// </para>
+    /// <para>
+    /// PUBLICATION IS GENERATION-GUARDED: the generation is taken when the read STARTS and re-checked
+    /// after every await, so an older read that completes late publishes nothing and cannot overwrite
+    /// the newer denied/cleared state.
+    /// </para>
+    /// </summary>
+    private async Task LoadAsync()
+    {
+        var generation = Interlocked.Increment(ref _loadGeneration);
         var decoded = Uri.UnescapeDataString(ReleaseId);
+        _loadedReleaseId = decoded;
+
+        // A reload starts from a CLEARED page: no previous release, goals or edit state may survive it.
+        ClearDetailState();
+        _loaded = false;
+
+        // THE SHARED HEADER IS CLEARED BEFORE THE AWAIT TOO. The title is a SHARED, circuit-scoped state
+        // the layout renders OUTSIDE this component, so clearing only the body would leave the PREVIOUS
+        // release's tag on screen for the whole pending window of an A → B reload. A neutral,
+        // non-tag title makes the pending window honest: nothing is claimed while nothing is loaded.
+        SetNeutralHeader();
 
         // AUTHORIZED READS: both the release and its goals go through IReleaseFacade, which
         // re-resolves this circuit user's CURRENT role/enabled state on every call and requires
-        // shared read. A direct GoalStore read here would be an identity-free bypass of the covered
-        // release-read surface. A refused or not-found release read leaves _release null and renders
-        // the existing "Release not found." surface; a refused GOALS read keeps _goals empty and
-        // reports through the page's existing _releaseError card. Nothing throws out of the renderer.
-        var releaseResult = await ReleaseFacade.GetReleaseAsync(
-            decoded, await ActingUserAsync(), CancellationToken.None);
-
-        if (releaseResult.Success && releaseResult.Value is not null)
+        // shared read.
+        FacadeResult<ReleaseDto> releaseResult;
+        try
         {
-            _release = releaseResult.Value;
-            PageHeader.SetTitle($"📦 {_release.Tag}");
-            PageHeader.SetBack("/releases");
-            _editNotes = _release.Notes ?? "";
-            _editTag = _release.Tag;
-            _selectedRepos = new HashSet<string>(_release.RepositoryNames, StringComparer.OrdinalIgnoreCase);
-
-            var goalsResult = await ReleaseFacade.GetGoalsByReleaseAsync(
+            releaseResult = await ReleaseFacade.GetReleaseAsync(
                 decoded, await ActingUserAsync(), CancellationToken.None);
-            if (goalsResult.Success && goalsResult.Value is not null)
-                _goals = goalsResult.Value.ToList();
-            else
-                _releaseError = goalsResult.Error;
         }
-        // A denied or not-found RELEASE read leaves _release null, so the page renders its EXISTING
-        // "Release not found." surface rather than throwing out of the renderer. Deliberately no new
-        // error UI and no denial-state machinery here: denial handling/redesign is a separate phase.
-
-        if (_release is null)
+        catch (OperationCanceledException)
         {
-            PageHeader.SetTitle("Release Not Found");
+            // Cancellation is the CALLER'S outcome, never a load failure: it is not converted into one.
+            throw;
+        }
+        catch (Exception)
+        {
+            // A THROWN read is a failure like any other: generation-aware clearing plus a SANITIZED
+            // message. The exception's own text is never rendered.
+            FailLoad(generation, ReleaseReadFailureMessage);
+            return;
+        }
+
+        if (generation != _loadGeneration)
+            return; // stale — a newer read owns the published state
+
+        var release = releaseResult.Success ? releaseResult.Value : null;
+        var goals = new List<Goal>();
+        string? loadError = null;
+
+        if (release is null)
+        {
+            // A genuine NOT FOUND keeps the page's own "Release not found." message; every other
+            // failure (a FORBIDDEN refusal included) reports the facade's sanitized text instead of
+            // claiming the release does not exist.
+            loadError = releaseResult.Kind == FacadeErrorKind.NotFound
+                ? null
+                : releaseResult.Error ?? ReleaseReadFailureMessage;
+        }
+        else
+        {
+            FacadeResult<IReadOnlyList<Goal>> goalsResult;
+            try
+            {
+                goalsResult = await ReleaseFacade.GetGoalsByReleaseAsync(
+                    decoded, await ActingUserAsync(), CancellationToken.None);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                FailLoad(generation, ReleaseGoalsReadFailureMessage);
+                return;
+            }
+
+            if (generation != _loadGeneration)
+                return; // stale — a newer read owns the published state
+
+            if (!goalsResult.Success || goalsResult.Value is null)
+            {
+                // A refused/failed GOALS read clears the release too: the page must not present a
+                // release whose goals it is not allowed to read.
+                release = null;
+                loadError = goalsResult.Error ?? ReleaseGoalsReadFailureMessage;
+            }
+            else
+            {
+                goals = goalsResult.Value.ToList();
+            }
+        }
+
+        // PUBLISH — reached only when EVERY read succeeded, or with a fully cleared page.
+        if (release is null)
+        {
+            ClearDetailState();
+            _loadError = loadError;
+
+            // The HEADER is honest too: only a genuine not-found says so; a refusal or another failure
+            // announces an unavailable release, so no surface claims the release does not exist.
+            PageHeader.SetTitle(loadError is null ? "Release Not Found" : "Release Unavailable");
             PageHeader.SetBack("/releases");
         }
+        else
+        {
+            _release = release;
+            _goals = goals;
+            _loadError = null;
+            _editNotes = release.Notes ?? "";
+            _editTag = release.Tag;
+            _selectedRepos = new HashSet<string>(release.RepositoryNames, StringComparer.OrdinalIgnoreCase);
+            PageHeader.SetTitle($"📦 {release.Tag}");
+            PageHeader.SetBack("/releases");
+        }
+
         _loaded = true;
+    }
+
+    /// <summary>
+    /// Applies ONE THROWN read failure to the page: the state is cleared and a SANITIZED message is
+    /// published — but ONLY by the generation that is still active, so a stale throw cannot overwrite the
+    /// newer load's state or its message.
+    /// </summary>
+    /// <param name="generation">The generation the failing read belongs to.</param>
+    /// <param name="message">The sanitized page error to surface.</param>
+    private void FailLoad(int generation, string message)
+    {
+        if (generation != _loadGeneration)
+            return; // stale — a newer load owns the published state and its message
+
+        ClearDetailState();
+        _loadError = message;
+        _loaded = true;
+
+        // The header announces the failure and names NO release, so neither the previous release's tag
+        // nor the requested one is claimed.
+        PageHeader.SetTitle("Release Unavailable");
+        PageHeader.SetBack("/releases");
+    }
+
+    /// <summary>
+    /// Puts the SHARED page header into a neutral, non-tag state. Used before every load so a pending
+    /// (or superseded) read cannot leave the PREVIOUS release's tag in the layout's header — which renders
+    /// outside this component and would otherwise keep showing the old release for the whole window.
+    /// </summary>
+    private void SetNeutralHeader()
+    {
+        PageHeader.SetTitle("Release");
+        PageHeader.SetBack("/releases");
+    }
+
+    /// <summary>
+    /// Clears EVERY value this page retains from a load: the release, its goals, the notes/tag/
+    /// repository edit state (and the "saved" flags), the validation and execution results, the
+    /// per-operation errors and the load error. Called before a load and on a denied/failed read, so
+    /// neither a parameter reload nor a refusal can present (or resurrect) previously loaded state.
+    /// </summary>
+    private void ClearDetailState()
+    {
+        _release = null;
+        _goals = [];
+        _editNotes = "";
+        _editTag = "";
+        _selectedRepos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _notesSaved = false;
+        _notesError = null;
+        _tagSaved = false;
+        _tagError = null;
+        _repositoriesSaved = false;
+        _repositoriesError = null;
+        _isValid = false;
+        _validationErrors = [];
+        _releaseResult = null;
+        _releaseError = null;
+        _executionFailed = false;
+        _deleteError = null;
+        _loadError = null;
     }
 
     private async Task ValidateReleaseAsync()

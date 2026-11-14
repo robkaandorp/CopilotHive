@@ -174,6 +174,16 @@ public sealed class ReleaseStatusDownstreamDenialTests : IDisposable
             string id, ClaimsPrincipal? actingUser, CancellationToken ct) =>
             inner.GetReleaseAsync(id, actingUser, ct);
 
+        /// <summary>
+        /// The RELEASE-LIST read is forwarded to the REAL facade exactly like the other reads: the row
+        /// drives the status route, so the list read is never exercised here — but it must never be
+        /// faked into an allow either. Forwarding keeps the real facade's fresh SharedRead gate as the
+        /// only decision, so this decorator cannot mask a denial.
+        /// </summary>
+        public Task<FacadeResult<IReadOnlyList<ReleaseDto>>> GetReleasesAsync(
+            ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            inner.GetReleasesAsync(actingUser, ct);
+
         public Task<FacadeResult<IReadOnlyList<Goal>>> GetGoalsByReleaseAsync(
             string releaseId, ClaimsPrincipal? actingUser, CancellationToken ct) =>
             inner.GetGoalsByReleaseAsync(releaseId, actingUser, ct);

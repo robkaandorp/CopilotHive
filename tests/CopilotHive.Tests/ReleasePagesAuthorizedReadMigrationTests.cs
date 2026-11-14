@@ -10,13 +10,19 @@ namespace CopilotHive.Tests;
 /// every assertion to the region it belongs to. They pin:
 /// </para>
 /// <list type="bullet">
-///   <item>NEITHER page reaches the goal store directly for a RELEASE read: the release detail
-///   read and the GOAL-BY-RELEASE read both go through the authorized facade methods that
-///   re-resolve the caller's current role/enabled state. Only the release LIST read
-///   (<c>GetReleasesAsync</c>) may remain a direct store read — the goal's explicit exception.</item>
+///   <item>NEITHER page reaches the goal store for ANY release read — the release LIST read
+///   (<c>ReleaseFacade.GetReleasesAsync</c>), the release DETAIL read and the GOAL-BY-RELEASE read
+///   all go through the authorized facade methods that re-resolve the caller's current
+///   role/enabled state. The release list's old, documented <c>IGoalStore.GetReleasesAsync</c>
+///   exception is CLOSED, and <c>IGoalStore</c> is no longer injected at all.</item>
 ///   <item>EVERY facade call in both pages passes the circuit identity, acquired through the single
 ///   <c>ComponentActingUser</c> helper — so no identity-free facade call site can survive.</item>
 /// </list>
+/// <para>
+/// These are SOURCE contracts only. The behaviour of a denial (stale clearing, safe messaging,
+/// callbacks and overlapping reads) is proven behaviourally by
+/// <c>ReleasePageDenialBehaviorTests</c>, which renders the real pages.
+/// </para>
 /// </summary>
 public sealed class ReleasePagesAuthorizedReadMigrationTests
 {
@@ -99,42 +105,68 @@ public sealed class ReleasePagesAuthorizedReadMigrationTests
         var source = ReadReleaseDetail();
         var code = StripLineComments(source);
 
-        // The load path uses the facade, with the identity.
-        var load = ExtractMethodSource(code, "protected override async Task OnInitializedAsync()", "ReleaseDetail.razor");
+        // The load path uses the facade, with the identity. The load runs from the parameter-set
+        // hook (so a route-parameter reload really re-reads) and its body lives in LoadAsync.
+        var parameters = ExtractMethodSource(code, "protected override async Task OnParametersSetAsync()", "ReleaseDetail.razor");
+        Assert.Contains("await LoadAsync()", parameters, StringComparison.Ordinal);
+
+        var load = ExtractMethodSource(code, "private async Task LoadAsync()", "ReleaseDetail.razor");
         Assert.Contains("ReleaseFacade.GetReleaseAsync(", load, StringComparison.Ordinal);
         Assert.Contains("ReleaseFacade.GetGoalsByReleaseAsync(", load, StringComparison.Ordinal);
         Assert.Contains("await ActingUserAsync()", load, StringComparison.Ordinal);
 
-        // NO direct goal-store read of either surface remains.
+        // NO direct goal-store read of either surface remains...
         Assert.DoesNotContain("GoalStore.GetReleaseAsync(", code, StringComparison.Ordinal);
         Assert.DoesNotContain("GoalStore.GetGoalsByReleaseAsync(", code, StringComparison.Ordinal);
+
+        // ...and the goal store is not injected at all, so no direct read can be reintroduced.
+        Assert.DoesNotContain("@inject IGoalStore ", source, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// <c>Releases.razor</c> reads each release's goals through the AUTHORIZED facade method —
-    /// never directly through the goal store. The release LIST read
-    /// (<c>GoalStore.GetReleasesAsync()</c>) is the goal's EXPLICIT exception and may remain.
+    /// <c>Releases.razor</c> reads BOTH the release list and each release's goals through the
+    /// AUTHORIZED facade methods — never directly through the goal store. The old, documented
+    /// exception that let the release LIST be a direct <c>IGoalStore.GetReleasesAsync()</c> call is
+    /// CLOSED, and the store is not injected at all.
     /// </summary>
     [Fact]
-    public void ReleasesPage_ReadsTheGoalsByRelease_ThroughTheAuthorizedFacade()
+    public void ReleasesPage_ReadsTheReleaseListAndTheGoalsByRelease_ThroughTheAuthorizedFacade()
     {
         var source = ReadReleases();
         var code = StripLineComments(source);
 
-        var load = ExtractMethodSource(code, "private async Task LoadGoalCountsAsync()", "Releases.razor");
+        var load = ExtractMethodSource(code, "private async Task LoadAsync()", "Releases.razor");
+        Assert.Contains("ReleaseFacade.GetReleasesAsync(", load, StringComparison.Ordinal);
         Assert.Contains("ReleaseFacade.GetGoalsByReleaseAsync(", load, StringComparison.Ordinal);
         Assert.Contains("await ActingUserAsync()", load, StringComparison.Ordinal);
 
-        // The direct goal-by-release store read is gone.
+        // NO direct goal-store read of either surface remains...
+        Assert.DoesNotContain("GoalStore.GetReleasesAsync(", code, StringComparison.Ordinal);
         Assert.DoesNotContain("GoalStore.GetGoalsByReleaseAsync(", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("GoalStore.", code, StringComparison.Ordinal);
 
-        // The release LIST read remains the explicit exception — and it is the ONLY goal-store
-        // use left in the page.
-        Assert.Contains("GoalStore.GetReleasesAsync()", code, StringComparison.Ordinal);
-        foreach (var line in code.Split('\n').Where(l => l.Contains("GoalStore.", StringComparison.Ordinal)))
-        {
-            Assert.Contains("GetReleasesAsync", line, StringComparison.Ordinal);
-        }
+        // ...and the goal store is not injected at all, so no direct read can be reintroduced.
+        Assert.DoesNotContain("@inject IGoalStore ", source, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The release list read is NOT substituted by a <c>GlobalAdmin</c> config read: the page must
+    /// never call <c>IConfigFacade.GetRepositoriesAsync</c>, because an ordinary shared-read release
+    /// view (and open mode) must work without global admin. The create dropdown keeps coming from
+    /// the in-memory <c>HiveConfig</c>.
+    /// </summary>
+    [Fact]
+    public void ReleasesPage_NeverReadsRepositoriesThroughTheGlobalAdminConfigFacade()
+    {
+        var source = ReadReleases();
+        var code = StripLineComments(source);
+
+        Assert.DoesNotContain("IConfigFacade", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("ConfigFacade", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetRepositoriesAsync(", code, StringComparison.Ordinal);
+
+        // The create dropdown is still fed from the in-memory configuration.
+        Assert.Contains("HiveConfig?.Repositories", source, StringComparison.Ordinal);
     }
 
     // ══════════════════════════════════════════════════════════════════════════

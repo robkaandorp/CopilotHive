@@ -438,12 +438,18 @@ public sealed class ReleasePagesFacadeTests
     /// <see cref="ReleaseDto"/>, so the page assigns the returned value directly instead of
     /// projecting a store-loaded entity itself.
     /// <para>
-    /// UPDATED COHERENTLY with the authorized-read migration: the release detail read is NO LONGER an
-    /// identity-free <c>GoalStore.GetReleaseAsync</c> call — it goes through the facade so the caller's
-    /// current role/enabled state is re-resolved. This test keeps pinning the DTO state shape (the
-    /// field's declared type and its assignment from the release read) while asserting the read is the
-    /// authorized one and that the identity-free store read is GONE — a strictly stronger contract
-    /// than the previous assertion, never a weaker one.
+    /// The release detail read is NO LONGER an identity-free <c>GoalStore.GetReleaseAsync</c> call — it
+    /// goes through the facade so the caller's current role/enabled state is re-resolved, and the page
+    /// loads from its PARAMETER hook (so a route-parameter reload really re-reads). This test keeps
+    /// pinning the DTO state shape (the field's declared type and its assignment from the release read)
+    /// while asserting the read is the authorized one and that the identity-free store read is GONE —
+    /// a strictly stronger contract than the previous assertion, never a weaker one.
+    /// </para>
+    /// <para>
+    /// UPDATED for the THROWN-read handling: the read is now bound through a guarded
+    /// <c>FacadeResult&lt;ReleaseDto&gt;</c> local inside a try/catch, so the assertion targets the
+    /// AUTHORIZED call itself (the assignment to that local and the awaited call) rather than the old
+    /// <c>var</c> declaration shape — the same contract, expressed for the guarded form.
     /// </para>
     /// </summary>
     [Fact]
@@ -452,14 +458,22 @@ public sealed class ReleasePagesFacadeTests
         var source = ReadReleaseDetailSource();
         Assert.Contains("private ReleaseDto? _release;", source);
 
-        // The load path assigns the DTO the AUTHORIZED facade read returns...
-        var method = ExtractMethodSource(source, "protected override async Task OnInitializedAsync()");
-        Assert.Contains("var releaseResult = await ReleaseFacade.GetReleaseAsync(", method);
-        Assert.Contains("await ActingUserAsync()", method);
-        Assert.Contains("_release = releaseResult.Value;", method);
+        // The parameter hook really drives the read (a reload is not skipped)...
+        var parameters = ExtractMethodSource(source, "protected override async Task OnParametersSetAsync()");
+        Assert.Contains("await LoadAsync()", parameters);
 
-        // ...and the identity-free store read of the release is GONE from the whole page.
+        // ...and the load path assigns the DTO the AUTHORIZED facade read returns, through the guarded
+        // local the thrown-read handling requires.
+        var method = ExtractMethodSource(source, "private async Task LoadAsync()");
+        Assert.Contains("ReleaseFacade.GetReleaseAsync(", method);
+        Assert.Contains("releaseResult = await ReleaseFacade.GetReleaseAsync(", method);
+        Assert.Contains("await ActingUserAsync()", method);
+        Assert.Contains("_release = release;", method);
+
+        // The identity-free store read of the release is GONE from the whole page — including the
+        // injection itself, so it cannot be reintroduced.
         Assert.DoesNotContain("GoalStore.GetReleaseAsync(", source);
+        Assert.DoesNotContain("@inject IGoalStore ", source);
         Assert.DoesNotContain("ReleaseDto.From(release)", source);
     }
 

@@ -58,8 +58,9 @@ namespace CopilotHive.Services;
 /// can reach a covered operation without an identity.
 /// </para>
 /// <para>
-/// THE ROLE MAP this facade enforces: the two reads
-/// (<see cref="GetReleaseAsync"/>, <see cref="GetGoalsByReleaseAsync"/>) require
+/// THE ROLE MAP this facade enforces: the three reads
+/// (<see cref="GetReleasesAsync"/>, <see cref="GetReleaseAsync"/>,
+/// <see cref="GetGoalsByReleaseAsync"/>) require
 /// <see cref="HiveCapability.SharedRead"/>; every release mutation (create, status, notes, tag,
 /// repositories, delete) and the validation the release workflow runs before execution require
 /// <see cref="HiveCapability.ExecutionOperator"/>. <see cref="HiveCapability.GlobalAdmin"/> is never
@@ -82,6 +83,24 @@ public interface IReleaseFacade
     /// shared read.
     /// </returns>
     Task<FacadeResult<ReleaseDto>> GetReleaseAsync(string id, ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Lists every release, replacing the direct <see cref="IGoalStore.GetReleasesAsync"/> read the
+    /// Releases page performed under the surface's old, documented exception.
+    /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token forwarded to the store.</param>
+    /// <returns>
+    /// The releases in the STORE'S OWN ORDER (the store orders by creation date descending) as
+    /// DETACHED <see cref="ReleaseDto"/> entries — each entry's
+    /// <see cref="ReleaseDto.RepositoryNames"/> is a COPY of the store entity's mutable list, so a
+    /// caller can neither mutate store state through the DTO nor observe a later store mutation
+    /// through a DTO it already holds. An empty list when no release exists, and
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold shared read —
+    /// returned BEFORE the store is read, so a refusal performs no release read at all.
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<ReleaseDto>>> GetReleasesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
     /// Lists the goals attached to a release, replacing the direct
@@ -308,6 +327,25 @@ public sealed class ReleaseFacade : IReleaseFacade
         return release is null
             ? new(false, null, $"Release '{id}' not found.", FacadeErrorKind.NotFound)
             : new(true, ReleaseDto.From(release), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<ReleaseDto>>> GetReleasesAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetReleasesAsync), ct))
+            return Forbidden<IReadOnlyList<ReleaseDto>>();
+
+        var releases = await _goalStore.GetReleasesAsync(ct);
+
+        // DETACHED: every entry is a fresh DTO and RepositoryNames is COPIED, so the caller can
+        // neither mutate the store's mutable List<string> through the result nor observe a later
+        // store mutation through a DTO it already holds. The store's ORDER is preserved exactly.
+        var detached = new List<ReleaseDto>(releases.Count);
+        foreach (var release in releases)
+            detached.Add(ReleaseDto.From(release) with { RepositoryNames = [.. release.RepositoryNames] });
+
+        return new(true, detached, null, FacadeErrorKind.None);
     }
 
     /// <inheritdoc />
