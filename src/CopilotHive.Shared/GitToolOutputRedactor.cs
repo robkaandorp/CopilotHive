@@ -263,6 +263,59 @@ public static class GitToolOutputRedactor
 
         /// <summary>The padded and, when different, unpadded standard-base64 spellings.</summary>
         public IReadOnlyList<string> Base64 { get; } = StandardBase64Forms(secret);
+
+        private CharMembership? _rawChars;
+        private CharMembership? _escapedChars;
+        private CharMembership?[]? _base64Chars;
+
+        /// <summary>Exactly the characters of the raw value (O(length), built once, on first use).</summary>
+        public CharMembership RawChars => _rawChars ??= CharMembership.Of(Secret);
+
+        /// <summary>
+        /// Exactly the characters a ONE-LEVEL percent-escaped reading of the value can contain: its
+        /// own characters, the escape introducer, and the hex digits an escape is written with.
+        /// </summary>
+        public CharMembership EscapedChars => _escapedChars ??= CharMembership.Of(Secret, "%0123456789ABCDEFabcdef");
+
+        /// <summary>Exactly the characters of the base64 spelling at <paramref name="index"/>.</summary>
+        public CharMembership Base64Chars(int index)
+        {
+            _base64Chars ??= new CharMembership?[Base64.Count];
+            return _base64Chars[index] ??= CharMembership.Of(Base64[index]);
+        }
+    }
+
+    /// <summary>The form of an inventory value that produced a match, and the extent it matched.</summary>
+    private readonly record struct InventoryMatch(int Start, int End, InventoryForms Form, int Base64Index, bool Escaped);
+
+    /// <summary>
+    /// An EXACT set of characters. "Does this value contain character c?" is a property of the value
+    /// itself, decidable in O(length) — never something to approximate under a scan budget.
+    /// </summary>
+    private sealed class CharMembership
+    {
+        private readonly bool[] _ascii = new bool[128];
+        private HashSet<char>? _other;
+
+        public static CharMembership Of(string text, string extra = "")
+        {
+            var set = new CharMembership();
+            foreach (var c in text)
+                set.Add(c);
+            foreach (var c in extra)
+                set.Add(c);
+            return set;
+        }
+
+        public bool Contains(char c) => c < 128 ? _ascii[c] : _other?.Contains(c) == true;
+
+        private void Add(char c)
+        {
+            if (c < 128)
+                _ascii[c] = true;
+            else
+                (_other ??= []).Add(c);
+        }
     }
 
     /// <summary>
@@ -275,20 +328,28 @@ public static class GitToolOutputRedactor
     /// regardless of which inventory entry it belongs to. A shorter raw match of one value inside
     /// another value's encoded variant merges into it instead of pre-empting it.
     /// </remarks>
-    private static List<(int Start, int End)> CollectInventorySpans(string text, List<InventoryForms> forms)
+    private static List<(int Start, int End)> CollectInventorySpans(string text, List<InventoryForms> forms) =>
+        CollectInventoryMatches(text, forms).Select(static match => (match.Start, match.End)).ToList();
+
+    /// <summary>
+    /// The matches behind <see cref="CollectInventorySpans"/>, each with the form that produced it
+    /// (so its exact character set can be consulted later), in ascending start order.
+    /// </summary>
+    private static List<InventoryMatch> CollectInventoryMatches(string text, List<InventoryForms> forms)
     {
-        var spans = new List<(int Start, int End)>();
+        var matches = new List<InventoryMatch>();
         for (var index = 0; index < text.Length; index++)
         {
             foreach (var form in forms)
             {
                 if (text.AsSpan(index).StartsWith(form.Secret, StringComparison.Ordinal))
-                    spans.Add((index, index + form.Secret.Length));
+                    matches.Add(new InventoryMatch(index, index + form.Secret.Length, form, -1, false));
 
-                foreach (var encoded in form.Base64)
+                for (var b = 0; b < form.Base64.Count; b++)
                 {
+                    var encoded = form.Base64[b];
                     if (text.AsSpan(index).StartsWith(encoded, StringComparison.Ordinal))
-                        spans.Add((index, index + encoded.Length));
+                        matches.Add(new InventoryMatch(index, index + encoded.Length, form, b, false));
                 }
 
                 // Fast path: only a literal first character or a leading escape can start a match.
@@ -296,12 +357,15 @@ public static class GitToolOutputRedactor
                     && (text[index] == form.Secret[0] || text[index] == '%')
                     && TryMatchPercentEncoded(text, index, form.Secret, out var percentEnd))
                 {
-                    spans.Add((index, percentEnd));
+                    // A match with no escape in it is the raw value itself and holds exactly its characters.
+                    var literal = percentEnd - index == form.Secret.Length
+                        && text.AsSpan(index, percentEnd - index).SequenceEqual(form.Secret);
+                    matches.Add(new InventoryMatch(index, percentEnd, form, -1, !literal));
                 }
             }
         }
 
-        return spans;
+        return matches;
     }
 
     /// <summary>
@@ -327,8 +391,8 @@ public static class GitToolOutputRedactor
     private static void CollectOriginalTextSpans(
         string original, string rewritten, List<InventoryForms> forms, List<(int Start, int End)> spans)
     {
-        var originalSpans = CollectInventorySpans(original, forms);
-        if (originalSpans.Count == 0)
+        var originalMatches = CollectInventoryMatches(original, forms);
+        if (originalMatches.Count == 0)
             return;
 
         // Unreachable for a deletion-only rewrite; if it ever failed the spans collected on the
@@ -336,9 +400,13 @@ public static class GitToolOutputRedactor
         if (UrlRewriteAlignment.Create(original, rewritten) is not { } alignment)
             return;
 
-        foreach (var (start, end) in originalSpans)
+        foreach (var match in originalMatches)
         {
-            if (alignment.Map(start, end) is { } mapped)
+            var chars = match.Escaped ? match.Form.EscapedChars
+                : match.Base64Index >= 0 ? match.Form.Base64Chars(match.Base64Index)
+                : match.Form.RawChars;
+
+            if (alignment.Map(match.Start, match.End, chars) is { } mapped)
                 spans.Add(mapped);
         }
     }
@@ -375,7 +443,7 @@ public static class GitToolOutputRedactor
     /// </remarks>
     private sealed class UrlRewriteAlignment
     {
-        /// <summary>Most ambiguous characters probed per text; beyond it the certain rule applies.</summary>
+        /// <summary>Most ambiguous characters probed per text; beyond it the character stays ambiguous and <see cref="Map"/> fails closed.</summary>
         private const int MaxProbes = 4096;
 
         /// <summary>Most positions examined while looking for ambiguous characters.</summary>
@@ -426,11 +494,13 @@ public static class GitToolOutputRedactor
         /// <remarks>
         /// A kept character is inside when it is placed there with certainty, or when it is ambiguous
         /// and an equal character that could be it lies inside the span (see
-        /// <see cref="CouldBeInside"/>). Only the characters at the two ends of the span can be
-        /// ambiguous, so the result is the hull between the first and the last included character.
+        /// <see cref="CouldBeInside"/>), where "equal character" is decided exactly from
+        /// <paramref name="chars"/>, the character set of the form that matched. Only the characters at
+        /// the two ends of the span can be ambiguous, so the result is the hull between the first and
+        /// the last included character.
         /// </remarks>
         /// <returns>The rewritten-text span, or <c>null</c> when no kept character qualifies.</returns>
-        public (int Start, int End)? Map(int start, int end)
+        public (int Start, int End)? Map(int start, int end, CharMembership chars)
         {
             // Every character whose possible placements intersect the span lies in [low, high].
             var low = FirstAtLeast(_latest, start);
@@ -442,7 +512,7 @@ public static class GitToolOutputRedactor
             var first = -1;
             for (var j = low; j <= high; j++)
             {
-                if (CouldBeInside(j, start, end, ref budget))
+                if (CouldBeInside(j, start, end, chars, ref budget))
                 {
                     first = j;
                     break;
@@ -455,7 +525,7 @@ public static class GitToolOutputRedactor
             var last = first;
             for (var j = high; j > first; j--)
             {
-                if (CouldBeInside(j, start, end, ref budget))
+                if (CouldBeInside(j, start, end, chars, ref budget))
                 {
                     last = j;
                     break;
@@ -470,16 +540,25 @@ public static class GitToolOutputRedactor
         /// [<paramref name="start"/>, <paramref name="end"/>).
         /// </summary>
         /// <remarks>
-        /// Certain: every placement is inside. Possible: it is ambiguous and an EQUAL character lies
-        /// inside the span within its placement range. When the scan budget is spent the answer is
-        /// "inside" — the fail-closed direction.
+        /// Certain: every placement is inside. Impossible: the matched value does not contain the
+        /// character at all — decided EXACTLY from <paramref name="chars"/>, never by a budget.
+        /// Possible: it is ambiguous and an EQUAL character lies inside the span within its placement
+        /// range. Only that PLACEMENT scan is budgeted; when the budget is spent the answer is
+        /// "inside" — the fail-closed direction, sanctioned because placement is what cannot be decided.
         /// </remarks>
-        private bool CouldBeInside(int j, int start, int end, ref int budget)
+        private bool CouldBeInside(int j, int start, int end, CharMembership chars, ref int budget)
         {
             var earliest = _earliest[j];
             var latest = _latest[j];
             if (earliest >= start && latest < end)
                 return true;
+
+            // MEMBERSHIP is decidable and exact: a character that the matched value does not contain
+            // cannot be inside its extent under ANY placement, however large the value is. Only the
+            // question of WHERE an equal character lies is budgeted below; answering this one wrongly
+            // on a budget would redact ordinary text no known value can cover.
+            if (!chars.Contains(_rewritten[j]))
+                return false;
 
             var from = Math.Max(earliest, start);
             var to = Math.Min(latest, end - 1);
