@@ -265,17 +265,10 @@ public static class GitToolOutputRedactor
         public IReadOnlyList<string> Base64 { get; } = StandardBase64Forms(secret);
 
         private CharMembership? _rawChars;
-        private CharMembership? _escapedChars;
         private CharMembership?[]? _base64Chars;
 
         /// <summary>Exactly the characters of the raw value (O(length), built once, on first use).</summary>
         public CharMembership RawChars => _rawChars ??= CharMembership.Of(Secret);
-
-        /// <summary>
-        /// Exactly the characters a ONE-LEVEL percent-escaped reading of the value can contain: its
-        /// own characters, the escape introducer, and the hex digits an escape is written with.
-        /// </summary>
-        public CharMembership EscapedChars => _escapedChars ??= CharMembership.Of(Secret, "%0123456789ABCDEFabcdef");
 
         /// <summary>Exactly the characters of the base64 spelling at <paramref name="index"/>.</summary>
         public CharMembership Base64Chars(int index)
@@ -297,13 +290,20 @@ public static class GitToolOutputRedactor
         private readonly bool[] _ascii = new bool[128];
         private HashSet<char>? _other;
 
-        public static CharMembership Of(string text, string extra = "")
+        public static CharMembership Of(string text)
         {
             var set = new CharMembership();
             foreach (var c in text)
                 set.Add(c);
-            foreach (var c in extra)
-                set.Add(c);
+            return set;
+        }
+
+        /// <summary>Exactly the characters of <c>text[start..end)</c> — the concrete text a match covers.</summary>
+        public static CharMembership OfSpan(string text, int start, int end)
+        {
+            var set = new CharMembership();
+            for (var i = start; i < end; i++)
+                set.Add(text[i]);
             return set;
         }
 
@@ -402,13 +402,98 @@ public static class GitToolOutputRedactor
 
         foreach (var match in originalMatches)
         {
-            var chars = match.Escaped ? match.Form.EscapedChars
+            var chars = match.Escaped ? PercentMatchChars(original, match)
                 : match.Base64Index >= 0 ? match.Form.Base64Chars(match.Base64Index)
                 : match.Form.RawChars;
 
             if (alignment.Map(match.Start, match.End, chars) is { } mapped)
                 spans.Add(mapped);
         }
+    }
+
+    /// <summary>Most reading positions followed while enumerating the readings of one percent match.</summary>
+    private const int MaxReadingSteps = 4_000_000;
+
+    /// <summary>
+    /// Exactly the characters of the CONCRETE text a percent-form match can cover — not those of every
+    /// spelling the value could hypothetically have.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A percent spelling of a value written with a literal <c>%</c> is ambiguous: <c>%25</c> may be one
+    /// escaped <c>%</c> or a literal <c>%</c> followed by text. Every genuine reading starts at the
+    /// same index, so each reading's span is a PREFIX of the longest one, and the union of their
+    /// characters is exactly the characters of the longest genuine reading. Membership is therefore
+    /// "is the character in <c>original[start..longestEnd)</c>", exact over the readings that can
+    /// actually occur. An earlier version used the raw value's characters plus the whole hex alphabet,
+    /// which answered "could ANY spelling contain it?" and so licensed coverage of an ordinary host
+    /// character (<c>a</c>–<c>f</c>, <c>0</c>–<c>9</c>, …) the real spelling does not contain.
+    /// </para>
+    /// </remarks>
+    private static CharMembership PercentMatchChars(string original, InventoryMatch match) =>
+        CharMembership.OfSpan(original, match.Start, LongestPercentReadingEnd(original, match.Start, match.Form.Secret, match.End));
+
+    /// <summary>
+    /// The end of the longest genuine one-level percent reading of <paramref name="secret"/> that
+    /// starts at <paramref name="start"/>.
+    /// </summary>
+    /// <param name="text">The text the match lies in.</param>
+    /// <param name="start">Where the match starts.</param>
+    /// <param name="secret">The inventory value whose readings are enumerated.</param>
+    /// <param name="matchedEnd">The end the matcher chose; the answer is never below it.</param>
+    /// <remarks>
+    /// The readings are followed as a set of reachable positions, one step per character of the value.
+    /// A position can only branch at a <c>%</c> of the value that meets <c>%25</c> in the text, so the
+    /// set stays tiny for any realistic value. If it ever does not (a pathological value made of
+    /// <c>%</c> against a text of <c>%25</c>), the answer is the longest span any reading could have —
+    /// the sanctioned conservative direction for a cost-limited enumeration, never used otherwise.
+    /// </remarks>
+    private static int LongestPercentReadingEnd(string text, int start, string secret, int matchedEnd)
+    {
+        var current = new List<int> { start };
+        var next = new List<int>();
+        var steps = 0;
+
+        foreach (var expected in secret)
+        {
+            next.Clear();
+            foreach (var position in current)
+            {
+                if (++steps > MaxReadingSteps)
+                    return Math.Min(text.Length, start + (3 * secret.Length));
+
+                if (position < text.Length && text[position] == expected)
+                    next.Add(position + 1);
+
+                if (position + 2 < text.Length
+                    && text[position] == '%'
+                    && TryParseHexDigit(text[position + 1], out var high)
+                    && TryParseHexDigit(text[position + 2], out var low)
+                    && (byte)((high << 4) | low) == (byte)expected)
+                {
+                    next.Add(position + 3);
+                }
+            }
+
+            if (next.Count > 1)
+            {
+                next.Sort();
+                var write = 1;
+                for (var read = 1; read < next.Count; read++)
+                {
+                    if (next[read] != next[write - 1])
+                        next[write++] = next[read];
+                }
+
+                next.RemoveRange(write, next.Count - write);
+            }
+
+            (current, next) = (next, current);
+            if (current.Count == 0)
+                return matchedEnd;
+        }
+
+        return Math.Max(matchedEnd, current.Max());
     }
 
     /// <summary>
