@@ -184,12 +184,21 @@ public static class GitToolOutputRedactor
         // modified here). It must still precede the assignment pass: that pass would otherwise
         // claim `token=abc&ref=topic` inside a URL query and swallow the parameters the URL
         // grammar keeps. It only DELETES credential text, so it cannot manufacture a marker.
+        //
+        // That deletion is destructive for the INVENTORY, though: a known value that CONTAINS a
+        // credentialed URL (`https://u:pw@host/r…`) no longer occurs in the rewritten text, and the
+        // rest of it would survive unmatched. So the inventory is matched against the ORIGINAL text
+        // as well and those spans are mapped onto the rewritten text (see CollectOriginalTextSpans).
         var current = GitUrlRedactor.Redact(text) ?? string.Empty;
 
         var spans = new List<(int Start, int End)>();
         var forms = BuildInventoryForms(knownSecrets);
         if (forms.Count > 0)
+        {
             spans.AddRange(CollectInventorySpans(current, forms));
+            if (!string.Equals(current, text, StringComparison.Ordinal))
+                CollectOriginalTextSpans(text, current, forms, spans);
+        }
 
         CollectScpStylePasswordSpans(current, spans);
         CollectSshUrlPasswordSpans(current, spans);
@@ -293,6 +302,280 @@ public static class GitToolOutputRedactor
         }
 
         return spans;
+    }
+
+    /// <summary>
+    /// Matches the inventory against the ORIGINAL text and adds the matches, mapped onto the
+    /// URL-rewritten text, to <paramref name="spans"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="GitUrlRedactor"/> only DELETES characters (userinfo, token parameters, fragments,
+    /// dangling delimiters), so the rewritten text is a subsequence of the original and every kept
+    /// character has a position in it. A match that lies wholly in deleted text maps to nothing — the
+    /// rewrite has already removed it, exactly as before. A match that reaches KEPT characters (a
+    /// known value that contains the whole URL, or only its host and path) maps to those characters,
+    /// so the union with the other spans removes the value whole instead of leaving a tail.
+    /// </para>
+    /// <para>
+    /// Spans that mapping cannot place with certainty are dropped rather than widened, so ordinary
+    /// text next to a deleted run is never redacted by mistake; see <see cref="UrlRewriteAlignment"/>.
+    /// </para>
+    /// </remarks>
+    private static void CollectOriginalTextSpans(
+        string original, string rewritten, List<InventoryForms> forms, List<(int Start, int End)> spans)
+    {
+        var originalSpans = CollectInventorySpans(original, forms);
+        if (originalSpans.Count == 0)
+            return;
+
+        // Unreachable for a deletion-only rewrite; if it ever failed the spans collected on the
+        // rewritten text above remain the (pre-existing) behaviour.
+        if (UrlRewriteAlignment.Create(original, rewritten) is not { } alignment)
+            return;
+
+        foreach (var (start, end) in originalSpans)
+        {
+            if (alignment.Map(start, end) is { } mapped)
+                spans.Add(mapped);
+        }
+    }
+
+    /// <summary>
+    /// Places each kept character of <see cref="GitUrlRedactor"/>'s rewritten text at its position in
+    /// the original text.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A plain diff is AMBIGUOUS when a deleted character equals an adjacent kept one: userinfo
+    /// <c>hunter:pw@</c> in front of host <c>host.invalid</c> deletes either <c>hunter:pw@</c> or
+    /// <c>unter:pw@h</c> and prints the same text. Guessing wrong would redact the host's first
+    /// character whenever a known value sits in userinfo — the most common real case. So the earliest
+    /// and latest greedy alignments bracket every possible placement, and each ambiguous alphanumeric
+    /// character is RESOLVED by probing: replace that one character by a fresh sentinel and re-run
+    /// the frozen redactor on the URL's own region. If the output is unchanged the character was
+    /// deleted (a kept character would have shown the sentinel).
+    /// </para>
+    /// <para>
+    /// Whatever stays ambiguous (a delimiter such as <c>&amp;</c>, a grammar-critical letter, or a
+    /// probe budget overrun) is mapped by the CERTAIN rule: a kept character belongs to a span only
+    /// when every possible placement lies inside it. That can leave one ambiguous delimiter of a span
+    /// unredacted; it can never damage text outside the span.
+    /// </para>
+    /// </remarks>
+    private sealed class UrlRewriteAlignment
+    {
+        /// <summary>Most ambiguous characters probed per text; beyond it the certain rule applies.</summary>
+        private const int MaxProbes = 4096;
+
+        /// <summary>Most positions examined while looking for ambiguous characters.</summary>
+        private const int MaxScan = 200_000;
+
+        private const string SentinelPool = "QXZJKWVYqxzjkwvy0123456789ABCDEFGHILMNOPRSTUabcdefghilmnoprstu";
+
+        private readonly int[] _earliest;
+        private readonly int[] _latest;
+
+        private UrlRewriteAlignment(int[] earliest, int[] latest)
+        {
+            _earliest = earliest;
+            _latest = latest;
+        }
+
+        /// <summary>Aligns <paramref name="rewritten"/> onto <paramref name="original"/>, or <c>null</c> when it is not a subsequence.</summary>
+        public static UrlRewriteAlignment? Create(string original, string rewritten)
+        {
+            var deleted = new bool[original.Length];
+            if (!TryAlign(original, rewritten, deleted, out var earliest, out var latest))
+                return null;
+
+            if (ProbeAmbiguousDeletions(original, rewritten, earliest, latest, deleted)
+                && TryAlign(original, rewritten, deleted, out var exactEarliest, out var exactLatest))
+            {
+                earliest = exactEarliest;
+                latest = exactLatest;
+            }
+
+            return new UrlRewriteAlignment(earliest, latest);
+        }
+
+        /// <summary>
+        /// Maps the original-text span [<paramref name="start"/>, <paramref name="end"/>) onto the
+        /// rewritten text: the kept characters whose EVERY possible placement lies inside it.
+        /// </summary>
+        /// <returns>The rewritten-text span, or <c>null</c> when no kept character qualifies.</returns>
+        public (int Start, int End)? Map(int start, int end)
+        {
+            var first = FirstAtLeast(_earliest, start);
+            var last = FirstAtLeast(_latest, end) - 1;
+            return first <= last ? (first, last + 1) : null;
+        }
+
+        /// <summary>Index of the first element that is >= <paramref name="value"/> in a strictly ascending array.</summary>
+        private static int FirstAtLeast(int[] ascending, int value)
+        {
+            var low = 0;
+            var high = ascending.Length;
+            while (low < high)
+            {
+                var middle = low + ((high - low) / 2);
+                if (ascending[middle] < value)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+
+            return low;
+        }
+
+        /// <summary>
+        /// Greedy earliest and latest alignments of <paramref name="rewritten"/> onto
+        /// <paramref name="original"/>, skipping positions already known to be deleted.
+        /// </summary>
+        private static bool TryAlign(string original, string rewritten, bool[] deleted, out int[] earliest, out int[] latest)
+        {
+            earliest = new int[rewritten.Length];
+            latest = new int[rewritten.Length];
+
+            var position = 0;
+            for (var j = 0; j < rewritten.Length; j++)
+            {
+                while (position < original.Length && (deleted[position] || original[position] != rewritten[j]))
+                    position++;
+                if (position >= original.Length)
+                    return false;
+                earliest[j] = position++;
+            }
+
+            position = original.Length - 1;
+            for (var j = rewritten.Length - 1; j >= 0; j--)
+            {
+                while (position >= 0 && (deleted[position] || original[position] != rewritten[j]))
+                    position--;
+                if (position < 0)
+                    return false;
+                latest[j] = position--;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Marks in <paramref name="deleted"/> every ambiguous alphanumeric position whose mutation
+        /// leaves the rewritten output unchanged.
+        /// </summary>
+        /// <returns><c>true</c> when at least one position was proven deleted.</returns>
+        private static bool ProbeAmbiguousDeletions(
+            string original, string rewritten, int[] earliest, int[] latest, bool[] deleted)
+        {
+            var candidates = new SortedSet<int>();
+            var scanned = 0;
+            for (var j = 0; j < rewritten.Length; j++)
+            {
+                if (earliest[j] == latest[j])
+                    continue;
+
+                for (var p = earliest[j]; p <= latest[j]; p++)
+                {
+                    if (++scanned > MaxScan)
+                        return false;
+                    if (original[p] == rewritten[j] && char.IsAsciiLetterOrDigit(original[p]))
+                        candidates.Add(p);
+                }
+            }
+
+            if (candidates.Count == 0 || candidates.Count > MaxProbes)
+                return false;
+
+            // The frozen redactor treats the text as independent regions that each START at an
+            // http(s):// scheme, so a probe only needs the region around the candidate. If that
+            // independence does not reproduce the full rewrite, probing is not trusted at all.
+            var starts = SchemeStarts(original);
+            if (!RegionsReproduceTheRewrite(original, rewritten, starts))
+                return false;
+
+            var any = false;
+            var regionRewrites = new Dictionary<int, string>();
+            foreach (var position in candidates)
+            {
+                var (regionStart, regionEnd) = RegionAround(starts, original.Length, position);
+                var region = original.Substring(regionStart, regionEnd - regionStart);
+                if (!regionRewrites.TryGetValue(regionStart, out var regionRewritten))
+                    regionRewrites[regionStart] = regionRewritten = GitUrlRedactor.Redact(region) ?? string.Empty;
+
+                if (FreshSentinel(region) is not { } sentinel)
+                    continue;
+
+                var index = position - regionStart;
+                var probe = string.Concat(region.AsSpan(0, index), sentinel.ToString(), region.AsSpan(index + 1));
+                if (string.Equals(GitUrlRedactor.Redact(probe), regionRewritten, StringComparison.Ordinal))
+                {
+                    deleted[position] = true;
+                    any = true;
+                }
+            }
+
+            return any;
+        }
+
+        /// <summary>The start index of every <c>http://</c> / <c>https://</c> occurrence (case-insensitive).</summary>
+        private static List<int> SchemeStarts(string text)
+        {
+            var starts = new List<int>();
+            for (var i = 0; i < text.Length; i++)
+            {
+                var rest = text.AsSpan(i);
+                if (rest.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                    || rest.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                {
+                    starts.Add(i);
+                }
+            }
+
+            return starts;
+        }
+
+        /// <summary>The region that begins at the scheme at or before <paramref name="position"/> and ends at the next one.</summary>
+        private static (int Start, int End) RegionAround(List<int> starts, int length, int position)
+        {
+            var index = starts.BinarySearch(position);
+            if (index < 0)
+                index = ~index - 1;
+
+            var regionStart = index >= 0 ? starts[index] : 0;
+            var regionEnd = index + 1 < starts.Count ? starts[index + 1] : length;
+            if (index < 0)
+                regionEnd = starts.Count > 0 ? starts[0] : length;
+
+            return (regionStart, regionEnd);
+        }
+
+        /// <summary>Whether rewriting each scheme-delimited region on its own yields exactly <paramref name="rewritten"/>.</summary>
+        private static bool RegionsReproduceTheRewrite(string original, string rewritten, List<int> starts)
+        {
+            var builder = new StringBuilder(rewritten.Length);
+            var previous = 0;
+            foreach (var start in starts.Append(original.Length))
+            {
+                if (start > previous)
+                    builder.Append(GitUrlRedactor.Redact(original.Substring(previous, start - previous)));
+                previous = start;
+            }
+
+            return string.Equals(builder.ToString(), rewritten, StringComparison.Ordinal);
+        }
+
+        /// <summary>An alphanumeric character that does not occur in <paramref name="region"/>, or <c>null</c>.</summary>
+        private static char? FreshSentinel(string region)
+        {
+            foreach (var candidate in SentinelPool)
+            {
+                if (region.IndexOf(candidate) < 0)
+                    return candidate;
+            }
+
+            return null;
+        }
     }
 
     /// <summary>
