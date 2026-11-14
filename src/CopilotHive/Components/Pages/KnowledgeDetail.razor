@@ -2,12 +2,27 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using CopilotHive.Knowledge
+@using CopilotHive.Security
+@using CopilotHive.Services
 @using Markdig
-@inject DashboardStateService State
-@inject IGoalStore GoalStore
+@using System.Security.Claims
+@implements IDisposable
+@* THE AUTHORIZED KNOWLEDGE BOUNDARY: the document and its outgoing/incoming links (with the linked
+   titles already resolved) come from IOperationalFacade, and the related goals from IGoalFacade.
+   Neither the live KnowledgeGraph nor IGoalStore is injected or read anywhere in this page. *@
+@inject IOperationalFacade OperationalFacade
+@inject IGoalFacade GoalFacade
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject PageHeaderState PageHeader
 
-@if (_notFound)
+@if (_denied)
+{
+    @* THE SAFE DENIAL STATE (NOT a false "not found" and NOT a login redirect): the caller's current
+       identity does not hold SharedRead. The document, its links, its related goals and the page title
+       have all been CLEARED, and there is deliberately no fallback to a direct graph or store read. *@
+    <p class="error-msg" style="margin-top:1rem">@_denialMessage</p>
+}
+else if (_notFound)
 {
     <div style="margin-top:2rem;text-align:center">
         <p style="color:var(--text-muted);font-size:1.1rem">Document <code>@DocumentId</code> was not found.</p>
@@ -90,13 +105,11 @@ else if (_doc is not null)
                                     <tr>
                                         <td>
                                             <a href="/knowledge/@link.TargetId" class="goal-link">@link.TargetId</a>
-                                            @if (_knowledgeGraph is not null)
+                                            @* The TARGET TITLE was resolved inside the authorized facade read:
+                                               this page never looks a document up to fill in a link row. *@
+                                            @if (!string.IsNullOrEmpty(link.TargetTitle))
                                             {
-                                                var targetDoc = _knowledgeGraph.GetDocument(link.TargetId);
-                                                @if (targetDoc is not null)
-                                                {
-                                                    <div style="font-size:0.8rem;color:var(--text-muted)">@targetDoc.Title</div>
-                                                }
+                                                <div style="font-size:0.8rem;color:var(--text-muted)">@link.TargetTitle</div>
                                             }
                                         </td>
                                         <td><span class="badge badge-muted">@link.Type</span></td>
@@ -127,13 +140,9 @@ else if (_doc is not null)
                                     <tr>
                                         <td>
                                             <a href="/knowledge/@link.SourceId" class="goal-link">@link.SourceId</a>
-                                            @if (_knowledgeGraph is not null)
+                                            @if (!string.IsNullOrEmpty(link.SourceTitle))
                                             {
-                                                var sourceDoc = _knowledgeGraph.GetDocument(link.SourceId);
-                                                @if (sourceDoc is not null)
-                                                {
-                                                    <div style="font-size:0.8rem;color:var(--text-muted)">@sourceDoc.Title</div>
-                                                }
+                                                <div style="font-size:0.8rem;color:var(--text-muted)">@link.SourceTitle</div>
                                             }
                                         </td>
                                         <td><span class="badge badge-muted">@link.Type</span></td>
@@ -178,53 +187,161 @@ else
 @code {
     [Parameter] public string DocumentId { get; set; } = "";
 
-    private KnowledgeGraph? _knowledgeGraph;
-    private KnowledgeDocument? _doc;
-    private List<DocumentLink> _outgoingLinks = [];
-    private List<IncomingLink> _incomingLinks = [];
-    private List<Goal> _relatedGoals = [];
+    /// <summary>The detached document projection of the last authorized read.</summary>
+    private KnowledgeDocumentDetail? _doc;
+
+    private IReadOnlyList<KnowledgeOutgoingLink> _outgoingLinks = [];
+    private IReadOnlyList<KnowledgeIncomingLink> _incomingLinks = [];
+    private IReadOnlyList<Goal> _relatedGoals = [];
+
     private bool _notFound;
 
+    /// <summary>
+    /// Set when the read was REFUSED. A refusal must not be rendered as "not found" (that would be a
+    /// false statement about the document) and must never redirect to login: the page shows its safe
+    /// denial state with every previously rendered value cleared.
+    /// </summary>
+    private bool _denied;
+
+    private string _denialMessage = "";
+
+    /// <summary>
+    /// Monotonic generation of the refresh in flight. Only the NEWEST refresh publishes, so an older
+    /// authorized read completing after a newer denied clear cannot restore stale content, and a stale
+    /// denial cannot wipe a newer authorized result.
+    /// </summary>
+    private int _refreshGeneration;
+
+    /// <summary>Set by <see cref="Dispose"/>: a late completion writes nothing and never renders.</summary>
+    private bool _disposed;
+
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
+    /// <summary>
+    /// Runs on EVERY load and EVERY parameter change. The document, its links, its related goals and
+    /// the page title are all produced by AUTHORIZED reads carrying this circuit's identity; a refused
+    /// read clears all of them and shows the safe denial state.
+    /// </summary>
     protected override async Task OnParametersSetAsync()
     {
-        _notFound = false;
-        _doc = null;
-        _outgoingLinks = [];
-        _incomingLinks = [];
-        _relatedGoals = [];
+        if (_disposed) return;
+
+        var generation = ++_refreshGeneration;
+
+        // Clear first: nothing from a previous parameter can linger while the new read is in flight.
+        ClearEverything();
 
         PageHeader.SetTitle($"📚 {DocumentId}");
         PageHeader.SetBack("/knowledge");
 
-        _knowledgeGraph = State.KnowledgeGraph;
+        // ONE identity acquisition per refresh; each facade call still re-resolves stored state.
+        var actingUser = await ActingUserAsync();
 
-        if (_knowledgeGraph is null)
+        // THE AUTHORIZED DOCUMENT READ: document, outgoing/incoming links and the resolved linked
+        // titles, all projected inside the facade while this caller was authorized. An UNCONFIGURED
+        // graph and a genuinely missing document both come back NotFound — exactly the two cases the
+        // direct graph read used to collapse into this page's one "was not found" surface, so the
+        // displayed behaviour is unchanged.
+        var documentResult = await OperationalFacade.GetKnowledgeDocumentAsync(
+            DocumentId, actingUser, CancellationToken.None);
+
+        if (_disposed || generation != _refreshGeneration) return;
+
+        if (!documentResult.Success)
         {
-            _notFound = true;
+            ClearEverything();
+
+            if (documentResult.Kind == FacadeErrorKind.Forbidden)
+            {
+                _denied = true;
+                _denialMessage = documentResult.Error ?? "The acting account is not authorized to perform this operation.";
+            }
+            else
+            {
+                // A genuine not-found (or an unconfigured graph): the page's existing surface.
+                _notFound = true;
+            }
+
             return;
         }
 
-        _doc = _knowledgeGraph.GetDocument(DocumentId);
-
-        if (_doc is null)
-        {
-            _notFound = true;
-            return;
-        }
+        var projection = documentResult.Value!;
+        _doc = projection.Document;
+        _outgoingLinks = projection.OutgoingLinks;
+        _incomingLinks = projection.IncomingLinks;
 
         PageHeader.SetTitle($"📚 {_doc.Title}");
         PageHeader.SetBack("/knowledge");
 
-        _outgoingLinks = _knowledgeGraph.GetOutgoingLinks(DocumentId);
-        _incomingLinks = _knowledgeGraph.GetIncomingLinks(DocumentId);
+        // Related goals go through the EXISTING authorized goal facade — never IGoalStore.
+        var goalsResult = await GoalFacade.GetGoalsAsync(actingUser, CancellationToken.None);
 
-        // Find goals that reference this document
-        var allGoals = await GoalStore.GetAllGoalsAsync();
-        _relatedGoals = allGoals
+        if (_disposed || generation != _refreshGeneration) return;
+
+        if (!goalsResult.Success)
+        {
+            if (goalsResult.Kind == FacadeErrorKind.Forbidden)
+            {
+                // FORBIDDEN IS AN AUTHORIZATION ANSWER: SharedRead was revoked between the document
+                // read and this one (disabled/deleted account). The document and its links were read
+                // while the caller was still authorized, but the caller is NOT authorized any more, so
+                // the WHOLE detail surface is cleared — document, links, related goals AND the page
+                // title — and the safe denial state is shown. Only a non-authorization failure below
+                // degrades gracefully.
+                ClearEverything();
+                _denied = true;
+                _denialMessage = goalsResult.Error ?? "The acting account is not authorized to perform this operation.";
+                PageHeader.SetTitle($"📚 {DocumentId}");
+                PageHeader.SetBack("/knowledge");
+                return;
+            }
+
+            // A NON-authorization failure of the goals read leaves the related-goals list empty and
+            // keeps the document, which came from its own authorized read.
+            ClearRelatedGoals();
+            return;
+        }
+
+        _relatedGoals = goalsResult.Value!
             .Where(g => g.Documents.Contains(DocumentId, StringComparer.OrdinalIgnoreCase))
             .OrderByDescending(g => g.CreatedAt)
             .ToList();
     }
+
+    /// <summary>
+    /// Clears EVERY value this page renders so a denied (or superseded) refresh cannot leave a
+    /// previously authorized document, link, related goal or page title on screen. Clearing is local
+    /// only: no store or graph is read on the denial path.
+    /// </summary>
+    private void ClearEverything()
+    {
+        _doc = null;
+        _outgoingLinks = [];
+        _incomingLinks = [];
+        _relatedGoals = [];
+        _notFound = false;
+        _denied = false;
+        _denialMessage = "";
+    }
+
+    private void ClearRelatedGoals() => _relatedGoals = [];
 
     private static readonly MarkdownPipeline MdPipeline = new MarkdownPipelineBuilder()
         .UseAdvancedExtensions()
@@ -268,4 +385,13 @@ else
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";
+
+    /// <summary>
+    /// Marks the page disposed: an in-flight refresh that completes afterwards publishes nothing and
+    /// never calls <see cref="ComponentBase.StateHasChanged"/> on a torn-down component.
+    /// </summary>
+    public void Dispose()
+    {
+        _disposed = true;
+    }
 }

@@ -176,6 +176,39 @@ internal sealed class HiveSecurityTestDirectory : IDisposable
     }
 
     /// <summary>
+    /// OVERWRITES the stored role text with an unrecognised legacy value ("legacy-superuser" etc.),
+    /// as a legacy row would carry: written as raw SQL because the model's conversion refuses to
+    /// write one. A later resolution must REFUSE (never default), so this models an account whose
+    /// stored state stopped being a valid role altogether.
+    /// </summary>
+    internal void SetRawRoleText(string gitHubId, string roleText)
+    {
+        using var db = CreateDbContext();
+        db.Database.ExecuteSqlRaw(
+            """
+            UPDATE "users" SET "role" = {0} WHERE "github_id" = {1}
+            """,
+            roleText,
+            gitHubId);
+    }
+
+    /// <summary>
+    /// PERMANENTLY DELETES the account, as an administrator removing it from the directory would: the
+    /// row is gone, so a later resolution of that identity must answer "unknown account". It is a
+    /// DISTINCT destructive operation from <see cref="SetEnabledAsync"/> (disabled, not deleted).
+    /// </summary>
+    internal async Task DeleteUserAsync(string gitHubId)
+    {
+        using var db = CreateDbContext();
+        var entity = await db.Users.SingleOrDefaultAsync(u => u.GitHubId == gitHubId, Ct);
+        if (entity is not null)
+        {
+            db.Users.Remove(entity);
+            await db.SaveChangesAsync(Ct);
+        }
+    }
+
+    /// <summary>
     /// Builds the authenticated GitHub principal a cookie would produce for one identity, optionally
     /// carrying EXTRA claims (a role claim in particular) so a test can prove they are ignored.
     /// </summary>

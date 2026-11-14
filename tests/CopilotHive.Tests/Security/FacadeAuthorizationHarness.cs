@@ -43,6 +43,21 @@ internal sealed class FacadeAuthorizationHarness : IDisposable
     /// <summary>Enables or disables the account, as an administrator would.</summary>
     internal Task SetEnabledAsync(string gitHubId, bool enabled) => _directory.SetEnabledAsync(gitHubId, enabled);
 
+    /// <summary>
+    /// DELETES the account from the directory, as an administrator would, so a later resolution of the
+    /// same identity answers "unknown account". Used to prove a deleted account is refused on its very
+    /// next operation.
+    /// </summary>
+    internal Task DeleteUserAsync(string gitHubId) => _directory.DeleteUserAsync(gitHubId);
+
+    /// <summary>
+    /// OVERWRITES the account's persisted role with an unrecognised legacy text, so a later resolution
+    /// is refused by the resolver instead of falling back to a role. Used to prove the role is re-read
+    /// from the directory on EVERY call rather than cached by the facade.
+    /// </summary>
+    internal void SetRawRoleText(string gitHubId, string roleText) =>
+        _directory.SetRawRoleText(gitHubId, roleText);
+
     /// <summary>The authenticated GitHub principal a cookie would produce for one identity.</summary>
     internal static ClaimsPrincipal Principal(string gitHubId) => HiveSecurityTestDirectory.GitHubPrincipal(gitHubId);
 

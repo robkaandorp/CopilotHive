@@ -176,10 +176,16 @@ public sealed class SecurityPrimitivesRegistrationTests
         // cascading AuthenticationState through the one ComponentActingUser seam and the SCOPED
         // accessor, so it must name them. It deliberately still makes NO authorization decision, so
         // the subset that matters for it is asserted separately right below.
+        //
+        // REMOVED FROM THIS LIST BY THE KNOWLEDGE/NAVIGATION AUTHORIZATION SLICE:
+        // "Components/Layout/NavMenu.razor". The nav menu now acquires the circuit identity through the
+        // ONE ComponentActingUser seam (and therefore names the SCOPED accessor) and reads both badge
+        // counters from the authorized IClarificationFacade / IOperationalFacade. It still makes NO
+        // capability or policy decision of its own, so — exactly like Routes.razor — the subset that
+        // matters for it is asserted separately right below.
         var boundaries = new[]
         {
             "Services/UserService.cs",
-            "Components/Layout/NavMenu.razor",
             "Actors/ComposerActor.cs",
             "Persistence/Entities/UserEntity.cs",
         };
@@ -214,21 +220,36 @@ public sealed class SecurityPrimitivesRegistrationTests
         // identity on the SCOPED accessor (the one ComponentActingUser seam) and makes no capability
         // or policy decision of its own — those belong to the facades, which re-resolve current
         // stored state per operation.
-        var routesBody = TestSourceScanner.StripNonCode(
-            File.ReadAllText(Path.Combine(src, "Components", "Routes.razor"))
-                .ReplaceLineEndings("\n"));
-
-        foreach (var enforcementPrimitive in new[]
+        foreach (var (relativePath, seam) in new[]
         {
-            "HivePrincipalResolver",
-            "HivePolicy",
-            "HiveCapability",
-            "ActingUserPrincipal",
-            "PrincipalResolution",
-            "ResolveAsync(",
+            ("Components/Routes.razor", "ComponentActingUser"),
+            ("Components/Layout/NavMenu.razor", "ComponentActingUser"),
         })
         {
-            Assert.DoesNotContain(enforcementPrimitive, routesBody, StringComparison.Ordinal);
+            var raw = File.ReadAllText(Path.Combine(src, relativePath.Replace('/', Path.DirectorySeparatorChar)))
+                .ReplaceLineEndings("\n");
+            var body = TestSourceScanner.StripNonCode(raw);
+
+            // The one identity seam IS named (that is the intentional wiring)...
+            Assert.Contains(seam, body, StringComparison.Ordinal);
+
+            // ...and none of the ENFORCEMENT primitives are, so no boundary outside the facades makes
+            // an authorization decision of its own.
+            foreach (var enforcementPrimitive in new[]
+            {
+                "HivePrincipalResolver",
+                "HivePolicy",
+                "HiveCapability",
+                "ActingUserPrincipal",
+                "PrincipalResolution",
+                "ResolveAsync(",
+            })
+            {
+                Assert.DoesNotContain(enforcementPrimitive, body, StringComparison.Ordinal);
+            }
+
+            // ...nor the resolver/policy enforcement seam the facades own.
+            Assert.DoesNotContain("FacadeAuthorization", body, StringComparison.Ordinal);
         }
     }
 

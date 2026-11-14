@@ -1,6 +1,7 @@
 using System.Security.Claims;
 
 using CopilotHive.Dashboard;
+using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Security;
 
@@ -11,14 +12,23 @@ namespace CopilotHive.Services;
 /// <summary>
 /// THE AUTHORIZED OPERATIONAL BOUNDARY over the live execution surface the Orchestrator page reads
 /// and mutates: the master Brain session RESET and the SHARED operational read projections (Brain
-/// stats, orchestrator info and the sanitized LLM-session list).
+/// stats, orchestrator info, the sanitized LLM-session list, and the knowledge-document
+/// list/detail/count projections the Knowledge pages and the navigation badge render).
 /// <para>
-/// The Orchestrator component depends on this interface instead of reaching into
-/// <see cref="DashboardStateService"/> or <see cref="LlmSessionRegistry"/> directly, so every
-/// operational read and the one operational mutation carry an explicit acting identity that is
-/// authorized BEFORE any service is touched. <see cref="DashboardStateService"/> and
-/// <see cref="LlmSessionRegistry"/> themselves stay TRUSTED INTERNAL services with their public APIs
-/// unchanged: this facade never reimplements any of their work, it delegates verbatim.
+/// The Orchestrator, Knowledge, KnowledgeDetail and NavMenu components depend on this interface
+/// instead of reaching into <see cref="DashboardStateService"/> or <see cref="LlmSessionRegistry"/>
+/// directly, so every operational read and the one operational mutation carry an explicit acting
+/// identity that is authorized BEFORE any service is touched. <see cref="DashboardStateService"/>
+/// and <see cref="LlmSessionRegistry"/> themselves stay TRUSTED INTERNAL services with their public
+/// APIs unchanged: this facade never reimplements any of their work, it delegates verbatim.
+/// </para>
+/// <para>
+/// KNOWLEDGE PROJECTIONS ARE DETACHED: the knowledge operations return value copies
+/// (<see cref="KnowledgeDocumentListProjection"/>, <see cref="KnowledgeDocumentProjection"/>) with
+/// only the fields the pages render, never the live mutable
+/// <see cref="Knowledge.KnowledgeGraph"/>/<see cref="Knowledge.KnowledgeDocument"/> or its mutable
+/// tag/link collections. Linked document TITLES are resolved inside these operations, while the
+/// caller is authorized, because resolving a title is itself a graph read.
 /// </para>
 /// </summary>
 /// <remarks>
@@ -33,8 +43,9 @@ namespace CopilotHive.Services;
 /// THE CAPABILITY SPLIT: resetting the master Brain session rewrites the orchestrator's live
 /// conversation for everybody, so it requires <see cref="HiveCapability.ExecutionOperator"/>
 /// (<see cref="UserRole.Operator"/> and above; a Viewer or a Member is refused). The read projections
-/// describe shared execution data, so they require <see cref="HiveCapability.SharedRead"/> (every
-/// role). A refusal produces <see cref="FacadeErrorKind.Forbidden"/> carrying the single sanitized
+/// — including all three knowledge reads — describe shared data, so they require
+/// <see cref="HiveCapability.SharedRead"/> (every role). A refusal produces
+/// <see cref="FacadeErrorKind.Forbidden"/> carrying the single sanitized
 /// <see cref="FacadeAuthorization.ForbiddenMessage"/> BEFORE any read or mutation runs.
 /// </para>
 /// <para>
@@ -107,6 +118,66 @@ public interface IOperationalFacade
     /// </returns>
     Task<FacadeResult<IReadOnlyList<LlmSessionInfo>>> GetSharedLlmSessionsAsync(
         ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads the SHARED knowledge-document list projection — optionally applying the graph's own
+    /// search semantics — together with whether a knowledge graph is configured at all.
+    /// </summary>
+    /// <remarks>
+    /// The projection is DETACHED: each row is a value copy (see
+    /// <see cref="KnowledgeDocumentSummary"/>), never the live mutable
+    /// <see cref="Knowledge.KnowledgeDocument"/> or its mutable tag/link collections. When
+    /// <paramref name="searchQuery"/> is non-blank the rows come from the unchanged
+    /// <see cref="Knowledge.KnowledgeGraph.Search(string)"/> semantics; otherwise they come from
+    /// <see cref="Knowledge.KnowledgeGraph.GetAllDocuments"/>. The page keeps its own type/status/tag
+    /// filtering and ordering, exactly as before.
+    /// </remarks>
+    /// <param name="searchQuery">The optional search text, or <c>null</c>/blank for every document.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the detached rows and the configured flag (an UNCONFIGURED graph is
+    /// a success with <see cref="KnowledgeDocumentListProjection.IsConfigured"/> <c>false</c>, never a
+    /// denial), or <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.SharedRead"/>.
+    /// </returns>
+    Task<FacadeResult<KnowledgeDocumentListProjection>> GetKnowledgeDocumentsAsync(
+        string? searchQuery, ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads ONE knowledge document plus its outgoing and incoming links, with every linked
+    /// document's title RESOLVED HERE while the caller is authorized.
+    /// </summary>
+    /// <remarks>
+    /// Resolving a link title is itself a graph read, so it happens inside this authorized operation:
+    /// the component never looks a document up to fill in a link row. Every returned part is
+    /// DETACHED (see <see cref="KnowledgeDocumentProjection"/>).
+    /// </remarks>
+    /// <param name="documentId">The document identifier to read.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the detached document and its links,
+    /// <see cref="FacadeErrorKind.NotFound"/> when the document does not exist (or the graph is not
+    /// configured — the page renders its existing not-found surface for both), or
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.SharedRead"/>.
+    /// </returns>
+    Task<FacadeResult<KnowledgeDocumentProjection>> GetKnowledgeDocumentAsync(
+        string documentId, ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads the SHARED knowledge-document count (the navigation badge's number).
+    /// </summary>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the unchanged
+    /// <see cref="DashboardStateService.GetKnowledgeDocumentCount"/> answer (0 when the graph is not
+    /// configured), or <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.SharedRead"/>.
+    /// </returns>
+    Task<FacadeResult<int>> GetKnowledgeDocumentCountAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
 }
 
 /// <summary>
@@ -141,9 +212,11 @@ public static class SharedSessionProjection
 
 /// <summary>
 /// Default implementation of <see cref="IOperationalFacade"/> delegating to the unchanged
-/// <see cref="DashboardStateService"/> and <see cref="LlmSessionRegistry"/>. The dashboard state
-/// service, the registry, the stateless principal resolver and the pure policy evaluator are all
-/// required dependencies, so there is no unauthenticated — and no dashboard-less — construction.
+/// <see cref="DashboardStateService"/> (including its <see cref="DashboardStateService.KnowledgeGraph"/>
+/// and <see cref="DashboardStateService.GetKnowledgeDocumentCount"/>, so the constructor takes no new
+/// dependency) and <see cref="LlmSessionRegistry"/>. The dashboard state service, the registry, the
+/// stateless principal resolver and the pure policy evaluator are all required dependencies, so
+/// there is no unauthenticated — and no dashboard-less — construction.
 /// </summary>
 public sealed class OperationalFacade : IOperationalFacade
 {
@@ -244,6 +317,99 @@ public sealed class OperationalFacade : IOperationalFacade
             FacadeErrorKind.None);
     }
 
+    // ── Authorized knowledge reads (SharedRead) ─────────────────────────────
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<KnowledgeDocumentListProjection>> GetKnowledgeDocumentsAsync(
+        string? searchQuery, ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST: the denied caller never reaches DashboardStateService or its graph.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetKnowledgeDocumentsAsync), ct))
+            return Forbidden<KnowledgeDocumentListProjection>();
+
+        var graph = _dashboard.KnowledgeGraph;
+
+        // An UNCONFIGURED graph is the service's own answer and stays a SUCCESS: the page renders its
+        // existing "knowledge graph is not configured" surface for it. A denial is never disguised as
+        // "not configured", and "not configured" is never disguised as a denial.
+        if (graph is null)
+            return new(true, new KnowledgeDocumentListProjection(false, []), null, FacadeErrorKind.None);
+
+        // The graph's OWN search semantics are preserved verbatim: a non-blank query goes through
+        // Search(...), everything else through GetAllDocuments(). Only the PROJECTION is new; the
+        // returned rows are detached copies, so no live document or mutable tag list escapes.
+        var documents = string.IsNullOrWhiteSpace(searchQuery)
+            ? graph.GetAllDocuments()
+            : graph.Search(searchQuery.Trim());
+
+        return new(
+            true,
+            new KnowledgeDocumentListProjection(
+                true,
+                DetachedKnowledgeCopy.Of(documents.Select(KnowledgeDocumentSummary.From))),
+            null,
+            FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<KnowledgeDocumentProjection>> GetKnowledgeDocumentAsync(
+        string documentId, ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST: no graph access before the fresh capability answer.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetKnowledgeDocumentAsync), ct))
+            return Forbidden<KnowledgeDocumentProjection>();
+
+        var graph = _dashboard.KnowledgeGraph;
+
+        // An unconfigured graph has no documents: the page's existing not-found surface is the right
+        // answer, exactly as when the page itself saw a null graph.
+        if (graph is null)
+            return NotFoundKnowledgeDocument(documentId);
+
+        var document = graph.GetDocument(documentId);
+        if (document is null)
+            return NotFoundKnowledgeDocument(documentId);
+
+        // LINK TITLES ARE RESOLVED HERE, while the caller is authorized: resolving a title is a graph
+        // read, so the component must never perform it. A missing target/source simply yields a null
+        // title (the page then renders only the id, exactly as before).
+        var outgoing = graph.GetOutgoingLinks(documentId)
+            .Select(link => new KnowledgeOutgoingLink(
+                link.TargetId,
+                graph.GetDocument(link.TargetId)?.Title,
+                link.Type,
+                link.Description))
+            .ToList();
+
+        var incoming = graph.GetIncomingLinks(documentId)
+            .Select(link => new KnowledgeIncomingLink(
+                link.SourceId,
+                graph.GetDocument(link.SourceId)?.Title,
+                link.Type,
+                link.Description))
+            .ToList();
+
+        return new(
+            true,
+            new KnowledgeDocumentProjection(
+                KnowledgeDocumentDetail.From(document),
+                DetachedKnowledgeCopy.Of(outgoing),
+                DetachedKnowledgeCopy.Of(incoming)),
+            null,
+            FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<int>> GetKnowledgeDocumentCountAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetKnowledgeDocumentCountAsync), ct))
+            return Forbidden<int>();
+
+        // The service's own answer (0 when the graph is not configured) is preserved unchanged.
+        return new(true, _dashboard.GetKnowledgeDocumentCount(), null, FacadeErrorKind.None);
+    }
+
     // ── Authorization + shared results ──────────────────────────────────────
 
     /// <summary>
@@ -269,4 +435,14 @@ public sealed class OperationalFacade : IOperationalFacade
     /// <returns>A <see cref="FacadeErrorKind.Forbidden"/> result carrying the sanitized denial text.</returns>
     private static FacadeResult Forbidden() =>
         new(false, FacadeAuthorization.ForbiddenMessage, FacadeErrorKind.Forbidden);
+
+    /// <summary>
+    /// Builds the "this knowledge document does not exist" answer — the same shape for a document id
+    /// the graph does not hold and for an unconfigured graph, because the page's existing
+    /// not-found surface renders either way. It names only the id the caller already supplied.
+    /// </summary>
+    /// <param name="documentId">The requested document id (echoed, never a graph detail).</param>
+    /// <returns>A <see cref="FacadeErrorKind.NotFound"/> result carrying no value.</returns>
+    private static FacadeResult<KnowledgeDocumentProjection> NotFoundKnowledgeDocument(string documentId) =>
+        new(false, default, $"Knowledge document '{documentId}' was not found.", FacadeErrorKind.NotFound);
 }

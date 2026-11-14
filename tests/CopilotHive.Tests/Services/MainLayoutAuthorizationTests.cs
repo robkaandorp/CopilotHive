@@ -94,6 +94,16 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton<NavigationManager>(new Navigation());
         services.AddSingleton<IClarificationFacade>(facade);
+        // NavMenu (rendered by this layout) now reads its knowledge-document count from the AUTHORIZED
+        // IOperationalFacade, so that boundary must resolve for the layout's nav child to activate.
+        // It is wired exactly as Program.cs does, over the same production resolver/policy.
+        services.AddSingleton(new LlmSessionRegistry());
+        services.AddSingleton<IOperationalFacade>(sp => new OperationalFacade(
+            sp.GetRequiredService<DashboardStateService>(),
+            sp.GetRequiredService<LlmSessionRegistry>(),
+            _auth.Resolver(mode),
+            _auth.Policy,
+            NullLogger<OperationalFacade>.Instance));
         services.AddScoped(_ => new CircuitUserPrincipalAccessor(_auth.Resolver(mode), _auth.Policy));
         var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
         var scope = provider.CreateAsyncScope();
@@ -564,12 +574,18 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
         internal async Task QueueEventRefreshAsync(ClarificationRequest? eventRequest = null)
         {
             var before = facade.CountCalls.Count;
-            var hold = facade.ArmCount();
+            // TWO parked readers: the layout AND its nav menu both subscribe to this queue as their
+            // refresh EVENT SOURCE and both read the count from the same authorized clarification
+            // boundary, so an enqueue drives two count reads. The hold rendezvous on both.
+            var hold = facade.ArmCount(expectedArrivals: 2);
             // Enqueue a NON-human event payload: the event remains real, but it must supply no data.
             await DispatchAsync(() => queue.Enqueue(eventRequest ?? new ClarificationRequest { Id = Guid.NewGuid().ToString(), Question = "EVENT-ONLY-NOT-DATA" }));
             await hold.Entered.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
             Assert.False(hold.Result.Task.IsCompleted);
-            Assert.Equal(before + 1, facade.CountCalls.Count);
+            // EXACT: BOTH subscribers of the queue event really refreshed through the authorized
+            // facade — the layout's own count read and the nav menu's — so the event caused exactly two
+            // authorized reads and no direct queue read anywhere.
+            Assert.Equal(before + 2, facade.CountCalls.Count);
             await ReleaseAsync(hold);
             Assert.True(hold.Result.Task.IsCompletedSuccessfully);
         }
@@ -607,11 +623,46 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
     // production await inline, including its assignments and StateHasChanged, not just a signal.
     private sealed class Hold
     {
+        internal Hold(int expectedArrivals = 1) => _expectedArrivals = expectedArrivals;
+
+        private readonly int _expectedArrivals;
+        private int _arrivals;
+
+        /// <summary>
+        /// Completed only once EVERY expected reader has parked. The layout AND its nav menu read the
+        /// SAME authorized clarification boundary (the nav menu renders the pending badge from it), so
+        /// an event-driven hold must rendezvous on both before a row asserts the intermediate state —
+        /// otherwise one consumer's arrival could be mistaken for "every refresh is parked".
+        /// </summary>
         internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Records one parked reader; signals <see cref="Entered"/> at the expected count.</summary>
+        internal void Arrive()
+        {
+            if (Interlocked.Increment(ref _arrivals) >= _expectedArrivals)
+                Entered.TrySetResult();
+        }
+
+        /// <summary>
+        /// THE SHARED COUNT RESULT. One armed count hold parks EVERY count read that arrives while it
+        /// is armed — the layout's own read AND the nav menu's read of the same authorized boundary —
+        /// and releases them all with the same answer, so arming a hold can never be "stolen" by one
+        /// consumer and leave the other's refresh unparked.
+        /// </summary>
         internal TaskCompletionSource<FacadeResult<int>> Result { get; } = new();
+
         internal TaskCompletionSource AnswerRelease { get; } = new();
         internal FacadeResult<int>? CountValue { get; set; }
         internal bool Answer { get; init; }
+
+        private int _released;
+
+        /// <summary>
+        /// Non-zero once <see cref="Release"/> has run: a released hold no longer parks later reads, so
+        /// a refresh issued AFTER the rendezvous is not silently blocked behind a completed hold.
+        /// </summary>
+        internal bool Released => Volatile.Read(ref _released) != 0;
+
         internal void Release(Exception? fault = null)
         {
             if (Answer)
@@ -619,6 +670,8 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
                 if (fault is null) AnswerRelease.TrySetResult(); else AnswerRelease.TrySetException(fault);
             }
             else if (CountValue is not null) Result.TrySetResult(CountValue);
+
+            Volatile.Write(ref _released, 1);
         }
     }
 
@@ -635,7 +688,7 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
         private Hold? _count;
         private Hold? _answer;
         private readonly List<Hold> _holds = [];
-        internal Hold ArmCount() { var h = new Hold(); _holds.Add(h); _count = h; return h; }
+        internal Hold ArmCount(int expectedArrivals = 1) { var h = new Hold(expectedArrivals); _holds.Add(h); _count = h; return h; }
         internal Hold ArmAnswer() { var h = new Hold { Answer = true }; _holds.Add(h); _answer = h; return h; }
         internal void ReleaseAll() { foreach (var hold in _holds) hold.Release(); }
         public async Task<FacadeResult<IReadOnlyList<ClarificationRequest>>> GetPendingHumanRequestsAsync(ClaimsPrincipal? u, CancellationToken ct)
@@ -650,10 +703,16 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
             CountCalls.Add(u);
             var result = CountOverride ?? await real.GetPendingHumanCountAsync(u, ct);
             CountResults.Add(result);
-            var hold = Interlocked.Exchange(ref _count, null);
-            if (hold is null) return result;
-            hold.CountValue = result;
-            hold.Entered.TrySetResult();
+            // EVERY count read parks while a hold is armed and UNRELEASED: both the layout and its nav
+            // menu read this same authorized boundary, so the hold must not be single-use for the
+            // arrivals it is waiting on. Once released it stops parking, so a later refresh is not
+            // silently blocked behind a completed hold.
+            var hold = _count;
+            if (hold is null || hold.Released) return result;
+            // The FIRST arriving reader's answer is the value the whole hold is released with; every
+            // parked reader (layout and nav menu) then observes that same answer.
+            hold.CountValue ??= result;
+            hold.Arrive();
             return await hold.Result.Task;
         }
         public async Task<FacadeResult<ClarificationAnswerResult>> SubmitAnswerAsync(string id, string answer, ClaimsPrincipal? u, CancellationToken ct)

@@ -1,23 +1,42 @@
 @page "/knowledge"
 @using CopilotHive.Dashboard
 @using CopilotHive.Knowledge
+@using CopilotHive.Security
+@using CopilotHive.Services
+@using System.Security.Claims
 @using System.Text.Json
+@implements IDisposable
 @inject IJSRuntime JS
-@inject DashboardStateService State
+@inject IOperationalFacade OperationalFacade
+@inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject PageHeaderState PageHeader
 
 <div class="goals-page">
-    @if (_knowledgeGraph is null)
+    @if (_denied)
+    {
+        @* THE SAFE DENIAL STATE: the caller's current identity does not hold SharedRead (disabled,
+           deleted or unknown account). It is NOT a login redirect and NOT a "not configured" claim:
+           every previously rendered document, filtered result, folder state and filter value has
+           been CLEARED, and there is deliberately no fallback to a direct graph read. *@
+        <p class="error-msg" style="margin-top:1rem">@_denialMessage</p>
+    }
+    else if (_loaded && !_configured)
     {
         <p style="color:var(--text-muted);margin-top:1rem">Knowledge graph is not configured — start the orchestrator with a config repo to enable it.</p>
+    }
+    else if (!_loaded)
+    {
+        @* The first authorized read is still in flight: nothing is claimed about the graph yet, so the
+           page cannot flash a "not configured" message or an empty filter bar it has not verified. *@
+        <p style="color:var(--text-muted);margin-top:1rem">Loading…</p>
     }
     else
     {
         <!-- Filter Bar -->
         <div class="filter-bar">
-            <input type="text" placeholder="Search documents…" @bind="_searchText" @bind:event="oninput" @bind:after="ApplyFilters" />
+            <input type="text" placeholder="Search documents…" @bind="_searchText" @bind:event="oninput" @bind:after="RefreshAsync" />
 
-            <select @bind="_typeFilter" @bind:after="ApplyFilters">
+            <select @bind="_typeFilter" @bind:after="RefreshAsync">
                 <option value="">All types</option>
                 @foreach (var t in Enum.GetValues<DocumentType>())
                 {
@@ -25,7 +44,7 @@
                 }
             </select>
 
-            <select @bind="_statusFilter" @bind:after="ApplyFilters">
+            <select @bind="_statusFilter" @bind:after="RefreshAsync">
                 <option value="">All (excl. archived)</option>
                 @foreach (var s in Enum.GetValues<DocumentStatus>())
                 {
@@ -33,7 +52,7 @@
                 }
             </select>
 
-            <input type="text" placeholder="Filter by tag…" @bind="_tagFilter" @bind:event="oninput" @bind:after="ApplyFilters" />
+            <input type="text" placeholder="Filter by tag…" @bind="_tagFilter" @bind:event="oninput" @bind:after="RefreshAsync" />
 
             @if (!string.IsNullOrWhiteSpace(_searchText) ||
                  !string.IsNullOrWhiteSpace(_typeFilter) || !string.IsNullOrWhiteSpace(_statusFilter) ||
@@ -70,7 +89,7 @@
 
                 <div style="margin-bottom:0.5rem">
                     <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:0.5rem 0.75rem;cursor:pointer;font-weight:600;display:flex;align-items:center;gap:0.5rem"
-                         @onclick="() => ToggleFolder(topic)">
+                         @onclick="() => ToggleFolderAsync(topic)">
                         <span>@(isExpanded ? "▾" : "▸")</span>
                         <span>@topic</span>
                         <span class="repo-tag">@group.Count()</span>
@@ -86,7 +105,7 @@
                                 var subExpanded = hasSearch || !_collapsedFolders.Contains(subKey);
                                 <div style="margin-bottom:0.5rem">
                                     <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:0.35rem 0.6rem;margin-left:0.5rem;cursor:pointer;font-size:0.9rem;font-weight:500;display:flex;align-items:center;gap:0.5rem"
-                                         @onclick="() => ToggleFolder(subKey)">
+                                         @onclick="() => ToggleFolderAsync(subKey)">
                                         <span>@(subExpanded ? "▾" : "▸")</span>
                                         <span>@subtopic</span>
                                         <span class="repo-tag">@subGroup.Count()</span>
@@ -120,10 +139,28 @@
 @code {
     [Inject] private NavigationManager Nav { get; set; } = default!;
 
-    private KnowledgeGraph? _knowledgeGraph;
-    private List<KnowledgeDocument> _allDocs = [];
-    private List<KnowledgeDocument> _filtered = [];
+    /// <summary>Every document row the last AUTHORIZED read returned (already detached copies).</summary>
+    private IReadOnlyList<KnowledgeDocumentSummary> _allDocs = [];
+
+    /// <summary>The retained, already-filtered rows the markup renders.</summary>
+    private List<KnowledgeDocumentSummary> _filtered = [];
+
     private bool _loaded;
+
+    /// <summary>
+    /// Whether the orchestrator has a knowledge graph at all. It is the FACADE's answer on a
+    /// SUCCESSFUL read (an unconfigured graph is not a denial), never a direct graph inspection.
+    /// </summary>
+    private bool _configured;
+
+    /// <summary>
+    /// Set when the last refresh was refused. While it is set the page renders its safe denial state
+    /// and NOTHING else: no document row, no filtered result, no filter value and no folder state can
+    /// survive a denial.
+    /// </summary>
+    private bool _denied;
+
+    private string _denialMessage = "";
 
     private HashSet<string> _collapsedFolders = new(StringComparer.OrdinalIgnoreCase);
 
@@ -132,36 +169,65 @@
     private string _statusFilter = "";
     private string _tagFilter = "";
 
-    protected override void OnInitialized()
-    {
-        PageHeader.SetTitle("📚 Knowledge");
-        _knowledgeGraph = State.KnowledgeGraph;
+    /// <summary>
+    /// Monotonic generation of the refresh in flight. A refresh publishes only when it is still the
+    /// newest one, so an OLDER authorized read that completes after a NEWER denied clear can never
+    /// repopulate the page (and vice versa: a stale denial cannot wipe a newer authorized result).
+    /// </summary>
+    private int _refreshGeneration;
 
-        if (_knowledgeGraph is not null)
-        {
-            _allDocs = _knowledgeGraph.GetAllDocuments()
-                .OrderBy(d => d.Topic)
-                .ThenBy(d => d.Title)
-                .ToList();
-        }
+    /// <summary>Set by <see cref="Dispose"/>: a late completion writes nothing and never renders.</summary>
+    private bool _disposed;
 
-        _loaded = true;
-        ApplyFilters();
-    }
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to EVERY identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator, so backward
+    /// compatibility is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated
+    /// principal, or null when no cascade exists (open mode / signed out). It is an IDENTITY only —
+    /// the facade re-resolves current role/enabled state on every operation, so a demoted, disabled
+    /// or deleted account is refused on its very next call.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
+    protected override void OnInitialized() => PageHeader.SetTitle("📚 Knowledge");
+
+    /// <summary>
+    /// THE LOAD AND THE CASCADE OBSERVATION. Blazor does NOT re-run <c>OnInitializedAsync</c> when the
+    /// parent <c>CascadingValue&lt;Task&lt;AuthenticationState&gt;&gt;</c> changes (sign-out, identity
+    /// replacement) while this instance is retained — it re-runs this method. So the initial load AND
+    /// every cascade update go through the one authorized, generation-guarded refresh: the identity is
+    /// observed on the circuit accessor and a refused read clears everything.
+    /// </summary>
+    protected override async Task OnParametersSetAsync() => await RefreshAsync();
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (!firstRender) return;
 
+        // The restore is only valid for the state it started under: capture the generation BEFORE the
+        // JS await, and write nothing if a denial, disposal or a newer refresh happened meanwhile.
+        var generation = _refreshGeneration;
+        var restored = false;
+
         try
         {
             var json = await JS.InvokeAsync<string>("localStorage.getItem", "knowledge-folders-collapsed");
-            if (!string.IsNullOrEmpty(json))
+            if (!string.IsNullOrEmpty(json) && !_disposed && !_denied && generation == _refreshGeneration)
             {
                 var saved = JsonSerializer.Deserialize<List<string>>(json);
                 if (saved is not null)
                 {
                     _collapsedFolders = new HashSet<string>(saved, StringComparer.OrdinalIgnoreCase);
+                    restored = true;
                 }
             }
         }
@@ -171,36 +237,124 @@
             // the JSON is malformed, or JS interop is unavailable. Never crash the page.
         }
 
+        if (restored && !_disposed) StateHasChanged();
+    }
+
+    /// <summary>
+    /// THE ONE authorized read of this page: every load AND every retained-data callback (search,
+    /// type/status/tag filter, reset, folder toggle) goes through it, so none of them can bypass the
+    /// fresh <see cref="HiveCapability.SharedRead"/> check.
+    /// <para>
+    /// A denied answer CLEARS everything previously rendered (documents, filtered results, filter
+    /// values, configured flag, folder state) and shows the safe denial state — never a login
+    /// redirect and never a direct graph read. The generation guard plus the disposal check mean only
+    /// the newest refresh publishes, so an older authorized refresh cannot overwrite a newer denial.
+    /// </para>
+    /// <para>
+    /// The tag/type/status filtering and ordering are unchanged: they are applied HERE, locally, over
+    /// the DETACHED rows the facade returned (the graph's own search semantics were applied facade-side
+    /// when a search query is present).
+    /// </para>
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> only when this refresh was AUTHORIZED, still owned the newest generation and
+    /// published; <c>false</c> when it was denied (state cleared), superseded or disposed.
+    /// </returns>
+    private async Task<bool> RefreshAsync()
+    {
+        if (_disposed) return false;
+
+        var generation = ++_refreshGeneration;
+
+        // ONE identity acquisition per refresh; each facade call still re-resolves stored state.
+        var result = await OperationalFacade.GetKnowledgeDocumentsAsync(
+            _searchText, await ActingUserAsync(), CancellationToken.None);
+
+        if (_disposed || generation != _refreshGeneration) return false;
+
+        if (!result.Success)
+        {
+            ClearLoadedDocuments(deniedByFacade: true, result.Error);
+            return false;
+        }
+
+        _configured = result.Value?.IsConfigured ?? false;
+        _allDocs = result.Value?.Documents ?? [];
+        _denied = false;
+        _denialMessage = "";
+        _loaded = true;
+        ApplyFilters();
+        return true;
+    }
+
+    /// <summary>
+    /// Re-renders after a retained-data callback. The refresh itself is authorized: the folder toggle
+    /// and the reset button keep their ordinary local behaviour, and both re-verify the caller's
+    /// identity through the facade before anything remains on screen.
+    /// </summary>
+    private async Task RefreshAndRenderAsync()
+    {
+        await RefreshAsync();
+        if (_disposed) return;
         StateHasChanged();
     }
 
-    private async Task ToggleFolder(string folderKey)
+    /// <summary>
+    /// THE DENY CLEAR: drops every piece of loaded/rendered document content so a refusal cannot leave
+    /// a previously authorized surface on screen. It clears only this page's document state (the page
+    /// header belongs to the layout) and never touches a store or the graph.
+    /// </summary>
+    /// <param name="deniedByFacade">Whether the clear is a refusal (renders the denial state).</param>
+    /// <param name="message">The facade's own sanitized denial text, or <c>null</c>.</param>
+    private void ClearLoadedDocuments(bool deniedByFacade, string? message)
     {
+        _allDocs = [];
+        _filtered = [];
+        _configured = false;
+        _loaded = false;
+        _collapsedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _searchText = "";
+        _typeFilter = "";
+        _statusFilter = "";
+        _tagFilter = "";
+        _denied = deniedByFacade;
+        _denialMessage = deniedByFacade ? message ?? "Knowledge documents could not be loaded." : "";
+    }
+
+    /// <summary>
+    /// The folder-collapse toggle. The localStorage UX is unchanged; the collapse set is applied to the
+    /// ALREADY-authorized rows the page holds. The toggle re-verifies this circuit's authorization
+    /// through the facade (see <see cref="RefreshAndRenderAsync"/>) so a retained-data callback cannot
+    /// keep a previously rendered surface alive after a denial.
+    /// </summary>
+    private async Task ToggleFolderAsync(string folderKey)
+    {
+        // AUTHORIZE AND CLAIM THE GENERATION FIRST. Nothing is mutated and nothing is persisted until
+        // the fresh SharedRead check has passed and this callback still owns the newest, non-disposed
+        // generation: a denied toggle has already cleared every loaded value, filter and folder, and
+        // a superseded or disposed one changes nothing.
+        if (!await RefreshAsync()) return;
+
+        var generation = _refreshGeneration;
+
         if (!_collapsedFolders.Add(folderKey))
             _collapsedFolders.Remove(folderKey);
 
-        await JS.InvokeVoidAsync("localStorage.setItem", "knowledge-folders-collapsed", JsonSerializer.Serialize(_collapsedFolders));
+        var json = JsonSerializer.Serialize(_collapsedFolders);
+        await JS.InvokeVoidAsync("localStorage.setItem", "knowledge-folders-collapsed", json);
+
+        // Re-render with the toggled folder only if this callback still owns the page.
+        if (_disposed || generation != _refreshGeneration) return;
+        StateHasChanged();
     }
 
+    /// <summary>
+    /// Applies the page's LOCAL type/status/tag filters and ordering to the detached rows of the last
+    /// authorized read. Archived documents stay hidden unless explicitly selected, exactly as before.
+    /// </summary>
     private void ApplyFilters()
     {
-        if (_knowledgeGraph is null)
-        {
-            _filtered = [];
-            return;
-        }
-
-        IEnumerable<KnowledgeDocument> query;
-
-        // Use Search() when there's a search query; otherwise start from full list
-        if (!string.IsNullOrWhiteSpace(_searchText))
-        {
-            query = _knowledgeGraph.Search(_searchText.Trim());
-        }
-        else
-        {
-            query = _allDocs;
-        }
+        IEnumerable<KnowledgeDocumentSummary> query = _allDocs;
 
         if (!string.IsNullOrWhiteSpace(_typeFilter) && Enum.TryParse<DocumentType>(_typeFilter, out var type))
             query = query.Where(d => d.Type == type);
@@ -227,13 +381,13 @@
             .ToList();
     }
 
-    private void ResetFilters()
+    private async Task ResetFilters()
     {
         _searchText = "";
         _typeFilter = "";
         _statusFilter = "";
         _tagFilter = "";
-        ApplyFilters();
+        await RefreshAndRenderAsync();
     }
 
     private void NavigateTo(string docId) => Nav.NavigateTo($"/knowledge/{docId}");
@@ -257,7 +411,7 @@
         _ => "badge-muted",
     };
 
-    private RenderFragment DocTable(IEnumerable<KnowledgeDocument> docs) => __builder =>
+    private RenderFragment DocTable(IEnumerable<KnowledgeDocumentSummary> docs) => __builder =>
     {
         <table class="goals-table">
             <thead>
@@ -292,4 +446,13 @@
             </tbody>
         </table>;
     };
+
+    /// <summary>
+    /// Marks the page disposed: an in-flight refresh that completes afterwards publishes nothing and
+    /// never calls <see cref="ComponentBase.StateHasChanged"/> on a torn-down component.
+    /// </summary>
+    public void Dispose()
+    {
+        _disposed = true;
+    }
 }

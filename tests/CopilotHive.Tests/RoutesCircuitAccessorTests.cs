@@ -122,7 +122,9 @@ public sealed class RoutesCircuitAccessorTests : IDisposable
     /// singleton types the app uses: the page injects the dashboard state service and its page-header
     /// singleton; the layout injects the clarification queue (its refresh EVENT SOURCE only) and the
     /// AUTHORIZED <see cref="IClarificationFacade"/> every clarification read/answer goes through; the
-    /// nav menu's knowledge count reads the same dashboard state.
+    /// nav menu reads BOTH badge counters from the authorized facades — the pending-clarification count
+    /// from <see cref="IClarificationFacade"/> and the knowledge-document count from the AUTHORIZED
+    /// <see cref="IOperationalFacade"/>, so that facade must be registered for NavMenu activation.
     /// </summary>
     private static void AddPageInfrastructure(ServiceCollection services)
     {
@@ -149,6 +151,17 @@ public sealed class RoutesCircuitAccessorTests : IDisposable
             notifier: null,
             brain: null);
         services.AddSingleton(dashboard);
+
+        // THE AUTHORIZED OPERATIONAL BOUNDARY the nav menu now depends on (its knowledge-document
+        // count read). Registered exactly as Program.cs wires it: the same production constructor
+        // signature, over the production resolver/policy the caller registered.
+        services.AddSingleton(new LlmSessionRegistry());
+        services.AddSingleton<IOperationalFacade>(sp => new OperationalFacade(
+            sp.GetRequiredService<DashboardStateService>(),
+            sp.GetRequiredService<LlmSessionRegistry>(),
+            sp.GetRequiredService<HivePrincipalResolver>(),
+            sp.GetRequiredService<HivePolicy>(),
+            NullLogger<OperationalFacade>.Instance));
     }
 
     // ══════════════════════════════════════════════════════════════════

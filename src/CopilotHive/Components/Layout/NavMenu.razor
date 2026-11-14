@@ -1,6 +1,8 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Orchestration
+@using CopilotHive.Security
 @using CopilotHive.Services
+@using System.Security.Claims
 @using System.Text.Encodings.Web
 @implements IDisposable
 
@@ -26,7 +28,7 @@
 <NavLink href="/orchestrator">🎵 <span class="nav-label">Orchestrator</span></NavLink>
 <NavLink href="/workers">🐝 <span class="nav-label">Workers</span></NavLink>
 <NavLink href="/configuration">⚙️ <span class="nav-label">Configuration</span></NavLink>
-<NavLink href="/logs">🪵 <span class="nav-label">Logs</span></NavLink>
+<NavLink href="/logs">🩵 <span class="nav-label">Logs</span></NavLink>
 
 @if (_authEnabled)
 {
@@ -58,19 +60,60 @@
 }
 
 @code {
-    [Inject] private DashboardStateService State { get; set; } = default!;
+    // The clarification queue is injected ONLY as this component's refresh EVENT SOURCE (OnChanged).
+    // PendingHumanCount is NEVER read here: every count comes from the AUTHORIZED facades below.
     [Inject] private ClarificationQueueService ClarificationQueue { get; set; } = default!;
+
+    // THE AUTHORIZED COUNTER BOUNDARIES: the pending-clarification count requires SharedRead and the
+    // knowledge-document count requires SharedRead through the operational facade.
+    [Inject] private IClarificationFacade ClarificationFacade { get; set; } = default!;
+    [Inject] private IOperationalFacade OperationalFacade { get; set; } = default!;
+
+    // The SCOPED per-circuit accessor, used by the single ComponentActingUser seam to obtain the
+    // identity handed to every facade call (and to observe the circuit's identity). It is never
+    // captured by a singleton.
+    [Inject] private CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal { get; set; } = default!;
 
     private int _pendingClarifications;
     private int _knowledgeDocCount;
     private bool _authEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID"));
 
-    protected override void OnInitialized()
-    {
-        _pendingClarifications = ClarificationQueue.PendingHumanCount;
-        _knowledgeDocCount = State.GetKnowledgeDocumentCount();
-        ClarificationQueue.OnChanged += HandleClarificationChanged;
-    }
+    /// <summary>
+    /// Monotonic generation of the refresh in flight. Only the NEWEST refresh publishes, so an older
+    /// authorized read cannot repopulate counters that a newer denied refresh has already cleared.
+    /// </summary>
+    private int _refreshGeneration;
+
+    /// <summary>Set by <see cref="Dispose"/>: a late callback publishes nothing and never renders.</summary>
+    private bool _disposed;
+
+    /// <summary>
+    /// The circuit's cascading authentication state, handed to every identity-aware facade call.
+    /// ABSENT in open mode — <c>Program.cs</c> registers <c>AddCascadingAuthenticationState</c> only
+    /// when authentication is enabled — in which case no cascade arrives, the helper yields a null
+    /// identity and the resolver answers with the open-mode local operator (which holds every
+    /// capability), so the legacy single-operator installation is unchanged and nothing throws.
+    /// </summary>
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    /// <summary>
+    /// The identity to hand to one identity-aware facade call: this circuit's authenticated principal,
+    /// or null when no cascade exists (open mode / signed out). It is an IDENTITY only — the facade
+    /// re-resolves current role/enabled state on every operation.
+    /// </summary>
+    private ValueTask<ClaimsPrincipal?> ActingUserAsync() =>
+        ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
+
+    // ONE-TIME subscription: it must live in OnInitialized, which runs once per instance, so the
+    // handler is never duplicated by a later parameter update.
+    protected override void OnInitialized() => ClarificationQueue.OnChanged += HandleClarificationChanged;
+
+    // THE INITIAL LOAD AND THE CASCADE OBSERVATION. Blazor does NOT re-run OnInitializedAsync when the
+    // parent CascadingValue<Task<AuthenticationState>> changes (sign-out, identity replacement) while this
+    // instance is retained — it re-runs this method. The first call is the initial load (OnInitialized
+    // has already subscribed), later calls are cascade updates; each is the generation-guarded refresh.
+    protected override async Task OnParametersSetAsync() => await RefreshCountsAsync();
 
     // The single-character placeholder shown when no GitHub avatar URL is available: the first
     // letter of the username (uppercased), or "?" when the username is missing/blank.
@@ -125,17 +168,81 @@
                 "</span>"));
     }
 
-    private void HandleClarificationChanged()
+    /// <summary>
+    /// The queue's synchronous <c>Action</c> notification. It carries NO data and grants nothing: it
+    /// only schedules a refresh, which re-resolves this circuit user's authorization from scratch. The
+    /// work is dispatched onto the renderer so the component's state is only ever touched on the
+    /// dispatcher, and the component is re-rendered explicitly — a service callback is NOT a component
+    /// event handler, so the framework will not schedule a render on our behalf.
+    /// </summary>
+    private void HandleClarificationChanged() => _ = InvokeAsync(RefreshAndRenderAsync);
+
+    /// <summary>Runs one refresh and re-renders, unless this component has already been disposed.</summary>
+    private async Task RefreshAndRenderAsync()
     {
-        InvokeAsync(() =>
+        await RefreshCountsAsync();
+
+        if (_disposed) return;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Re-reads BOTH nav counters through the authorized facades.
+    /// <para>
+    /// FRESH AUTHORIZATION EVERY TIME: both reads carry this circuit's identity, and each facade
+    /// re-resolves the caller's CURRENT role/enabled state, so a disabled, deleted or signed-out
+    /// account loses both counters on its very next refresh.
+    /// </para>
+    /// <para>
+    /// DENIAL CLEARS BOTH COUNTERS: when EITHER read is refused (or otherwise unsuccessful) both
+    /// <c>_pendingClarifications</c> and <c>_knowledgeDocCount</c> are cleared to 0 — there is
+    /// deliberately no fallback to a direct queue or dashboard read.
+    /// </para>
+    /// <para>
+    /// OVERLAP-SAFE: the generation guard means only the newest refresh publishes, so two
+    /// notifications in flight cannot interleave, and a refresh that completes after disposal writes
+    /// nothing and never re-renders a torn-down component.
+    /// </para>
+    /// </summary>
+    private async Task RefreshCountsAsync()
+    {
+        if (_disposed) return;
+
+        var generation = ++_refreshGeneration;
+
+        // ONE identity acquisition per refresh, reused by both reads: it is an IDENTITY only, and each
+        // facade call still re-resolves current stored state on its own.
+        var actingUser = await ActingUserAsync();
+
+        var clarifications = await ClarificationFacade.GetPendingHumanCountAsync(actingUser, CancellationToken.None);
+        var knowledge = await OperationalFacade.GetKnowledgeDocumentCountAsync(actingUser, CancellationToken.None);
+
+        // A newer refresh (or disposal) superseded this one: publish nothing.
+        if (_disposed || generation != _refreshGeneration) return;
+
+        if (!clarifications.Success || !knowledge.Success)
         {
-            _pendingClarifications = ClarificationQueue.PendingHumanCount;
-            StateHasChanged();
-        });
+            ClearCounts();
+            return;
+        }
+
+        _pendingClarifications = clarifications.Value;
+        _knowledgeDocCount = knowledge.Value;
+    }
+
+    /// <summary>
+    /// THE DENY CLEAR: both counters return to zero together, so a refusal of either read can never
+    /// leave a previously authorized number rendered beside a denied one.
+    /// </summary>
+    private void ClearCounts()
+    {
+        _pendingClarifications = 0;
+        _knowledgeDocCount = 0;
     }
 
     public void Dispose()
     {
+        _disposed = true;
         ClarificationQueue.OnChanged -= HandleClarificationChanged;
     }
 }

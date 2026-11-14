@@ -344,6 +344,11 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
     /// (<see cref="DashboardStateService.GetComposerStats"/> is per-user private usage), and neither
     /// does any projection it returns. This pins the OMISSION decision so a later change cannot
     /// quietly add the surface back without changing the boundary's contract on purpose.
+    /// <para>
+    /// The expected operation set is EXACT: the four original operations plus the three knowledge
+    /// <see cref="HiveCapability.SharedRead"/> reads added by the KNOWLEDGE/NAVIGATION AUTHORIZATION
+    /// slice. Anything beyond that set (a Composer-statistics projection above all) fails here.
+    /// </para>
     /// </summary>
     [Fact]
     public void TheSharedBoundary_ExposesNoComposerUsageProjection()
@@ -353,7 +358,7 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
             .Select(m => m.Name)
             .ToHashSet(StringComparer.Ordinal);
 
-        // The boundary's operation set is EXACTLY the four authorized operations: no more, no less.
+        // The boundary's operation set is EXACTLY the seven authorized operations: no more, no less.
         Assert.Equal(
             new HashSet<string>(StringComparer.Ordinal)
             {
@@ -361,6 +366,11 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
                 nameof(IOperationalFacade.GetBrainStatsAsync),
                 nameof(IOperationalFacade.GetOrchestratorInfoAsync),
                 nameof(IOperationalFacade.GetSharedLlmSessionsAsync),
+                // THE KNOWLEDGE/NAVIGATION SharedRead reads: the document list/search projection,
+                // one document with its outgoing/incoming links, and the navigation badge count.
+                nameof(IOperationalFacade.GetKnowledgeDocumentsAsync),
+                nameof(IOperationalFacade.GetKnowledgeDocumentAsync),
+                nameof(IOperationalFacade.GetKnowledgeDocumentCountAsync),
             },
             operations);
 
