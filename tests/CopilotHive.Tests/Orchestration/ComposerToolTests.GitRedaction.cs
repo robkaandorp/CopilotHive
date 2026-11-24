@@ -72,6 +72,184 @@ public sealed partial class ComposerToolTests
             Assert.False(result.Contains(value, StringComparison.Ordinal), "Synthetic credential reached model-visible Git output.");
     }
 
+    /// <summary>
+    /// Returns the leading object-name token of the model-visible blame output, ignoring only the
+    /// COMPLETE Git colour decoration directly before it and the optional boundary caret.
+    /// </summary>
+    /// <remarks>
+    /// Ordinary <c>git blame</c> prints <c>&lt;abbreviated-name&gt; (author date lineno) content</c>.
+    /// Git can colour the name (<c>color.blame=always</c>, notably <c>blame.coloring=repeatedLines</c>
+    /// and <c>highlightRecent</c>) by emitting a complete SGR sequence (<c>ESC '[' digits/';' 'm'</c>)
+    /// BEFORE it, and prefixes the boundary (root) commit's name with <c>^</c> unless
+    /// <c>blame.showRoot</c> is set; observed shapes are <c>name</c>, <c>^name</c>, <c>ESC[31mname</c>
+    /// and <c>ESC[31m^name</c>, so SGR sequences are skipped before the caret. Nothing else is removed:
+    /// the token ends at the first space or newline, so an incomplete or non-SGR escape stays in the
+    /// returned token (which then cannot be a prefix of the commit name), and a token is never joined
+    /// from fragments or borrowed from a later line. A bare marker leaves an empty name.
+    /// </remarks>
+    private static string BlameObjectName(string output)
+    {
+        var index = 0;
+        while (TryConsumeSgr(output, ref index))
+        {
+        }
+        if (index < output.Length && output[index] == '^')
+            index++;
+        var end = output.IndexOfAny([' ', '\n'], index);
+        return end < 0 ? output[index..] : output[index..end];
+    }
+
+    /// <summary>
+    /// Advances <paramref name="index"/> past ONE complete SGR colour sequence
+    /// (<c>ESC '[' (digit | ';')* 'm'</c>) and returns <see langword="true"/>; leaves it unchanged and
+    /// returns <see langword="false"/> for anything else, including an unterminated sequence, a bare
+    /// ESC, or a CSI whose final byte is not <c>m</c>.
+    /// </summary>
+    private static bool TryConsumeSgr(string text, ref int index)
+    {
+        if (index + 1 >= text.Length || text[index] != '\u001b' || text[index + 1] != '[')
+            return false;
+        var cursor = index + 2;
+        while (cursor < text.Length && (text[cursor] is (>= '0' and <= '9') or ';'))
+            cursor++;
+        if (cursor >= text.Length || text[cursor] != 'm')
+            return false;
+        index = cursor + 1;
+        return true;
+    }
+
+    /// <summary>
+    /// Proves the leading object name of the model-visible blame output is attributed to the commit
+    /// <paramref name="sha"/> that <c>git rev-parse HEAD</c> already reported for this fixture.
+    /// </summary>
+    /// <remarks>
+    /// Git derives the displayed abbreviation length from the object store, so it is NOT a fixed number
+    /// of characters: CI run 43606604223/job 132482481229 displayed 7 (<c>fa1efcb</c>) where the retired
+    /// assertion had assumed 8, and a SHA-256 repository legitimately reports a 64-character name. The
+    /// displayed name must therefore be a PREFIX of whatever length <paramref name="sha"/> actually is,
+    /// and is never truncated or padded to a guessed width. Being a literal prefix of the lowercase
+    /// fixture name already forces lowercase hex, so no separate character-class check is needed.
+    /// Requiring such a prefix — rather than the mere presence of SHA-like text — is what rejects an
+    /// attribution to a DIFFERENT commit.
+    /// </remarks>
+    private static void AssertBlameOutputNamesCommit(string output, string sha)
+    {
+        Assert.NotEmpty(sha);
+        var name = BlameObjectName(output);
+        Assert.True(
+            name.Length >= 4
+                && name.Length <= sha.Length
+                && sha.StartsWith(name, StringComparison.Ordinal),
+            $"Blame output does not name the fixture commit '{sha}': {output}");
+    }
+
+    /// <summary>
+    /// The full commit name that the failing CI run (43606604223/job 132482481229) displayed as
+    /// <c>fa1efcb</c> — 7 characters, where the retired assertion had assumed 8. Its tail past the
+    /// CI-observed prefix is arbitrary: the correlation under test only looks at prefixes of this name.
+    /// </summary>
+    private const string CiObservedFullSha = "fa1efcbb0123456789abcdef0123456789abcdef";
+
+    [Fact]
+    public void GitBlame_AbbreviatedCommitNameCorrelation_AcceptsSevenAndEightButRejectsOtherCommits()
+    {
+        var sha = CiObservedFullSha;
+        const string author = " (Test 2026-11-24 13:40:46 +0000 1) ";
+        var seven = $"{sha[..7]}{author}unchanged-marker\n{sha[..7]}{author}ssh://u:[redacted]@h.invalid/r\n";
+        var eight = $"{sha[..8]}{author}unchanged-marker\n";
+
+        // The RETIRED oracle was `Assert.Contains(sha[..8], output)`. It throws on the observed
+        // 7-character display and passes on the 8-character one.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => Assert.Contains(sha[..8], seven, StringComparison.Ordinal));
+        Assert.Contains(sha[..8], eight, StringComparison.Ordinal);
+
+        // The replacement accepts BOTH observed lengths, with and without the optional root `^` marker:
+        // 7 and 8 characters times marked and unmarked is all four combinations.
+        AssertBlameOutputNamesCommit(seven, sha);
+        AssertBlameOutputNamesCommit(eight, sha);
+        AssertBlameOutputNamesCommit($"^{sha[..7]}{author}unchanged-marker\n", sha);
+        // Kept as its own shape even though the coloured caret-8 case below also rejects a missing caret
+        // strip: this is the uncoloured `blame.showRoot` default that ordinary output actually takes.
+        AssertBlameOutputNamesCommit($"^{sha[..8]}{author}unchanged-marker\n", sha);
+
+        // Git may colour the object name (color.blame=always with blame.coloring=repeatedLines or
+        // highlightRecent), emitting an ANSI SGR sequence BEFORE the name; the escape is decoration
+        // rather than part of the name. When both are present, Git prints the colour before the caret.
+        // The repeatedLines shape — plain leading line, coloured second line — is included too.
+        AssertBlameOutputNamesCommit($"\u001b[36m{sha[..8]}{author}unchanged-marker\n", sha);
+        AssertBlameOutputNamesCommit($"\u001b[31m^{sha[..7]}{author}unchanged-marker\n", sha);
+        AssertBlameOutputNamesCommit($"\u001b[31m^{sha[..8]}{author}unchanged-marker\n", sha);
+        AssertBlameOutputNamesCommit(
+            $"{sha[..8]}{author}unchanged-marker\n\u001b[36m{sha[..8]}{author}ssh://u:[redacted]@h.invalid/r\u001b[m\n",
+            sha);
+
+        // No 40-character assumption: a SHA-256 repository names HEAD with 64 characters, and an
+        // object-store abbreviation of that name still correlates to it, with OR without the optional
+        // `^` marker (blame.showRoot decides whether git prints it, independently of hash width).
+        var sha256 = sha + sha[..24];
+        Assert.Equal(64, sha256.Length);
+        var sha256Line = $"{sha256[..12]}{author}unchanged-marker\n";
+        AssertBlameOutputNamesCommit(sha256Line, sha256);
+        AssertBlameOutputNamesCommit("^" + sha256Line, sha256);
+        AssertBlameOutputNamesCommit("\u001b[31m^" + sha256Line, sha256);
+
+        // Rejections, none of which fall back to "some SHA-like text exists". `fa1efcc` has the SAME
+        // length as the observed display and shares its first six characters, so only an exact prefix
+        // comparison rejects it; `deadbeef` is another commit at the retired assumption's length; and a
+        // leading token that is not the commit name at all (here the file CONTENT) must also fail.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit(seven.Replace(sha[..7], "fa1efcc", StringComparison.Ordinal), sha));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit(seven.Replace(sha[..7], "deadbeef", StringComparison.Ordinal), sha));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"unchanged-marker{author}x\n", sha));
+        // git never abbreviates below four characters: a shorter prefix, and a bare `^` boundary marker
+        // with no object name at all, must not be mistaken for an attribution to the fixture commit.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"{sha[..3]}{author}x\n", sha));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"^{author}x\n", sha));
+        // The wrong prefix must also be rejected under the 64-character name and the marked shape:
+        // neither a different hash width nor an optional `^` may relax the exact-prefix correlation.
+        var wrongSha256 = sha256Line.Replace(sha256[..12], "0" + sha256[..11], StringComparison.Ordinal);
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit(wrongSha256, sha256));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit("^" + wrongSha256, sha256));
+        // Stripping the colour decoration must not become a way to smuggle a wrong commit past the
+        // check: a coloured wrong prefix stays rejected, exactly like its uncoloured form.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit("\u001b[31m^" + wrongSha256, sha256));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit(
+                seven.Replace(sha[..7], "\u001b[36mfa1efcc", StringComparison.Ordinal),
+                sha));
+
+        // Malformed decoration is NOT Git's complete SGR colour, so it must neither be stripped nor let
+        // the check borrow a token from elsewhere. Each probe is labelled and asserted on its own.
+        // Valid complete-SGR controls first (multi-parameter and bare reset forms), so that rejecting
+        // every coloured token could not satisfy the probes below.
+        AssertBlameOutputNamesCommit($"\u001b[1;31m{sha[..7]}{author}unchanged-marker\n", sha);
+        AssertBlameOutputNamesCommit($"\u001b[m\u001b[36m^{sha[..7]}{author}unchanged-marker\n", sha);
+
+        // PROBE 1: an incomplete CSI crossing a line. The valid-looking name on the NEXT line must not
+        // be borrowed.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"\u001b[31\n{sha[..7]}{author}unchanged-marker\n", sha));
+        // PROBE 2: a bare ESC crossing a line, with the same borrowed-token hazard.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"\u001b\n{sha[..7]}{author}unchanged-marker\n", sha));
+        // PROBE 3: a non-SGR CSI (final byte `c`, not `m`) inside the token, hiding the mismatching `c`:
+        // permissive stripping would leave `fa1efc`, a valid prefix, and accept it.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"{sha[..6]}\u001b[31c{author}unchanged-marker\n", sha));
+        // Even a complete SGR is not decoration when it splits the name. Stripping it here would
+        // join the two fragments into the otherwise valid seven-character prefix.
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+            () => AssertBlameOutputNamesCommit($"{sha[..3]}\u001b[31m{sha[3..7]}{author}unchanged-marker\n", sha));
+    }
+
     [Theory]
     [InlineData("log")]
     [InlineData("diff")]
@@ -110,7 +288,9 @@ public sealed partial class ComposerToolTests
                 Assert.Contains("+ssh://u:[redacted]@h.invalid/r", output);
                 break;
             case "blame":
-                Assert.Contains(sha[..8], output);
+                // Git abbreviates the leading object name to an object-store-dependent length, so
+                // correlate it to the sha `rev-parse HEAD` already returned instead of an assumed width.
+                AssertBlameOutputNamesCommit(output, sha);
                 Assert.Contains("unchanged-marker", output);
                 Assert.Contains("ssh://u:[redacted]@h.invalid/r", output);
                 break;
