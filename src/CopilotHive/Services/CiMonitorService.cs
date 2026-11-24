@@ -1643,16 +1643,45 @@ public class CiMonitorService
     }
 
     /// <summary>
-    /// Creates a CI-failure issue (or appends to an existing open/triaged issue with the same
-    /// title and source goal). The description and dedup-append text are pre-built by the
-    /// caller so each issue format (output-derived, log-derived, URL-only) stays in one place.
+    /// Whether an issue status still counts as an ACTIVE CI-failure issue for deduplication, i.e.
+    /// a repeated observation of the same failure appends its evidence to that issue instead of
+    /// creating another one. Open and Triaged qualify (reported / prioritised), and so do
+    /// Acknowledged and InProgress: a human (or the Composer) having seen the failure does not
+    /// make it a different failure, so re-observing it must not file a duplicate. Resolved and
+    /// Closed are terminal and never qualify — the failure is no longer being worked on, so such
+    /// an issue never absorbs later evidence and keeps its status and description untouched.
     /// </summary>
+    /// <param name="status">The status of a candidate existing issue.</param>
+    /// <returns><c>true</c> when the issue is active and may absorb the new evidence.</returns>
+    private static bool IsActiveCiFailureStatus(IssueStatus status) =>
+        status is IssueStatus.Open or IssueStatus.Triaged or IssueStatus.Acknowledged or IssueStatus.InProgress;
+
+    /// <summary>
+    /// Creates a CI-failure issue, or appends the new evidence to the existing issue that shares
+    /// this failure's title, source goal and repository while still being ACTIVE — Open, Triaged,
+    /// Acknowledged or InProgress (see <see cref="IsActiveCiFailureStatus(IssueStatus)"/>).
+    /// Resolved/Closed issues never absorb the evidence: they are left byte-identical, and a fresh
+    /// issue carrying the new description is created only if no matching active issue exists. When
+    /// an active and a terminal issue share the same key, the ACTIVE one absorbs the append and the
+    /// terminal one is still left untouched. On a matched issue the monitor changes
+    /// <see cref="Issue.Description"/> and nothing else: it never transitions the status (no
+    /// automatic reopening either), and <see cref="Issue.UpdatedAt"/> is advanced by the store's
+    /// update, not written here. The description and dedup-append text are pre-built by the caller
+    /// so each issue format (output-derived, log-derived, URL-only) stays in one place.
+    /// </summary>
+    /// <remarks>
+    /// The predicate runs against the snapshot returned by <see cref="IIssueStore.GetIssuesAsync"/>
+    /// and the append is written back with <see cref="IIssueStore.UpdateIssueAsync"/>, exactly as
+    /// before: an unrelated concurrent resolve/close landing between those two calls can still be
+    /// overwritten by this store's pre-existing read-modify-write race. This method only decides
+    /// WHICH existing issue absorbs the evidence; it makes no claim about that race.
+    /// </remarks>
     private async Task<(int Created, int Updated)> CreateOrUpdateIssueAsync(
         string goalId, string repoName, string title, string description, string dedupAppend, CancellationToken ct)
     {
         var issues = await _issueStore!.GetIssuesAsync(repository: repoName, ct: ct);
         var existing = issues.FirstOrDefault(i =>
-            (i.Status == IssueStatus.Open || i.Status == IssueStatus.Triaged) &&
+            IsActiveCiFailureStatus(i.Status) &&
             string.Equals(i.Title, title, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(i.SourceGoalId, goalId, StringComparison.OrdinalIgnoreCase));
 

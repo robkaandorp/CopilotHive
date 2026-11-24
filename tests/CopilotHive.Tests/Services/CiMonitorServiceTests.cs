@@ -93,6 +93,18 @@ public sealed class CiMonitorServiceTests : IDisposable
         public bool ThrowOnCreate { get; set; }
 
         /// <summary>
+        /// Ids passed to <see cref="CreateIssueAsync"/>, in call order. Recording is thread-safe
+        /// (<see cref="ConcurrentQueue{T}"/>) because monitor tests drive creates concurrently.
+        /// </summary>
+        public ConcurrentQueue<string> CreateCalls { get; } = new();
+
+        /// <summary>
+        /// Ids passed to <see cref="UpdateIssueAsync"/>, in call order — lets a test prove the
+        /// dedup path UPDATED the matched issue rather than re-creating it under the same id.
+        /// </summary>
+        public ConcurrentQueue<string> UpdateCalls { get; } = new();
+
+        /// <summary>
         /// Optional hook invoked at the start of <see cref="GetIssuesAsync"/>, letting a test
         /// block inside the store (to create a controlled race) or throw a specific exception.
         /// </summary>
@@ -133,12 +145,14 @@ public sealed class CiMonitorServiceTests : IDisposable
         {
             if (ThrowOnCreate)
                 throw new InvalidOperationException("Simulated issue store failure");
+            CreateCalls.Enqueue(issue.Id);
             Issues[issue.Id] = issue;
             return Task.FromResult(issue);
         }
 
         public Task UpdateIssueAsync(Issue issue, CancellationToken ct = default)
         {
+            UpdateCalls.Enqueue(issue.Id);
             Issues[issue.Id] = issue;
             return Task.CompletedTask;
         }
@@ -449,10 +463,19 @@ public sealed class CiMonitorServiceTests : IDisposable
         $"[Updated {clock.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture)}]";
 
     /// <summary>
-    /// Pre-seeds an open issue with the given title, source goal <c>goal-1</c> and repository
-    /// <c>test-repo</c>: the issue <c>CreateOrUpdateIssueAsync</c> must find and append to.
+    /// Pre-seeds an existing issue with the given title, source goal <c>goal-1</c> and repository
+    /// <c>test-repo</c> (both overridable) so <c>CreateOrUpdateIssueAsync</c> can find it. The
+    /// status defaults to <see cref="IssueStatus.Open"/> — the pre-existing dedup case — and is
+    /// overridden by the status tests to exercise Acknowledged/InProgress/Triaged/Resolved/Closed
+    /// and the cross-goal/cross-repository isolation cases.
     /// </summary>
-    private static Issue SeedExistingIssue(FakeIssueStore issueStore, string title, string description)
+    private static Issue SeedExistingIssue(
+        FakeIssueStore issueStore,
+        string title,
+        string description,
+        IssueStatus status = IssueStatus.Open,
+        string sourceGoalId = "goal-1",
+        string repositoryName = "test-repo")
     {
         var existingIssue = new Issue
         {
@@ -461,9 +484,9 @@ public sealed class CiMonitorServiceTests : IDisposable
             Title = title,
             Description = description,
             Severity = IssueSeverity.High,
-            Status = IssueStatus.Open,
-            RepositoryNames = ["test-repo"],
-            SourceGoalId = "goal-1",
+            Status = status,
+            RepositoryNames = [repositoryName],
+            SourceGoalId = sourceGoalId,
             SourceRole = "ci",
         };
         issueStore.Issues[existingIssue.Id] = existingIssue;
@@ -8057,6 +8080,652 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Contains("Error: alpha failure", issue.Description);
         Assert.Contains("at Alpha.First()", issue.Description);
         Assert.Equal("goal-1", issue.SourceGoalId);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    // ── Active-status CI-failure deduplication ─────────────────────────────
+    //
+    // A repeated observation of the SAME failure — same title AND source goal AND repository —
+    // must append its evidence to the issue already tracking it for as long as that issue is
+    // ACTIVE: Open, Triaged, Acknowledged or InProgress. The predicate used to accept only
+    // Open/Triaged, so a failure the Composer had ACKNOWLEDGED was re-filed as a duplicate issue
+    // on the next poll (issue-909c7735ea2748298403de8a46542b67 next to issue-87a3255e6b954e1fb499a854c74d825d
+    // in the reported incident). Resolved/Closed stay terminal and are never reused.
+
+    /// <summary>
+    /// The title the output-derived dedup tests observe: one parseable xUnit test name in the
+    /// check run's own output, so the issue is created from that output.
+    /// </summary>
+    private const string ObservedOutputTitle =
+        "CI failure: MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum";
+
+    /// <summary>Check-runs response whose single failed run names one xUnit test in its output.</summary>
+    private static string CheckRunsJsonOneObservedFailure() =>
+        CheckRunsJson(1, ("build", "completed", "failure", "✗ MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum", "First failure"));
+
+    /// <summary>Counts non-overlapping occurrences of <paramref name="needle"/> in <paramref name="haystack"/>.</summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Every ACTIVE status deduplicates a repeated observation of the same failure: the second
+    /// observation appends the clock-stamped dedup block to the SAME issue id, keeps that issue's
+    /// status untouched (no transition in either direction), creates no second issue, and does not
+    /// publish a second <c>CiFailed</c> event.
+    /// </summary>
+    /// <remarks>
+    /// Removal-proof: with the retired Open/Triaged-only predicate the Acknowledged and InProgress
+    /// rows create a second issue, so <see cref="FakeIssueStore.CreateCalls"/> holds two ids and the
+    /// dictionary holds two entries — every assertion below fails. The Open and Triaged rows pin the
+    /// behaviour that already existed, so widening the predicate cannot quietly break them.
+    /// </remarks>
+    [Theory]
+    [InlineData(IssueStatus.Open)]
+    [InlineData(IssueStatus.Triaged)]
+    [InlineData(IssueStatus.Acknowledged)]
+    [InlineData(IssueStatus.InProgress)]
+    public async Task MonitorMergeAsync_ActiveIssueStatus_RepeatedObservationAppendsToSameIssue(IssueStatus activeStatus)
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJsonOneObservedFailure()));
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+
+        // First observation creates the issue through the real monitor path.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        var created = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal(ObservedOutputTitle, created.Title);
+        var issueId = created.Id;
+        var descriptionAfterFirstObservation = created.Description;
+        Assert.DoesNotContain("---", descriptionAfterFirstObservation, StringComparison.Ordinal);
+
+        // The issue is moved into the status under test before the next poll.
+        created.Status = activeStatus;
+
+        clock.Advance(TimeSpan.FromMinutes(2) + TimeSpan.FromTicks(765_432));
+
+        // Second observation of the SAME failure (same title, same source goal, same repository).
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // Exactly one issue exists — the SAME one — and it was never re-created.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal(issueId, issue.Id);
+        Assert.Equal([issueId], issueStore.CreateCalls.ToArray());
+        Assert.Equal([issueId], issueStore.UpdateCalls.ToArray());
+
+        // The status is preserved verbatim: an append is not a lifecycle transition.
+        Assert.Equal(activeStatus, issue.Status);
+        Assert.Null(issue.ResolvedAt);
+
+        // The new evidence is APPENDED to the original description, stamped at second-poll time.
+        Assert.StartsWith(descriptionAfterFirstObservation, issue.Description, StringComparison.Ordinal);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n", issue.Description, StringComparison.Ordinal);
+        Assert.Contains("First failure", issue.Description, StringComparison.Ordinal);
+
+        // Event-once semantics are untouched: one CiFailed for the goal/commit/repository.
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    /// <summary>
+    /// Explicit Triaged coverage on the LOG-DERIVED issue format (one parsed test failure): a
+    /// matching triaged issue absorbs the append block, keeps Triaged, and no duplicate appears.
+    /// Triaged was already accepted by the predicate, so this row must keep passing — it is the
+    /// control that the widened predicate did not disturb an existing status.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_ExistingTriagedIssue_LogDerivedFailureAppendsToSameIssue()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithOneFailure());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+        var seeded = SeedExistingIssue(
+            issueStore, "CI failure: Tests.Alpha.First", "Original triaged description.", IssueStatus.Triaged);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal(seeded.Id, issue.Id);
+        Assert.Equal(IssueStatus.Triaged, issue.Status);
+        Assert.Empty(issueStore.CreateCalls);
+        Assert.Equal([seeded.Id], issueStore.UpdateCalls.ToArray());
+        Assert.StartsWith("Original triaged description.", issue.Description, StringComparison.Ordinal);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\nTest: Tests.Alpha.First\n", issue.Description, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Resolved and Closed are TERMINAL for a DIFFERENT observed failure: the new failure gets its
+    /// own fresh Open issue, and the terminal issue keeps its status AND its description verbatim —
+    /// it is never updated, never reused and never moved out of its terminal state.
+    /// </summary>
+    [Theory]
+    [InlineData(IssueStatus.Resolved)]
+    [InlineData(IssueStatus.Closed)]
+    public async Task MonitorMergeAsync_TerminalIssueStatus_DistinctFailureCreatesFreshIssueAndLeavesOldUntouched(IssueStatus terminalStatus)
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJsonOneObservedFailure()));
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+        var terminal = SeedExistingIssue(
+            issueStore,
+            "CI failure: MyApp.Tests.Old.StillBroken",
+            "Terminal description that must not change.",
+            terminalStatus,
+            sourceGoalId: "goal-1",
+            repositoryName: "test-repo");
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // A fresh issue for the DISTINCT observed failure, plus the untouched terminal one.
+        Assert.Equal(2, issueStore.Issues.Count);
+        var untouched = issueStore.Issues[terminal.Id];
+        Assert.Equal(terminalStatus, untouched.Status);
+        Assert.Equal("Terminal description that must not change.", untouched.Description);
+        Assert.DoesNotContain(terminal.Id, issueStore.UpdateCalls);
+
+        var fresh = Assert.Single(issueStore.Issues.Values, i => i.Id != terminal.Id);
+        Assert.Equal(ObservedOutputTitle, fresh.Title);
+        Assert.Equal(IssueStatus.Open, fresh.Status);
+        Assert.Equal("goal-1", fresh.SourceGoalId);
+        Assert.Equal(["test-repo"], fresh.RepositoryNames);
+        Assert.Contains("First failure", fresh.Description, StringComparison.Ordinal);
+
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    /// <summary>
+    /// Resolved and Closed stay terminal even for a failure with the SAME title, source goal and
+    /// repository: there is no automatic reopening, so a second issue is created instead and the
+    /// terminal one is left byte-identical. This is the sequential-observation contract — the
+    /// monitor never resurrects a finished issue.
+    /// </summary>
+    [Theory]
+    [InlineData(IssueStatus.Resolved)]
+    [InlineData(IssueStatus.Closed)]
+    public async Task MonitorMergeAsync_TerminalIssueStatus_SameFailureCreatesFreshIssueWithoutReopening(IssueStatus terminalStatus)
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJsonOneObservedFailure()));
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+        var terminal = SeedExistingIssue(
+            issueStore, ObservedOutputTitle, "Resolved long ago — must stay resolved.", terminalStatus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // The terminal issue keeps its status and description; the same failure opens a new issue.
+        var untouched = issueStore.Issues[terminal.Id];
+        Assert.Equal(terminalStatus, untouched.Status);
+        Assert.Equal("Resolved long ago — must stay resolved.", untouched.Description);
+        Assert.DoesNotContain(terminal.Id, issueStore.UpdateCalls);
+
+        Assert.Equal(2, issueStore.Issues.Count);
+        var fresh = Assert.Single(issueStore.Issues.Values, i => i.Id != terminal.Id);
+        Assert.Equal(ObservedOutputTitle, fresh.Title);
+        Assert.Equal(IssueStatus.Open, fresh.Status);
+        Assert.NotEqual(terminal.Id, fresh.Id);
+    }
+
+    /// <summary>
+    /// The dedup key stays exactly (title, source goal, repository): an ACTIVE issue that differs
+    /// in ANY of those three dimensions is a different failure's issue, so the observation creates
+    /// its own issue and leaves the active one untouched. Each row changes exactly ONE dimension
+    /// against an otherwise identical Acknowledged issue.
+    /// </summary>
+    [Theory]
+    [InlineData("different-source-goal")]
+    [InlineData("different-title")]
+    [InlineData("different-repository")]
+    public async Task MonitorMergeAsync_ActiveIssueInDifferentGoalTitleOrRepository_CreatesSeparateIssue(string difference)
+    {
+        var (seedTitle, seedGoalId, seedRepository) = difference switch
+        {
+            "different-source-goal" => (ObservedOutputTitle, "goal-2", "test-repo"),
+            "different-title" => ("CI failure: MyApp.Tests.Other.Broken", "goal-1", "test-repo"),
+            "different-repository" => (ObservedOutputTitle, "goal-1", "other-repo"),
+            _ => throw new InvalidOperationException($"Unhandled difference '{difference}'."),
+        };
+
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJsonOneObservedFailure()));
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+        var seeded = SeedExistingIssue(
+            issueStore, seedTitle, "Active issue for a different key.", IssueStatus.Acknowledged, seedGoalId, seedRepository);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // The differently-keyed active issue is untouched: no append, no status change.
+        var untouched = issueStore.Issues[seeded.Id];
+        Assert.Equal(IssueStatus.Acknowledged, untouched.Status);
+        Assert.Equal("Active issue for a different key.", untouched.Description);
+        Assert.DoesNotContain(seeded.Id, issueStore.UpdateCalls);
+
+        // The observation gets its own issue for the observed (goal-1, test-repo, observed title) key.
+        Assert.Equal(2, issueStore.Issues.Count);
+        var created = Assert.Single(issueStore.Issues.Values, i => i.Id != seeded.Id);
+        Assert.Equal(ObservedOutputTitle, created.Title);
+        Assert.Equal("goal-1", created.SourceGoalId);
+        Assert.Equal(["test-repo"], created.RepositoryNames);
+        Assert.Equal(IssueStatus.Open, created.Status);
+    }
+
+    // ── Synthetic regression: acknowledged log-fallback issue is not duplicated ──
+
+    /// <summary>
+    /// GitHub Actions timestamp prefix used by <see cref="SyntheticIncidentLog"/> — the same
+    /// ISO-8601 shape raw job logs carry.
+    /// </summary>
+    private const string IncidentStampPrefix = "2025-09-12T04:31:07.1142360Z ";
+
+    /// <summary>
+    /// An explicitly SYNTHETIC stand-in for the job log of the reported incident
+    /// (run 43622046033 / job 132529661140). The original run's bytes are NOT in this checkout and
+    /// are not reproduced here: this log only reproduces the shape that decides the code path —
+    /// every line carries a GitHub Actions ISO-8601 timestamp, no line matches a failure header
+    /// (so nothing parses), and the body is long enough that the bounded head+tail excerpt has a
+    /// truncated middle. The head and tail sentinels mark the two windows the fallback excerpt
+    /// keeps.
+    /// </summary>
+    private static string SyntheticIncidentLog()
+    {
+        var builder = new StringBuilder();
+        builder.Append(IncidentStampPrefix).Append("INCIDENT_HEAD_MARKER restore/build step started\n");
+        for (var i = 0; i < 80; i++)
+            builder.Append(IncidentStampPrefix).Append("Step ").Append(i.ToString("D2", CultureInfo.InvariantCulture)).Append(": building project (no test output on this line)\n");
+        builder.Append(IncidentStampPrefix).Append("INCIDENT_TAIL_MARKER process exited with code 1\n");
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Regression for the reported incident, reproduced with a SYNTHETIC timestamped log: the
+    /// fallback issue is created through the real log-fetch/issue path, the Composer then sets it
+    /// to Acknowledged, and a later poll observes the SAME failure again. That poll must append the
+    /// new fallback evidence to the SAME issue id, preserve Acknowledged, create no second issue,
+    /// and publish no second <c>CiFailed</c> event.
+    /// </summary>
+    /// <remarks>
+    /// Removal-proof: under the retired Open/Triaged-only predicate the second poll cannot find the
+    /// Acknowledged issue, so it creates a duplicate — <see cref="FakeIssueStore.CreateCalls"/> holds
+    /// two ids, the dictionary holds two issues, and the "same id" assertion fails.
+    /// </remarks>
+    [Fact]
+    public async Task MonitorMergeAsync_SyntheticAcknowledgedLogFallbackIncident_SecondObservationAppendsToSameIssue()
+    {
+        var log = SyntheticIncidentLog();
+
+        // Premise: this log really drives the FALLBACK path (nothing parses) and really is the
+        // timestamped shape, so the test cannot silently exercise a different format.
+        Assert.Empty(CiMonitorService.ParseTestFailuresFromLogs(log));
+        Assert.StartsWith(IncidentStampPrefix, log, StringComparison.Ordinal);
+
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => log);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+
+        // Poll 1: a real log fetch → no parsable failures → head+tail excerpt → fallback issue.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var created = Assert.Single(issueStore.Issues.Values);
+        var issueId = created.Id;
+        Assert.Equal("CI failure: build", created.Title);
+        Assert.Equal(IssueStatus.Open, created.Status);
+        Assert.Contains(CiMonitorService.FallbackExcerptLabel, created.Description, StringComparison.Ordinal);
+        Assert.Contains("INCIDENT_HEAD_MARKER", created.Description, StringComparison.Ordinal);
+        Assert.Contains("INCIDENT_TAIL_MARKER", created.Description, StringComparison.Ordinal);
+        // Both excerpt windows are bounded, so the middle of this log is truncated away: a real
+        // head+tail fallback, not a whole-log dump.
+        Assert.Contains("characters omitted between the head and the tail of the log", created.Description, StringComparison.Ordinal);
+        var firstDescription = created.Description;
+        var initialCiFailedEvents = eventBus.Published.Count;
+        Assert.Equal(1, initialCiFailedEvents);
+
+        // The Composer acknowledges the filed issue the way the real path does it: it works on a
+        // DETACHED snapshot (the store returns detached copies) and writes that snapshot back.
+        // Using a distinct instance proves the dedup matches on the persisted key fields, not on
+        // object identity.
+        var acknowledgedSnapshot = new Issue
+        {
+            Id = created.Id,
+            Type = created.Type,
+            Title = created.Title,
+            Description = created.Description,
+            Severity = created.Severity,
+            Status = IssueStatus.Acknowledged,
+            RepositoryNames = [.. created.RepositoryNames],
+            SourceGoalId = created.SourceGoalId,
+            SourceRole = created.SourceRole,
+        };
+        Assert.NotSame(created, acknowledgedSnapshot);
+        await issueStore.UpdateIssueAsync(acknowledgedSnapshot, TestContext.Current.CancellationToken);
+        Assert.Equal(IssueStatus.Acknowledged, issueStore.Issues[issueId].Status);
+
+        clock.Advance(TimeSpan.FromMinutes(4) + TimeSpan.FromTicks(321_098));
+
+        // Poll 2: the SAME run fails the SAME test-less way → same title/goal/repository key.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // Same issue id, still Acknowledged, nothing re-created.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal(issueId, issue.Id);
+        Assert.Equal(IssueStatus.Acknowledged, issue.Status);
+        Assert.Equal([issueId], issueStore.CreateCalls.ToArray());
+        // Exactly two updates reach the store: the test's own Composer-style acknowledgement and
+        // the monitor's dedup append — no third write, and no create.
+        Assert.Equal([issueId, issueId], issueStore.UpdateCalls.ToArray());
+
+        // The evidence of the second observation was APPENDED to that issue...
+        Assert.StartsWith(firstDescription, issue.Description, StringComparison.Ordinal);
+        Assert.Contains($"\n\n---\n{ExpectedStamp(clock)}\n{CiMonitorService.FallbackExcerptLabel}\n", issue.Description, StringComparison.Ordinal);
+        // ...so the excerpt label now appears once for the original description and once per append.
+        Assert.Equal(2, CountOccurrences(issue.Description, CiMonitorService.FallbackExcerptLabel));
+
+        // Both polls really ran, and CiFailed was still published exactly once.
+        Assert.Equal(2, handler.Captured.Count(c => c.Url.Contains("/commits/abc123/check-runs", StringComparison.Ordinal)));
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    // ── Strengthening: case-insensitive key, distinct observed failure, append evidence ──
+
+    /// <summary>
+    /// Builds a check-runs body whose single failed run names ONE test in its own output. The
+    /// output carries <paramref name="evidence"/> as its text and the given run URL, so two
+    /// observations can differ in run/commit/evidence while retaining the exact same dedup key
+    /// (title + source goal + repository).
+    /// </summary>
+    private static string CheckRunsJsonObservedFailureWithEvidence(string evidence, string runUrl) =>
+        RawCheckRunsJson(1, $$"""
+            [{
+              "name": "build",
+              "status": "completed",
+              "conclusion": "failure",
+              "html_url": "{{runUrl}}",
+              "output": {
+                "summary": "✗ MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum",
+                "text": {{JsonString(evidence)}}
+              }
+            }]
+            """);
+
+    /// <summary>
+    /// The dedup key is matched CASE-INSENSITIVELY on all three dimensions, but the comparison
+    /// happens at TWO different sites: <c>Title</c> and <c>SourceGoalId</c> are matched inside
+    /// <c>CiMonitorService.CreateOrUpdateIssueAsync</c> (<c>StringComparison.OrdinalIgnoreCase</c>
+    /// in its predicate), whereas <c>RepositoryNames</c> is matched inside
+    /// <c>IIssueStore.GetIssuesAsync</c> — the repository filter the monitor passes to the store.
+    /// Each row varies exactly ONE dimension's casing against a matching ACTIVE issue; the
+    /// "all-three" row varies all three at once.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mutant reach differs by site, which is why the rows are split this way. Changing the
+    /// MONITOR's predicate to <c>StringComparison.Ordinal</c> fails only the <c>Title</c>,
+    /// <c>SourceGoalId</c> and <c>all-three</c> rows; the repository-only rows stay GREEN under that
+    /// mutant, because they exercise the store's repository filter contract rather than the
+    /// monitor's predicate. Conversely, making the STORE's repository filter case-sensitive fails
+    /// only the repository-only rows plus <c>all-three</c>.
+    /// </para>
+    /// <para>
+    /// This repository comparison is exercised here through the test <see cref="FakeIssueStore"/>,
+    /// which mirrors the store contract client-side. The real EF-backed
+    /// <c>IssueStore.GetIssuesAsync</c> filtering (its JSON-column workaround applied in memory) is
+    /// covered separately in the store's own tests; this test pins the monitor's contract that it
+    /// passes the configured repository name through to the store unchanged and relies on that
+    /// case-insensitive match.
+    /// </para>
+    /// <para>
+    /// The seeded title is cased inside the xUnit test name too, proving the observed title comes
+    /// from parsing the output rather than from a constant shared with the seed.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(IssueStatus.Open, "title")]
+    [InlineData(IssueStatus.Triaged, "title")]
+    [InlineData(IssueStatus.Acknowledged, "title")]
+    [InlineData(IssueStatus.InProgress, "title")]
+    [InlineData(IssueStatus.Open, "goal")]
+    [InlineData(IssueStatus.Triaged, "goal")]
+    [InlineData(IssueStatus.Acknowledged, "goal")]
+    [InlineData(IssueStatus.InProgress, "goal")]
+    [InlineData(IssueStatus.Open, "repository")]
+    [InlineData(IssueStatus.Triaged, "repository")]
+    [InlineData(IssueStatus.Acknowledged, "repository")]
+    [InlineData(IssueStatus.InProgress, "repository")]
+    [InlineData(IssueStatus.Acknowledged, "all-three")]
+    public async Task MonitorMergeAsync_ActiveIssueKeyCasingOnly_StillAppendsToSameIssue(
+        IssueStatus activeStatus, string casedDimension)
+    {
+        const string casedTitle = "CI FAILURE: myapp.tests.CALCULATORtests.Add_TwoNumbers_ReturnsSum";
+        const string casedGoal = "GOAL-1";
+        const string casedRepository = "TEST-REPO";
+
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(
+            CheckRunsJsonObservedFailureWithEvidence("First failure", "https://github.com/org/test-repo/actions/runs/1")));
+        // The monitor always observes the PLAIN-cased forms (the parsed title, "goal-1", and the
+        // configured repository name). Only the seeded issue's selected dimension is cased, so a
+        // row isolates exactly one case-insensitive comparison.
+        var config = CreateConfig(CreateRepo(name: "test-repo"));
+        var service = CreateService(handler, config: config, issueStore: issueStore, eventBus: eventBus);
+
+        var seedTitle = casedDimension is "title" or "all-three" ? casedTitle : ObservedOutputTitle;
+        var seedGoal = casedDimension is "goal" or "all-three" ? casedGoal : "goal-1";
+        var seedRepository = casedDimension is "repository" or "all-three" ? casedRepository : "test-repo";
+        var seeded = SeedExistingIssue(
+            issueStore, seedTitle, "Seeded case-varied description.", activeStatus, seedGoal, seedRepository);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // The case-varied ACTIVE issue is the one deduplicated: no second issue, no create.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal(seeded.Id, issue.Id);
+        Assert.Empty(issueStore.CreateCalls);
+        Assert.Equal([seeded.Id], issueStore.UpdateCalls.ToArray());
+        Assert.Equal(activeStatus, issue.Status);
+        Assert.StartsWith("Seeded case-varied description.", issue.Description, StringComparison.Ordinal);
+        Assert.Contains("\n\n---\n", issue.Description, StringComparison.Ordinal);
+        Assert.Contains("First failure", issue.Description, StringComparison.Ordinal);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    /// <summary>
+    /// TERMINAL statuses stay terminal when a genuinely DIFFERENT observed failure occurs on a new
+    /// run and commit while the title, source goal and repository are IDENTICAL to the terminal
+    /// issue's key. The new observation opens a FRESH Open issue from its own real output, and that
+    /// fresh active issue — never the terminal one — absorbs the later same-key observation.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the distinct-TITLE test above, changing the TITLE would make the isolation trivially
+    /// follow from the key comparison. Here the only thing that distinguishes the observations is
+    /// the observation itself (run/commit/evidence), which is precisely the "new run or commit with
+    /// the same title, source goal, and repository" case in the acceptance criteria. Terminal issues
+    /// are deliberately NOT reused even though the key matches.
+    /// </remarks>
+    [Theory]
+    [InlineData(IssueStatus.Resolved)]
+    [InlineData(IssueStatus.Closed)]
+    public async Task MonitorMergeAsync_TerminalIssueStatus_NewRunAndCommitSameKey_CreatesFreshIssueAndLeavesTerminalUntouched(
+        IssueStatus terminalStatus)
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        const string run1Url = "https://github.com/org/test-repo/actions/runs/43622046033";
+        const string run2Url = "https://github.com/org/test-repo/actions/runs/43622046999";
+        const string run3Url = "https://github.com/org/test-repo/actions/runs/43622047123";
+        var handler = new ScriptedHttpMessageHandler(req =>
+        {
+            var url = req.RequestUri!.ToString();
+            var (evidence, runUrl) = url switch
+            {
+                _ when url.Contains("/commits/def456/check-runs", StringComparison.Ordinal) =>
+                    ("Second failure on a new run", run2Url),
+                _ when url.Contains("/commits/fed987/check-runs", StringComparison.Ordinal) =>
+                    ("Third failure on yet another run", run3Url),
+                _ => ("First failure", run1Url),
+            };
+            return OkResponse(CheckRunsJsonObservedFailureWithEvidence(evidence, runUrl));
+        });
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+        var terminal = SeedExistingIssue(
+            issueStore, ObservedOutputTitle, "Terminal description that must not change.", terminalStatus);
+        terminal.ResolvedAt = new DateTime(2025, 9, 12, 5, 0, 0, DateTimeKind.Utc);
+        var resolvedAtBefore = terminal.ResolvedAt;
+
+        // Observation 1: the SAME key as the terminal issue — it must not be reused.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var untouchedAfterFirst = issueStore.Issues[terminal.Id];
+        Assert.Equal(terminalStatus, untouchedAfterFirst.Status);
+        Assert.Equal("Terminal description that must not change.", untouchedAfterFirst.Description);
+        Assert.Equal(resolvedAtBefore, untouchedAfterFirst.ResolvedAt);
+        Assert.DoesNotContain(terminal.Id, issueStore.UpdateCalls);
+
+        var fresh = Assert.Single(issueStore.Issues.Values, i => i.Id != terminal.Id);
+        var freshId = fresh.Id;
+        Assert.Equal(ObservedOutputTitle, fresh.Title);
+        Assert.Equal(IssueStatus.Open, fresh.Status);
+        Assert.Equal("goal-1", fresh.SourceGoalId);
+        Assert.Equal(["test-repo"], fresh.RepositoryNames);
+        var freshFirstDescription = fresh.Description;
+        Assert.StartsWith("CI failed for goal 'goal-1' (commit abc123).", freshFirstDescription, StringComparison.Ordinal);
+        Assert.Contains(run1Url, freshFirstDescription, StringComparison.Ordinal);
+        Assert.Contains("First failure", freshFirstDescription, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n\n---\n", freshFirstDescription, StringComparison.Ordinal);
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+
+        // Observation 2: a DIFFERENT run and commit, still with the same title/source/repository.
+        // It must append to the FRESH active issue, never to the terminal one.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "def456", TestContext.Current.CancellationToken);
+
+        var untouched = issueStore.Issues[terminal.Id];
+        Assert.Equal(terminalStatus, untouched.Status);
+        Assert.Equal("Terminal description that must not change.", untouched.Description);
+        Assert.Equal(resolvedAtBefore, untouched.ResolvedAt);
+        Assert.DoesNotContain(terminal.Id, issueStore.UpdateCalls);
+
+        // Exactly one fresh issue exists (plus the untouched terminal one); no duplicate was filed.
+        Assert.Equal(2, issueStore.Issues.Count);
+        Assert.Equal([freshId], issueStore.CreateCalls.ToArray());
+        Assert.Equal([freshId], issueStore.UpdateCalls.ToArray());
+        var appended = issueStore.Issues[freshId];
+        Assert.Equal(IssueStatus.Open, appended.Status);
+        Assert.StartsWith(freshFirstDescription, appended.Description, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(appended.Description, $"\n\n---\n{ExpectedStamp(clock)}\n"));
+        Assert.Contains("Second failure on a new run", appended.Description, StringComparison.Ordinal);
+        Assert.Contains(run2Url, appended.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("Third failure on yet another run", appended.Description, StringComparison.Ordinal);
+
+        clock.Advance(TimeSpan.FromMinutes(7));
+
+        // Observation 3: yet another distinct run/commit with the same key. Still no terminal reuse.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "fed987", TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, issueStore.Issues.Count);
+        Assert.Equal([freshId], issueStore.CreateCalls.ToArray());
+        Assert.Equal([freshId, freshId], issueStore.UpdateCalls.ToArray());
+        Assert.Equal(terminalStatus, issueStore.Issues[terminal.Id].Status);
+        Assert.Equal("Terminal description that must not change.", issueStore.Issues[terminal.Id].Description);
+        Assert.Equal(resolvedAtBefore, issueStore.Issues[terminal.Id].ResolvedAt);
+        Assert.Equal(IssueStatus.Open, issueStore.Issues[freshId].Status);
+        Assert.Equal(2, CountOccurrences(issueStore.Issues[freshId].Description, "\n\n---\n"));
+        Assert.Contains("Third failure on yet another run", issueStore.Issues[freshId].Description, StringComparison.Ordinal);
+        Assert.Contains(run3Url, issueStore.Issues[freshId].Description, StringComparison.Ordinal);
+
+        // One CiFailed per distinct (goal, commit, repository), using the event-once machinery.
+        Assert.Equal(3, eventBus.Published.Count);
+        Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiFailed, e.Type));
+    }
+
+    /// <summary>
+    /// The second observation's evidence is genuinely APPENDED for every ACTIVE status: the same
+    /// failure is observed twice through two real monitor calls, but with distinct output evidence
+    /// and a distinct run URL each time. The appended block must be the ONLY place the new evidence
+    /// appears (it is absent from the original description), stamped at the second poll's manual
+    /// clock time, and the original description must remain as the prefix.
+    /// </summary>
+    [Theory]
+    [InlineData(IssueStatus.Open)]
+    [InlineData(IssueStatus.Triaged)]
+    [InlineData(IssueStatus.Acknowledged)]
+    [InlineData(IssueStatus.InProgress)]
+    public async Task MonitorMergeAsync_ActiveIssueStatus_SecondObservationEvidenceAppendedNotReplaced(
+        IssueStatus activeStatus)
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var clock = new ControlledTimeProvider();
+        var observation = 0;
+        var handler = new ScriptedHttpMessageHandler(_ =>
+        {
+            // The two check-runs probes are identical requests; the scripted RESPONSE sequence is
+            // what makes the second observation carry distinct evidence and a distinct run URL.
+            var isSecondRun = Interlocked.Increment(ref observation) == 2;
+            return OkResponse(CheckRunsJsonObservedFailureWithEvidence(
+                isSecondRun ? "SECOND_RUN_EVIDENCE" : "FIRST_RUN_EVIDENCE",
+                isSecondRun ? "https://github.com/org/test-repo/actions/runs/2" : "https://github.com/org/test-repo/actions/runs/1"));
+        });
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, clock: clock);
+
+        // First observation: create the issue from the real monitor path, then move it into the
+        // status under test (as the Composer would, working on the persisted snapshot).
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        var first = Assert.Single(issueStore.Issues.Values);
+        var issueId = first.Id;
+        var firstDescription = first.Description;
+        Assert.Contains("FIRST_RUN_EVIDENCE", firstDescription, StringComparison.Ordinal);
+        Assert.DoesNotContain("SECOND_RUN_EVIDENCE", firstDescription, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n\n---\n", firstDescription, StringComparison.Ordinal);
+        first.Status = activeStatus;
+
+        clock.Advance(TimeSpan.FromMinutes(6) + TimeSpan.FromTicks(987_654));
+
+        // Second observation of the SAME failure key, with DIFFERENT evidence and a later stamp.
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal(issueId, issue.Id);
+        Assert.Equal([issueId], issueStore.CreateCalls.ToArray());
+        Assert.Equal([issueId], issueStore.UpdateCalls.ToArray());
+        Assert.Equal(activeStatus, issue.Status);
+
+        // The original text is retained whole and the new evidence is appended exactly once.
+        Assert.StartsWith(firstDescription, issue.Description, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(issue.Description, "FIRST_RUN_EVIDENCE"));
+        Assert.Equal(1, CountOccurrences(issue.Description, "SECOND_RUN_EVIDENCE"));
+        Assert.Equal(1, CountOccurrences(issue.Description, $"\n\n---\n{ExpectedStamp(clock)}\n"));
+        Assert.Contains(
+            $"\n\n---\n{ExpectedStamp(clock)}\n✗ MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum\n\nSECOND_RUN_EVIDENCE\nCI run: https://github.com/org/test-repo/actions/runs/2",
+            issue.Description, StringComparison.Ordinal);
+
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.CiFailed, evt.Type);
     }
