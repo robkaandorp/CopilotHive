@@ -273,7 +273,9 @@ internal sealed class CiFailureRetention
 /// opens a block, the block's own lines are accumulated up to
 /// <see cref="MaxFailureBlockChars"/>, and the block is finalized by the next failure header of
 /// either format (VSTest blocks) or by the next failure header or MTP result/footer line (MTP
-/// blocks), exactly as the whole-log parser does.
+/// blocks), exactly as the whole-log parser does. Within a block, an
+/// <c>--- End of stack trace … ---</c> marker closes the stack-trace section for both formats —
+/// in an MTP block only when it directly follows a genuine .NET stack frame.
 /// </para>
 /// <para>
 /// Secret redaction runs on each <em>complete</em> line before it is parsed, counted, or retained,
@@ -379,12 +381,43 @@ internal sealed class CiLogStreamParser
 
     /// <summary>
     /// Matches a bare stack-frame line (<c>at {method} …</c>) inside an MTP failure block. MTP
-    /// prints no <c>Stack Trace:</c> label, so the trailing run of such lines is the trace. The
-    /// leading whitespace is optional because <see cref="StripActionsTimestamp"/> consumes the
+    /// prints no <c>Stack Trace:</c> label, so the trailing run of such lines is the trace, and an
+    /// <c>--- End of stack trace … ---</c> marker bounds that run when it directly follows a genuine
+    /// frame (<see cref="MtpGenuineStackFrameRegex"/>); this loose shape is also what the trailing scan uses.
+    /// The leading whitespace is optional because <see cref="StripActionsTimestamp"/> consumes the
     /// indentation that follows a GitHub Actions timestamp prefix.
     /// </summary>
     private static readonly Regex MtpStackTraceLineRegex = new(
         @"^\s*at\s+\S",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// <para>
+    /// Matches a GENUINE .NET stack frame: <c>at {Namespace.Type.Method}({parameters})</c> with an
+    /// optional <c>in {file}[:line N]</c> suffix. It is deliberately stricter than
+    /// <see cref="MtpStackTraceLineRegex"/> and is used ONLY to decide whether an end-of-stack-trace
+    /// marker really closes a stack (see <see cref="EndsFrameRun"/>): the loose <c>at {non-space}</c>
+    /// shape also matches assertion prose such as <c>at least two values were expected</c>, so using
+    /// it for that decision would let quoted marker text in an assertion truncate the error. The
+    /// method token must be dot-qualified and contain no whitespace (generic <c>[T]</c>, <c>&lt;&gt;c</c>,
+    /// <c>..ctor</c>, <c>InvokeStub_X.Y</c> and <c>b__0_0</c> shapes all qualify), the parameter list
+    /// must be one balanced <c>(…)</c> pair with no nested parentheses, and nothing but the optional
+    /// <c>in</c> clause may follow it. Prose such as <c>at Foo.Bar(x) was called</c> therefore fails.
+    /// </para>
+    /// <para>
+    /// The ONE unqualified method name accepted is the runtime-generated <c>lambda_method{N}</c> (an
+    /// expression-tree / <c>DynamicMethod</c> frame, printed file-less as
+    /// <c>at lambda_method42(String)</c>; captured from a .NET 10 / xUnit v3 MTP run whose exception
+    /// was rethrown through <c>ExceptionDispatchInfo</c> directly before the end marker). The suffix
+    /// is a NONEMPTY run of ASCII digits <c>[0-9]+</c> — deliberately not <c>\d</c>, which .NET also
+    /// matches against non-ASCII decimal digits, and not <c>*</c>, which would accept a bare
+    /// <c>at lambda_method(0)</c>; both appear as assertion text, and real expression-tree frames
+    /// generated under en-US, ar-EG and fa-IR all carry ASCII suffixes. Any other unqualified call
+    /// such as <c>at offset(0)</c> is still prose.
+    /// </para>
+    /// </summary>
+    private static readonly Regex MtpGenuineStackFrameRegex = new(
+        @"^\s*at\s+(?:(?:[^\s(]*\.)[^\s(]+|lambda_method[0-9]+)\([^()]*\)(?:\s+in\s+(?:.+?:(?:line\s+)?\d+|\S*[./\\]\S*))?\s*$",
         RegexOptions.Compiled);
 
     /// <summary>Matches the <c>Error Message:</c> section header of an xUnit failure block.</summary>
@@ -399,7 +432,11 @@ internal sealed class CiLogStreamParser
 
     /// <summary>
     /// Matches the <c>--- End of stack trace ---</c> marker that terminates a stack-trace
-    /// section in .NET/xUnit output.
+    /// section in .NET output. Both extractors honour it: in a VSTest/xUnit block it closes the
+    /// <c>Stack Trace:</c> section, and in an MTP block — which prints no section labels — it closes
+    /// the trailing run of <c>at …</c> frames when it directly follows one (see
+    /// <see cref="EndsFrameRun"/>), so an assertion that merely quotes the marker text stays in the
+    /// error text.
     /// </summary>
     private static readonly Regex StackTraceEndMarkerRegex = new(
         @"^\s*---\s*End of stack trace",
@@ -1197,20 +1234,38 @@ internal sealed class CiLogStreamParser
     /// <summary>
     /// Extracts one MTP failure block: the trailing run of bare <c>at …</c> frames is the stack
     /// trace and everything before it (after the optional <c>from {dll} (…)</c> line) is the error.
+    /// An end-of-stack-trace marker (<see cref="StackTraceEndMarkerRegex"/>) closes the stack
+    /// section only when it TERMINATES an inferred run of stack frames: the frames before it are the
+    /// trace, while the marker itself and every continuation line after it belong to neither field —
+    /// the same semantics the VSTest extractor applies to the identical marker. A marker-shaped line
+    /// with no frame run above it is assertion text (an assertion that quotes the marker), so it is
+    /// kept in the error text rather than dropping the whole failure.
     /// </summary>
     private bool TryExtractMtpFailure(string testName, long omittedChars)
     {
         var lines = _blockLines;
 
-        // Trailing blank/whitespace-only lines must not stop the backwards stack-frame scan.
-        var bodyEnd = lines.Count;
-        while (bodyEnd > 0 && string.IsNullOrWhiteSpace(lines[bodyEnd - 1]))
-            bodyEnd--;
-
         // Skip MTP's indented "from <dll> (<tfm>|<arch>)" location line when present.
         var bodyStart = 0;
-        if (bodyStart < bodyEnd && MtpFromLineRegex.IsMatch(lines[bodyStart]))
+        if (bodyStart < lines.Count && MtpFromLineRegex.IsMatch(lines[bodyStart]))
             bodyStart++;
+
+        // The end marker terminates the stack section. Without this bound the backwards frame scan
+        // below cannot reach the frames when anything follows them, so the frames and the marker
+        // itself would be reported as error text with no stack trace at all.
+        var bodyEnd = lines.Count;
+        for (var i = bodyStart; i < lines.Count; i++)
+        {
+            if (StackTraceEndMarkerRegex.IsMatch(lines[i]) && EndsFrameRun(lines, bodyStart, i))
+            {
+                bodyEnd = i;
+                break;
+            }
+        }
+
+        // Trailing blank/whitespace-only lines must not stop the backwards stack-frame scan.
+        while (bodyEnd > bodyStart && string.IsNullOrWhiteSpace(lines[bodyEnd - 1]))
+            bodyEnd--;
 
         var stackStart = bodyEnd;
         for (var i = bodyEnd - 1; i >= bodyStart; i--)
@@ -1234,6 +1289,21 @@ internal sealed class CiLogStreamParser
         Emit(testName, error, stackTrace, omittedChars);
         return true;
     }
+
+    /// <summary>
+    /// Whether the line at <paramref name="index"/> terminates a run of stack frames, i.e. the
+    /// immediately preceding line (searched no further back than <paramref name="bodyStart"/>) is a
+    /// GENUINE stack frame (<see cref="MtpGenuineStackFrameRegex"/>), not merely a line that starts
+    /// with <c>at </c>. MTP prints no <c>Stack Trace:</c> label, so real frame structure is the only
+    /// evidence that a marker closes a stack section: an assertion that quotes the marker text — even
+    /// right after prose such as <c>at least two values were expected</c> — has no frame above it
+    /// and must stay in the error text, otherwise the error is truncated at the quoted line.
+    /// </summary>
+    /// <param name="lines">The block's lines.</param>
+    /// <param name="bodyStart">First line of the body (after the optional <c>from …</c> line).</param>
+    /// <param name="index">Index of the candidate marker line.</param>
+    private static bool EndsFrameRun(List<string> lines, int bodyStart, int index) =>
+        index > bodyStart && MtpGenuineStackFrameRegex.IsMatch(lines[index - 1]);
 
     /// <summary>Joins and trims a line range; an empty range yields an empty string.</summary>
     private static string SliceLines(List<string> lines, int start, int end) =>

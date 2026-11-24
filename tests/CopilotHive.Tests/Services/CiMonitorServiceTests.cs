@@ -7783,6 +7783,84 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     /// <summary>
+    /// The user-supplied SANITIZED MTP excerpt (run 43606604223 / job 132482481229) becomes ONE
+    /// named issue whose Error carries the assertion text only and whose Stack Trace carries the
+    /// at-frame — the <c>--- End of stack trace … ---</c> marker and everything after it appear in
+    /// neither field.
+    /// </summary>
+    /// <remarks>
+    /// The log is served as a CRLF, synthetically timestamped raw-Actions body so the regression
+    /// covers the production streaming path end to end. The synthetic prefixes are fixtures, not
+    /// evidence about the original raw log's prefixes; this test is source-level evidence of field
+    /// separation, not an explanation of the original run's zero parsed failures.
+    /// </remarks>
+    [Fact]
+    public async Task MonitorMergeAsync_SuppliedMtpExcerptWithEndMarker_CreatesNamedIssueWithSeparatedFields()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        const string stamp = "2026-01-02T03:04:05.0000000Z ";
+        var log = string.Join("\r\n", SuppliedMtpExcerpt.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(line => stamp + line))
+            + "\r\n";
+
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => log);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: " + SuppliedMtpTheoryName, issue.Title);
+
+        Assert.DoesNotContain("--- End of stack trace", issue.Description, StringComparison.Ordinal);
+
+        // Bound both diagnostic sections with the renderer's delimiters; asserting only that a
+        // line appears somewhere in the issue would not prove it stayed in the correct field.
+        const string errorHeading = "\n\nError: ";
+        const string stackHeading = "\n\nStack Trace:\n";
+        var errorIndex = issue.Description.IndexOf(errorHeading, StringComparison.Ordinal);
+        var stackIndex = issue.Description.IndexOf(stackHeading, StringComparison.Ordinal);
+        var runIndex = issue.Description.IndexOf("\n\nCI run: ", StringComparison.Ordinal);
+        Assert.True(errorIndex >= 0 && stackIndex >= errorIndex + errorHeading.Length
+            && runIndex >= stackIndex + stackHeading.Length,
+            "The issue must render the Error, Stack Trace and CI run sections in order.");
+
+        var errorSection = issue.Description[(errorIndex + errorHeading.Length)..stackIndex];
+        Assert.Equal(
+            "Assert.Contains() Failure: Sub-string not found\n"
+            + "String: \"fa1efcb (Test 2026-11-14 14:57:49 +0000 1) unchang\"···\n"
+            + "Not found: \"fa1efcbb\"",
+            errorSection.Replace("\r\n", "\n", StringComparison.Ordinal));
+
+        var stackSection = issue.Description[(stackIndex + stackHeading.Length)..runIndex];
+        Assert.Equal(
+            "at CopilotHive.Tests.Orchestration.ComposerToolTests.GitRedaction_ActualOutput_RemovesCredentialsAndRetainsGitContent(String tool) in .../ComposerToolTests.GitRedaction.cs:113",
+            stackSection);
+
+        Assert.Equal(EventType.CiFailed, Assert.Single(eventBus.Published).Type);
+    }
+
+    /// <summary>
+    /// The user-supplied SANITIZED, PARTIAL MTP excerpt from CI run 43606604223 / job 132482481229.
+    /// The <c>.../</c> paths and the trailing <c>···</c> are the supplied text's own elisions and are
+    /// reproduced verbatim rather than guessed at.
+    /// </summary>
+    private const string SuppliedMtpTheoryName =
+        "CopilotHive.Tests.Orchestration.ComposerToolTests.GitRedaction_ActualOutput_RemovesCredentialsAndRetainsGitContent(tool: \"blame\")";
+
+    private const string SuppliedMtpExcerpt =
+        "failed " + SuppliedMtpTheoryName + " (36ms)\n"
+        + "  from .../CopilotHive.Tests.dll (net10.0|x64)\n"
+        + "  Assert.Contains() Failure: Sub-string not found\n"
+        + "  String: \"fa1efcb (Test 2026-11-14 14:57:49 +0000 1) unchang\"···\n"
+        + "  Not found: \"fa1efcbb\"\n"
+        + "  at CopilotHive.Tests.Orchestration.ComposerToolTests.GitRedaction_ActualOutput_RemovesCredentialsAndRetainsGitContent(String tool) in .../ComposerToolTests.GitRedaction.cs:113\n"
+        + "  --- End of stack trace from previous location ---\n";
+
+    /// <summary>
     /// The log-fallback issue carries the bounded head+tail excerpt under the NEW label — the old
     /// "Log output (last 500 chars)" label is gone.
     /// </summary>
