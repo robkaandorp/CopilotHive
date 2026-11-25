@@ -18,12 +18,24 @@ namespace CopilotHive.Services;
 /// </para>
 /// <para>
 /// <b>Two span sources, one replacement.</b> Both sources only COLLECT the spans they recognise
-/// in the same unmodified text; the union of all spans is then replaced in a single pass. Neither
+/// in the same text; the union of all spans is then replaced in a single pass. Neither
 /// source ever sees the other's output, so an inventory value that happens to coincide with a
 /// structural recognition marker (the header name <c>Authorization</c>, the assignment name
 /// <c>GITHUB_TOKEN</c>, the prefix <c>ssh://u:</c>) cannot erase the marker and hide the
 /// credential that follows it. Overlapping spans merge into one placeholder; spans that merely
 /// touch keep their own.
+/// </para>
+/// <para>
+/// <b>ANSI SGR decoration is removed, not emulated.</b> Only a COMPLETE SGR sequence —
+/// <c>ESC '['</c>, zero or more ASCII parameter bytes from <c>0-9 : ; &lt; = &gt; ?</c>, and a
+/// final lowercase <c>m</c> (so the bare reset <c>ESC[m</c> qualifies) — is removed. Unsupported
+/// or incomplete escapes, CR, LF, tabs and ordinary text are preserved, and no terminal state is
+/// modelled. Git prints such sequences whenever colour is forced (<c>color.blame=always</c> with
+/// <c>blame.coloring</c>), where they land BETWEEN the characters a structural grammar needs: a
+/// bare reset sits immediately before a <c>git blame</c> content line, so <c>token = …</c> no
+/// longer starts a line and the assignment pass would miss it. Normalization therefore runs
+/// before the URL rewrite and the structural scans, and the inventory is additionally matched on
+/// the RAW and NORMALIZED text (see <see cref="Redact"/>).
 /// </para>
 /// <list type="number">
 ///   <item>
@@ -33,6 +45,9 @@ namespace CopilotHive.Services;
 ///     least <see cref="MinimumInventoryValueLength"/> characters participate: a one- or
 ///     two-character "secret" would match ordinary text everywhere and destroy the output for no
 ///     security benefit. Shorter structural credentials are still removed by the structural source.
+///     The bound is applied to the ORIGINAL value, and an eligible value whose visible spelling
+///     changes once SGR sequences are removed contributes that spelling as a LITERAL-ONLY
+///     addition — never an encoded variant of it, and never an empty spelling.
 ///     </description>
 ///   </item>
 ///   <item>
@@ -176,52 +191,209 @@ public static class GitToolOutputRedactor
         // the "ssh://u:" prefix) the marker was destroyed and the credential that followed it
         // escaped entirely. Running the layers the other way round is no fix: a structural pass
         // would then redact a fraction of an inventory value and the whole-value match would be
-        // lost. Instead every layer only COLLECTS spans against the same unmodified text; the
-        // union is replaced once.
+        // lost. Instead every layer only COLLECTS spans against the same text; the union is
+        // replaced once.
         //
-        // The composed GitUrlRedactor runs first because it is the one pass that rewrites text
+        // ANSI SGR decoration is removed FIRST, because it sits INSIDE the sequences both layers
+        // need. Git emits a bare reset immediately before a coloured blame line's content, so
+        // `token = …` would no longer start a line; and a sequence between a structural marker and
+        // its value (or inside a credential) would break every adjacency the grammar requires.
+        // Only COMPLETE SGR sequences are dropped — see SgrNormalization — so unsupported or
+        // incomplete escapes, CR/LF and tabs reach the layers exactly as before.
+        var sgr = SgrNormalization.Create(text);
+        var normalized = sgr.Text;
+
+        // The composed GitUrlRedactor runs next because it is the one pass that rewrites text
         // rather than reporting spans (it deletes userinfo and token parameters and is not
         // modified here). It must still precede the assignment pass: that pass would otherwise
         // claim `token=abc&ref=topic` inside a URL query and swallow the parameters the URL
-        // grammar keeps. It only DELETES credential text, so it cannot manufacture a marker.
+        // grammar keeps. It only DELETES credential text, so it cannot manufacture a marker. It
+        // runs on the NORMALIZED text (never on the raw text) so a colour sequence inside a URL
+        // cannot hide the credential-bearing component from it.
         //
         // That deletion is destructive for the INVENTORY, though: a known value that CONTAINS a
         // credentialed URL (`https://u:pw@host/r…`) no longer occurs in the rewritten text, and the
-        // rest of it would survive unmatched. So the inventory is matched against the ORIGINAL text
-        // as well and those spans are mapped onto the rewritten text (see CollectOriginalTextSpans).
-        var current = GitUrlRedactor.Redact(text) ?? string.Empty;
+        // rest of it would survive unmatched. So inventory matches are ALSO collected on the
+        // NORMALIZED text and on the RAW text, then mapped onto the rewritten text: raw matches
+        // through the EXACT SGR offset map, and both through the URL rewrite's own alignment.
+        var rewritten = GitUrlRedactor.Redact(normalized) ?? string.Empty;
 
         var spans = new List<(int Start, int End)>();
         var forms = BuildInventoryForms(knownSecrets);
         if (forms.Count > 0)
         {
-            spans.AddRange(CollectInventorySpans(current, forms));
-            if (!string.Equals(current, text, StringComparison.Ordinal))
-                CollectOriginalTextSpans(text, current, forms, spans);
+            // Unchanged: the inventory still matches the text the structural scans see.
+            spans.AddRange(CollectInventorySpans(rewritten, forms));
+            CollectVisibleInventorySpans(normalized, rewritten, text, sgr, forms, spans);
         }
 
-        CollectScpStylePasswordSpans(current, spans);
-        CollectSshUrlPasswordSpans(current, spans);
-        CollectAuthorizationHeaderSpans(current, spans);
-        CollectSecretAssignmentSpans(current, spans);
+        // Structural scans read the REWRITTEN (normalized, URL-redacted) text ONLY. A raw
+        // structural span is never projected: its coordinates describe text that no longer exists,
+        // and a raw assignment span would claim the URL parameters the rewrite deliberately kept.
+        CollectScpStylePasswordSpans(rewritten, spans);
+        CollectSshUrlPasswordSpans(rewritten, spans);
+        CollectAuthorizationHeaderSpans(rewritten, spans);
+        CollectSecretAssignmentSpans(rewritten, spans);
 
         if (spans.Count == 0)
-            return current;
+            return rewritten;
 
         // ReplaceSpans merges in a single ascending sweep; touching spans stay distinct.
         spans.Sort(static (left, right) =>
             left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.End.CompareTo(right.End));
-        return ReplaceSpans(current, spans);
+        return ReplaceSpans(rewritten, spans);
+    }
+
+    // ── ANSI SGR normalization ────────────────────────────────────────────────
+
+    /// <summary>The ESC character that starts every ANSI escape sequence.</summary>
+    private const char EscapeCharacter = '\u001b';
+
+    /// <summary>
+    /// Whether <paramref name="c"/> is an ASCII SGR parameter byte: the CSI parameter bytes
+    /// <c>0-9 : ; &lt; = &gt; ?</c>. Deliberately a closed set: a fullwidth or other Unicode digit
+    /// LOOKALIKE is not a parameter byte, so the sequence containing it is incomplete and survives.
+    /// </summary>
+    private static bool IsSgrParameterByte(char c) =>
+        c is >= '0' and <= '9' or ':' or ';' or '<' or '=' or '>' or '?';
+
+    /// <summary>
+    /// The length of the COMPLETE SGR sequence that starts at <paramref name="index"/>, or 0 when
+    /// no complete sequence starts there.
+    /// </summary>
+    /// <remarks>
+    /// Complete means exactly <c>ESC '['</c>, zero or more <see cref="IsSgrParameterByte"/>
+    /// characters, and a final LOWERCASE <c>m</c> — so the bare reset <c>ESC[m</c> (three
+    /// characters) qualifies, and so does every colour/intensity sequence git emits. Everything
+    /// else returns 0 and is therefore preserved verbatim by the normalizer: a bare ESC, a
+    /// non-<c>'['</c> introducer, a CSI whose final byte is not <c>m</c>, a sequence interrupted by
+    /// a line break, and any parameter byte outside the ASCII set. This is a grammar for ONE
+    /// sequence, never a terminal emulator: no cursor movement, no state, no charset handling.
+    /// </remarks>
+    private static int CompleteSgrLength(string text, int index)
+    {
+        if (index + 1 >= text.Length || text[index] != EscapeCharacter || text[index + 1] != '[')
+            return 0;
+
+        var cursor = index + 2;
+        while (cursor < text.Length && IsSgrParameterByte(text[cursor]))
+            cursor++;
+
+        return cursor < text.Length && text[cursor] == 'm' ? cursor + 1 - index : 0;
+    }
+
+    /// <summary>
+    /// Text with every complete SGR sequence removed, plus the EXACT raw-to-normalized offset map.
+    /// </summary>
+    /// <remarks>
+    /// Deletion is the only operation, so the map needs no alignment machinery and no
+    /// fail-closed guessing: <see cref="Project"/> answers with certainty. The offset array holds,
+    /// at raw index i, the number of KEPT characters that precede i, which makes the surviving
+    /// characters of the raw span <c>[start, end)</c> exactly the contiguous normalized range
+    /// <c>[offset[start], offset[end])</c>.
+    /// </remarks>
+    private sealed class SgrNormalization
+    {
+        private readonly int[]? _offsets;
+
+        private SgrNormalization(string text, int[]? offsets)
+        {
+            Text = text;
+            _offsets = offsets;
+        }
+
+        /// <summary>The normalized text — the SAME instance when nothing was removed.</summary>
+        public string Text { get; }
+
+        /// <summary>Whether any complete SGR sequence was actually removed.</summary>
+        public bool Changed => _offsets is not null;
+
+        /// <summary>Normalizes <paramref name="text"/> and builds its offset map.</summary>
+        public static SgrNormalization Create(string text)
+        {
+            // Fast path: nothing can be removed when there is no ESC at all (reference-identical).
+            if (text.IndexOf(EscapeCharacter) < 0)
+                return new SgrNormalization(text, null);
+
+            var builder = new StringBuilder(text.Length);
+            var offsets = new int[text.Length + 1];
+
+            for (var index = 0; index < text.Length;)
+            {
+                var sgrLength = CompleteSgrLength(text, index);
+                if (sgrLength > 0)
+                {
+                    // Every removed character maps to the count of KEPT characters before it, so a
+                    // span boundary inside the sequence never advances.
+                    for (var skip = index; skip < index + sgrLength; skip++)
+                        offsets[skip] = builder.Length;
+                    index += sgrLength;
+                    continue;
+                }
+
+                offsets[index] = builder.Length;
+                builder.Append(text[index]);
+                index++;
+            }
+
+            offsets[text.Length] = builder.Length;
+
+            return builder.Length == text.Length
+                ? new SgrNormalization(text, null)
+                : new SgrNormalization(builder.ToString(), offsets);
+        }
+
+        /// <summary>
+        /// Projects the raw span <c>[start, end)</c> onto normalized coordinates, or <c>null</c>
+        /// when no character of it survived (the whole span was removed SGR sequences).
+        /// </summary>
+        public (int Start, int End)? Project(int start, int end)
+        {
+            if (!Changed)
+                return (start, end);
+
+            var projectedStart = _offsets![start];
+            var projectedEnd = _offsets[end];
+            return projectedStart == projectedEnd ? null : (projectedStart, projectedEnd);
+        }
+    }
+
+    /// <summary>
+    /// Removes the complete SGR sequences from <paramref name="text"/> without building an offset
+    /// map. Used to derive the VISIBLE spelling of an inventory value; matching uses
+    /// <see cref="SgrNormalization"/> instead.
+    /// </summary>
+    private static string RemoveSgrSequences(string text)
+    {
+        if (text.IndexOf(EscapeCharacter) < 0)
+            return text;
+
+        var builder = new StringBuilder(text.Length);
+        for (var index = 0; index < text.Length;)
+        {
+            var sgrLength = CompleteSgrLength(text, index);
+            if (sgrLength > 0)
+            {
+                index += sgrLength;
+                continue;
+            }
+
+            builder.Append(text[index]);
+            index++;
+        }
+
+        return builder.ToString();
     }
 
     // ── Span source 1: the known-secret inventory ─────────────────────────────
 
     /// <summary>
     /// Builds the matchable forms of every eligible inventory value (raw, one-level percent
-    /// escapes, standard padded / unpadded base64). The spans they match are collected by
-    /// <see cref="CollectInventorySpans"/> against the original text and merged with the
-    /// structural spans, so a secret that CONTAINS another (or an encoded variant that merely
-    /// STARTS with another value) is removed whole whatever order the values arrive in.
+    /// escapes, standard padded / unpadded base64, plus the derived visible spelling). The spans
+    /// they match are collected by <see cref="CollectInventorySpans"/> and
+    /// <see cref="CollectVisibleInventorySpans"/> and merged with the structural spans, so a secret
+    /// that CONTAINS another (or an encoded variant that merely STARTS with another value) is
+    /// removed whole whatever order the values arrive in.
     /// </summary>
     /// <returns>The forms, or an empty list when there is no eligible value.</returns>
     private static List<InventoryForms> BuildInventoryForms(IEnumerable<string?>? knownSecrets)
@@ -239,12 +411,12 @@ public static class GitToolOutputRedactor
                 eligible.Add(candidate);
         }
 
-        // ORDER-INDEPENDENT by construction. Every form of every value is matched against the
-        // ORIGINAL text and the matched spans are merged, so no pass ever sees another pass's
-        // output. Any sequence of per-value replacement passes lets one value's replacement
-        // destroy a prefix of a DIFFERENT value's longer (encoded) variant and strand its tail,
-        // whatever order it runs in: sorting by raw length, running base64 first, or re-scanning
-        // only moves WHICH pair of values collides.
+        // ORDER-INDEPENDENT by construction. Every form of every value is matched against the SAME
+        // text (and, for raw and normalized text, projected onto it) and the matched spans are
+        // merged, so no pass ever sees another pass's output. Any sequence of per-value replacement
+        // passes lets one value's replacement destroy a prefix of a DIFFERENT value's longer
+        // (encoded) variant and strand its tail, whatever order it runs in: sorting by raw length,
+        // running base64 first, or re-scanning only moves WHICH pair of values collides.
         forms.AddRange(eligible.Select(static secret => new InventoryForms(secret)));
         return forms;
     }
@@ -253,6 +425,15 @@ public static class GitToolOutputRedactor
     /// The matchable forms of one inventory value: its raw text, its one-level percent-encoded
     /// readings, and its standard padded / unpadded base64.
     /// </summary>
+    /// <remarks>
+    /// The value's VISIBLE spelling — what survives removing its complete SGR sequences — is
+    /// carried as a separate LITERAL-ONLY form. It is deliberately not a second inventory value:
+    /// percent and base64 spellings of it are never derived, because the raw value is what the
+    /// caller's inventory holds and only that value's own encodings are known shapes. The visible
+    /// spelling may be SHORTER than <see cref="MinimumInventoryValueLength"/> and still matches: the
+    /// bound is decided on the ORIGINAL value, which was eligible, so dropping its visible spelling
+    /// would leak exactly the characters the decoration was hiding.
+    /// </remarks>
     private sealed class InventoryForms(string secret)
     {
         /// <summary>The raw value (also the form the percent-aware matcher starts from).</summary>
@@ -264,11 +445,22 @@ public static class GitToolOutputRedactor
         /// <summary>The padded and, when different, unpadded standard-base64 spellings.</summary>
         public IReadOnlyList<string> Base64 { get; } = StandardBase64Forms(secret);
 
+        /// <summary>
+        /// The value's spelling once its complete SGR sequences are removed, or <c>null</c> when
+        /// that spelling is unchanged (nothing extra to match) or empty (an empty derived spelling
+        /// must never match everywhere).
+        /// </summary>
+        public string? Visible { get; } = DerivedVisibleSpelling(secret);
+
         private CharMembership? _rawChars;
+        private CharMembership? _visibleChars;
         private CharMembership?[]? _base64Chars;
 
         /// <summary>Exactly the characters of the raw value (O(length), built once, on first use).</summary>
         public CharMembership RawChars => _rawChars ??= CharMembership.Of(Secret);
+
+        /// <summary>Exactly the characters of the visible spelling, or <see cref="RawChars"/> when there is none.</summary>
+        public CharMembership VisibleChars => Visible is null ? RawChars : _visibleChars ??= CharMembership.Of(Visible);
 
         /// <summary>Exactly the characters of the base64 spelling at <paramref name="index"/>.</summary>
         public CharMembership Base64Chars(int index)
@@ -278,8 +470,35 @@ public static class GitToolOutputRedactor
         }
     }
 
+    /// <summary>
+    /// The visible spelling of <paramref name="value"/> — its complete SGR sequences removed — or
+    /// <c>null</c> when removing them changes nothing or leaves nothing.
+    /// </summary>
+    private static string? DerivedVisibleSpelling(string value)
+    {
+        var visible = RemoveSgrSequences(value);
+        return visible.Length == 0 || string.Equals(visible, value, StringComparison.Ordinal) ? null : visible;
+    }
+
     /// <summary>The form of an inventory value that produced a match, and the extent it matched.</summary>
-    private readonly record struct InventoryMatch(int Start, int End, InventoryForms Form, int Base64Index, bool Escaped);
+    private readonly record struct InventoryMatch(
+        int Start, int End, InventoryForms Form, int Base64Index, bool Escaped, bool Visible);
+
+    /// <summary>
+    /// Exactly the characters of the concrete text <paramref name="match"/> covers, in the
+    /// coordinate space of <paramref name="text"/>.
+    /// </summary>
+    /// <remarks>
+    /// A derived-visible match covers exactly the visible spelling's characters. A percent match
+    /// covers exactly the characters of its genuine readings (see <see cref="PercentMatchChars"/>;
+    /// that question is answered in the SAME text the match was found in). A base64 or raw match
+    /// covers its form's characters.
+    /// </remarks>
+    private static CharMembership MatchChars(string text, InventoryMatch match) =>
+        match.Visible ? match.Form.VisibleChars
+        : match.Escaped ? PercentMatchChars(text, match)
+        : match.Base64Index >= 0 ? match.Form.Base64Chars(match.Base64Index)
+        : match.Form.RawChars;
 
     /// <summary>
     /// An EXACT set of characters. "Does this value contain character c?" is a property of the value
@@ -343,13 +562,22 @@ public static class GitToolOutputRedactor
             foreach (var form in forms)
             {
                 if (text.AsSpan(index).StartsWith(form.Secret, StringComparison.Ordinal))
-                    matches.Add(new InventoryMatch(index, index + form.Secret.Length, form, -1, false));
+                    matches.Add(new InventoryMatch(index, index + form.Secret.Length, form, -1, false, false));
+
+                // The derived VISIBLE spelling is matched as LITERALLY as the raw value is — no
+                // percent reading, no base64 variant — because it is not a value the caller holds,
+                // only the readable residue of one.
+                if (form.Visible is { } visible
+                    && text.AsSpan(index).StartsWith(visible, StringComparison.Ordinal))
+                {
+                    matches.Add(new InventoryMatch(index, index + visible.Length, form, -1, false, true));
+                }
 
                 for (var b = 0; b < form.Base64.Count; b++)
                 {
                     var encoded = form.Base64[b];
                     if (text.AsSpan(index).StartsWith(encoded, StringComparison.Ordinal))
-                        matches.Add(new InventoryMatch(index, index + encoded.Length, form, b, false));
+                        matches.Add(new InventoryMatch(index, index + encoded.Length, form, b, false, false));
                 }
 
                 // Fast path: only a literal first character or a leading escape can start a match.
@@ -360,7 +588,7 @@ public static class GitToolOutputRedactor
                     // A match with no escape in it is the raw value itself and holds exactly its characters.
                     var literal = percentEnd - index == form.Secret.Length
                         && text.AsSpan(index, percentEnd - index).SequenceEqual(form.Secret);
-                    matches.Add(new InventoryMatch(index, percentEnd, form, -1, !literal));
+                    matches.Add(new InventoryMatch(index, percentEnd, form, -1, !literal, false));
                 }
             }
         }
@@ -369,45 +597,120 @@ public static class GitToolOutputRedactor
     }
 
     /// <summary>
-    /// Matches the inventory against the ORIGINAL text and adds the matches, mapped onto the
-    /// URL-rewritten text, to <paramref name="spans"/>.
+    /// Collects, on the RAW and NORMALIZED texts, the inventory matches and projects them into
+    /// <paramref name="rewritten"/> coordinates — the text the structural scans read.
     /// </summary>
+    /// <param name="normalized">The text after complete SGR sequences were removed.</param>
+    /// <param name="rewritten"><paramref name="normalized"/> after the HTTP URL rewrite — the text the spans live in.</param>
+    /// <param name="raw">The caller's original text.</param>
+    /// <param name="sgr">The normalization that produced <paramref name="normalized"/>.</param>
+    /// <param name="forms">The inventory forms.</param>
+    /// <param name="spans">The span union, in <paramref name="rewritten"/> coordinates.</param>
     /// <remarks>
     /// <para>
-    /// <see cref="GitUrlRedactor"/> only DELETES characters (userinfo, token parameters, fragments,
-    /// dangling delimiters), so the rewritten text is a subsequence of the original and every kept
-    /// character has a position in it. A match that lies wholly in deleted text maps to nothing — the
-    /// rewrite has already removed it, exactly as before. A match that reaches KEPT characters (a
-    /// known value that contains the whole URL, or only its host and path) maps to those characters,
-    /// so the union with the other spans removes the value whole instead of leaving a tail.
+    /// <b>Why the raw text is still needed.</b> Removing SGR sequences is exactly what makes
+    /// <c>%41BCD</c> out of <c>%41B</c> + <c>ESC[31m</c> + <c>CD</c>, and that is not a literal
+    /// match for <c>ABCD</c>: a decorated one-level escape would be stranded. So every form is
+    /// matched against the raw text too and each match is projected through the EXACT offset map —
+    /// no alignment, no ambiguity and no fail-closed guesswork, because normalization only deletes
+    /// characters, so a raw span's survivors are always one contiguous normalized range. A match
+    /// the deletion consumed entirely projects to nothing and is dropped.
     /// </para>
     /// <para>
-    /// Where mapping cannot decide which of several equal characters the rewrite kept, it fails
-    /// TOWARD coverage of the known value — never toward a dropped byte of it — but only where a
-    /// matching character really lies inside the known value's extent, so ordinary text elsewhere is
-    /// not redacted by ambiguity alone; see <see cref="UrlRewriteAlignment"/>.
+    /// <b>Why the normalized text is also needed.</b> The inventory itself may hold the decoration
+    /// (<c>AB ESC[31m CD</c>), so the literal the caller holds is only findable once the sequence is
+    /// gone; its match is projected through the URL rewrite's alignment, exactly like a raw match,
+    /// because that rewrite can delete part of a value overlapping a credentialed URL.
+    /// </para>
+    /// <para>
+    /// <b>URL alignment.</b> <see cref="GitUrlRedactor"/> only DELETES characters (userinfo, token
+    /// parameters, fragments, dangling delimiters), so the rewritten text is a subsequence and every
+    /// kept character has a position in it. A match lying wholly in deleted text maps to nothing —
+    /// the rewrite has already removed it, exactly as before. A match reaching KEPT characters (a
+    /// known value containing the whole URL, or only its host and path) maps to those characters, so
+    /// the union removes the value whole instead of leaving a tail. Where mapping cannot decide which
+    /// of several equal characters the rewrite kept it fails TOWARD coverage of the known value — but
+    /// only where a matching character really lies inside the known value's extent, so ordinary text
+    /// elsewhere is not redacted by ambiguity alone; see <see cref="UrlRewriteAlignment"/>.
     /// </para>
     /// </remarks>
-    private static void CollectOriginalTextSpans(
-        string original, string rewritten, List<InventoryForms> forms, List<(int Start, int End)> spans)
+    private static void CollectVisibleInventorySpans(
+        string normalized,
+        string rewritten,
+        string raw,
+        SgrNormalization sgr,
+        List<InventoryForms> forms,
+        List<(int Start, int End)> spans)
     {
-        var originalMatches = CollectInventoryMatches(original, forms);
-        if (originalMatches.Count == 0)
+        var urlRewrite = !string.Equals(normalized, rewritten, StringComparison.Ordinal);
+
+        // Nothing differs from the text already scanned above: every form was matched there.
+        if (!sgr.Changed && !urlRewrite)
             return;
 
-        // Unreachable for a deletion-only rewrite; if it ever failed the spans collected on the
-        // rewritten text above remain the (pre-existing) behaviour.
-        if (UrlRewriteAlignment.Create(original, rewritten) is not { } alignment)
-            return;
+        // The URL alignment is the expensive part (it scans and probes the whole text), so it is
+        // created LAZILY — only when the first non-empty pre-rewrite inventory span actually needs
+        // it — and at MOST ONCE: the normalized and the raw-projected sources share one attempt,
+        // including a failed one. An unrelated inventory value, which matches nothing, never pays.
+        var alignmentAttempted = false;
+        UrlRewriteAlignment? alignment = null;
 
-        foreach (var match in originalMatches)
+        // Maps a span in normalized coordinates into rewritten coordinates. Returns false when the
+        // rewrite happened but could not be aligned, in which case NO projection may be added at
+        // all: a normalized span would describe text that no longer exists at those coordinates.
+        // The spans collected on the rewritten text itself remain the (pre-existing) behaviour.
+        bool TryProject(int start, int end, string foundIn, InventoryMatch match, out (int Start, int End)? mapped)
         {
-            var chars = match.Escaped ? PercentMatchChars(original, match)
-                : match.Base64Index >= 0 ? match.Form.Base64Chars(match.Base64Index)
-                : match.Form.RawChars;
+            mapped = null;
+            if (!urlRewrite)
+            {
+                mapped = (start, end);
+                return true;
+            }
 
-            if (alignment.Map(match.Start, match.End, chars) is { } mapped)
-                spans.Add(mapped);
+            if (!alignmentAttempted)
+            {
+                alignmentAttempted = true;
+                alignment = UrlRewriteAlignment.Create(normalized, rewritten);
+            }
+
+            if (alignment is null)
+                return false;
+
+            mapped = alignment.Map(start, end, MatchChars(foundIn, match));
+            return true;
+        }
+
+        // Normalized matches: when the URL rewrite changed nothing, `normalized` IS `rewritten`, and
+        // every form was already matched against it by the caller — collecting again would only
+        // duplicate those spans.
+        if (urlRewrite)
+        {
+            foreach (var match in CollectInventoryMatches(normalized, forms))
+            {
+                if (!TryProject(match.Start, match.End, normalized, match, out var mapped))
+                    return;
+                if (mapped is { } span)
+                    spans.Add(span);
+            }
+        }
+
+        // Raw matches: only normalization can differ between raw and normalized text, so they are
+        // collected only when it actually removed something.
+        if (!sgr.Changed)
+            return;
+
+        // A match whose whole extent was SGR sequences projects to nothing and is dropped before
+        // it can request an alignment.
+        foreach (var match in CollectInventoryMatches(raw, forms))
+        {
+            if (sgr.Project(match.Start, match.End) is not { } projected)
+                continue;
+
+            if (!TryProject(projected.Start, projected.End, raw, match, out var mapped))
+                return;
+            if (mapped is { } span)
+                spans.Add(span);
         }
     }
 
@@ -424,14 +727,21 @@ public static class GitToolOutputRedactor
     /// escaped <c>%</c> or a literal <c>%</c> followed by text. Every genuine reading starts at the
     /// same index, so each reading's span is a PREFIX of the longest one, and the union of their
     /// characters is exactly the characters of the longest genuine reading. Membership is therefore
-    /// "is the character in <c>original[start..longestEnd)</c>", exact over the readings that can
+    /// "is the character in <c>text[start..longestEnd)</c>", exact over the readings that can
     /// actually occur. An earlier version used the raw value's characters plus the whole hex alphabet,
     /// which answered "could ANY spelling contain it?" and so licensed coverage of an ordinary host
     /// character (<c>a</c>–<c>f</c>, <c>0</c>–<c>9</c>, …) the real spelling does not contain.
     /// </para>
+    /// <para>
+    /// The answer is relative to the text the match was FOUND in — <c>raw</c> or normalized — so a
+    /// caller projecting a raw match must ask this question of the raw text, before the SGR offset
+    /// map, because that is the text the readings were enumerated in.
+    /// </para>
     /// </remarks>
-    private static CharMembership PercentMatchChars(string original, InventoryMatch match) =>
-        CharMembership.OfSpan(original, match.Start, LongestPercentReadingEnd(original, match.Start, match.Form.Secret, match.End));
+    /// <param name="text">The text the match was found in.</param>
+    /// <param name="match">The percent-form match.</param>
+    private static CharMembership PercentMatchChars(string text, InventoryMatch match) =>
+        CharMembership.OfSpan(text, match.Start, LongestPercentReadingEnd(text, match.Start, match.Form.Secret, match.End));
 
     /// <summary>
     /// The longest end of a COMPLETED genuine reading, when the enumeration ran out of budget.
