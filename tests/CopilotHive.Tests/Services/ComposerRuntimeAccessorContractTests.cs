@@ -42,9 +42,78 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
     private readonly FacadeAuthorizationHarness _auth = new();
     private readonly CopilotHiveDbContext _goalDb = CopilotHiveDbContext.CreateInMemory();
     private readonly string _dir = Path.Combine(Path.GetTempPath(), $"composer-accessor-contract-{Guid.NewGuid():N}");
-    private readonly List<ServiceProvider> _providers = [];
-    private readonly List<ComposerRuntimeManager> _managers = [];
-    private readonly List<Task> _requests = [];
+    // OUTER FIXTURE OWNERSHIP. Every Build() creates one GROUP (provider + manager) and every
+    // Acquire/Connect registers its request against the group whose accessor it used, so teardown knows
+    // which resources a still-pending request depends on. Admission is closed by DisposeAsync.
+    private readonly object _lifecycleGate = new();
+    private readonly List<FixtureGroup> _groups = [];
+    private readonly Dictionary<ComposerRuntimeAccessor, FixtureGroup> _groupOf = [];
+    private readonly List<string> _cleanupLog = [];
+    private readonly List<Exception> _deferredFailures = [];
+    private bool _requestsClosed;
+    private bool _disposeStarted;
+    private TaskCompletionSource _cleanupChanged = NewSignal();
+
+    private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Func<string, TimeProvider> OuterClockForStep { get; init; } = _ => TimeProvider.System;
+
+    /// <summary>
+    /// Test-only observation point on the REAL deadline continuation: invoked after a step's own deadline
+    /// has won and before that step's outcome is classified. A test can hold it to let the work settle
+    /// first. Null is inert in production use of the fixture; a throwing hook never changes teardown.
+    /// </summary>
+    private Func<string, Task, Task>? OnDeadlineWon { get; init; }
+    private static readonly TimeSpan ProbeGuard = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Bound for EVERY outer teardown wait (request joins, manager shutdown, provider disposal, deferred
+    /// steps). It is independent of the scenario/test cancellation token, which never reaches teardown.
+    /// </summary>
+    private TimeSpan OuterJoinTimeout { get; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Completes when every cleanup step the bounded <see cref="DisposeAsync"/> had to DEFER (because
+    /// unfinished work still depended on it) has run. <see cref="Task.CompletedTask"/> when nothing was
+    /// deferred. Observed by the regression; never awaited by xUnit.
+    /// </summary>
+    internal Task DeferredCleanup { get; private set; } = Task.CompletedTask;
+
+    /// <summary>Ordered evidence of every teardown step attempted, deferred, timed out or completed.</summary>
+    internal IReadOnlyList<string> CleanupLog
+    {
+        get { lock (_lifecycleGate) return [.. _cleanupLog]; }
+    }
+
+    /// <summary>Faults of the deferred (post-quiescence) cleanup, surfaced for observation.</summary>
+    internal IReadOnlyList<Exception> DeferredFailures
+    {
+        get { lock (_lifecycleGate) return [.. _deferredFailures]; }
+    }
+
+    private sealed class FixtureGroup(string name, ServiceProvider provider, ComposerRuntimeManager manager)
+    {
+        internal string Name { get; } = name;
+        internal ServiceProvider Provider { get; } = provider;
+        internal ComposerRuntimeManager Manager { get; } = manager;
+        internal List<Task> Requests { get; } = [];
+        internal List<Task> Unfinished { get; } = [];
+        // The ORIGINAL requests whose outer join timed out. Unfinished holds only the observation
+        // continuation (which completes successfully even when the request faults), so the request
+        // itself is retained here to report a LATE fault exactly once after it settles.
+        internal List<Task> LateRequests { get; } = [];
+        internal Task? Shutdown { get; set; }
+        internal Task? Disposal { get; set; }
+    }
+
+    private void Log(string entry)
+    {
+        lock (_lifecycleGate)
+        {
+            _cleanupLog.Add(entry);
+            _cleanupChanged.TrySetResult();
+            _cleanupChanged = NewSignal();
+        }
+    }
 
     private HivePrincipalResolver _resolver = null!;
     private HivePolicy _policy = null!;
@@ -231,7 +300,10 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
 
         var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
         var stale = Acquire(accessor, gate.Task);
-        try
+        var work = new CircuitObservationTestWork(ParkedJoinTimeout);
+        work.ReleaseBeforeJoin(() => gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
         {
             Assert.False(stale.IsCompleted);
             // Another call establishes A and then observes the sign-out while the stale task is parked.
@@ -251,12 +323,7 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
             AssertDenied(await Acquire(accessor, (Task<AuthenticationState>?)null));
             AssertDenied(await ConnectCircuit(accessor, CircuitState(OriginalId)));
             Assert.Equal(new[] { _originalId }, ManagerEntries(manager)); // only pre-sign-out runtime exists
-        }
-        finally
-        {
-            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
-            await stale;
-        }
+        });
     }
 
     /// <summary>
@@ -522,6 +589,9 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
         Assert.Equal(ComposerRuntimeStatus.Refused, access.Status);
     }
 
+    /// <summary>Bounded, cancellation-INDEPENDENT join budget for releasing/joining parked operations.</summary>
+    private static readonly TimeSpan ParkedJoinTimeout = TimeSpan.FromSeconds(15);
+
     [Theory]
     [InlineData("demoted")]
     [InlineData("disabled")]
@@ -634,6 +704,965 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
         }
     }
 
+    // ── Stale acquisitions: capability authorization and the Composer circuit path ──────────────
+
+    /// <summary>
+    /// A SUPERSEDED CAPABILITY QUESTION IS DENIED, WHILE THE CURRENT TASK STILL AUTHORIZES. The exact
+    /// older task is held while a newer one is registered; the older task is released carrying the
+    /// ADMIN account. Because it is superseded it forwards no claims, so the capability question denies
+    /// — and the healthiest possible identity on the stale task cannot change that. The CURRENT task is
+    /// then released and really answers <c>true</c>, and the accessor still resolves the admin.
+    /// </summary>
+    [Fact]
+    public async Task StaleCapabilityQuestion_Denies_WhileTheCurrentTaskStillAuthorizes()
+    {
+        var circuit = NewCircuitAccessor();
+        Assert.True(await ComponentActingUser.IsAllowedAsync(
+            CircuitState(OriginalId), circuit, HiveCapability.InteractiveMember, Ct));
+        Assert.Equal(OriginalId, (await circuit.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+
+        var olderGate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newerGate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = ComponentActingUser.IsAllowedAsync(
+            olderGate.Task, circuit, HiveCapability.InteractiveMember, Ct).AsTask();
+        var current = ComponentActingUser.IsAllowedAsync(
+            newerGate.Task, circuit, HiveCapability.InteractiveMember, Ct).AsTask();
+        var work = new CircuitObservationTestWork(ParkedJoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        work.ReleaseBeforeJoin(() => newerGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        _ = work.Track(stale);
+        _ = work.Track(current);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(stale.IsCompleted);
+            Assert.False(current.IsCompleted);
+
+            // THE OLDER, HEALTHY IDENTITY COMPLETES WHILE THE NEWER IS STILL PENDING: denied.
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            Assert.False(await stale.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.Initialized, circuit.IdentityState);
+            Assert.Equal(OriginalId, (await circuit.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+
+            // THE CURRENT TASK REALLY AUTHORIZES — the denial above was supersession, not a broken path.
+            newerGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            Assert.True(await current.WaitAsync(Ct));
+            Assert.True(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+        });
+    }
+
+    /// <summary>
+    /// A SUPERSEDED CAPABILITY QUESTION IS DENIED EVEN AFTER THE NEWER TASK ALREADY WON — so the rule
+    /// does not depend on the newer task still being in flight.
+    /// </summary>
+    [Fact]
+    public async Task StaleCapabilityQuestion_AfterTheNewerTaskWon_StillDenies()
+    {
+        var circuit = NewCircuitAccessor();
+        Assert.True(await ComponentActingUser.IsAllowedAsync(
+            CircuitState(OriginalId), circuit, HiveCapability.InteractiveMember, Ct));
+
+        var olderGate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = ComponentActingUser.IsAllowedAsync(
+            olderGate.Task, circuit, HiveCapability.InteractiveMember, Ct).AsTask();
+        var work = new CircuitObservationTestWork(ParkedJoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
+        {
+            Assert.True(await ComponentActingUser.IsAllowedAsync(
+                CircuitState(OriginalId), circuit, HiveCapability.InteractiveMember, Ct));
+
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            Assert.False(await stale.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.Initialized, circuit.IdentityState);
+            Assert.True(await circuit.IsAllowedAsync(HiveCapability.InteractiveMember, Ct));
+        });
+    }
+
+    /// <summary>
+    /// A SUPERSEDED COMPOSER CIRCUIT ACQUIRE NEVER REACHES THE RUNTIME PATH, WHILE THE CURRENT TASK DOES.
+    /// <para>
+    /// <see cref="ComposerRuntimeAccessor.AcquireForCircuitAsync"/> inherits the shared ordering fix
+    /// without any caller change: the stale task is superseded, so the identity it would have carried is
+    /// never forwarded, no runtime is created for it, and the manager's entry table stays EMPTY for it. A
+    /// stale call that passes <c>null</c> downstream and receives <c>Forbidden</c> is the CORRECT outcome
+    /// — zero Composer calls is not required. The CURRENT task then really connects a runtime, so the
+    /// stale denial is discriminating rather than a broken path.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task StaleComposerCircuitAcquire_IsDeniedWithoutARuntime_AndTheCurrentTaskReachesTheRuntime()
+    {
+        var circuit = NewCircuitAccessor();
+        var (manager, accessor) = Build(officialProvider: "ollama-local", circuit);
+
+        var olderGate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = Acquire(accessor, olderGate.Task);
+        var work = new CircuitObservationTestWork(ParkedJoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(stale.IsCompleted);
+
+            // The NEWER registration supersedes the older one immediately. It is the CURRENT task.
+            var current = await Acquire(accessor, CircuitState(OriginalId));
+            Assert.True(current.IsAuthorized, "the current circuit task must reach the runtime path");
+            Assert.NotNull(current.Runtime);
+            Assert.Equal(_originalId, current.Runtime!.State.UserId);
+            Assert.False(circuit.IsInvalidated);
+
+            // THE SUPERSEDED ACQUIRE COMPLETES WITH THE HEALTHY ADMIN IDENTITY: still denied, no runtime.
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            AssertDenied(await stale.WaitAsync(Ct));
+            Assert.Equal(new[] { _originalId }, ManagerEntries(manager));
+            Assert.Equal(CircuitIdentityState.Initialized, circuit.IdentityState);
+            Assert.Equal(OriginalId, (await circuit.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        });
+    }
+
+    /// <summary>
+    /// A SUPERSEDED COMPOSER CIRCUIT CONNECT IS DENIED AND CONNECTS NOTHING, WHILE THE CURRENT TASK
+    /// CONNECTS THE RUNTIME it created. The runtime's <see cref="ComposerUserRuntime.Composer"/> is the
+    /// REAL object the manager owns: a stale connect that had reached the manager would have flipped its
+    /// <c>Composer.IsConnected</c> flag, so that flag is the positive control.
+    /// </summary>
+    [Fact]
+    public async Task StaleComposerCircuitConnect_IsDeniedAndConnectsNothing_AndTheCurrentTaskConnects()
+    {
+        var circuit = NewCircuitAccessor();
+        var (_, accessor) = Build(officialProvider: "ollama-local", circuit);
+
+        // A runtime exists for the account, created through the CURRENT circuit task.
+        var acquired = await Acquire(accessor, CircuitState(OriginalId));
+        Assert.True(acquired.IsAuthorized);
+        Assert.NotNull(acquired.Runtime);
+
+        var olderGate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stale = ConnectCircuit(accessor, olderGate.Task);
+        var work = new CircuitObservationTestWork(ParkedJoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(stale.IsCompleted);
+
+            // THE NEWER REGISTRATION is current and really connects the runtime.
+            var connected = await ConnectCircuit(accessor, CircuitState(OriginalId));
+            Assert.True(connected.IsAuthorized);
+            Assert.Same(acquired.Runtime, connected.Runtime);
+            Assert.True(connected.Runtime!.Composer.IsConnected);
+
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId)));
+            AssertDenied(await stale.WaitAsync(Ct));
+
+            // The stale connect changed nothing: the runtime is still the one the current call connected.
+            Assert.Same(acquired.Runtime, connected.Runtime);
+            Assert.True(acquired.Runtime!.Composer.IsConnected);
+            Assert.Equal(CircuitIdentityState.Initialized, circuit.IdentityState);
+        });
+    }
+
+    [Fact]
+    public async Task ComposerCleanup_CanceledScenarioAndFirstJoinFault_StillReleasesAndJoinsSecondAcquire()
+    {
+        var (_, accessor) = Build(officialProvider: "ollama-local", NewCircuitAccessor());
+        var work = new CircuitObservationTestWork(ParkedJoinTimeout);
+        var first = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var second = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFault = new InvalidOperationException("first acquire failed during cleanup");
+        var lastFault = new InvalidOperationException("last join was attempted");
+        using var scenario = new CancellationTokenSource();
+        var primary = new InvalidOperationException("primary assertion failure");
+        work.ReleaseBeforeJoin(() => first.TrySetException(firstFault));
+        work.ReleaseBeforeJoin(() => second.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId))));
+        var firstAcquire = work.Track(Acquire(accessor, first.Task));
+        var secondAcquire = work.Track(Acquire(accessor, second.Task));
+        _ = work.Track(Task.FromException(lastFault));
+
+        var error = await Assert.ThrowsAsync<AggregateException>(() => work.RunAsync(async () =>
+        {
+            Assert.False(firstAcquire.IsCompleted);
+            Assert.False(secondAcquire.IsCompleted);
+            scenario.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => secondAcquire.WaitAsync(scenario.Token));
+            throw primary;
+        }));
+
+        Assert.Collection(error.InnerExceptions, ex => Assert.Same(primary, ex),
+            ex => Assert.Same(firstFault, ex), ex => Assert.Same(lastFault, ex));
+        Assert.True(secondAcquire.IsCompletedSuccessfully);
+        Assert.True((await secondAcquire).IsAuthorized);
+    }
+
+    // ── OUTER FIXTURE TEARDOWN (the exact DisposeAsync path xUnit invokes) ─────────────────────
+
+    /// <summary>The provider of the group <paramref name="accessor"/> was built in (test-support).</summary>
+    private ServiceProvider ProviderOf(ComposerRuntimeAccessor accessor)
+    {
+        lock (_lifecycleGate) return _groupOf[accessor].Provider;
+    }
+
+    private static bool IsDisposed(ServiceProvider provider)
+    {
+        try { _ = provider.GetRequiredService<HivePolicy>(); return false; }
+        catch (ObjectDisposedException) { return true; }
+    }
+
+    private static bool IsDisposed(CopilotHiveDbContext db)
+    {
+        try { _ = db.Model; return false; }
+        catch (ObjectDisposedException) { return true; }
+    }
+
+    private static Task<T> Bounded<T>(Task<T> task) => task.WaitAsync(ProbeGuard, CancellationToken.None);
+
+    private sealed class ProviderDisposalProbe(Exception? failure = null, Action? onEnter = null) : IAsyncDisposable
+    {
+        internal TaskCompletionSource Entered { get; } = NewSignal();
+        internal TaskCompletionSource Release { get; } = NewSignal();
+        internal int Calls;
+        internal bool Exited { get; private set; }
+
+        public async ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref Calls);
+            onEnter?.Invoke();
+            Entered.TrySetResult();
+            await Release.Task;
+            Exited = true;
+            if (failure is not null) throw failure;
+        }
+    }
+
+    private sealed class ManagerShutdownProbe
+    {
+        internal TaskCompletionSource Entered { get; } = NewSignal();
+        internal TaskCompletionSource Release { get; } = NewSignal();
+
+        // The real manager invokes this on its teardown worker, before it can retire the entry.
+        internal void HoldJoin(int _, Task __)
+        {
+            Entered.TrySetResult();
+            Release.Task.WaitAsync(TimeSpan.FromSeconds(45), CancellationToken.None).GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>The actual task observed by the held deadline handler, not merely a stage-entry signal.</summary>
+    private sealed class DeadlineHold
+    {
+        internal TaskCompletionSource<Task> Held { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource Release { get; } = NewSignal();
+    }
+
+    private sealed class OuterDisposalScenario
+    {
+        private readonly CircuitObservationTestWork _owner = new(ProbeGuard);
+        private AggregateException? _observedOuter;
+        private IReadOnlyList<Exception> _observedDeferred = [];
+        private Task? _outer;
+        // Separate clocks prevent an earlier stage's timer from satisfying the next rendezvous.
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ControlledTimeProvider> _clocks = new();
+        private ControlledTimeProvider ClockFor(string step) => _clocks.GetOrAdd(step, _ => new());
+        internal ComposerRuntimeAccessorContractTests Fixture { get; }
+
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DeadlineHold> _holds = new();
+
+        internal OuterDisposalScenario() => Fixture = new() { OuterClockForStep = ClockFor, OnDeadlineWon = HoldAsync };
+
+        /// <summary>Holds the REAL deadline continuation of <paramref name="step"/>; the rescue always releases it.</summary>
+        internal DeadlineHold HoldDeadline(string step)
+        {
+            var hold = new DeadlineHold();
+            _holds[step] = hold;
+            RescueWith(() => hold.Release.TrySetResult());
+            return hold;
+        }
+
+        private async Task HoldAsync(string step, Task work)
+        {
+            if (!_holds.TryGetValue(step, out var hold)) return;
+            hold.Held.TrySetResult(work);
+            await hold.Release.Task.WaitAsync(TimeSpan.FromSeconds(45), CancellationToken.None);
+        }
+        internal T Track<T>(T task) where T : Task => _owner.Track(task);
+        internal void RescueWith(Action release) => _owner.ReleaseBeforeJoin(release);
+        internal Task Begin() => _outer ??= ((IAsyncDisposable)Fixture).DisposeAsync().AsTask();
+
+        /// <summary>Rendezvous on the fixture arming its own bounded wait for <paramref name="step"/>, WITHOUT advancing the clock.</summary>
+        internal async Task WaitArmedAsync(string step)
+        {
+            try { await ClockFor(step).WaitForPendingTimerAsync(Fixture.OuterJoinTimeout, CancellationToken.None); }
+            catch (TimeoutException) { Assert.Fail($"{step}: the fixture must arm its own bounded wait."); }
+        }
+
+        internal async Task ExpireAsync(string step)
+        {
+            var clock = ClockFor(step);
+            try { await clock.WaitForPendingTimerAsync(Fixture.OuterJoinTimeout, CancellationToken.None); }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"{step}: the fixture must arm its own bounded wait before rescue.");
+            }
+            clock.Advance(Fixture.OuterJoinTimeout);
+        }
+
+        internal async Task<Task> ExpireAndIdentifyAsync(string step, DeadlineHold hold, Func<Task?> owned)
+        {
+            await ExpireAsync(step);
+            // Timer arming/advancement is only a trigger. The real winner branch publishes the task
+            // it was waiting on, after the fixture has assigned the group's Shutdown or Disposal.
+            var work = await Bounded(hold.Held.Task);
+            Assert.Same(Assert.IsAssignableFrom<Task>(owned()), work);
+            Assert.False(work.IsCompleted, $"{step}: the actual owned operation must still be pending after its deadline wins");
+            Assert.False(hold.Release.Task.IsCompleted, $"{step}: the deadline handler must still be held");
+            return work;
+        }
+
+        internal async Task ExpectTimeoutAsync(string step)
+        {
+            var error = await Assert.ThrowsAsync<AggregateException>(() => Begin().WaitAsync(ProbeGuard, CancellationToken.None));
+            _observedOuter = error;
+            var named = Assert.IsType<TimeoutException>(Assert.Single(error.InnerExceptions));
+            Assert.Contains($"'{step}'", named.Message, StringComparison.Ordinal);
+            Assert.Contains("NOT stopped", named.Message, StringComparison.Ordinal);
+        }
+
+        internal async Task ExpectFaultAsync(Exception fault)
+        {
+            var error = await Assert.ThrowsAsync<AggregateException>(() => Begin().WaitAsync(ProbeGuard, CancellationToken.None));
+            _observedOuter = error;
+            Assert.Same(fault, Assert.Single(error.InnerExceptions));
+        }
+
+        internal async Task JoinDeferredAsync(params Action<Exception>[] expected)
+        {
+            await Fixture.DeferredCleanup.WaitAsync(ProbeGuard, CancellationToken.None);
+            var failures = Fixture.DeferredFailures;
+            Assert.Collection(failures, expected);
+            _observedDeferred = failures;
+        }
+
+        // CircuitObservationTestWork performs the rescue in its finally, then attempts every
+        // bounded join, even if a prior assertion or join fails. Do not swallow diagnostics that
+        // the scenario did not already observe. Always join the retained continuation after outer.
+        internal Task RunAsync(Func<Task> scenario) => _owner.RunAsync(scenario, async () =>
+        {
+            try { await Begin(); }
+            catch (AggregateException ex) when (ReferenceEquals(ex, _observedOuter)) { }
+        }, async () =>
+        {
+            await Fixture.DeferredCleanup;
+            var unobserved = Fixture.DeferredFailures.Except(_observedDeferred).ToArray();
+            if (unobserved.Length != 0) throw new AggregateException("Deferred fixture teardown failed.", unobserved);
+        });
+    }
+
+    private async Task WaitForCleanupEntryAsync(string entry)
+    {
+        async Task ObserveAsync(CancellationToken guard)
+        {
+            while (true)
+            {
+                Task changed;
+                lock (_lifecycleGate)
+                {
+                    if (_cleanupLog.Contains(entry)) return;
+                    changed = _cleanupChanged.Task;
+                }
+                await changed.WaitAsync(guard);
+            }
+        }
+
+        // This is only a test hang guard; the fixture's expiry is driven by the controlled clock.
+        using var timeout = new CancellationTokenSource(ProbeGuard);
+        try { await ObserveAsync(timeout.Token); }
+        catch (OperationCanceledException) { Assert.Fail($"Expected cleanup milestone '{entry}' before rescue."); }
+    }
+
+    private static void AssertSharedResourcesAlive(ComposerRuntimeAccessorContractTests fixture)
+    {
+        Assert.False(IsDisposed(fixture._goalDb), "Dependent goal db must stay available until actual quiescence.");
+        using var stillAvailable = fixture._auth.Directory.CreateDbContext();
+        Assert.True(Directory.Exists(fixture._dir));
+        Assert.DoesNotContain(fixture.CleanupLog, entry => entry.StartsWith("goal-db:", StringComparison.Ordinal));
+        Assert.False(fixture.DeferredCleanup.IsCompleted);
+    }
+
+    private static void AssertSharedResourcesDisposed(ComposerRuntimeAccessorContractTests fixture)
+    {
+        foreach (var entry in new[] { "goal-db:done", "auth-harness:done", "directory:done" })
+            Assert.Contains(entry, fixture.CleanupLog);
+        Assert.True(IsDisposed(fixture._goalDb));
+        Assert.Throws<ObjectDisposedException>(() => { using var _ = fixture._auth.Directory.CreateDbContext(); });
+        Assert.False(Directory.Exists(fixture._dir));
+    }
+
+    private static void AssertManagerFinished(ComposerRuntimeManager manager, ComposerUserRuntime runtime)
+    {
+        Assert.Empty(ManagerEntries(manager));
+        Assert.True(runtime.Composer.TeardownCompletion.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task OuterFixtureDisposal_WithAStalledTrackedRequest_TimesOutByName_DefersDependentCleanup_AndFinishesAfterRescue()
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var auth = new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId));
+        run.RescueWith(() => gate.TrySetResult(auth));
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (stalledManager, stalledAccessor) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var (finishedManager, finishedAccessor) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var finished = await Bounded(run.Track(sut.Acquire(finishedAccessor, CircuitState(OriginalId))));
+            Assert.True(finished.IsAuthorized);
+            var stalled = run.Track(sut.Acquire(stalledAccessor, gate.Task));
+            Assert.False(stalled.IsCompleted);
+
+            using var scenario = new CancellationTokenSource();
+            scenario.Cancel();
+            var primary = new OperationCanceledException("original scenario canceled", scenario.Token);
+            var work = new CircuitObservationTestWork(TimeSpan.Zero);
+            _ = work.Track(stalled);
+            var inner = await Assert.ThrowsAsync<AggregateException>(() => work.RunAsync(() => Task.FromException(primary)));
+            Assert.Collection(inner.InnerExceptions, ex => Assert.Same(primary, ex), ex => Assert.IsType<TimeoutException>(ex));
+            Assert.True(scenario.IsCancellationRequested);
+            Assert.False(stalled.IsCompleted, "the inner timeout did not stop the request");
+
+            var disposal = run.Begin();
+            Assert.False(stalled.IsCompleted, "the real tracked request is pending on entry to outer disposal");
+            Assert.False(disposal.IsCompleted);
+            Assert.Throws<InvalidOperationException>(() =>
+            {
+                _ = sut.Register(stalledAccessor, () => throw new Xunit.Sdk.XunitException("request started after final sweep began"));
+            });
+            Assert.Throws<InvalidOperationException>(() => { _ = sut.Acquire(finishedAccessor, CircuitState(OriginalId)); });
+            await run.ExpireAsync("request-join:group-0");
+            await run.ExpectTimeoutAsync("request-join:group-0");
+
+            Assert.False(stalled.IsCompleted);
+            Assert.Contains("request-join:group-0:timed-out", sut.CleanupLog);
+            Assert.Contains("manager-shutdown:group-1:done", sut.CleanupLog);
+            Assert.Contains("provider-dispose:group-1:done", sut.CleanupLog);
+            AssertManagerFinished(finishedManager, finished.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(finishedAccessor)), "the finished group's provider must really be disposed");
+            Assert.Contains("deferred:group-0", sut.CleanupLog);
+            Assert.Contains("deferred:shared-resources", sut.CleanupLog);
+            Assert.DoesNotContain(sut.CleanupLog, entry => entry.Contains("provider-dispose:group-0", StringComparison.Ordinal));
+            Assert.False(IsDisposed(sut.ProviderOf(stalledAccessor)), "the pending request's provider must stay available");
+            AssertSharedResourcesAlive(sut);
+
+            gate.SetResult(auth);
+            var rescued = await Bounded(stalled);
+            Assert.True(rescued.IsAuthorized);
+            await run.JoinDeferredAsync();
+            var final = sut.CleanupLog.ToList();
+            Assert.Contains("deferred:quiesced", final);
+            Assert.Contains("deferred-provider-dispose:group-0:done", final);
+            Assert.True(final.IndexOf("deferred:quiesced") < final.IndexOf("deferred-provider-dispose:group-0:done"));
+            Assert.Contains("deferred:complete", final);
+            AssertManagerFinished(stalledManager, rescued.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(stalledAccessor)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    // The scenario asserts this particular injected failure. The finally join must still report any
+    // unexpected failure, including when an earlier assertion prevented the scenario from reaching its join.
+    private static async Task JoinExpectedFaultAsync(Task work, Exception? expected)
+    {
+        try { await work; }
+        catch (Exception ex) when (ReferenceEquals(ex, expected)) { }
+    }
+
+    /// <summary>
+    /// THE HELD-REQUEST PATH shared by the late-fault and late-success cases. A REAL tracked Acquire stays
+    /// pending through the original scenario error, the inner timeout and the NAMED outer timeout; only then
+    /// is it rescued (with <paramref name="lateFault"/>, or successfully when it is <c>null</c>). The rescue
+    /// is also registered with the bounded, cancellation-independent owner, so a failed assertion cannot
+    /// leave the request running.
+    /// </summary>
+    private static async Task RunHeldRequestAsync(Exception? lateFault)
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var auth = new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId));
+        run.RescueWith(() =>
+        {
+            if (lateFault is null) gate.TrySetResult(auth);
+            else gate.TrySetException(lateFault);
+        });
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            Task<ComposerRuntimeAccess>? registeredRequest = null;
+            var settledAtProviderDispose = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var dependentProvider = new ProviderDisposalProbe(onEnter: () =>
+                settledAtProviderDispose.TrySetResult(registeredRequest is { IsCompleted: true }));
+            // Observe the real DI disposal entry, but do not introduce a second held operation.
+            dependentProvider.Release.SetResult();
+            var (manager, accessor) = sut.Build("ollama-local", sut.NewCircuitAccessor(), disposalProbe: dependentProvider);
+            var (safeManager, safeAccessor) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var active = await Bounded(run.Track(sut.Acquire(accessor, CircuitState(OriginalId))));
+            var safe = await Bounded(run.Track(sut.Acquire(safeAccessor, CircuitState(OriginalId))));
+            Assert.True(active.IsAuthorized);
+            Assert.True(safe.IsAuthorized);
+            var activeRuntime = Assert.IsType<ComposerUserRuntime>(active.Runtime);
+            var held = registeredRequest = sut.Acquire(accessor, gate.Task);
+            _ = run.Track(JoinExpectedFaultAsync(held, lateFault));
+            Assert.False(held.IsCompleted);
+
+            // ORIGINAL scenario error + INNER timeout, with the request still pending.
+            using var scenario = new CancellationTokenSource();
+            scenario.Cancel();
+            var primary = new OperationCanceledException("original scenario canceled", scenario.Token);
+            var inner = new CircuitObservationTestWork(TimeSpan.Zero);
+            _ = inner.Track(held);
+            var innerError = await Assert.ThrowsAsync<AggregateException>(() => inner.RunAsync(() => Task.FromException(primary)));
+            Assert.Collection(innerError.InnerExceptions, ex => Assert.Same(primary, ex), ex => Assert.IsType<TimeoutException>(ex));
+            Assert.False(held.IsCompleted, "the inner timeout did not stop the request");
+
+            // The NAMED OUTER timeout, still before any rescue.
+            Assert.True(scenario.IsCancellationRequested);
+            var outer = run.Begin();
+            Assert.False(outer.IsCompleted);
+            Assert.False(held.IsCompleted, "the actual request is pending at entry to fixture disposal");
+            Assert.Throws<InvalidOperationException>(() =>
+            {
+                _ = sut.Register(accessor, () => throw new Xunit.Sdk.XunitException("request started after final sweep began"));
+            });
+            await run.ExpireAsync("request-join:group-0");
+            await run.ExpectTimeoutAsync("request-join:group-0");
+            Assert.False(held.IsCompleted, "the request is still pending when the outer timeout is reported");
+            Assert.Empty(sut.DeferredFailures);
+            AssertManagerFinished(safeManager, safe.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(safeAccessor)), "the later safe group must finish before rescue");
+            Assert.False(activeRuntime.Composer.TeardownCompletion.IsCompleted);
+            Assert.False(dependentProvider.Entered.Task.IsCompleted);
+            Assert.DoesNotContain(sut.CleanupLog, entry => entry.Contains("provider-dispose:group-0", StringComparison.Ordinal));
+            Assert.False(IsDisposed(sut.ProviderOf(accessor)));
+            AssertSharedResourcesAlive(sut);
+
+            // Only now rescue. The success and fault rows otherwise take exactly the same path.
+            if (lateFault is null)
+            {
+                gate.SetResult(auth);
+                var access = await Bounded(held);
+                Assert.True(access.IsAuthorized);
+                Assert.Same(activeRuntime, access.Runtime);
+                await run.JoinDeferredAsync();
+                Assert.Empty(sut.DeferredFailures);
+            }
+            else
+            {
+                gate.SetException(lateFault);
+                var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => Bounded(held));
+                Assert.Same(lateFault, thrown);
+                await run.JoinDeferredAsync(reported => Assert.Same(lateFault, reported));
+                Assert.Equal(1, sut.DeferredFailures.Count(f => ReferenceEquals(f, lateFault)));
+            }
+
+            Assert.True(await Bounded(settledAtProviderDispose.Task), "the real provider disposal entered only after the request settled");
+            AssertManagerFinished(manager, activeRuntime);
+            var final = sut.CleanupLog.ToList();
+            Assert.Contains("deferred:quiesced", final);
+            Assert.Contains("deferred-provider-dispose:group-0:done", final);
+            Assert.True(final.IndexOf("deferred:quiesced") < final.IndexOf("deferred-provider-dispose:group-0:done"));
+            Assert.Contains("deferred:complete", final);
+            Assert.True(IsDisposed(sut.ProviderOf(accessor)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    /// <summary>LATE FAULT: a request that faults only AFTER the named outer timeout is reported exactly once.</summary>
+    [Fact]
+    public Task OuterFixtureDisposal_LateRequestFault_AfterNamedTimeout_IsReportedOnceInDeferredDiagnostics() =>
+        RunHeldRequestAsync(new InvalidOperationException("distinct late request fault"));
+
+    /// <summary>SUCCESSFUL RESCUE control on the same held-request path: no deferred fault is reported.</summary>
+    [Fact]
+    public Task OuterFixtureDisposal_LateRequestSuccess_AfterNamedTimeout_ReportsNoDeferredFault() =>
+        RunHeldRequestAsync(null);
+
+    /// <summary>
+    /// ORDINARY FAULT: the scenario observes the actual request fault BEFORE fixture teardown. Teardown then
+    /// succeeds and does not report that exception a second time (no timeout, nothing deferred).
+    /// </summary>
+    [Fact]
+    public async Task OuterFixtureDisposal_OrdinaryRequestFault_ObservedByTheScenario_IsNotReportedByTeardown()
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var fault = new InvalidOperationException("ordinary request fault handled by the scenario");
+        var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        run.RescueWith(() => gate.TrySetException(fault));
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (manager, accessor) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var active = await Bounded(run.Track(sut.Acquire(accessor, CircuitState(OriginalId))));
+            Assert.True(active.IsAuthorized);
+            var request = sut.Acquire(accessor, gate.Task);
+            _ = run.Track(JoinExpectedFaultAsync(request, fault));
+            Assert.False(request.IsCompleted);
+            gate.SetException(fault);
+            Assert.Same(fault, await Assert.ThrowsAsync<InvalidOperationException>(() => Bounded(request)));
+
+            Assert.True(request.IsFaulted, "the scenario handled the actual request fault before disposal");
+            Assert.False(IsDisposed(sut.ProviderOf(accessor)));
+            await run.Begin().WaitAsync(ProbeGuard, CancellationToken.None);
+
+            Assert.DoesNotContain(sut.CleanupLog, entry => entry.Contains("timed-out", StringComparison.Ordinal)
+                                                         || entry.StartsWith("deferred", StringComparison.Ordinal));
+            Assert.Empty(sut.DeferredFailures);
+            Assert.True(sut.DeferredCleanup.IsCompletedSuccessfully);
+            AssertManagerFinished(manager, active.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(accessor)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    [Fact]
+    public async Task OuterFixtureDisposal_WithoutAStalledRequest_CompletesManagerProviderAndFixtureResourceTeardown()
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (firstManager, first) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var (secondManager, second) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var firstAccess = await Bounded(run.Track(sut.Acquire(first, CircuitState(OriginalId))));
+            var secondAccess = await Bounded(run.Track(sut.Acquire(second, CircuitState(OriginalId))));
+            Assert.True(firstAccess.IsAuthorized);
+            Assert.True(secondAccess.IsAuthorized);
+            await run.Begin().WaitAsync(ProbeGuard, CancellationToken.None);
+
+            var log = sut.CleanupLog;
+            foreach (var group in new[] { "group-0", "group-1" })
+            {
+                Assert.Contains($"manager-shutdown:{group}:done", log);
+                Assert.Contains($"provider-dispose:{group}:done", log);
+            }
+            Assert.DoesNotContain(log, entry => entry.Contains("timed-out", StringComparison.Ordinal)
+                                               || entry.StartsWith("deferred", StringComparison.Ordinal));
+            Assert.True(sut.DeferredCleanup.IsCompletedSuccessfully);
+            AssertManagerFinished(firstManager, firstAccess.Runtime!);
+            AssertManagerFinished(secondManager, secondAccess.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(first)));
+            Assert.True(IsDisposed(sut.ProviderOf(second)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    [Theory]
+    [InlineData("manager-shutdown", false)]
+    [InlineData("provider-dispose", false)]
+    [InlineData("manager-shutdown", true)]
+    [InlineData("provider-dispose", true)]
+    public async Task OuterFixtureDisposal_HeldCleanupStage_RetainsDependentsUntilActualQuiescence(string stage, bool deferred)
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var auth = new AuthenticationState(FacadeAuthorizationHarness.Principal(OriginalId));
+        var requestGate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var shutdown = new ManagerShutdownProbe();
+        var providerFault = new InvalidOperationException("late DI-owned disposal fault");
+        var holdManager = stage == "manager-shutdown";
+        var provider = new ProviderDisposalProbe(holdManager ? null : providerFault);
+        var step = $"{(deferred ? "deferred-" : "")}{stage}:group-0";
+        run.RescueWith(() => requestGate.TrySetResult(auth));
+        run.RescueWith(() => shutdown.Release.TrySetResult());
+        run.RescueWith(() => provider.Release.TrySetResult());
+        var hold = run.HoldDeadline(step);
+
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (manager, accessor) = sut.Build("ollama-local", sut.NewCircuitAccessor(), disposalProbe: provider);
+            var (safeManager, safeAccessor) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            var active = await Bounded(run.Track(sut.Acquire(accessor, CircuitState(OriginalId))));
+            var safe = await Bounded(run.Track(sut.Acquire(safeAccessor, CircuitState(OriginalId))));
+            Assert.True(active.IsAuthorized);
+            Assert.True(safe.IsAuthorized);
+            if (holdManager)
+            {
+                manager.OnJoiningOperation = shutdown.HoldJoin;
+                provider.Release.SetResult();
+            }
+            var request = deferred ? run.Track(sut.Acquire(accessor, requestGate.Task)) : null;
+            _ = run.Begin();
+            if (request is not null)
+            {
+                Assert.False(request.IsCompleted);
+                await run.ExpireAsync("request-join:group-0");
+                await run.ExpectTimeoutAsync("request-join:group-0");
+                Assert.False(request.IsCompleted);
+                AssertManagerFinished(safeManager, safe.Runtime!);
+                Assert.True(IsDisposed(sut.ProviderOf(safeAccessor)));
+                requestGate.SetResult(auth);
+                Assert.True((await Bounded(request)).IsAuthorized);
+            }
+
+            await (holdManager ? shutdown.Entered.Task : provider.Entered.Task).WaitAsync(ProbeGuard, CancellationToken.None);
+            var group = sut._groupOf[accessor];
+            var retained = await run.ExpireAndIdentifyAsync(step, hold, () => holdManager ? group.Shutdown : group.Disposal);
+            _ = run.Track(JoinExpectedFaultAsync(retained, holdManager ? null : providerFault));
+            hold.Release.SetResult(); // handler runs before the still-held manager or provider is released
+            if (deferred)
+                await sut.WaitForCleanupEntryAsync($"{step}:retained");
+            else
+                await run.ExpectTimeoutAsync(step);
+
+            Assert.Contains($"{step}:timed-out", sut.CleanupLog);
+            AssertManagerFinished(safeManager, safe.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(safeAccessor)), "the later independent group must really be disposed before rescue");
+            AssertSharedResourcesAlive(sut);
+            Assert.False(retained.IsCompleted, $"{step} remains owned after its waiter expires");
+            if (holdManager)
+            {
+                Assert.False(active.Runtime!.Composer.TeardownCompletion.IsCompleted);
+                Assert.False(provider.Entered.Task.IsCompleted, "provider disposal cannot start while its manager owns live work");
+                Assert.False(IsDisposed(sut.ProviderOf(accessor)));
+                shutdown.Release.SetResult();
+            }
+            else
+            {
+                AssertManagerFinished(manager, active.Runtime!);
+                Assert.False(provider.Exited);
+                provider.Release.SetResult();
+            }
+
+            var expected = new List<Action<Exception>>();
+            if (deferred) expected.Add(ex => Assert.Contains($"'{step}'", Assert.IsType<TimeoutException>(ex).Message, StringComparison.Ordinal));
+            if (!holdManager) expected.Add(ex => Assert.Same(providerFault, ex));
+            await run.JoinDeferredAsync([.. expected]);
+            Assert.Same(retained, holdManager ? group.Shutdown : group.Disposal);
+            Assert.True(retained.IsCompleted);
+            AssertManagerFinished(manager, active.Runtime!);
+            Assert.True(provider.Exited);
+            Assert.Equal(1, provider.Calls);
+            Assert.True(IsDisposed(sut.ProviderOf(accessor)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    // Deadline wins while the REAL operation is pending; the real deadline continuation is held; the SAME
+    // operation then completes (success or fault) BEFORE that continuation is released.
+    private static async Task RunDeadlineWonThenWorkSettledAsync(string stage, bool workFaults)
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var holdManager = stage == "manager-shutdown";
+        var shutdown = new ManagerShutdownProbe();
+        var fault = new InvalidOperationException("work fault after its deadline won");
+        var provider = new ProviderDisposalProbe(workFaults ? fault : null);
+        var step = $"{stage}:group-0";
+        run.RescueWith(() => shutdown.Release.TrySetResult());
+        run.RescueWith(() => provider.Release.TrySetResult());
+        var hold = run.HoldDeadline(step);
+
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (manager, accessor) = sut.Build("ollama-local", sut.NewCircuitAccessor(), disposalProbe: provider);
+            var active = await Bounded(run.Track(sut.Acquire(accessor, CircuitState(OriginalId))));
+            Assert.True(active.IsAuthorized);
+            if (holdManager)
+            {
+                manager.OnJoiningOperation = shutdown.HoldJoin;
+                provider.Release.SetResult();
+            }
+
+            _ = run.Begin();
+            await (holdManager ? shutdown.Entered.Task : provider.Entered.Task).WaitAsync(ProbeGuard, CancellationToken.None);
+            var group = sut._groupOf[accessor];
+            // Provider.Entered can run before the call returns the task to the fixture. Wait for
+            // the actual deadline winner to identify the owned task before either work release.
+            var work = await run.ExpireAndIdentifyAsync(step, hold, () => holdManager ? group.Shutdown : group.Disposal);
+            _ = run.Track(JoinExpectedFaultAsync(work, workFaults ? fault : null));
+            if (holdManager)
+            {
+                Assert.False(active.Runtime!.Composer.TeardownCompletion.IsCompleted);
+                Assert.NotEmpty(ManagerEntries(manager));
+                Assert.False(provider.Entered.Task.IsCompleted, "provider disposal must not start while its manager is held");
+                Assert.False(IsDisposed(sut.ProviderOf(accessor)));
+            }
+            else
+            {
+                AssertManagerFinished(manager, active.Runtime!);
+                Assert.False(provider.Exited);
+            }
+            Assert.DoesNotContain($"{step}:timed-out", sut.CleanupLog);
+            Assert.False(IsDisposed(sut._goalDb));
+
+            // The SAME operation completes BEFORE the held handler resumes.
+            if (holdManager) shutdown.Release.SetResult(); else provider.Release.SetResult();
+            if (workFaults)
+            {
+                var actual = await Assert.ThrowsAsync<InvalidOperationException>(() => work.WaitAsync(ProbeGuard, CancellationToken.None));
+                Assert.Same(fault, actual);
+            }
+            else
+            {
+                await work.WaitAsync(ProbeGuard, CancellationToken.None);
+            }
+            Assert.True(work.IsCompleted);
+            Assert.Equal(workFaults ? TaskStatus.Faulted : TaskStatus.RanToCompletion, work.Status);
+            Assert.DoesNotContain($"{step}:timed-out", sut.CleanupLog);
+            Assert.DoesNotContain($"{step}:done", sut.CleanupLog);
+            Assert.False(run.Begin().IsCompleted, "the held deadline handler keeps outer disposal in progress");
+            Assert.False(hold.Release.Task.IsCompleted);
+            Assert.False(IsDisposed(sut._goalDb));
+            if (holdManager)
+                Assert.False(provider.Entered.Task.IsCompleted, "provider disposal must not pass the held deadline handler");
+
+            hold.Release.SetResult();
+
+            // The NAMED timeout remains visible although the work has already completed.
+            await run.ExpectTimeoutAsync(step);
+            Assert.Single(sut.CleanupLog, entry => entry == $"{step}:timed-out");
+            Assert.DoesNotContain($"{step}:done", sut.CleanupLog);
+            Assert.DoesNotContain($"{step}:faulted", sut.CleanupLog);
+
+            if (workFaults) await run.JoinDeferredAsync(ex => Assert.Same(fault, ex));
+            else await run.JoinDeferredAsync();
+            Assert.Equal(workFaults ? 1 : 0, sut.DeferredFailures.Count(f => ReferenceEquals(f, fault)));
+            Assert.Same(work, holdManager ? group.Shutdown : group.Disposal);
+            Assert.Equal(1, provider.Calls);
+            var final = sut.CleanupLog.ToList();
+            Assert.True(final.IndexOf("deferred:quiesced") >= 0);
+            Assert.Contains("deferred:complete", final);
+            AssertManagerFinished(manager, active.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(accessor)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    // Work wins before its deadline; the deadline continuation must never be reached.
+    private static async Task RunWorkWonBeforeDeadlineAsync(string stage, Exception? workFault)
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var holdManager = stage == "manager-shutdown";
+        var shutdown = new ManagerShutdownProbe();
+        var provider = new ProviderDisposalProbe(workFault);
+        var step = $"{stage}:group-0";
+        run.RescueWith(() => shutdown.Release.TrySetResult());
+        run.RescueWith(() => provider.Release.TrySetResult());
+        var hold = run.HoldDeadline(step);
+
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (manager, accessor) = sut.Build("ollama-local", sut.NewCircuitAccessor(), disposalProbe: provider);
+            var active = await Bounded(run.Track(sut.Acquire(accessor, CircuitState(OriginalId))));
+            Assert.True(active.IsAuthorized);
+            if (holdManager)
+            {
+                manager.OnJoiningOperation = shutdown.HoldJoin;
+                provider.Release.SetResult();
+            }
+
+            _ = run.Begin();
+            await (holdManager ? shutdown.Entered.Task : provider.Entered.Task).WaitAsync(ProbeGuard, CancellationToken.None);
+            await run.WaitArmedAsync(step);
+            var group = sut._groupOf[accessor];
+            var work = Assert.IsAssignableFrom<Task>(holdManager ? group.Shutdown : group.Disposal);
+            _ = run.Track(JoinExpectedFaultAsync(work, workFault));
+            Assert.False(work.IsCompleted);
+
+            // The work finishes while the deadline has NOT fired.
+            if (holdManager) shutdown.Release.SetResult(); else provider.Release.SetResult();
+
+            if (workFault is null)
+            {
+                await work.WaitAsync(ProbeGuard, CancellationToken.None);
+                Assert.True(work.IsCompletedSuccessfully);
+                await run.Begin().WaitAsync(ProbeGuard, CancellationToken.None);
+                Assert.Contains($"{step}:done", sut.CleanupLog);
+                Assert.True(sut.DeferredCleanup.IsCompletedSuccessfully);
+            }
+            else
+            {
+                var reported = await Assert.ThrowsAsync<TimeoutException>(() => work.WaitAsync(ProbeGuard, CancellationToken.None));
+                Assert.Same(workFault, reported);
+                await run.ExpectFaultAsync(workFault);
+                Assert.DoesNotContain("Outer fixture teardown step", reported.Message, StringComparison.Ordinal);
+                Assert.Contains($"{step}:faulted", sut.CleanupLog);
+            }
+
+            Assert.Same(work, holdManager ? group.Shutdown : group.Disposal);
+            Assert.False(hold.Held.Task.IsCompleted, "the fixture deadline never won");
+            Assert.DoesNotContain(sut.CleanupLog, entry => entry.Contains("timed-out", StringComparison.Ordinal)
+                                                         || entry.StartsWith("deferred", StringComparison.Ordinal));
+            Assert.Empty(sut.DeferredFailures);
+            Assert.True(sut.DeferredCleanup.IsCompletedSuccessfully);
+            Assert.Equal(1, provider.Calls);
+            AssertManagerFinished(manager, active.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(accessor)));
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
+    /// <summary>DEADLINE WINS; the held handler resumes after the work SUCCEEDED. The named timeout stays visible.</summary>
+    [Theory]
+    [InlineData("manager-shutdown")]
+    [InlineData("provider-dispose")]
+    public Task OuterFixtureDisposal_DeadlineWins_HandlerResumesAfterWorkSucceeds_StillReportsNamedTimeout(string stage) =>
+        RunDeadlineWonThenWorkSettledAsync(stage, workFaults: false);
+
+    /// <summary>DEADLINE WINS; the held handler resumes after the work FAULTED. Both are reported, once each.</summary>
+    [Fact]
+    public Task OuterFixtureDisposal_DeadlineWins_HandlerResumesAfterWorkFaults_ReportsNamedTimeoutAndExactFaultOnce() =>
+        RunDeadlineWonThenWorkSettledAsync("provider-dispose", workFaults: true);
+
+    /// <summary>WORK WINS before the deadline with success: no fixture deadline diagnostic.</summary>
+    [Theory]
+    [InlineData("manager-shutdown")]
+    [InlineData("provider-dispose")]
+    public Task OuterFixtureDisposal_WorkWinsBeforeDeadline_Success_ProducesNoDeadlineDiagnostic(string stage) =>
+        RunWorkWonBeforeDeadlineAsync(stage, workFault: null);
+
+    /// <summary>WORK WINS with its OWN TimeoutException: reported as the work's fault, not as a fixture deadline.</summary>
+    [Fact]
+    public Task OuterFixtureDisposal_WorkWinsBeforeDeadline_WorkOriginatedTimeoutException_IsNotMistakenForTheFixtureDeadline() =>
+        RunWorkWonBeforeDeadlineAsync("provider-dispose", new TimeoutException("work-originated timeout"));
+
+    [Fact]
+    public async Task OuterFixtureDisposal_FaultedProvider_KeepsFaultAndStillDisposesLaterGroupAndSharedResources()
+    {
+        var run = new OuterDisposalScenario();
+        var sut = run.Fixture;
+        var fault = new InvalidOperationException("DI-owned disposal failed");
+        var provider = new ProviderDisposalProbe(fault);
+        run.RescueWith(() => provider.Release.TrySetResult());
+        await run.RunAsync(async () =>
+        {
+            await sut.InitializeAsync();
+            var (_, first) = sut.Build("ollama-local", sut.NewCircuitAccessor(), disposalProbe: provider);
+            var (laterManager, later) = sut.Build("ollama-local", sut.NewCircuitAccessor());
+            Assert.True((await Bounded(run.Track(sut.Acquire(first, CircuitState(OriginalId))))).IsAuthorized);
+            var laterAccess = await Bounded(run.Track(sut.Acquire(later, CircuitState(OriginalId))));
+            Assert.True(laterAccess.IsAuthorized);
+            _ = run.Begin();
+            await provider.Entered.Task.WaitAsync(ProbeGuard, CancellationToken.None);
+            Assert.False(IsDisposed(sut.ProviderOf(later)));
+            Assert.NotEmpty(ManagerEntries(laterManager));
+            provider.Release.SetResult();
+            await run.ExpectFaultAsync(fault);
+            Assert.Contains("provider-dispose:group-0:faulted", sut.CleanupLog);
+            AssertManagerFinished(laterManager, laterAccess.Runtime!);
+            Assert.True(IsDisposed(sut.ProviderOf(later)));
+            Assert.True(sut.DeferredCleanup.IsCompletedSuccessfully);
+            AssertSharedResourcesDisposed(sut);
+        });
+    }
+
     // ── Fixture ────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -648,7 +1677,8 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
         new(_auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy);
 
     private (ComposerRuntimeManager Manager, ComposerRuntimeAccessor Accessor) Build(
-        string officialProvider, CircuitUserPrincipalAccessor? circuitAccessor, Func<bool>? tokenAvailable = null)
+        string officialProvider, CircuitUserPrincipalAccessor? circuitAccessor, Func<bool>? tokenAvailable = null,
+        ProviderDisposalProbe? disposalProbe = null)
     {
         var config = new HiveConfigFile
         {
@@ -669,10 +1699,10 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
             sp.GetRequiredService<HiveAuthMode>(),
             NullLogger<HivePrincipalResolver>.Instance));
         services.AddSingleton<LlmSessionRegistry>();
+        if (disposalProbe is not null)
+            services.AddSingleton(_ => disposalProbe); // factory-created instances are owned by DI
 
         var provider = services.BuildServiceProvider();
-        _providers.Add(provider);
-
         _resolver = provider.GetRequiredService<HivePrincipalResolver>();
         _policy = provider.GetRequiredService<HivePolicy>();
 
@@ -686,7 +1716,6 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
 
         var manager = new ComposerRuntimeManager(
             factory, _auth.Directory.Service, NullLogger<ComposerRuntimeManager>.Instance);
-        _managers.Add(manager);
 
         var accessor = new ComposerRuntimeAccessor(
             manager,
@@ -695,38 +1724,49 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
             _policy,
             NullLogger<ComposerRuntimeAccessor>.Instance);
 
+        lock (_lifecycleGate)
+        {
+            var group = new FixtureGroup($"group-{_groups.Count}", provider, manager);
+            _groups.Add(group);
+            _groupOf[accessor] = group;
+        }
+
+        if (disposalProbe is not null)
+            _ = provider.GetRequiredService<ProviderDisposalProbe>();
         return (manager, accessor);
     }
 
-    private Task<ComposerRuntimeAccess> Acquire(ComposerRuntimeAccessor accessor, ClaimsPrincipal principal)
+    /// <summary>
+    /// STARTS and REGISTERS one request atomically against the group whose accessor it uses. Admission is
+    /// checked BEFORE the request starts, so once teardown has closed admission no request can begin
+    /// unowned.
+    /// </summary>
+    private Task<ComposerRuntimeAccess> Register(
+        ComposerRuntimeAccessor accessor, Func<Task<ComposerRuntimeAccess>> start)
     {
-        var task = accessor.AcquireForRequestAsync(principal, Ct);
-        _requests.Add(task);
-        return task;
+        lock (_lifecycleGate)
+        {
+            if (_requestsClosed)
+                throw new InvalidOperationException("Composer fixture request admission is closed.");
+            var task = start();
+            _groupOf[accessor].Requests.Add(task);
+            return task;
+        }
     }
+
+    private Task<ComposerRuntimeAccess> Acquire(ComposerRuntimeAccessor accessor, ClaimsPrincipal principal) =>
+        Register(accessor, () => accessor.AcquireForRequestAsync(principal, Ct));
 
     private Task<ComposerRuntimeAccess> ConnectCircuit(
-        ComposerRuntimeAccessor accessor, Task<AuthenticationState>? state)
-    {
-        var task = accessor.ConnectForCircuitAsync(state, Ct);
-        _requests.Add(task);
-        return task;
-    }
+        ComposerRuntimeAccessor accessor, Task<AuthenticationState>? state) =>
+        Register(accessor, () => accessor.ConnectForCircuitAsync(state, Ct));
 
     private Task<ComposerRuntimeAccess> Acquire(
-        ComposerRuntimeAccessor accessor, Task<AuthenticationState>? state)
-    {
-        var task = accessor.AcquireForCircuitAsync(state, Ct);
-        _requests.Add(task);
-        return task;
-    }
+        ComposerRuntimeAccessor accessor, Task<AuthenticationState>? state) =>
+        Register(accessor, () => accessor.AcquireForCircuitAsync(state, Ct));
 
-    private Task<ComposerRuntimeAccess> Connect(ComposerRuntimeAccessor accessor, ClaimsPrincipal principal)
-    {
-        var task = accessor.ConnectForRequestAsync(principal, Ct);
-        _requests.Add(task);
-        return task;
-    }
+    private Task<ComposerRuntimeAccess> Connect(ComposerRuntimeAccessor accessor, ClaimsPrincipal principal) =>
+        Register(accessor, () => accessor.ConnectForRequestAsync(principal, Ct));
 
     private static Task<AuthenticationState> CircuitState(string gitHubId) =>
         Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(gitHubId)));
@@ -739,34 +1779,211 @@ public sealed class ComposerRuntimeAccessorContractTests : IAsyncLifetime
         return entries.Keys.Cast<int>().ToArray();
     }
 
+    /// <summary>
+    /// THE FIXTURE TEARDOWN xUnit invokes (it calls <c>DisposeAsync</c>, not the synchronous
+    /// <c>Dispose</c>, when both exist). Every wait is BOUNDED by <see cref="OuterJoinTimeout"/> and none
+    /// observes a scenario token.
+    /// <list type="number">
+    /// <item>Request admission is CLOSED first.</item>
+    /// <item>Each group's requests are joined with a bound. A request that does not finish makes the
+    /// timeout a NAMED fault, RETAINS the unfinished work and marks its group BLOCKED — a wait expiring
+    /// does not mean the work stopped.</item>
+    /// <item>Groups with no unfinished work still get their manager shut down and provider disposed, and
+    /// later steps run even after an earlier timeout or fault.</item>
+    /// <item>Anything a blocked group still depends on (its manager/provider and the shared goal db,
+    /// user directory and temp directory) is DEFERRED to <see cref="DeferredCleanup"/>, which runs only
+    /// after the retained work quiesces, so disposal can never race live work.</item>
+    /// </list>
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
-        var failures = new List<Exception>();
-
-        async Task Step(Func<Task> action)
+        FixtureGroup[] groups;
+        lock (_lifecycleGate)
         {
-            try { await action(); }
-            catch (Exception ex) { failures.Add(ex); }
+            if (_disposeStarted) return;
+            _disposeStarted = true;
+            _requestsClosed = true;
+            groups = [.. _groups];
         }
 
-        foreach (var request in _requests.ToArray())
-            await Step(() => request.ContinueWith(
-                _ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default));
+        var failures = new List<Exception>();
 
-        // The manager is the sole disposer: shut every one down before the providers.
-        foreach (var manager in _managers)
-            await Step(manager.ShutdownAsync);
+        // Request assertion failures belong to the scenario. The outer sweep observes them without
+        // duplicating them, but its own timeout must be reported even if the request later succeeds.
+        foreach (var group in groups)
+        {
+            foreach (var request in group.Requests)
+            {
+                var observed = request.ContinueWith(
+                    task => { _ = task.Exception; }, CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                if (!await AwaitBoundedAsync($"request-join:{group.Name}", observed, failures))
+                {
+                    group.Unfinished.Add(observed);
+                    group.LateRequests.Add(request);
+                }
+            }
+        }
 
-        foreach (var provider in _providers)
-            await Step(() => provider.DisposeAsync().AsTask());
+        // Start each operation once. If it outlives the deadline, the eventual continuation joins
+        // that exact task instead of invoking disposal twice or assuming a timeout stopped the work.
+        foreach (var group in groups.Where(g => g.Unfinished.Count == 0))
+        {
+            group.Shutdown = Start(group.Manager.ShutdownAsync);
+            if (!await AwaitBoundedAsync($"manager-shutdown:{group.Name}", group.Shutdown, failures))
+            {
+                group.Unfinished.Add(group.Shutdown);
+                continue;
+            }
 
-        await Step(() => { _goalDb.Dispose(); return Task.CompletedTask; });
-        // xUnit invokes DisposeAsync, not the synchronous Dispose, when both exist.
-        await Step(() => { _auth.Dispose(); return Task.CompletedTask; });
-        await Step(() => { if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true); return Task.CompletedTask; });
+            group.Disposal = Start(() => group.Provider.DisposeAsync().AsTask());
+            if (!await AwaitBoundedAsync($"provider-dispose:{group.Name}", group.Disposal, failures))
+                group.Unfinished.Add(group.Disposal);
+        }
+
+        var blocked = groups.Where(g => g.Unfinished.Count != 0).ToArray();
+        if (blocked.Length == 0)
+        {
+            DisposeShared(failures);
+        }
+        else
+        {
+            foreach (var group in blocked) Log($"deferred:{group.Name}");
+            Log("deferred:shared-resources");
+            DeferredCleanup = RunDeferredAsync(blocked);
+        }
 
         if (failures.Count > 0)
             throw new AggregateException("Accessor contract test cleanup failed", failures);
     }
 
+    private static Task Start(Func<Task> action)
+    {
+        try { return action(); }
+        catch (Exception ex) { return Task.FromException(ex); }
+    }
+
+    /// <summary>
+    /// Bounds one teardown step and PRESERVES WHICH SIGNAL ACTUALLY WON. The winner is decided by
+    /// <see cref="Task.WhenAny(Task, Task)"/> between the work and the step's own deadline, so it is
+    /// independent of what the work task looks like when this continuation later resumes:
+    /// <list type="bullet">
+    /// <item><b>Work wins</b>: its success, or its ORIGINAL exception (even a <see cref="TimeoutException"/>
+    /// the work itself threw), is reported as the work's own outcome; no fixture deadline is invented.</item>
+    /// <item><b>Deadline wins</b>: the NAMED timeout is reported even if the work has completed by the time
+    /// this continuation resumes. A fault of that work is NOT reported here — the caller retains the work
+    /// and reports its exact exception once after quiescence — and actual quiescence alone decides when
+    /// dependent cleanup is safe (the caller treats the step as unfinished).</item>
+    /// </list>
+    /// </summary>
+    private async Task<bool> AwaitBoundedAsync(string step, Task work, List<Exception> sink)
+    {
+        using var stopDeadline = new CancellationTokenSource();
+        var deadline = Task.Delay(OuterJoinTimeout, OuterClockForStep(step), stopDeadline.Token);
+        var winner = await Task.WhenAny(work, deadline);
+
+        if (!ReferenceEquals(winner, deadline))
+        {
+            stopDeadline.Cancel();
+            try
+            {
+                await work;
+                Log($"{step}:done");
+            }
+            catch (Exception ex)
+            {
+                sink.Add(ex);
+                Log($"{step}:faulted");
+            }
+            return true;
+        }
+
+        if (OnDeadlineWon is { } onDeadline)
+        {
+            try { await onDeadline(step, work); }
+            catch (Exception) { /* observation must never change teardown */ }
+        }
+
+        sink.Add(new TimeoutException(
+            $"Outer fixture teardown step '{step}' timed out after {OuterJoinTimeout}; " +
+            "the work was NOT stopped, is retained, and dependent cleanup is deferred."));
+        Log($"{step}:timed-out");
+        return false;
+    }
+
+    // The shared fixture resources. Each step is attempted even when an earlier one faults.
+    private void DisposeShared(List<Exception> sink)
+    {
+        void Step(string name, Action action)
+        {
+            try { action(); Log($"{name}:done"); }
+            catch (Exception ex) { sink.Add(ex); Log($"{name}:faulted"); }
+        }
+
+        Step("goal-db", _goalDb.Dispose);
+        // xUnit invokes DisposeAsync, not the synchronous Dispose, when both exist.
+        Step("auth-harness", _auth.Dispose);
+        Step("directory", () => { if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true); });
+    }
+
+    // This retained continuation is not an outer xUnit wait. It advances ONLY after the actual
+    // task settles; otherwise resources stay owned by the continuation. Independent groups can
+    // finish while one group is still parked, but shared cleanup is behind all groups.
+    private async Task RunDeferredAsync(FixtureGroup[] blocked)
+    {
+        await Task.WhenAll(blocked.Select(ResumeGroupAsync));
+        var sink = new List<Exception>();
+        DisposeShared(sink);
+        lock (_lifecycleGate) _deferredFailures.AddRange(sink);
+        Log("deferred:complete");
+    }
+
+    private async Task ResumeGroupAsync(FixtureGroup group)
+    {
+        foreach (var work in group.Unfinished)
+            await AfterQuiescenceAsync(work);
+        // Only a request still pending at its outer timeout reaches here, so a fault the scenario already
+        // observed before teardown is never reported a second time. The exact exception is added once.
+        foreach (var request in group.LateRequests)
+            await AfterQuiescenceAsync(request);
+        Log("deferred:quiesced");
+
+        if (group.Shutdown is null)
+        {
+            group.Shutdown = Start(group.Manager.ShutdownAsync);
+            await ObserveDeferredStepAsync($"deferred-manager-shutdown:{group.Name}", group.Shutdown);
+        }
+        if (group.Disposal is null)
+        {
+            group.Disposal = Start(() => group.Provider.DisposeAsync().AsTask());
+            await ObserveDeferredStepAsync($"deferred-provider-dispose:{group.Name}", group.Disposal);
+        }
+    }
+
+    private async Task ObserveDeferredStepAsync(string step, Task work)
+    {
+        var sink = new List<Exception>();
+        var finished = await AwaitBoundedAsync(step, work, sink);
+        lock (_lifecycleGate) _deferredFailures.AddRange(sink);
+        if (!finished)
+        {
+            Log($"{step}:retained");
+            // Reporting the deadline is bounded. The continuation still owns the underlying task
+            // and must not advance to dependent disposal until that actual task has settled.
+            await AfterQuiescenceAsync(work);
+            Log($"{step}:quiesced");
+        }
+    }
+
+    private async Task AfterQuiescenceAsync(Task work)
+    {
+        try { await work; }
+        catch (Exception ex)
+        {
+            lock (_lifecycleGate)
+            {
+                if (!_deferredFailures.Any(existing => ReferenceEquals(existing, ex))) _deferredFailures.Add(ex);
+            }
+        }
+    }
 }

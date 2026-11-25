@@ -1,8 +1,28 @@
+using System.Runtime.CompilerServices;
 using System.Security.Claims;
 
 using Microsoft.AspNetCore.Components.Authorization;
 
 namespace CopilotHive.Security;
+
+/// <summary>
+/// The ORDER TICKET of one cascading-state registration (see
+/// <see cref="CircuitUserPrincipalAccessor.RegisterObservation"/>). It identifies the position the
+/// registered <see cref="Task{TResult}"/> of <see cref="AuthenticationState"/> holds in this circuit's
+/// registration order; only the newest registration may apply an identity transition (see
+/// <see cref="CircuitUserPrincipalAccessor.CompleteObservation"/>).
+/// </summary>
+internal readonly struct CircuitAuthObservation
+{
+    /// <summary>Creates a ticket carrying <paramref name="order"/>.</summary>
+    internal CircuitAuthObservation(int order) => Order = order;
+
+    /// <summary>
+    /// The registration order the task held at its FIRST registration: smaller means older. The
+    /// newest order currently registered is the only one allowed to observe.
+    /// </summary>
+    internal int Order { get; }
+}
 
 /// <summary>
 /// The observable lifecycle state of one circuit's identity record (see
@@ -52,6 +72,16 @@ public enum CircuitIdentityState
 /// reintroduce an identity.
 /// </para>
 /// <para>
+/// OBSERVATION ORDER: the explicit <see cref="Observe"/>/<see cref="Initialize"/>/<see cref="Clear"/>
+/// entries are order-free, but the CASCADING acquisitions of a circuit are ordered by
+/// <see cref="RegisterObservation"/>/<see cref="CompleteObservation"/>: the first registration of each
+/// distinct <see cref="Task{TResult}"/> of <see cref="AuthenticationState"/> fixes its order, a newer
+/// registration supersedes every older one
+/// immediately, and only the newest one may apply a transition. That is what stops an older overlapping
+/// cascade (a late same-identity re-read, or a late sign-out/replacement) from changing the identity a
+/// newer observation already published. Registering the SAME task again never advances its order.
+/// </para>
+/// <para>
 /// There is NO authorization cache: EVERY operation RE-RESOLVES the current principal through
 /// <see cref="HivePrincipalResolver"/>. <see cref="GetPrincipalAsync"/> and <see cref="IsAllowedAsync"/>
 /// never reuse a principal from a previous operation; a role change or a disabled account in the
@@ -88,6 +118,21 @@ public sealed class CircuitUserPrincipalAccessor
     // The comparison key of the recorded identity: null for a signed-out (unauthenticated) state.
     private string? _identityKey;
     private CircuitIdentityState _state = CircuitIdentityState.Uninitialized;
+
+    // THE OBSERVATION ORDER of the already-registered cascading-state acquisitions of THIS circuit.
+    //
+    // Every distinct Task<AuthenticationState> handed to AcquireAsync is registered ONCE, before it
+    // is awaited, and keeps the order it was FIRST registered with; the highest order handed out is
+    // therefore the newest registration. Only that newest registration may apply an identity
+    // transition, so a superseded (older) task that resumes later — even if it carries the ORIGINAL
+    // identity — observes nothing and yields null.
+    //
+    // The table is keyed WEAKLY by the task itself: a superseded task is remembered only while it is
+    // still alive somewhere else, so no superseded task is retained for the circuit's lifetime (there
+    // is no strong reference to ANY task here, not even the newest). _newestObservationOrder is the
+    // newest order handed out; it is monotonic, so "current" never moves backwards.
+    private readonly ConditionalWeakTable<Task<AuthenticationState>, StrongBox<int>> _observationOrders = new();
+    private int _newestObservationOrder;
 
     /// <summary>
     /// Initialises a new <see cref="CircuitUserPrincipalAccessor"/>.
@@ -164,37 +209,12 @@ public sealed class CircuitUserPrincipalAccessor
     {
         ArgumentNullException.ThrowIfNull(authenticationState);
 
-        var user = authenticationState.User;
-        var key = IdentityKeyOf(user);
-
+        // ORDER-FREE: a direct observation carries its own explicit order, so it applies its transition
+        // immediately under the SAME lock the cascading path uses (see CompleteObservation). The
+        // transition itself lives in exactly ONE place.
         lock (_gate)
         {
-            switch (_state)
-            {
-                case CircuitIdentityState.SignedOut:
-                case CircuitIdentityState.IdentityReplaced:
-                    // Permanent: never adopt a replacement, never restore a former identity.
-                    return null;
-
-                case CircuitIdentityState.Uninitialized:
-                    _claimsPrincipal = user;
-                    _identityKey = key;
-                    _state = CircuitIdentityState.Initialized;
-                    return user;
-
-                default:
-                    if (string.Equals(_identityKey, key, StringComparison.Ordinal))
-                        return user;
-
-                    // A signed-out state after an established identity is a sign-out; any other
-                    // difference is a replacement. Either way the recorded identity is dropped.
-                    _state = key is null && _identityKey is not null
-                        ? CircuitIdentityState.SignedOut
-                        : CircuitIdentityState.IdentityReplaced;
-                    _claimsPrincipal = null;
-                    _identityKey = null;
-                    return null;
-            }
+            return TransitionLocked(authenticationState);
         }
     }
 
@@ -212,6 +232,120 @@ public sealed class CircuitUserPrincipalAccessor
             _identityKey = null;
             if (_state != CircuitIdentityState.IdentityReplaced)
                 _state = CircuitIdentityState.SignedOut;
+        }
+    }
+
+    /// <summary>
+    /// REGISTERS one distinct cascading-acquisition task BEFORE it is awaited and returns its order
+    /// ticket. The FIRST registration of a task fixes its order forever: registering the very same
+    /// task again returns the SAME order, so a reacquisition can never advance (re-promote) it. Each
+    /// NEW task is registered above every earlier one and therefore supersedes all of them
+    /// IMMEDIATELY — while they are still pending, and even if they later fault or are cancelled.
+    /// </summary>
+    /// <param name="authenticationState">The cascading state the caller is about to await.</param>
+    /// <returns>
+    /// The ticket to hand the matching <see cref="CompleteObservation"/>; the newest registration is
+    /// the only one whose completion may apply an identity transition.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="authenticationState"/> is null.</exception>
+    internal CircuitAuthObservation RegisterObservation(Task<AuthenticationState> authenticationState)
+    {
+        ArgumentNullException.ThrowIfNull(authenticationState);
+
+        // ONE lock over BOTH the order table and the identity transition it gates: deciding "am I the
+        // newest?" and applying the transition are therefore atomic with respect to every other
+        // registration and completion on this circuit.
+        lock (_gate)
+        {
+            if (_observationOrders.TryGetValue(authenticationState, out var existing))
+            {
+                // The SAME task registered again: reacquisition never advances its order.
+                return new CircuitAuthObservation(existing.Value);
+            }
+
+            var order = checked(++_newestObservationOrder);
+            _observationOrders.Add(authenticationState, new StrongBox<int>(order));
+
+            // Every other registration is now superseded. The newest task is never retained either:
+            // the table is keyed WEAKLY, so an entry disappears with the task it describes.
+            return new CircuitAuthObservation(order);
+        }
+    }
+
+    /// <summary>
+    /// COMPLETES one registered observation with the state its task produced, atomically deciding
+    /// currentness and applying any identity transition under the same lock. Only the NEWEST
+    /// registered task may observe: a superseded completion — even one carrying the ORIGINAL identity —
+    /// returns <c>null</c> without reading its state or substituting the recorded identity, so stale
+    /// work can neither establish an identity nor restore one.
+    /// </summary>
+    /// <param name="observation">The ticket returned by <see cref="RegisterObservation"/>.</param>
+    /// <param name="authenticationState">The state the registered task completed with.</param>
+    /// <returns>
+    /// The identity established for this circuit, or <c>null</c> when this completion is superseded or
+    /// the circuit is (now) invalidated.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="authenticationState"/> is null.</exception>
+    internal ClaimsPrincipal? CompleteObservation(
+        CircuitAuthObservation observation, AuthenticationState authenticationState)
+    {
+        ArgumentNullException.ThrowIfNull(authenticationState);
+
+        lock (_gate)
+        {
+            // DECIDE CURRENTNESS FIRST, under the lock: a superseded task observes NOTHING — its
+            // state is not read, its claims are not forwarded, and the recorded identity is not
+            // substituted for it. A newer registration may still be pending; it already superseded
+            // this one the moment it was registered. Nothing has to be swept here either: the order
+            // table is keyed WEAKLY by the task, so this registration's bookkeeping disappears with
+            // the task instead of being retained for the circuit's lifetime.
+            if (observation.Order != _newestObservationOrder)
+                return null;
+
+            return TransitionLocked(authenticationState);
+        }
+    }
+
+    /// <summary>
+    /// THE ONE identity state machine, applied while <see cref="_gate"/> is ALREADY held. Both the
+    /// order-free <see cref="Observe"/>/<see cref="Initialize"/> entries and the ordered cascading path
+    /// (<see cref="CompleteObservation"/>, which decides currentness first) call this, so the transition
+    /// rules exist in exactly one place.
+    /// </summary>
+    /// <param name="authenticationState">The state whose claims identity to record.</param>
+    /// <returns>
+    /// The identity established for this circuit, or <c>null</c> when the circuit is (now) invalidated.
+    /// </returns>
+    private ClaimsPrincipal? TransitionLocked(AuthenticationState authenticationState)
+    {
+        var user = authenticationState.User;
+        var key = IdentityKeyOf(user);
+
+        switch (_state)
+        {
+            case CircuitIdentityState.SignedOut:
+            case CircuitIdentityState.IdentityReplaced:
+                // Permanent: never adopt a replacement, never restore a former identity.
+                return null;
+
+            case CircuitIdentityState.Uninitialized:
+                _claimsPrincipal = user;
+                _identityKey = key;
+                _state = CircuitIdentityState.Initialized;
+                return user;
+
+            default:
+                if (string.Equals(_identityKey, key, StringComparison.Ordinal))
+                    return user;
+
+                // A signed-out state after an established identity is a sign-out; any other
+                // difference is a replacement. Either way the recorded identity is dropped.
+                _state = key is null && _identityKey is not null
+                    ? CircuitIdentityState.SignedOut
+                    : CircuitIdentityState.IdentityReplaced;
+                _claimsPrincipal = null;
+                _identityKey = null;
+                return null;
         }
     }
 

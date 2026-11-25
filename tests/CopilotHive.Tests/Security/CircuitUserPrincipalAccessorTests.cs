@@ -350,6 +350,39 @@ public sealed class CircuitUserPrincipalAccessorTests
             () => new CircuitUserPrincipalAccessor(directory.AuthEnabledResolver(), null!));
     }
 
+    // ── The DIRECT Observe / Initialize / Clear entries are ORDER-FREE ────────────────────────
+
+    /// <summary>
+    /// THE DIRECT ENTRY POINTS ARE UNCHANGED BY THE CASCADING ORDERING: <see cref="CircuitUserPrincipalAccessor.Observe"/>,
+    /// <see cref="CircuitUserPrincipalAccessor.Initialize"/> and <see cref="CircuitUserPrincipalAccessor.Clear"/>
+    /// carry their own explicit order (they are not registered cascading tasks), so they apply their
+    /// transitions immediately and in call order — the first observation establishes, the same identity
+    /// is idempotent, a different one replaces, and an explicit clear is permanent.
+    /// </summary>
+    [Fact]
+    public async Task DirectObserveInitializeAndClear_RemainOrderFree_AndUnchanged()
+    {
+        using var directory = new HiveSecurityTestDirectory();
+        await directory.SeedActivatedAccountAsync("1", UserRole.Admin);
+        var accessor = directory.Accessor(HiveAuthMode.AuthenticationEnabled);
+
+        // Initialize = Observe: the first state establishes.
+        accessor.Initialize(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1")));
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+        Assert.NotNull(accessor.EstablishedIdentity);
+
+        // The same identity observed directly is idempotent.
+        Assert.NotNull(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+
+        // Clear is explicit and permanent, even for the same identity afterwards.
+        accessor.Clear();
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+        Assert.Null(accessor.Observe(StateOf(HiveSecurityTestDirectory.GitHubPrincipal("1"))));
+        Assert.Null(accessor.EstablishedIdentity);
+        Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
+    }
+
     // ── Sign-out / replacement DURING a real directory resolution ────────────────────────────
 
     /// <summary>

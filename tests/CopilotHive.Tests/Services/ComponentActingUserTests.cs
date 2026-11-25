@@ -1,3 +1,5 @@
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Claims;
 
 using CopilotHive.Security;
@@ -323,7 +325,10 @@ public sealed class ComponentActingUserTests : IDisposable
 
         var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
         var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor).AsTask();
-        try
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
         {
             Assert.False(stale.IsCompleted); // parked on the gate: the await has not resumed.
             // Another call observes the explicit sign-out while the stale task is parked.
@@ -339,12 +344,7 @@ public sealed class ComponentActingUserTests : IDisposable
             Assert.Null((await accessor.GetPrincipalAsync(Ct)).Principal);
             Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
             Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
-        }
-        finally
-        {
-            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
-            await stale;
-        }
+        });
     }
 
     /// <summary>
@@ -359,7 +359,10 @@ public sealed class ComponentActingUserTests : IDisposable
 
         var gate = new TaskCompletionSource<AuthenticationState>(TaskCreationOptions.RunContinuationsAsynchronously);
         var stale = ComponentActingUser.AcquireAsync(gate.Task, accessor).AsTask();
-        try
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
         {
             Assert.False(stale.IsCompleted);
             accessor.Clear();
@@ -370,12 +373,7 @@ public sealed class ComponentActingUserTests : IDisposable
             Assert.Equal(CircuitIdentityState.SignedOut, accessor.IdentityState);
             Assert.Null(accessor.EstablishedIdentity);
             Assert.False(await ComponentActingUser.IsAllowedAsync(StateFor(AdminId), accessor, HiveCapability.SharedRead, Ct));
-        }
-        finally
-        {
-            gate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
-            await stale;
-        }
+        });
     }
 
     [Fact]
@@ -488,6 +486,668 @@ public sealed class ComponentActingUserTests : IDisposable
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
             await ComponentActingUser.IsAllowedAsync(
                 StateFor(AdminId), accessor, (HiveCapability)999, Ct));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  REGISTRATION ORDER: a newer registration supersedes every older one
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>A gate plus the acquisition parked on it, owned by the row that created it.</summary>
+    private static TaskCompletionSource<AuthenticationState> NewGate() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Bounded, cancellation-INDEPENDENT join budget for releasing/joining parked acquisitions.</summary>
+    private static readonly TimeSpan JoinTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>The identity a principal carries, for readable assertions.</summary>
+    private static string? IdentityOf(ClaimsPrincipal? principal) =>
+        principal?.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+    /// <summary>
+    /// THE CORE ORDERING CELL: while a NEWER task is still PENDING, the OLDER task completes with each
+    /// of the three outcomes. All three must yield <c>null</c> and must leave the accessor EXACTLY as it
+    /// was — the accessor's state and established identity are compared before/after, so "unchanged" is
+    /// asserted rather than "denied for some other reason".
+    /// <para>
+    /// The outcomes cover the whole surface: a SIGN-OUT (which would otherwise invalidate), a valid
+    /// REPLACEMENT (which would otherwise permanently replace), and the SAME identity (which would
+    /// otherwise be served as a harmless idempotent re-read). Because all three behave identically, the
+    /// rows discriminate on supersession rather than on the identity the older task happened to carry.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("sign-out")]
+    [InlineData("replacement")]
+    [InlineData("same-identity")]
+    public async Task SupersededOlderTask_CompletingWhileANewerIsPending_YieldsNull_AndLeavesTheAccessorUnchanged(
+        string olderOutcome)
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        await _auth.SeedAsync(MemberId, UserRole.Admin);
+        var accessor = Accessor();
+
+        // Establish A through the helper, exactly as a page's first acquisition does.
+        var established = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+        Assert.Equal(AdminId, IdentityOf(established));
+        var stateBefore = accessor.IdentityState;
+        var identityBefore = accessor.EstablishedIdentity;
+        Assert.Equal(CircuitIdentityState.Initialized, stateBefore);
+        Assert.NotNull(identityBefore);
+
+        var olderGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var newerGate = NewGate();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        work.ReleaseBeforeJoin(() => newerGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(older.IsCompleted);
+
+            // THE NEWER REGISTRATION arrives and is still PENDING — it already superseded the older.
+            var newer = work.Track(ComponentActingUser.AcquireAsync(newerGate.Task, accessor).AsTask());
+            Assert.False(newer.IsCompleted);
+
+            olderGate.SetResult(olderOutcome switch
+            {
+                "sign-out" => new AuthenticationState(FacadeAuthorizationHarness.Anonymous()),
+                "replacement" => new AuthenticationState(FacadeAuthorizationHarness.Principal(MemberId)),
+                "same-identity" => new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)),
+                _ => throw new InvalidOperationException(olderOutcome),
+            });
+
+            // SUPERSEDED: null, with the accessor byte-for-byte unchanged in state AND identity.
+            Assert.Null(await older.WaitAsync(Ct));
+            Assert.Equal(stateBefore, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+            Assert.False(accessor.IsInvalidated);
+
+            // The capability question and the principal resolution are equally unaffected.
+            Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+            Assert.Equal(AdminId, (await accessor.GetPrincipalAsync(Ct)).Principal!.GitHubId);
+        });
+    }
+
+    /// <summary>
+    /// THE SAME ORDERING CELL, REVERSED: the NEWER task completes FIRST (winning and publishing the
+    /// same identity), and the OLDER task is released afterwards. The older completion is still
+    /// superseded, so it observes nothing and the newer outcome stands unchanged.
+    /// </summary>
+    [Theory]
+    [InlineData("sign-out")]
+    [InlineData("replacement")]
+    [InlineData("same-identity")]
+    public async Task SupersededOlderTask_CompletingAfterTheNewerOneWon_YieldsNull_AndLeavesTheAccessorUnchanged(
+        string olderOutcome)
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        await _auth.SeedAsync(MemberId, UserRole.Admin);
+        var accessor = Accessor();
+
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+        var stateBefore = accessor.IdentityState;
+        var identityBefore = accessor.EstablishedIdentity;
+
+        var olderGate = NewGate();
+        var newerGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var newer = ComponentActingUser.AcquireAsync(newerGate.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        work.ReleaseBeforeJoin(() => newerGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        _ = work.Track(newer);
+        await work.RunAsync(async () =>
+        {
+            // THE NEWER TASK WINS FIRST: it is the current registration, so it observes.
+            newerGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Equal(AdminId, IdentityOf(await newer.WaitAsync(Ct)));
+            Assert.Equal(stateBefore, accessor.IdentityState);
+
+            // THE OLDER COMPLETION ARRIVES AFTER the newer one already won: still superseded.
+            olderGate.SetResult(olderOutcome switch
+            {
+                "sign-out" => new AuthenticationState(FacadeAuthorizationHarness.Anonymous()),
+                "replacement" => new AuthenticationState(FacadeAuthorizationHarness.Principal(MemberId)),
+                "same-identity" => new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)),
+                _ => throw new InvalidOperationException(olderOutcome),
+            });
+            Assert.Null(await older.WaitAsync(Ct));
+
+            Assert.Equal(stateBefore, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+            Assert.False(accessor.IsInvalidated);
+            Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        });
+    }
+
+    /// <summary>
+    /// ON A FRESH CIRCUIT, STALE WORK CANNOT ESTABLISH THE FIRST IDENTITY: the older task is registered
+    /// and held BEFORE any identity exists; a newer registration then supersedes it while still pending.
+    /// The older completion must NOT initialise the accessor — it stays
+    /// <see cref="CircuitIdentityState.Uninitialized"/> with no recorded identity — and the capability
+    /// question still refuses. This is what makes "first registration establishes the identity" safe
+    /// under overlap.
+    /// </summary>
+    [Theory]
+    [InlineData("sign-out")]
+    [InlineData("replacement")]
+    [InlineData("same-identity")]
+    public async Task OnAFreshCircuit_AStaleTaskCannotEstablishTheFirstIdentity(string olderOutcome)
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        await _auth.SeedAsync(MemberId, UserRole.Admin);
+        var accessor = Accessor();
+
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+
+        var olderGate = NewGate();
+        var newerGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var newer = ComponentActingUser.AcquireAsync(newerGate.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        work.ReleaseBeforeJoin(() => newerGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        _ = work.Track(newer);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(older.IsCompleted);
+            Assert.False(newer.IsCompleted);
+
+            olderGate.SetResult(olderOutcome switch
+            {
+                "sign-out" => new AuthenticationState(FacadeAuthorizationHarness.Anonymous()),
+                "replacement" => new AuthenticationState(FacadeAuthorizationHarness.Principal(MemberId)),
+                "same-identity" => new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)),
+                _ => throw new InvalidOperationException(olderOutcome),
+            });
+
+            Assert.Null(await older.WaitAsync(Ct));
+
+            // THE CIRCUIT IS STILL FRESH: no identity was fabricated from the superseded task, not even
+            // by the same-identity row that would otherwise have established it.
+            Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+            Assert.False(accessor.IsInitialized);
+            Assert.Null(accessor.EstablishedIdentity);
+            Assert.False(accessor.IsInvalidated);
+            Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+            // The no-cascade acquisition cannot stand in for a first identity either.
+            Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+            Assert.False(await ComponentActingUser.IsAllowedAsync(
+                null, accessor, HiveCapability.SharedRead, Ct));
+            Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+        });
+    }
+
+    /// <summary>
+    /// REACQUIRING THE EXACT SAME TASK NEVER ADVANCES ITS ORDER. The exact older task object is
+    /// re-acquired while a newer one is pending, and again after the newer one has won. Both
+    /// re-acquisitions must stay DENIED (they return <c>null</c>), while the exact CURRENT task object
+    /// still WORKS when re-acquired — so the rule is "the same task keeps its original order", not
+    /// "every re-acquisition is denied".
+    /// </summary>
+    [Fact]
+    public async Task ReacquiringTheExactOlderTask_NeverAdvancesIt_WhileTheExactCurrentTaskStillWorks()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+
+        var olderGate = NewGate();
+        var newerGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var newer = ComponentActingUser.AcquireAsync(newerGate.Task, accessor).AsTask();
+        // THE REPLAY IS OWNED BEFORE any assertion can throw: a second acquisition of the EXACT older
+        // task is started here and joined in the finally below even if a rendezvous assertion fails.
+        var reacquiredWhilePending = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        work.ReleaseBeforeJoin(() => newerGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        _ = work.Track(newer);
+        _ = work.Track(reacquiredWhilePending);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(reacquiredWhilePending.IsCompleted);
+
+            newerGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Equal(AdminId, IdentityOf(await newer.WaitAsync(Ct)));
+
+            // ...and after the newer one has won: still the ORIGINAL (older) order, so still denied.
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await older.WaitAsync(Ct));
+            Assert.Null(await reacquiredWhilePending.WaitAsync(Ct));
+
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Equal(AdminId, IdentityOf(accessor.EstablishedIdentity));
+
+            // THE CURRENT TASK STILL WORKS when the SAME object is re-acquired: it holds the newest
+            // order, so its (idempotent) observation is served.
+            Assert.Equal(AdminId, IdentityOf(await newer));
+            Assert.Equal(AdminId, IdentityOf(
+                await ComponentActingUser.AcquireAsync(newerGate.Task, accessor)));
+            Assert.Equal(AdminId, IdentityOf(accessor.EstablishedIdentity));
+        });
+    }
+
+    /// <summary>
+    /// REACQUIRING THE EXACT T1 TASK AFTER T2 WON: the replay row above covers a second
+    /// acquisition of the exact older object only WHILE T2 is pending. This row closes the other half of
+    /// the ReplaySuperseded cell: once T2 has completed and published its identity, reacquiring the
+    /// EXACT older task object is still DENIED (it keeps its first, superseded order), while reacquiring
+    /// the EXACT current T2 object is still ALLOWED. The accessor's state and identity are unchanged by
+    /// every replay, so a call-count-only re-promote is impossible.
+    /// </summary>
+    [Fact]
+    public async Task ReacquiringTheExactOlderTask_AfterTheNewerOneWon_StaysDenied_WhileTheExactCurrentTaskStillWorks()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+        var identityBefore = accessor.EstablishedIdentity;
+        Assert.NotNull(identityBefore);
+
+        var olderGate = NewGate();
+        var newerGate = NewGate();
+        var exactOlder = olderGate.Task;
+        var exactCurrent = newerGate.Task;
+        var older = ComponentActingUser.AcquireAsync(exactOlder, accessor).AsTask();
+        var newer = ComponentActingUser.AcquireAsync(exactCurrent, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        work.ReleaseBeforeJoin(() => newerGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        _ = work.Track(newer);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(older.IsCompleted);
+            Assert.False(newer.IsCompleted);
+
+            // T2 WINS. The exact task objects are retained; this is a replay, not a new registration.
+            newerGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Equal(AdminId, IdentityOf(await newer.WaitAsync(Ct)));
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+
+            // REPLAY the EXACT older T1 object AFTER T2 WON: still superseded, still denied.
+            var replayAfterWin = work.Track(ComponentActingUser.AcquireAsync(exactOlder, accessor).AsTask());
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await older.WaitAsync(Ct));
+            Assert.Null(await replayAfterWin.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+            Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+
+            // REPLAY the EXACT current T2 object: still current, still served.
+            Assert.Equal(AdminId, IdentityOf(
+                await ComponentActingUser.AcquireAsync(exactCurrent, accessor)));
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+        });
+    }
+
+    /// <summary>
+    /// CURRENT SIGN-OUT AND REPLACEMENT REMAIN PERMANENTLY INVALIDATING even with late older work and a
+    /// fresh task carrying the ORIGINAL account in flight. A CURRENT sign-out (or a current
+    /// replacement) invalidates; the late older task and the fresh original-account task are then both
+    /// superseded-or-invalidated and restore nothing.
+    /// </summary>
+    [Theory]
+    [InlineData("sign-out", CircuitIdentityState.SignedOut)]
+    [InlineData("replacement", CircuitIdentityState.IdentityReplaced)]
+    public async Task CurrentSignOutOrReplacement_StaysTerminal_DespiteLateOlderWorkAndAFreshOriginalTask(
+        string terminal, CircuitIdentityState expected)
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        await _auth.SeedAsync(MemberId, UserRole.Admin);
+        var accessor = Accessor();
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+
+        // An OLDER task is parked before the CURRENT invalidating update arrives.
+        var olderGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        await work.RunAsync(async () =>
+        {
+            Assert.False(older.IsCompleted);
+
+            // THE CURRENT UPDATE invalidates the circuit permanently.
+            var invalidating = terminal == "sign-out"
+                ? new AuthenticationState(FacadeAuthorizationHarness.Anonymous())
+                : new AuthenticationState(FacadeAuthorizationHarness.Principal(MemberId));
+            Assert.Null(await ComponentActingUser.AcquireAsync(Task.FromResult(invalidating), accessor));
+            Assert.Equal(expected, accessor.IdentityState);
+            Assert.True(accessor.IsInvalidated);
+
+            // The LATE OLDER task now completes with the ORIGINAL account: superseded, so it restores
+            // nothing.
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await older.WaitAsync(Ct));
+            Assert.Equal(expected, accessor.IdentityState);
+            Assert.Null(accessor.EstablishedIdentity);
+
+            // A FRESH task carrying the ORIGINAL account is the CURRENT registration and IS observed —
+            // and the terminal state still refuses it, so nothing is restored.
+            Assert.Null(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor));
+            Assert.Equal(expected, accessor.IdentityState);
+            Assert.True(accessor.IsInvalidated);
+            Assert.Null(accessor.EstablishedIdentity);
+            Assert.False(await accessor.IsAllowedAsync(HiveCapability.SharedRead, Ct));
+            Assert.Null(await ComponentActingUser.AcquireAsync(null, accessor));
+            Assert.Null((await accessor.GetPrincipalAsync(Ct)).Principal);
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  FAULT / CANCELLATION OF THE NEWEST TASK
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A FAULTED NEWEST TASK: the exception PROPAGATES to the caller (it is never converted into a
+    /// denial), the accessor's identity is UNCHANGED, and there is NO fallback to the older — already
+    /// superseded — task, which stays denied even after it completes successfully. The circuit is NOT
+    /// terminal, so a fresh valid task still recovers it.
+    /// </summary>
+    [Fact]
+    public async Task AFaultedNewestTask_Propagates_LeavesIdentityUnchanged_AndDoesNotFallBackToTheOlderTask()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+        var identityBefore = accessor.EstablishedIdentity;
+        var injected = new InvalidOperationException("Inject: the cascading state provider failed.");
+
+        var olderGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        await work.RunAsync(async () =>
+        {
+            var faulted = NewGate();
+            var newest = ComponentActingUser.AcquireAsync(faulted.Task, accessor).AsTask();
+            faulted.SetException(injected);
+
+            var caught = await Assert.ThrowsAsync<InvalidOperationException>(() => newest.WaitAsync(Ct));
+            Assert.Same(injected, caught); // the caller's own fault, propagated verbatim
+
+            Assert.Same(identityBefore, await ComponentActingUser.AcquireAsync(null, accessor));
+
+            // NO identity change and NO fallback to the older task.
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+            Assert.False(accessor.IsInvalidated);
+            Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+
+            // The older task completes successfully afterwards: it is SUPERSEDED, so it restores nothing
+            // either — a failed newest leaves the older one superseded with no fallback.
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await older.WaitAsync(Ct));
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+
+            // RECOVERY ON THIS NON-TERMINAL CIRCUIT: a FRESH valid task is current and is observed.
+            Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+            Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+        });
+    }
+
+    /// <summary>
+    /// A CANCELED NEWEST TASK: <see cref="OperationCanceledException"/> propagates (cancellation is
+    /// never converted into a denial), the identity is UNCHANGED, the older task stays superseded, and a
+    /// fresh valid task recovers the circuit.
+    /// </summary>
+    [Fact]
+    public async Task ACanceledNewestTask_Propagates_LeavesIdentityUnchanged_AndDoesNotFallBackToTheOlderTask()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+        var identityBefore = accessor.EstablishedIdentity;
+
+        var olderGate = NewGate();
+        var older = ComponentActingUser.AcquireAsync(olderGate.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => olderGate.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(older);
+        await work.RunAsync(async () =>
+        {
+            var canceled = NewGate();
+            var newest = ComponentActingUser.AcquireAsync(canceled.Task, accessor).AsTask();
+            using var cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            canceled.SetCanceled(cancellation.Token);
+
+            var caught = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => newest.WaitAsync(Ct));
+            Assert.Equal(cancellation.Token, caught.CancellationToken);
+            Assert.Same(identityBefore, await ComponentActingUser.AcquireAsync(null, accessor));
+
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+            Assert.False(accessor.IsInvalidated);
+            Assert.True(await accessor.IsAllowedAsync(HiveCapability.GlobalAdmin, Ct));
+
+            olderGate.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await older.WaitAsync(Ct));
+            Assert.Same(identityBefore, accessor.EstablishedIdentity);
+
+            Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+        });
+    }
+
+    /// <summary>
+    /// A FAILED NEWEST TASK DOES NOT COST THE CIRCUIT AN ALREADY ESTABLISHED IDENTITY: the genuine
+    /// no-cascade ACQUISITION still returns the established identity (identity is not authorization),
+    /// while the no-cascade CAPABILITY check still DENIES while authentication is enabled. The contrast
+    /// between those two answers is the point: the identity survives, the authority does not.
+    /// </summary>
+    [Fact]
+    public async Task AfterAFailedNewestTask_TheGenuineNoCascadeAcquisitionStillReturnsTheEstablishedIdentity_ButTheCapabilityCheckDenies()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+        var established = await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor);
+        Assert.Equal(AdminId, IdentityOf(established));
+
+        var faulted = NewGate();
+        var newest = ComponentActingUser.AcquireAsync(faulted.Task, accessor).AsTask();
+        faulted.SetException(new InvalidOperationException("Inject: the cascading state provider failed."));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => newest.WaitAsync(Ct));
+
+        // A GENUINE no-cascade acquisition (a child component acquiring before/without its parent).
+        Assert.Same(established, await ComponentActingUser.AcquireAsync(null, accessor));
+        Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+
+        // ...and the no-cascade CAPABILITY question still denies while authentication is enabled.
+        foreach (var capability in Enum.GetValues<HiveCapability>())
+            Assert.False(await ComponentActingUser.IsAllowedAsync(null, accessor, capability, Ct));
+    }
+
+    /// <summary>
+    /// NO-CASCADE REFUSAL, FRESH AND TERMINAL, PLUS THE EXPLICIT OPEN SUCCESS: on a FRESH
+    /// authentication-enabled circuit a missing cascade is denied as an acquisition AND as a capability,
+    /// with nothing initialised; on a TERMINAL circuit it is denied too; in EXPLICIT OPEN mode the
+    /// missing cascade is the local-operator decision, so it is served and allowed.
+    /// </summary>
+    [Fact]
+    public async Task NoCascadeAcquisition_IsRefusedWhenFreshAndWhenTerminal_AndSucceedsOnlyInExplicitOpenMode()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+
+        // FRESH: no cascade establishes nothing and answers nothing.
+        var fresh = Accessor();
+        Assert.Null(await ComponentActingUser.AcquireAsync(null, fresh));
+        Assert.False(await ComponentActingUser.IsAllowedAsync(null, fresh, HiveCapability.SharedRead, Ct));
+        Assert.Equal(CircuitIdentityState.Uninitialized, fresh.IdentityState);
+
+        // TERMINAL: once the circuit is invalidated, the cascade-less acquisition is denied as well.
+        var terminal = Accessor();
+        Assert.NotNull(await ComponentActingUser.AcquireAsync(StateFor(AdminId), terminal));
+        Assert.Null(await ComponentActingUser.AcquireAsync(
+            Task.FromResult(new AuthenticationState(FacadeAuthorizationHarness.Anonymous())), terminal));
+        Assert.True(terminal.IsInvalidated);
+        Assert.Null(await ComponentActingUser.AcquireAsync(null, terminal));
+        Assert.False(await ComponentActingUser.IsAllowedAsync(null, terminal, HiveCapability.SharedRead, Ct));
+
+        // EXPLICIT OPEN: the missing cascade is the local operator, unchanged.
+        var open = Accessor(HiveAuthMode.Open);
+        Assert.Null(await ComponentActingUser.AcquireAsync(null, open));
+        Assert.True(await ComponentActingUser.IsAllowedAsync(null, open, HiveCapability.GlobalAdmin, Ct));
+        Assert.Equal(CircuitIdentityState.Uninitialized, open.IdentityState);
+    }
+
+    /// <summary>
+    /// SUPERSEDED TASKS ARE NOT RETAINED FOR THE CIRCUIT'S LIFETIME. The accessor's observation-order
+    /// bookkeeping is keyed WEAKLY by the task: no field of the accessor may hold a STRONG reference to a
+    /// <see cref="Task{TResult}"/>, so a superseded task's entry disappears with the task instead of
+    /// living for the circuit's lifetime.
+    /// <para>
+    /// This is asserted STRUCTURALLY (reflection over the accessor's own fields), because a collection
+    /// proof is not discriminating here: a task the accessor never saw stays rooted by the calling
+    /// method's own async state machine in a Debug test build, so "collected" would fail either way.
+    /// The rule is enforced on the ONLY thing that could retain the task — the accessor.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task TheAccessor_HoldsNoStrongReferenceToAnyCascadeTask()
+    {
+        await _auth.SeedAsync(AdminId, UserRole.Admin);
+        var accessor = Accessor();
+
+        // Exercise the ordering boundary so the bookkeeping really exists when the rule is checked.
+        Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+        var older = NewGate();
+        var stale = ComponentActingUser.AcquireAsync(older.Task, accessor).AsTask();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        work.ReleaseBeforeJoin(() => older.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(stale);
+        await work.RunAsync(async () =>
+        {
+            Assert.Equal(AdminId, IdentityOf(await ComponentActingUser.AcquireAsync(StateFor(AdminId), accessor)));
+            older.SetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId)));
+            Assert.Null(await stale.WaitAsync(Ct));
+
+            var offenders = new List<string>();
+            foreach (var field in typeof(CircuitUserPrincipalAccessor)
+                .GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+            {
+                // A ConditionalWeakTable holds its KEY weakly and its VALUE strongly: the key may be the
+                // cascade task, the value must never be one.
+                if (field.FieldType.IsGenericType &&
+                    field.FieldType.GetGenericTypeDefinition() == typeof(ConditionalWeakTable<,>))
+                {
+                    var arguments = field.FieldType.GetGenericArguments();
+                    Assert.Equal(typeof(Task<AuthenticationState>), arguments[0]);
+                    if (HoldsATask(arguments[1])) offenders.Add($"{field.Name} values");
+                    continue;
+                }
+
+                if (HoldsATask(field.FieldType)) offenders.Add(field.Name);
+            }
+
+            Assert.True(offenders.Count == 0,
+                "the accessor must not retain cascade tasks for the circuit's lifetime: " + string.Join(", ", offenders));
+        });
+    }
+
+    /// <summary>Whether <paramref name="type"/> is, or is built from, a <see cref="Task"/> type.</summary>
+    private static bool HoldsATask(Type type)
+    {
+        if (type == typeof(Task) || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>)))
+            return true;
+        if (type.IsArray && HoldsATask(type.GetElementType()!)) return true;
+        return type.IsGenericType && type.GetGenericArguments().Any(HoldsATask);
+    }
+
+    [Fact]
+    public async Task ReplayCleanup_CanceledScenarioAndEarlyFault_StillReleasesAndJoinsReplay()
+    {
+        var accessor = Accessor();
+        var work = new CircuitObservationTestWork(JoinTimeout);
+        var t1 = NewGate();
+        var t2 = NewGate();
+        using var scenario = new CancellationTokenSource();
+        var releaseFault = new InvalidOperationException("first release failed");
+        var replayFault = new InvalidOperationException("released replay failed");
+        var joinFault = new InvalidOperationException("first join failed");
+        work.ReleaseBeforeJoin(() => throw releaseFault);
+        work.ReleaseBeforeJoin(() => t1.TrySetException(replayFault));
+        work.ReleaseBeforeJoin(() => t2.TrySetResult(new AuthenticationState(FacadeAuthorizationHarness.Principal(AdminId))));
+        _ = work.Track(Task.FromException(joinFault));
+        var older = work.Track(ComponentActingUser.AcquireAsync(t1.Task, accessor).AsTask());
+        var current = work.Track(ComponentActingUser.AcquireAsync(t2.Task, accessor).AsTask());
+        var replay = work.Track(ComponentActingUser.AcquireAsync(t1.Task, accessor).AsTask());
+
+        var error = await Assert.ThrowsAsync<AggregateException>(() => work.RunAsync(() =>
+        {
+            Assert.False(older.IsCompleted);
+            Assert.False(current.IsCompleted);
+            Assert.False(replay.IsCompleted);
+            scenario.Cancel();
+            return Task.FromCanceled(scenario.Token);
+        }));
+
+        Assert.Equal(scenario.Token, Assert.IsAssignableFrom<OperationCanceledException>(error.InnerExceptions[0]).CancellationToken);
+        Assert.Collection(error.InnerExceptions.Skip(1), ex => Assert.Same(releaseFault, ex),
+            ex => Assert.Same(joinFault, ex), ex => Assert.Same(replayFault, ex));
+        Assert.True(replay.IsFaulted);
+        Assert.True(current.IsCompletedSuccessfully);
+        Assert.Equal(AdminId, IdentityOf(await current));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task DirectAndCurrentOrderedObservations_ApplyEquivalentTransitions(bool anonymousFirst, bool signOut)
+    {
+        var direct = Accessor();
+        var ordered = Accessor();
+        var original = anonymousFirst ? FacadeAuthorizationHarness.Anonymous() : FacadeAuthorizationHarness.Principal(AdminId);
+        var same = anonymousFirst ? FacadeAuthorizationHarness.Anonymous() : FacadeAuthorizationHarness.Principal(AdminId);
+        var next = signOut ? FacadeAuthorizationHarness.Anonymous() : FacadeAuthorizationHarness.Principal(MemberId);
+        foreach (var user in new[] { original, same, next, original })
+        {
+            var state = new AuthenticationState(user);
+            Assert.Same(direct.Observe(state), await ComponentActingUser.AcquireAsync(Task.FromResult(state), ordered));
+            Assert.Equal(direct.IdentityState, ordered.IdentityState);
+            Assert.Same(direct.EstablishedIdentity, ordered.EstablishedIdentity);
+        }
+        Assert.Equal((anonymousFirst, signOut) switch
+        {
+            (true, true) => CircuitIdentityState.Initialized,
+            (false, true) => CircuitIdentityState.SignedOut,
+            _ => CircuitIdentityState.IdentityReplaced,
+        }, ordered.IdentityState);
+    }
+
+    private sealed class IdentityReadProbe : ClaimsPrincipal
+    {
+        public int Reads { get; private set; }
+        public override System.Security.Principal.IIdentity? Identity
+        {
+            get { Reads++; return base.Identity; }
+        }
+    }
+
+    [Fact]
+    public void CompleteObservation_SupersededTicketDoesNotReadClaims_CurrentTicketDoes()
+    {
+        var accessor = Accessor();
+        var staleState = new AuthenticationState(new IdentityReadProbe());
+        var currentState = new AuthenticationState(new IdentityReadProbe());
+        var older = accessor.RegisterObservation(Task.FromResult(staleState));
+        var newer = accessor.RegisterObservation(Task.FromResult(currentState));
+        Assert.Null(accessor.CompleteObservation(older, staleState));
+        Assert.Equal(0, ((IdentityReadProbe)staleState.User).Reads);
+        Assert.Equal(CircuitIdentityState.Uninitialized, accessor.IdentityState);
+        Assert.Same(currentState.User, accessor.CompleteObservation(newer, currentState));
+        Assert.Equal(1, ((IdentityReadProbe)currentState.User).Reads);
     }
 
     public void Dispose() => _auth.Dispose();

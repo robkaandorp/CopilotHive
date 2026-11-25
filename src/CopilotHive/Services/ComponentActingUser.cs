@@ -61,15 +61,26 @@ public static class ComponentActingUser
     /// state if there is one, OBSERVES it on the scoped <see cref="CircuitUserPrincipalAccessor"/> and
     /// returns the identity to hand to an identity-aware facade, or <c>null</c> when there is none.
     /// <list type="bullet">
-    /// <item>Cascade present: the accessor's atomic observation decides. The first state establishes the
-    /// identity; the same identity is idempotent; a different identity or a signed-out state after an
-    /// established identity permanently invalidates the circuit and yields <c>null</c>; an already
-    /// invalidated circuit yields <c>null</c> without adopting or restoring anything. The invalidation
-    /// check happens AT THE AWAIT'S RESUMPTION (inside the observation), so a stale task that completes
-    /// after another call observed a sign-out writes nothing and returns <c>null</c>.</item>
+    /// <item>Cascade present: the accessor's atomic observation decides. Each DISTINCT cascade task is
+    /// REGISTERED by reference BEFORE it is awaited, and its first registration fixes its order. A
+    /// newer registration supersedes every older one IMMEDIATELY — even while the newer task is still
+    /// pending, and even if it later faults or is cancelled — so a superseded completion returns
+    /// <c>null</c> without observing its state. Re-acquiring the exact same task never advances its
+    /// order (a call-count-only re-promote is impossible). A superseded <see cref="Task{TResult}"/> is
+    /// never retained for the circuit's lifetime.</item>
+    /// <item>The identity state machine itself is unchanged: the first state establishes the identity;
+    /// the same identity is idempotent; a different identity or a signed-out state after an established
+    /// identity permanently invalidates the circuit. Currentness and the transition are decided
+    /// together under the accessor's ONE lock, so a late older task can neither establish the first
+    /// identity nor change an established one, and never substitutes the recorded identity.</item>
+    /// <item>Faults and cancellation PROPAGATE UNTOUCHED. A failed newest acquisition applies no
+    /// identity transition and falls back to no older (already superseded) task, so whatever identity
+    /// was established before it remains exactly as it was.</item>
     /// <item>No cascade: never initialises the accessor. Returns the already established identity ONLY
     /// when authentication is enabled and no invalidation has been observed; otherwise <c>null</c>
-    /// (explicit open mode, unknown mode, never established, or invalidated).</item>
+    /// (explicit open mode, unknown mode, never established, or invalidated). This is a genuine
+    /// no-cascade ACQUISITION — the capability question in <see cref="IsAllowedAsync"/> still denies it
+    /// while authentication is enabled.</item>
     /// </list>
     /// Every question later asked still re-resolves current stored state, so a returned identity pins
     /// no role.
@@ -88,11 +99,24 @@ public static class ComponentActingUser
             return accessor is { AuthEnabled: true } ? accessor.EstablishedIdentity : null;
         }
 
+        if (accessor is null)
+            return (await authenticationState).User;
+
+        // REGISTER BEFORE AWAITING, on the circuit's ONE ordering boundary: the FIRST registration of
+        // this exact task fixes its order, a NEWER task supersedes every earlier registration
+        // IMMEDIATELY (while it is still pending, and even if it later faults or is cancelled), and
+        // re-acquiring the SAME task returns its original order, so it can never be re-promoted.
+        var observation = accessor.RegisterObservation(authenticationState);
+
+        // Faults and cancellation propagate UNTOUCHED: a failed acquisition applies no identity
+        // transition at all, so nothing is restored, nothing is adopted and there is no fallback to an
+        // older — already superseded — task.
         var state = await authenticationState;
 
-        // Resumption point: the accessor re-checks its CURRENT invalidation state atomically with the
-        // write, so a late completion after a sign-out can neither initialise nor restore identity.
-        return accessor is null ? state.User : accessor.Observe(state);
+        // THE ATOMIC DECISION: currentness and any identity transition happen together inside the
+        // accessor's lock. A superseded completion returns null WITHOUT observing its state, so a
+        // late older task can neither establish the first identity nor change an established one.
+        return accessor.CompleteObservation(observation, state);
     }
 
     /// <summary>

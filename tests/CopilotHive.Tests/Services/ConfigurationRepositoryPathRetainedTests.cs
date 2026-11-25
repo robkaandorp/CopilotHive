@@ -119,17 +119,41 @@ public sealed class ConfigurationRepositoryPathRetainedTests : IDisposable
     // ── the recording/gating decorator over the PRODUCTION config facade ───
 
     /// <summary>
+    /// One recorded path-projection delegation: the ACTUAL principal argument the page forwarded (with
+    /// its actual nullness, so a null identity is distinguishable from an anonymous one), the ACTUAL
+    /// production result, and the protected path the caller was allowed to obtain (<c>null</c> unless the
+    /// call really succeeded with a configured repo).
+    /// </summary>
+    internal sealed record PathCall(ClaimsPrincipal? ActingUser, bool Success, FacadeErrorKind Kind, string? Value)
+    {
+        /// <summary>Whether the page forwarded NO principal at all (the superseded/denied shape).</summary>
+        internal bool ForwardedNullPrincipal => ActingUser is null;
+
+        /// <summary>The GitHub identity the page forwarded, or <c>null</c> when it forwarded none.</summary>
+        internal string? ActingIdentity => ActingUser?.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    }
+
+    /// <summary>
     /// The registered <see cref="IConfigFacade"/>: the production facade decorated so the test can
     /// park a path projection AFTER the real production answer and script the discovery result. EVERY
-    /// operation is recorded; every other method delegates verbatim to production.
+    /// operation is recorded; every path projection additionally records the ACTUAL argument and result,
+    /// so a row can prove which principal really crossed this boundary and what it obtained.
     /// </summary>
     private sealed class GateableConfigFacade(IConfigFacade production) : IConfigFacade
     {
         private readonly object _gateLock = new();
         private readonly Queue<ReadGate> _armed = new();
         private readonly List<ReadGate> _gates = [];
+        private readonly List<PathCall> _pathCalls = [];
 
         internal int PathCalls { get; private set; }
+
+        /// <summary>EVERY path projection recorded so far, in call order (actual argument + actual result).</summary>
+        internal IReadOnlyList<PathCall> RecordedPathCalls
+        {
+            get { lock (_gateLock) return [.. _pathCalls]; }
+        }
+
         internal int DiscoveryCalls { get; private set; }
         internal bool DenyDiscovery { get; set; }
         internal IReadOnlyList<DiscoveredModelDto> DiscoveryResult { get; set; } =
@@ -155,6 +179,7 @@ public sealed class ConfigurationRepositoryPathRetainedTests : IDisposable
             // The PRODUCTION answer is computed FIRST: parked means "real authorized result in hand,
             // publication pending", never "authorization not yet decided".
             var result = await production.GetConfigRepositoryPathAsync(a, ct);
+            lock (_gateLock) _pathCalls.Add(new PathCall(a, result.Success, result.Kind, result.Value));
             ReadGate? gate;
             lock (_gateLock) _armed.TryDequeue(out gate);
             if (gate is not null) await gate.ParkAsync(result);
@@ -1061,12 +1086,33 @@ public sealed class ConfigurationRepositoryPathRetainedTests : IDisposable
         });
     }
 
+    /// <summary>
+    /// REVERSE COMPLETION (updated expectation): the OLDER cascade completes AFTER a newer same-account
+    /// cascade already authorized and published the path. The older acquisition is SUPERSEDED by the
+    /// newer registration, so it is DENIED (it returns no identity and never forwards stale claims), the
+    /// circuit stays <see cref="CircuitIdentityState.Initialized"/> with the account it established, and
+    /// the NEWER banner remains untouched in state and markup.
+    /// <para>
+    /// The retired expectation was that a parked older sign-out/replacement cascade would invalidate the
+    /// circuit and clear the banner. That is no longer the contract: an older task is superseded the
+    /// moment a newer one is registered, so it cannot change the circuit at all — whether it completes
+    /// while the newer one is still pending or after the newer one has won (see
+    /// <see cref="ComponentActingUser.AcquireAsync"/>). A GENUINE (current) sign-out/replacement is still
+    /// permanently invalidating; that is pinned by <see cref="RetainedPath_CascadeChanged"/>.
+    /// </para>
+    /// </summary>
     [Theory]
     [InlineData("sign-out")]
     [InlineData("replacement")]
-    public Task RetainedPath_ReverseCompletion_OlderCascadeInvalidatesAfterNewerPublication_ClearsTheBanner(
-        string terminal) => ReverseCascadeCompletionAsync(terminal);
+    public Task RetainedPath_ReverseCompletion_SupersededOlderCascadeAfterNewerPublication_IsDeniedAndKeepsTheNewerBanner(
+        string olderOutcome) => ReverseCascadeCompletionAsync(olderOutcome);
 
+    /// <summary>
+    /// THE SAME-IDENTITY CONTROL for the reversed completion above: an older cascade carrying the SAME
+    /// identity is likewise superseded (it yields no identity and forwards no claims), the circuit stays
+    /// initialized, and the newer banner remains — the same outcome as the sign-out/replacement rows, so
+    /// those rows discriminate on the SUPERSESSION rather than on which identity the older task carried.
+    /// </summary>
     [Fact]
     public Task RetainedPath_ReverseCompletion_OlderSameIdentityCascadeAfterNewerPublication_KeepsTheBanner() =>
         ReverseCascadeCompletionAsync("same-identity");
@@ -1087,6 +1133,15 @@ public sealed class ConfigurationRepositoryPathRetainedTests : IDisposable
             var accessor = page.CircuitAccessor;
             Assert.Contains(Banner(path), await page.HtmlAsync(), StringComparison.Ordinal);
             Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+
+            // THE ORIGINAL IDENTITY REFERENCE, captured ONCE. A recorded-identity fallback (returning the
+            // established principal for a superseded completion) would still leave a banner and still
+            // leave a plausible IdentityState — so the REFERENCE is what this row pins: whatever the
+            // circuit established before the overlap must be the very same object afterwards.
+            var originalIdentity = accessor.EstablishedIdentity;
+            Assert.NotNull(originalIdentity);
+            Assert.Equal(AdminId, originalIdentity!.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+
             // A newer publication must change what is visible, not inherit the initial banner.
             await page.SetFieldAsync("_configRepoPath", null);
             await page.RequestRenderAsync();
@@ -1109,38 +1164,59 @@ public sealed class ConfigurationRepositoryPathRetainedTests : IDisposable
             Assert.Same(instance, page.Component);
             Assert.Equal(callsBefore + 1, host.ConfigFacade.PathCalls);
             Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.Same(originalIdentity, accessor.EstablishedIdentity);
             Assert.Equal(path, page.Field<string?>("_configRepoPath"));
             Assert.Contains(Banner(path), await page.HtmlAsync(), StringComparison.Ordinal);
             Assert.False(olderAuth.Task.IsCompleted);
             Assert.False(olderRefresh.IsCompleted, "The older cascade must still be held after the newer render.");
 
-            var (olderState, expectedState) = terminal switch
+            // THE NEWER CALL: the REAL published path call forwarded the ESTABLISHED admin identity and
+            // obtained the configured path — the authorized control this row depends on.
+            var newerCall = Assert.Single(host.ConfigFacade.RecordedPathCalls.Skip(callsBefore).Take(1));
+            Assert.False(newerCall.ForwardedNullPrincipal, "the newer (current) path call must forward a principal");
+            Assert.Equal(AdminId, newerCall.ActingIdentity);
+            Assert.Same(originalState.User, newerCall.ActingUser);
+            Assert.True(newerCall.Success);
+            Assert.Equal(FacadeErrorKind.None, newerCall.Kind);
+            Assert.Equal(path, newerCall.Value);
+
+            var olderState = terminal switch
             {
-                "sign-out" => (new AuthenticationState(FacadeAuthorizationHarness.Anonymous()), CircuitIdentityState.SignedOut),
-                "replacement" => (new AuthenticationState(Principal(ReplacementId)), CircuitIdentityState.IdentityReplaced),
-                "same-identity" => (originalState, CircuitIdentityState.Initialized),
+                "sign-out" => new AuthenticationState(FacadeAuthorizationHarness.Anonymous()),
+                "replacement" => new AuthenticationState(Principal(ReplacementId)),
+                "same-identity" => originalState,
                 _ => throw new InvalidOperationException(terminal),
             };
             olderAuth.SetResult(olderState);
             await olderRefresh.WaitAsync(JoinTimeout, Ct);
 
             Assert.Same(instance, page.Component);
-            Assert.Equal(callsBefore + 2, host.ConfigFacade.PathCalls);
-            Assert.Equal(expectedState, accessor.IdentityState);
+
+            // Pin the preserved publication independently, before checking the stale facade result.
             var html = await page.HtmlAsync();
-            if (terminal == "same-identity")
-            {
-                Assert.False(accessor.IsInvalidated);
-                Assert.Equal(path, page.Field<string?>("_configRepoPath"));
-                Assert.Contains(Banner(path), html, StringComparison.Ordinal);
-            }
-            else
-            {
-                Assert.True(accessor.IsInvalidated);
-                Assert.DoesNotContain(BannerLabel, html, StringComparison.Ordinal);
-                Assert.DoesNotContain(path, html, StringComparison.Ordinal);
-                Assert.Null(page.Field<string?>("_configRepoPath"));
-            }
+            Assert.Equal(path, page.Field<string?>("_configRepoPath"));
+            Assert.Contains(Banner(path), html, StringComparison.Ordinal);
+
+            // THE OLDER (SUPERSEDED) PATH CALL, observed at the REAL facade boundary. A counted call plus
+            // an unchanged banner is NOT proof of denial: the page's generation guard discards a stale
+            // SUCCESS exactly as it discards a stale denial, so both "denied" and "silently served the
+            // recorded identity" look identical from the banner alone. The recorded argument and result
+            // are what discriminate them.
+            Assert.Equal(callsBefore + 2, host.ConfigFacade.PathCalls);
+            var supersededCall = Assert.Single(host.ConfigFacade.RecordedPathCalls.Skip(callsBefore + 1).Take(1));
+            Assert.True(supersededCall.ForwardedNullPrincipal,
+                "a superseded completion must forward NO principal — never the recorded/established identity");
+            Assert.Null(supersededCall.ActingIdentity);
+            Assert.False(supersededCall.Success);
+            Assert.Equal(FacadeErrorKind.Forbidden, supersededCall.Kind);
+            Assert.Null(supersededCall.Value);
+
+            // THE CIRCUIT IS UNCHANGED: same state, and the SAME established-identity REFERENCE.
+            Assert.Equal(CircuitIdentityState.Initialized, accessor.IdentityState);
+            Assert.False(accessor.IsInvalidated);
+            Assert.Same(originalIdentity, accessor.EstablishedIdentity);
+            Assert.Equal(AdminId, accessor.EstablishedIdentity!
+                .FindFirst(ClaimTypes.NameIdentifier)?.Value);
         });
     }
 
