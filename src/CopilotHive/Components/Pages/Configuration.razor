@@ -7,16 +7,23 @@
 @using Microsoft.Extensions.AI
 @using Microsoft.AspNetCore.Components.Authorization
 @implements IDisposable
-@inject ConfigRepoManager ConfigRepo
 @inject PageHeaderState PageHeader
 @inject IConfigFacade ConfigFacade
 @inject CopilotHive.Security.CircuitUserPrincipalAccessor CircuitPrincipal
 @inject IBackupFacade BackupFacade
 @inject IJSRuntime JS
 
-<p style="color:var(--text-muted);margin-bottom:1.5rem">
-    Config repo: <code style="font-size:0.85rem">@ConfigRepo.LocalPath</code>
-</p>
+@* THE AUTHORIZED PROJECTION ONLY: the banner renders EXACTLY when IConfigFacade's GlobalAdmin-gated
+   read returns a path — and renders NOTHING when no config repo is configured or when the caller was
+   refused. The page no longer injects ConfigRepoManager and no longer reads LocalPath directly: that
+   direct read bypassed the administration requirement every other configuration projection enforces
+   and kept the host path on screen after the caller was demoted or disabled. *@
+@if (_configRepoPath is not null)
+{
+    <p style="color:var(--text-muted);margin-bottom:1.5rem">
+        Config repo: <code style="font-size:0.85rem">@_configRepoPath</code>
+    </p>
+}
 
 @if (_loading)
 {
@@ -1179,6 +1186,40 @@ else
     private readonly Dictionary<string, string> _files = [];
     private List<string> _tabs = [];
 
+    /// <summary>
+    /// THE AUTHORIZED config-repo PATH PROJECTION the banner renders, or <c>null</c> when no banner may
+    /// be shown (no config repo configured, or a refusal). It is written ONLY from
+    /// <see cref="IConfigFacade.GetConfigRepositoryPathAsync"/>: this page deliberately does not inject
+    /// the config-repo manager and never reads its clone path, so the path cannot reach the markup
+    /// without the administration requirement being re-resolved for the CURRENT caller.
+    /// </summary>
+    private string? _configRepoPath;
+
+    /// <summary>
+    /// Monotonic OWNERSHIP token of the path projection. A refresh claims the NEXT value BEFORE its
+    /// first await and publishes only while it still owns that value, so an OLDER authorized read can
+    /// never restore the banner after a newer refusal, a superseding refresh, an observed circuit
+    /// invalidation or disposal.
+    /// </summary>
+    private int _pathRefreshGeneration;
+
+    /// <summary>
+    /// The cascading authentication state the path projection was last refreshed for. It distinguishes
+    /// an ACTUAL cascading authentication parameter update from the framework's routine re-render,
+    /// which re-runs <see cref="OnParametersSetAsync"/> with an unchanged value.
+    /// </summary>
+    private Task<AuthenticationState>? _observedAuthenticationState;
+
+    /// <summary>
+    /// Whether the current cascade value was already observed by
+    /// <see cref="OnInitializedAsync"/> — so the framework's immediate
+    /// <see cref="OnParametersSetAsync"/> call cannot turn the same value into a second read.
+    /// </summary>
+    private bool _cascadeObserved;
+
+    /// <summary>Set by <see cref="Dispose"/>: a late projection completion writes nothing.</summary>
+    private bool _disposed;
+
     private ModelsConfigDto? _modelsData;
     private bool _modelsLoading;
     private bool _modelsSaving;
@@ -1349,6 +1390,123 @@ else
         ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal);
 
     /// <summary>
+    /// THE ONE SHARED DENIAL HANDLER for every configuration and backup response on this page. A
+    /// <see cref="FacadeErrorKind.Forbidden"/> answer is an ACCOUNT-LEVEL refusal: it says nothing about
+    /// the individual operation, so it must be handled BEFORE any branch that reasons about that
+    /// operation's own outcome — an operation-specific early return, an error field, or the branch
+    /// fetch's stale-generation check. The banner is cleared and every pending path publication is
+    /// invalidated; nothing is re-read and no cascade is touched, because the refusal already answered
+    /// the question.
+    /// </summary>
+    /// <typeparam name="T">The facade value type of the response.</typeparam>
+    /// <param name="result">The response to inspect.</param>
+    private void HandleForbidden<T>(FacadeResult<T> result)
+    {
+        if (result.Success || result.Kind != FacadeErrorKind.Forbidden) return;
+        ClearConfigRepositoryPath();
+    }
+
+    /// <summary>
+    /// THE DENY CLEAR for the config-repo banner: drops the projected path AND invalidates every path
+    /// projection already in flight, so an OLDER authorized read that completes afterwards cannot
+    /// restore it. Deliberately performs no read, no re-resolution and no render: a refusal stands
+    /// until the page refreshes the projection again.
+    /// </summary>
+    private void ClearConfigRepositoryPath()
+    {
+        _configRepoPath = null;
+        _pathRefreshGeneration++;
+    }
+
+    /// <summary>
+    /// THE AUTHORIZED PATH PROJECTION REFRESH — the ONLY way <see cref="_configRepoPath"/> is written,
+    /// and the only way this page learns whether a config repo exists or where its clone lives.
+    /// <para>
+    /// OWNERSHIP IS CLAIMED BEFORE THE FIRST AWAIT and re-checked before publication, so an older
+    /// successful read can never restore the banner after a newer refusal, a superseding refresh, an
+    /// observed circuit invalidation or disposal.
+    /// </para>
+    /// <para>
+    /// The identity travels through <see cref="ComponentActingUser"/>, which OBSERVES the circuit's
+    /// cascading state: a signed-out state or a different account after an established identity
+    /// permanently invalidates this circuit (the replacement is never adopted), the facade then refuses
+    /// and the shared denial clear removes the banner. Explicit open mode is unchanged.
+    /// </para>
+    /// </summary>
+    private async Task RefreshConfigRepositoryPathAsync()
+    {
+        if (_disposed) return;
+
+        // Claim ownership BEFORE the first await: every later completion can tell whether a newer
+        // refusal / refresh / invalidation / disposal has taken the banner since.
+        var generation = ++_pathRefreshGeneration;
+
+        FacadeResult<string> result;
+        try
+        {
+            result = await ConfigFacade.GetConfigRepositoryPathAsync(
+                await ActingUserAsync(), CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // A failure to ANSWER is a refusal for rendering purposes: no banner. It must never leave a
+            // previously authorized path on screen, and it must never restore one over a newer denial.
+            // OBSERVED PERMANENT INVALIDATION OUTRANKS OWNERSHIP here too: see the note below.
+            if (!_disposed && (generation == _pathRefreshGeneration || IsCircuitInvalidated()))
+                ClearConfigRepositoryPath();
+            return;
+        }
+
+        // A DISPOSED instance is never written to: a torn-down circuit must not be repainted, whatever
+        // it observed.
+        if (_disposed) return;
+
+        // OBSERVED PERMANENT CIRCUIT INVALIDATION OUTRANKS PUBLICATION OWNERSHIP, SO IT IS DECIDED
+        // BEFORE THE STALE-GENERATION EXIT BELOW.
+        //
+        // A refresh awaits the cascading AuthenticationState, and that await can resume ARBITRARILY LATE:
+        // an older real cascade may still be parked there while a newer same-account cascade authorizes
+        // and visibly publishes the path. If the parked task then resolves to a sign-out or to another
+        // account, ComponentActingUser's observation PERMANENTLY invalidates this circuit — a circuit-wide
+        // fact that no later authorized publication can undo. Checking ownership first would let this
+        // superseded completion exit early and leave the newer banner rendered over a dead circuit.
+        //
+        // This cannot over-clear: the SAME identity is an idempotent observation that never invalidates,
+        // so a harmless older same-identity completion still falls through to the ownership exit below and
+        // leaves the newer authorized banner untouched; and once the circuit IS invalidated no authorized
+        // path can ever be published again in it.
+        if (IsCircuitInvalidated())
+        {
+            ClearConfigRepositoryPath();
+            return;
+        }
+
+        // Publication ownership: a superseded completion publishes nothing, so an obsolete authorized
+        // result can never restore — or overwrite — the banner.
+        if (generation != _pathRefreshGeneration) return;
+
+        // The ONE shared denial handler: a refusal clears the banner instead of publishing a path.
+        HandleForbidden(result);
+        if (result.Success)
+        {
+            // Authorized: the exact LocalPath when a config repo is configured, or null when it is not
+            // (authorized absence is a success — the page then renders no banner).
+            _configRepoPath = result.Value;
+        }
+    }
+
+    /// <summary>
+    /// Whether this circuit's identity has been PERMANENTLY invalidated (a sign-out or a different
+    /// account observed). A circuit with no scoped accessor, or one in explicit open mode, is never
+    /// invalidated — open mode carries no per-circuit identity to invalidate.
+    /// </summary>
+    private bool IsCircuitInvalidated() => CircuitPrincipal?.IsInvalidated == true;
+
+    /// <summary>
     /// Re-evaluates the caller's admin capability from CURRENT stored state. Called once per
     /// initialisation; the value only gates RENDERING, never authorization — the facade re-resolves
     /// and refuses independently, so a stale flag can only under-render, never over-grant.
@@ -1380,6 +1538,11 @@ else
     {
         PageHeader.SetTitle("⚙️ Configuration");
 
+        // The FIRST cascade value available to this instance is recorded here, so the framework's
+        // immediate OnParametersSetAsync call cannot turn the same value into a second path read.
+        _observedAuthenticationState = AuthenticationState;
+        _cascadeObserved = true;
+
         // MINIMAL circuit identity acquisition: this initialises the scoped accessor from the circuit's
         // AuthenticationState (no-op in open mode, where no cascade exists) and derives the admin gate
         // for the GLOBAL Composer settings below. It never throws when auth services are absent.
@@ -1387,6 +1550,9 @@ else
 
         try
         {
+            // The INITIAL RENDER trigger for the authorized config-repo path projection.
+            await RefreshConfigRepositoryPathAsync();
+
             await LoadFilesAsync();
             await LoadModelsAsync();
             await LoadBackupsAsync();
@@ -1405,6 +1571,34 @@ else
         }
     }
 
+    /// <summary>
+    /// THE CASCADE TRIGGER. Blazor does NOT re-run <see cref="OnInitializedAsync"/> when a retained
+    /// instance receives a NEW cascading <see cref="AuthenticationState"/>, but it does re-run this
+    /// method — so an ACTUAL cascading authentication parameter update re-reads the authorized path
+    /// projection, and a signed-out or replaced identity is refused here.
+    /// <para>
+    /// An unchanged cascade value is a routine re-render, not an update: it performs no read (the
+    /// initial render already did one) and therefore cannot multiply facade calls per render.
+    /// </para>
+    /// <para>
+    /// A sign-out or an account replacement must NOT be adopted: <see cref="ComponentActingUser"/>
+    /// records the observation on the scoped circuit accessor, which permanently invalidates the
+    /// circuit, so the facade refuses from then on and this instance can never render the new
+    /// account's content. Recovery requires a new circuit (explicit reauthentication).
+    /// </para>
+    /// </summary>
+    protected override async Task OnParametersSetAsync()
+    {
+        var state = AuthenticationState;
+        if (_cascadeObserved && ReferenceEquals(state, _observedAuthenticationState))
+            return;
+
+        _observedAuthenticationState = state;
+        _cascadeObserved = true;
+
+        await RefreshConfigRepositoryPathAsync();
+    }
+
     private async Task LoadFilesAsync()
     {
         // THE RAW CONFIGURATION FILES ARE A FULL CONFIG PROJECTION: the read goes through
@@ -1415,6 +1609,11 @@ else
         // unauthorized state; open mode answers the local operator through the same seam, unchanged.
         var filesResult = await ConfigFacade.GetConfigFilesAsync(
             await ActingUserAsync(), CancellationToken.None);
+
+        // THE SHARED DENIAL HANDLER RUNS BEFORE THIS OPERATION'S OWN FAILURE BRANCH: a Forbidden answer
+        // is an account-level refusal, so it clears the config-repo banner (and every pending path
+        // publication) here rather than being reported as a per-tab load error.
+        HandleForbidden(filesResult);
 
         if (!filesResult.Success || filesResult.Value is null)
         {
@@ -1452,6 +1651,7 @@ else
         try
         {
             var result = await ConfigFacade.GetModelsAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (!result.Success)
             {
                 // Same inner message the endpoint body carried, without an HTTP status prefix.
@@ -1678,6 +1878,7 @@ else
             var update = BuildModelConfigUpdate();
 
             var result = await ConfigFacade.SaveModelsAsync(update, await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadModelsAsync();
@@ -1707,6 +1908,7 @@ else
         try
         {
             var result = await BackupFacade.GetBackupsAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _backups = result.Value ?? [];
@@ -1737,6 +1939,7 @@ else
         try
         {
             var result = await BackupFacade.CreateBackupAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadBackupsAsync();
@@ -1771,6 +1974,7 @@ else
         try
         {
             var result = await ConfigFacade.GetRepositoriesAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _repositories = result.Value ?? [];
@@ -1796,6 +2000,7 @@ else
         try
         {
             var result = await ConfigFacade.GetOrchestratorAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (!result.Success)
             {
                 _orchestratorSaveError = $"Failed to load orchestrator settings: {result.Error}";
@@ -1828,6 +2033,7 @@ else
         try
         {
             var result = await ConfigFacade.GetWorkersAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (!result.Success)
             {
                 _workersSaveError = $"Failed to load worker settings: {result.Error}";
@@ -1858,6 +2064,7 @@ else
         try
         {
             var result = await ConfigFacade.GetComposerAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (!result.Success)
             {
                 _composerSaveError = $"Failed to load composer settings: {result.Error}";
@@ -1914,6 +2121,7 @@ else
                 BranchCleanupDelayHours: _orchBranchCleanupDelayHours,
                 WorkerTaskTimeoutMinutes: _orchWorkerTaskTimeoutMinutes),
                 await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadOrchestratorAsync();
@@ -1948,6 +2156,7 @@ else
                 ["docwriter"] = _docwriterContextWindow,
                 ["improver"] = _improverContextWindow,
             }, await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadWorkersAsync();
@@ -2023,6 +2232,7 @@ else
                 EventNotificationsThrottleSeconds: _composerNotifThrottle),
                 await ComponentActingUser.AcquireAsync(AuthenticationState, CircuitPrincipal),
                 CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadComposerAsync();
@@ -2073,6 +2283,7 @@ else
                 MonitorCi: _newRepoMonitorCi,
                 CiTimeoutMinutes: _newRepoMonitorCi ? _newRepoCiTimeout : (int?)null),
                 await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main"; _newRepoMergeTo = ""; _newRepoTagBranch = "";
@@ -2118,6 +2329,11 @@ else
         {
             // The repository routes never unescaped the name, so the facade receives it raw.
             var result = await ConfigFacade.GetBranchesAsync(repo.Name, await ActingUserAsync(), token);
+            // THE SHARED DENIAL HANDLER RUNS BEFORE THE STALE-BRANCH CHECK: an account-level refusal
+            // clears the config-repo banner (and any pending path publication) whether or not this
+            // particular fetch is still the newest one — a superseded fetch must not swallow the
+            // refusal, and the refusal must never be treated as a branch-load failure.
+            HandleForbidden(result);
             if (generation == _branchFetchGeneration)
             {
                 if (result.Success)
@@ -2179,6 +2395,7 @@ else
                 MonitorCi: _editRepoMonitorCi,
                 CiTimeoutMinutes: _editRepoMonitorCi ? _editRepoCiTimeout : (int?)null),
                 await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _editingRepoName = null;
@@ -2207,6 +2424,7 @@ else
         try
         {
             var result = await ConfigFacade.RemoveRepositoryAsync(name, await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadRepositoriesAsync();
@@ -2244,6 +2462,7 @@ else
         try
         {
             var result = await ConfigFacade.DiscoverModelsAsync(await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (!result.Success)
             {
                 _availableModelsError = $"Discovery failed: {result.Error}";
@@ -2275,6 +2494,7 @@ else
             foreach (var dm in _discoveredModels.Where(m => _selectedDiscoveredIds.Contains(m.Id)))
             {
                 var result = await AddAvailableModelEntryAsync(dm.Id, dm.ContextWindow, null);
+                HandleForbidden(result);
                 if (!result.Success)
                 {
                     _availableModelsError = $"Failed to add '{dm.Id}': {result.Error}";
@@ -2309,6 +2529,7 @@ else
         {
             var newDescription = string.IsNullOrWhiteSpace(_newModelDescription) ? null : _newModelDescription;
             var result = await AddAvailableModelEntryAsync(_newModelName, _newModelContextWindow, newDescription, _newModelSupportsVision);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _newModelName = "";
@@ -2366,6 +2587,7 @@ else
                     Description: editDescription,
                     SupportsVision: _editModelSupportsVision),
                 await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _editingModelName = null;
@@ -2399,6 +2621,7 @@ else
         try
         {
             var result = await ConfigFacade.RemoveAvailableModelAsync(name, await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadModelsAsync();
@@ -2459,6 +2682,7 @@ else
             var reasoning = ParseReasoning(_newSubAgentModelReasoningEffort);
             var description = string.IsNullOrWhiteSpace(_newSubAgentModelDescription) ? null : _newSubAgentModelDescription;
             var result = await AddSubAgentModelEntryAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description, _newSubAgentModelSupportsVision);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _newSubAgentModelName = "";
@@ -2520,6 +2744,7 @@ else
                     Description: description,
                     SupportsVision: _editSubAgentModelSupportsVision),
                 await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 _editingSubAgentModelName = null;
@@ -2553,6 +2778,7 @@ else
         try
         {
             var result = await ConfigFacade.RemoveSubAgentModelAsync(name, await ActingUserAsync(), CancellationToken.None);
+            HandleForbidden(result);
             if (result.Success)
             {
                 await LoadModelsAsync();
@@ -2617,6 +2843,12 @@ else
 
     public void Dispose()
     {
+        // DISPOSAL INVALIDATES ANY PENDING PATH PUBLICATION: an authorized read that completes after
+        // disposal publishes nothing (the generation and the disposed flag are both checked at the
+        // resumption point), so a torn-down circuit cannot be repainted.
+        _disposed = true;
+        _pathRefreshGeneration++;
+
         _branchFetchCts?.Cancel();
         _branchFetchCts?.Dispose();
     }

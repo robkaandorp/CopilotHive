@@ -92,31 +92,27 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
 
     /// <summary>
     /// Builds ONE page instance with the circuit identity of <paramref name="gitHubId"/> (or NO cascade
-    /// at all, which is what open mode looks like) and the page's own config-repo handle, WITHOUT
-    /// running its load. Separating construction from loading is what lets a row drive the SAME page
-    /// through SEVERAL loads — the only way "does a denied reload clear what was already loaded?" can
-    /// be asked at all.
+    /// at all, which is what open mode looks like), WITHOUT running its load. Separating construction
+    /// from loading is what lets a row drive the SAME page through SEVERAL loads — the only way
+    /// "does a denied reload clear what was already loaded?" can be asked at all.
+    /// <para>
+    /// The page has NO config-repo handle of its own any more: it reads the gate through
+    /// <see cref="IConfigFacade"/> only, and the config-repo manager lives INSIDE the facade (see
+    /// <see cref="CreateConfigFacade"/>). The former <c>ConfigRepo</c> property this helper used to set
+    /// reflectively was removed with that direct path read, so there is nothing to inject here — and a
+    /// mutant that reintroduced a direct read would not compile rather than silently pass.
+    /// </para>
     /// </summary>
     /// <param name="facade">The config facade the page reads through.</param>
     /// <param name="gitHubId">The circuit identity's GitHub id, or <c>null</c> to inject no cascade.</param>
-    /// <param name="repoRoot">The config-repo clone directory, or <c>null</c> to leave the handle unset.</param>
     /// <returns>The constructed page, with NO load performed yet.</returns>
-    private ConfigurationPage CreatePage(ConfigFacade facade, string? gitHubId, string? repoRoot)
+    private ConfigurationPage CreatePage(ConfigFacade facade, string? gitHubId)
     {
         var page = new ConfigurationPage();
 
         SetProperty(page, "ConfigFacade", facade);
         SetProperty(page, "CircuitPrincipal", new CircuitUserPrincipalAccessor(
             _auth.Resolver(HiveAuthMode.AuthenticationEnabled), _auth.Policy));
-
-        // The page's own config-repo handle. It is injected so a mutant that reaches for the raw
-        // files through the page can compile — and so the ungated-read mutant below is a REAL
-        // "read straight off disk" rather than a stub.
-        if (repoRoot is not null)
-        {
-            SetProperty(page, "ConfigRepo",
-                new ConfigRepoManager("https://example.com/config.git", repoRoot));
-        }
 
         if (gitHubId is not null)
         {
@@ -162,9 +158,9 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
     /// rows that do not care about carried-over state use.
     /// </summary>
     private async Task<(Dictionary<string, string> Files, string? Error, List<string> Tabs)>
-        RunLoadFilesAsync(ConfigFacade facade, string? gitHubId, string? repoRoot = null)
+        RunLoadFilesAsync(ConfigFacade facade, string? gitHubId)
     {
-        var page = CreatePage(facade, gitHubId, repoRoot);
+        var page = CreatePage(facade, gitHubId);
         return await LoadFilesAsync(page);
     }
 
@@ -201,7 +197,7 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
 
         foreach (var insufficient in new[] { ViewerId, MemberId, OperatorId })
         {
-            var (files, error, _) = await RunLoadFilesAsync(facade, insufficient, root);
+            var (files, error, _) = await RunLoadFilesAsync(facade, insufficient);
 
             // NO CONTENT — not even a file name.
             Assert.Empty(files);
@@ -248,7 +244,7 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
         var facade = CreateConfigFacade(root, HiveAuthMode.AuthenticationEnabled);
 
         // ONE page instance and ONE circuit identity for the WHOLE sequence.
-        var page = CreatePage(facade, AdminId, root);
+        var page = CreatePage(facade, AdminId);
 
         // ── 1. The Admin loads the genuine content into THAT page. ──
         var (adminFiles, adminError, adminTabs) = await LoadFilesAsync(page);
@@ -312,7 +308,7 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
         var (root, yaml) = CreateConfigRepo();
         var facade = CreateConfigFacade(root, HiveAuthMode.AuthenticationEnabled);
 
-        var (files, error, tabs) = await RunLoadFilesAsync(facade, AdminId, root);
+        var (files, error, tabs) = await RunLoadFilesAsync(facade, AdminId);
 
         Assert.Null(error);
         Assert.Equal(3, files.Count);
@@ -338,7 +334,7 @@ public sealed class ConfigurationRawFileReadBehaviorTests : IDisposable
         var facade = CreateConfigFacade(root, HiveAuthMode.Open);
 
         // NO identity at all — exactly what a page in open mode has.
-        var (files, error, tabs) = await RunLoadFilesAsync(facade, gitHubId: null, root);
+        var (files, error, tabs) = await RunLoadFilesAsync(facade, gitHubId: null);
 
         Assert.Null(error);
         Assert.Equal(3, files.Count);

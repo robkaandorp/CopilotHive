@@ -326,6 +326,43 @@ public interface IConfigFacade
         ClaimsPrincipal? actingUser, CancellationToken ct);
 
     /// <summary>
+    /// Projects the CONFIGURATION page's config-repository banner: the local clone path of the configured
+    /// config repo, or <c>null</c> when none was configured.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS AN AUTHORIZATION-GATED CONFIGURATION PROJECTION AND IT REQUIRES
+    /// <see cref="HiveCapability.GlobalAdmin"/>. The path is not merely an informational string: it names
+    /// the installation's config-repo clone — where <c>hive-config.yaml</c> and the
+    /// <c>agents/*.agents.md</c> files live — so whether a config repo EXISTS and WHERE it lives are both
+    /// configuration facts. The gate therefore runs BEFORE the optional <see cref="ConfigRepoManager"/> is
+    /// consulted at all, which is also why a refusal answers with the standard sanitized denial in the
+    /// configured AND the unconfigured case alike: an unauthorized caller cannot use the difference
+    /// between "no path" and a refusal to learn whether a config repo is configured.
+    /// </para>
+    /// <para>
+    /// AUTHORIZED ABSENCE IS A SUCCESS: when no config repo was configured at startup the operation
+    /// succeeds with a <c>null</c> value (the page then renders no banner), exactly as the page used to
+    /// render no banner when its clone directory did not exist. Nothing here probes the file system, so
+    /// this is a pure projection of the manager the host registered — never a clone or disk check.
+    /// </para>
+    /// <para>
+    /// Before this operation existed the page injected <see cref="ConfigRepoManager"/> itself and read
+    /// <see cref="ConfigRepoManager.LocalPath"/> directly, which rendered the host path to any
+    /// authenticated role and, worse, kept rendering it AFTER the caller had been demoted or disabled.
+    /// </para>
+    /// </remarks>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// Success carrying the EXACT <see cref="ConfigRepoManager.LocalPath"/> when a config repo is
+    /// configured, success carrying <c>null</c> when it is not, or
+    /// <see cref="FacadeErrorKind.Forbidden"/> carrying the sanitized denial text and a <c>null</c> value
+    /// (in both cases) when the caller does not currently hold <see cref="HiveCapability.GlobalAdmin"/>.
+    /// </returns>
+    Task<FacadeResult<string>> GetConfigRepositoryPathAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
     /// Persists Composer setting changes (validate → mutate → write → commit).
     /// </summary>
     /// <remarks>
@@ -979,6 +1016,24 @@ public sealed class ConfigFacade : IConfigFacade
         }
 
         return new(true, files, null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<string>> GetConfigRepositoryPathAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST, before the optional manager is consulted at all: whether a config repo is
+        // configured and where its clone lives are both configuration facts, so a non-admin learns
+        // neither. This also makes the refusal ANSWER-IDENTICAL for the configured and the unconfigured
+        // installation, so the difference cannot be used as an oracle.
+        if (!await IsAllowedAsync(actingUser, nameof(GetConfigRepositoryPathAsync), ct).ConfigureAwait(false))
+            return Forbidden<string>();
+
+        // AUTHORIZED ABSENCE IS A SUCCESS with a null value: no config repo configured means the page
+        // renders no banner, exactly the state the page rendered when its clone directory did not exist.
+        // The manager's LocalPath is a pure constructor-time value — no clone, no disk probe, no I/O.
+        var configRepo = _configRepo;
+        return new(true, configRepo?.LocalPath, null, FacadeErrorKind.None);
     }
 
     /// <inheritdoc />
