@@ -90,6 +90,15 @@ public sealed class DashboardStateService : IDisposable
     /// consistency is relative to pool-owned worker-state mutations ONLY; it makes no claim about
     /// external writes to a leaked worker instance, and the goals and pipelines in this snapshot come
     /// from their own separate reads.
+    /// <para>
+    /// THE GOAL MERGE IS SIDE-EFFECT FREE: a pipeline-backed row's <see cref="Goal.Status"/> is
+    /// DERIVED from the pipeline phase and is written onto a SEPARATE display instance created by
+    /// <see cref="CreateDisplayRow(Goal, GoalStatus)"/> — never onto the store-returned goal and never
+    /// onto the live <see cref="GoalPipeline.Goal"/>. Building a snapshot therefore mutates neither
+    /// input, so the stored row keeps its lifecycle status (what <see cref="GetGoalDetail"/>'s resume
+    /// check reads) and the live goal keeps its own. On an ID overlap every non-status field comes
+    /// from the STORE row; when the store has no matching row those fields come from the LIVE goal.
+    /// </para>
     /// </remarks>
     public async Task<DashboardSnapshot> GetSnapshot()
     {
@@ -101,6 +110,9 @@ public sealed class DashboardStateService : IDisposable
         var workers = _workerPool.CaptureWorkerStatus();
         var pipelines = _pipelineManager.GetAllPipelines();
 
+        // THE SOURCE ROWS, keyed by goal id: the store rows first (in the store's order), then a
+        // pipeline-only goal appended for any id the store did not return. These instances are READ
+        // ONLY from here on — nothing below writes to them.
         var goalsById = new Dictionary<string, Goal>();
 
         // Add all goals from SQLite store (includes all statuses)
@@ -111,12 +123,18 @@ public sealed class DashboardStateService : IDisposable
                 goalsById[g.Id] = g;
         }
 
-        // Merge pipeline goals and derive status from pipeline phase
+        // The DISPLAY status each pipeline-backed id derives from its pipeline phase, kept BESIDE the
+        // source rows instead of being written onto them. Done => Completed, Failed => Failed, every
+        // other phase (including Planning) => InProgress.
+        var displayStatusByGoalId = new Dictionary<string, GoalStatus>(StringComparer.Ordinal);
+
         foreach (var p in pipelines)
         {
+            // STORE ROW PRECEDENCE: a store row already present for this id keeps supplying every
+            // non-status field; the live pipeline goal only supplies them when the store has no match.
             goalsById.TryAdd(p.GoalId, p.Goal);
 
-            goalsById[p.GoalId].Status = p.Phase switch
+            displayStatusByGoalId[p.GoalId] = p.Phase switch
             {
                 GoalPhase.Done => GoalStatus.Completed,
                 GoalPhase.Failed => GoalStatus.Failed,
@@ -124,7 +142,18 @@ public sealed class DashboardStateService : IDisposable
             };
         }
 
-        var goals = goalsById.Values.ToList();
+        // The snapshot rows, in the SAME order and count as the source rows above. A pipeline-backed
+        // row is a SEPARATE display instance carrying the phase-derived status, so reading the
+        // snapshot leaves the stored goal's lifecycle status — the authoritative input of
+        // GetGoalDetail's resume check — and the live pipeline goal's own status untouched. A goal
+        // with no pipeline has nothing to derive, so its source row is published as it is.
+        var goals = new List<Goal>(goalsById.Count);
+        foreach (var (goalId, source) in goalsById)
+        {
+            goals.Add(displayStatusByGoalId.TryGetValue(goalId, out var displayStatus)
+                ? CreateDisplayRow(source, displayStatus)
+                : source);
+        }
 
         return new DashboardSnapshot
         {
@@ -170,6 +199,60 @@ public sealed class DashboardStateService : IDisposable
             AwaitingReadyWorkers = workers.Count(w => w.AwaitingWorkerReady),
         };
     }
+
+    /// <summary>
+    /// Builds the SNAPSHOT's display row for one source goal: a SEPARATE <see cref="Goal"/> instance
+    /// carrying every non-status field of <paramref name="source"/> and
+    /// <paramref name="displayStatus"/> as its status.
+    /// </summary>
+    /// <remarks>
+    /// THE WHOLE POINT IS WHAT IT DOES NOT TOUCH. The status a pipeline-backed row shows is DERIVED
+    /// from the pipeline phase, so writing it onto <paramref name="source"/> would corrupt the two
+    /// inputs this merge combines: the store-returned goal — whose persisted lifecycle status is the
+    /// authoritative resume-eligibility input of <see cref="GetGoalDetail"/>, read through
+    /// <c>GetGoalAsync</c> — and the live <see cref="GoalPipeline.Goal"/>, which the pipeline itself
+    /// keeps using. This helper therefore only READS the source and returns a new instance; a snapshot
+    /// read can never change either one.
+    /// <para>
+    /// Every non-status field is COPIED BY VALUE (its current value is read into the new instance),
+    /// and the collection-valued ones — repositories, metadata, notes, summaries, documents, usage —
+    /// are shared BY REFERENCE with the source. That preserves what callers already see (the same
+    /// summaries, metadata, repositories and usage a caller read before) and is deliberately NOT a
+    /// deep copy: isolating later collection mutation is out of this change's scope, so this row must
+    /// not be read as a detached copy of those collections.
+    /// </para>
+    /// </remarks>
+    /// <param name="source">The store row, or the live pipeline goal when the store has no match.</param>
+    /// <param name="displayStatus">The status derived from the pipeline phase.</param>
+    /// <returns>A new <see cref="Goal"/>; <paramref name="source"/> is unchanged.</returns>
+    private static Goal CreateDisplayRow(Goal source, GoalStatus displayStatus) => new()
+    {
+        Id = source.Id,
+        Description = source.Description,
+        Priority = source.Priority,
+        Scope = source.Scope,
+        Status = displayStatus,
+        RepositoryNames = source.RepositoryNames,
+        TargetRepositoryNames = source.TargetRepositoryNames,
+        DependsOn = source.DependsOn,
+        Metadata = source.Metadata,
+        CreatedAt = source.CreatedAt,
+        StartedAt = source.StartedAt,
+        CompletedAt = source.CompletedAt,
+        Iterations = source.Iterations,
+        FailureReason = source.FailureReason,
+        Notes = source.Notes,
+        PhaseDurations = source.PhaseDurations,
+        IterationSummaries = source.IterationSummaries,
+        TotalDurationSeconds = source.TotalDurationSeconds,
+        MergeCommitHash = source.MergeCommitHash,
+        ReleaseId = source.ReleaseId,
+        Documents = source.Documents,
+        BranchCleanedUp = source.BranchCleanedUp,
+        ReviewStatus = source.ReviewStatus,
+        BrainUsage = source.BrainUsage,
+        ReviewUsage = source.ReviewUsage,
+    };
 
     // ── Goal detail ────────────────────────────────────────────────────────────
 

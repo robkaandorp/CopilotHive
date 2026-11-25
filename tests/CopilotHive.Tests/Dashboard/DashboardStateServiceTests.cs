@@ -3910,6 +3910,546 @@ public sealed class DashboardStateServiceTests : IDisposable
         var info = service.GetOrchestratorInfo();
         Assert.Equal("(not configured)", info.ComposerModel);
     }
+
+    // ── GetSnapshot goal merge — side-effect-free display rows ────────────────
+    //
+    // The merge derives a pipeline-backed row's Status from the pipeline phase. These theories pin
+    // that the derivation lands on a SEPARATE display instance: the store-returned goal and the live
+    // GoalPipeline.Goal are both inputs this merge only READS. Each theory asserts the premises that
+    // make it non-vacuous (the store really hits/misses with the exact seeded instance, the pipeline
+    // really holds its own goal, the seeded statuses really disagree) and then asserts on the INPUT
+    // INSTANCES those premises handed to the merge — never on a fresh read substituted for them.
+
+    /// <summary>The pipeline-backed goal id used by the store-MISS theory (no store row exists).</summary>
+    private const string MergeMissGoalId = "merge-miss-pipeline-goal";
+
+    /// <summary>The pipeline-backed goal id used by the store-HIT theory (a store row exists).</summary>
+    private const string MergeHitGoalId = "merge-hit-store-goal";
+
+    /// <summary>A store-only control goal id whose Pending status is unaffected by the merge.</summary>
+    private const string MergeControlPendingId = "merge-control-pending";
+
+    /// <summary>
+    /// A store-only control goal id whose Cancelled status is counted by NO snapshot counter — so its
+    /// row proves the merge leaves pipeline-less rows alone rather than inflating unrelated totals.
+    /// </summary>
+    private const string MergeControlCancelledId = "merge-control-cancelled";
+
+    /// <summary>The worker registered in both merge theories, so the worker projection is pinned too.</summary>
+    private const string MergeWorkerId = "worker-merge";
+
+    /// <summary>
+    /// Fixed UTC creation timestamps for the merge fixtures. <see cref="Goal.CreatedAt"/> otherwise
+    /// defaults to <c>DateTime.UtcNow</c>, which would make the exact timestamp parity assertion
+    /// non-deterministic AND would let a store-hit row sourced from the LIVE goal pass when the two
+    /// happened to be created in the same tick. Every value here is distinct, including the two
+    /// same-ID store-hit goals.
+    /// </summary>
+    private static readonly DateTime MergeMissLiveCreatedAt =
+        new(2021, 4, 5, 6, 7, 8, DateTimeKind.Utc);
+    private static readonly DateTime MergeHitStoredCreatedAt =
+        new(2022, 5, 6, 7, 8, 9, DateTimeKind.Utc);
+    private static readonly DateTime MergeHitLiveCreatedAt =
+        new(2023, 6, 7, 8, 9, 10, DateTimeKind.Utc);
+    private static readonly DateTime MergeControlPendingCreatedAt =
+        new(2020, 3, 4, 5, 6, 7, DateTimeKind.Utc);
+    private static readonly DateTime MergeControlCancelledCreatedAt =
+        new(2019, 2, 3, 4, 5, 6, DateTimeKind.Utc);
+
+    /// <summary>
+    /// One iteration summary with distinguishable content, used to tell a stored summary list from a
+    /// live one by BOTH its count and its notes.
+    /// </summary>
+    private static IterationSummary MergeIterationSummary(int iteration, string note) => new()
+    {
+        Iteration = iteration,
+        Phases =
+        [
+            new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                WorkerOutput = note,
+            },
+        ],
+        TestCounts = new TestCounts { Total = 10 + iteration, Passed = 10 + iteration - 1, Failed = 1 },
+        BuildSuccess = true,
+        Notes = [note],
+    };
+
+    /// <summary>
+    /// Asserts that a pipeline-backed DISPLAY row carries EVERY non-status <see cref="Goal"/> field from
+    /// its source, by VALUE equality for scalars and by REFERENCE for the collection-valued fields.
+    /// The production helper copies each field explicitly, so a field omitted by a future merge shape
+    /// is caught here even when the literal precedence assertions below do not read it. Status is
+    /// deliberately excluded: it is the one derived field asserted separately.
+    /// </summary>
+    private static void AssertAllNonStatusFieldsCopied(Goal source, Goal row)
+    {
+        Assert.Equal(source.Id, row.Id);
+        Assert.Equal(source.Description, row.Description);
+        Assert.Equal(source.Priority, row.Priority);
+        Assert.Equal(source.Scope, row.Scope);
+        Assert.Same(source.RepositoryNames, row.RepositoryNames);
+        Assert.Equal(source.TargetRepositoryNames, row.TargetRepositoryNames);
+        Assert.Same(source.DependsOn, row.DependsOn);
+        Assert.Same(source.Metadata, row.Metadata);
+        Assert.Equal(source.CreatedAt, row.CreatedAt);
+        Assert.Equal(source.StartedAt, row.StartedAt);
+        Assert.Equal(source.CompletedAt, row.CompletedAt);
+        Assert.Equal(source.Iterations, row.Iterations);
+        Assert.Equal(source.FailureReason, row.FailureReason);
+        Assert.Same(source.Notes, row.Notes);
+        Assert.Same(source.PhaseDurations, row.PhaseDurations);
+        Assert.Same(source.IterationSummaries, row.IterationSummaries);
+        Assert.Equal(source.TotalDurationSeconds, row.TotalDurationSeconds);
+        Assert.Equal(source.MergeCommitHash, row.MergeCommitHash);
+        Assert.Equal(source.ReleaseId, row.ReleaseId);
+        Assert.Same(source.Documents, row.Documents);
+        Assert.Equal(source.BranchCleanedUp, row.BranchCleanedUp);
+        Assert.Equal(source.ReviewStatus, row.ReviewStatus);
+        Assert.Same(source.BrainUsage, row.BrainUsage);
+        Assert.Same(source.ReviewUsage, row.ReviewUsage);
+    }
+
+    /// <summary>
+    /// Builds the CONFIGURED <see cref="InMemoryGoalStore"/> shared by both merge theories: the two
+    /// store-only controls, added in this order so the snapshot's row order is observable, and — for
+    /// the hit theory — the pipeline-backed store row first.
+    /// </summary>
+    private static (InMemoryGoalStore Store, Goal Pending, Goal Cancelled) MergeStore(
+        Goal? pipelineBackedStoreRow = null)
+    {
+        var store = new InMemoryGoalStore();
+        if (pipelineBackedStoreRow is not null)
+            store.AddGoal(pipelineBackedStoreRow);
+
+        var pending = new Goal
+        {
+            Id = MergeControlPendingId,
+            Description = "Store-only control, Pending and pipeline-less",
+            Status = GoalStatus.Pending,
+            RepositoryNames = ["control-repo"],
+            Metadata = new Dictionary<string, string> { ["source"] = "control" },
+            CreatedAt = MergeControlPendingCreatedAt,
+        };
+        var cancelled = new Goal
+        {
+            Id = MergeControlCancelledId,
+            Description = "Store-only control, Cancelled and pipeline-less",
+            Status = GoalStatus.Cancelled,
+            CreatedAt = MergeControlCancelledCreatedAt,
+        };
+
+        store.AddGoal(pending);
+        store.AddGoal(cancelled);
+        return (store, pending, cancelled);
+    }
+
+    /// <summary>
+    /// Builds the service plus the real pipeline manager used by both merge theories: one busy worker
+    /// (so the worker projection is pinned) and a real pipeline for <paramref name="liveGoal"/> advanced
+    /// to <paramref name="phase"/>.
+    /// </summary>
+    private static (DashboardStateService Service, GoalPipelineManager PipelineManager, GoalPipeline Pipeline)
+        MergeService(IGoalStore store, Goal liveGoal, GoalPhase phase)
+    {
+        var workerPool = new WorkerPool();
+        workerPool.RegisterWorker(MergeWorkerId, []);
+        workerPool.MarkBusy(MergeWorkerId, "task-merge");
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(liveGoal);
+        pipeline.AdvanceTo(phase);
+
+        var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            new DashboardLogSink(),
+            new ProgressLog(),
+            goalStore: store);
+
+        return (service, pipelineManager, pipeline);
+    }
+
+    /// <summary>
+    /// STORE-MISS BRANCH: the store is configured but holds NO row for the pipeline's goal, so the
+    /// display row's non-status fields must come from the LIVE pipeline goal — while the phase-derived
+    /// status is written onto the separate display instance ONLY. The live goal keeps its own status
+    /// and every rich field, and the store-only control rows keep their own statuses, order and
+    /// counts.
+    /// </summary>
+    /// <remarks>
+    /// The seeded live status deliberately DISAGREES with the expected display status, so a merge that
+    /// mutated the live goal (the pre-change behaviour) would be caught by the
+    /// <c>liveGoal.Status</c> assertion rather than coincidentally agreeing with it.
+    /// </remarks>
+    [Theory]
+    [InlineData(GoalPhase.Planning, GoalStatus.InProgress, GoalStatus.Failed)]
+    [InlineData(GoalPhase.Done, GoalStatus.Completed, GoalStatus.Pending)]
+    [InlineData(GoalPhase.Failed, GoalStatus.Failed, GoalStatus.Completed)]
+    public async Task GetSnapshot_StoreMiss_LeavesLiveGoalUnchanged(
+        GoalPhase phase, GoalStatus expectedDisplayStatus, GoalStatus liveGoalStatus)
+    {
+        // Arrange
+        var ct = TestContext.Current.CancellationToken;
+        var (store, controlPending, controlCancelled) = MergeStore();
+
+        var liveGoal = new Goal
+        {
+            Id = MergeMissGoalId,
+            Description = "LIVE description (the store holds no row for this goal)",
+            Status = liveGoalStatus,
+            Priority = GoalPriority.High,
+            Scope = GoalScope.Feature,
+            RepositoryNames = ["live-repo"],
+            Metadata = new Dictionary<string, string> { ["source"] = "live" },
+            Iterations = 2,
+            FailureReason = null,
+            Notes = ["live note"],
+            IterationSummaries = [MergeIterationSummary(1, "live iteration one")],
+            BrainUsage = HeartbeatUsage("model-live-brain", 4_200, 1_300),
+            ReviewUsage = HeartbeatUsage("model-live-review", 44, 4),
+            TotalDurationSeconds = 321.5,
+            MergeCommitHash = "live-merge-sha",
+            TargetRepositoryNames = "live-repo",
+            DependsOn = ["live-dependency"],
+            Documents = ["live-doc"],
+            PhaseDurations = new Dictionary<string, double> { ["Coding"] = 7.5 },
+            ReleaseId = "live-release",
+            BranchCleanedUp = true,
+            ReviewStatus = ReviewStatus.Approved,
+            CreatedAt = MergeMissLiveCreatedAt,
+            StartedAt = new DateTime(2025, 1, 2, 3, 4, 5, DateTimeKind.Utc),
+            CompletedAt = new DateTime(2025, 1, 3, 3, 4, 5, DateTimeKind.Utc),
+        };
+
+        var merge = MergeService(store, liveGoal, phase);
+        using var service = merge.Service;
+        var pipelineManager = merge.PipelineManager;
+        var pipeline = merge.Pipeline;
+
+        // PREMISES — the miss is real and the pipeline really holds the exact live instance.
+        Assert.Null(await store.GetGoalAsync(MergeMissGoalId, ct));
+        Assert.DoesNotContain(await store.GetAllGoalsAsync(ct), g => g.Id == MergeMissGoalId);
+        Assert.Same(liveGoal, pipeline.Goal);
+        Assert.Same(liveGoal, pipelineManager.GetByGoalId(MergeMissGoalId)!.Goal);
+        Assert.Equal(phase, pipeline.Phase);
+        // …and the seeded live status really disagrees with the status the phase derives.
+        Assert.NotEqual(expectedDisplayStatus, liveGoalStatus);
+        // …and CreatedAt is a FIXED UTC value, not the wall-clock default, so timestamp parity is
+        // deterministic and a display row that fell back to DateTime.UtcNow cannot pass by accident.
+        Assert.Equal(MergeMissLiveCreatedAt, liveGoal.CreatedAt);
+
+        var snapshot = await service.GetSnapshot();
+
+        // THE SOURCE-MUTATION REGRESSION ASSERTIONS COME FIRST: they read the ORIGINAL live Goal instance
+        // and the pipeline's own Goal reference, so restoring the old write-through merge fails HERE —
+        // on Status — rather than being masked by a later display-identity assertion. Every other
+        // assertion below is retained unchanged and still runs on the fixed implementation.
+        Assert.Equal(liveGoalStatus, liveGoal.Status);
+        Assert.Equal(liveGoalStatus, pipeline.Goal.Status);
+        Assert.Same(liveGoal, pipeline.Goal);
+
+        // ONE display row per ID, on a SEPARATE instance carrying the phase-derived status. The ID
+        // inventory comes FIRST: Assert.Single(predicate) would throw on a duplicate before any
+        // downstream distinct/Count assertion could report it.
+        Assert.Equal(3, snapshot.Goals.Count);
+        Assert.Equal(3, snapshot.Goals.Select(g => g.Id).Distinct(StringComparer.Ordinal).Count());
+        Assert.Contains(snapshot.Goals, g => g.Id == MergeMissGoalId);
+        Assert.Contains(snapshot.Goals, g => g.Id == MergeControlPendingId);
+        Assert.Contains(snapshot.Goals, g => g.Id == MergeControlCancelledId);
+        var row = Assert.Single(snapshot.Goals, g => g.Id == MergeMissGoalId);
+        Assert.Equal(expectedDisplayStatus, row.Status);
+        Assert.NotSame(liveGoal, row);
+        AssertAllNonStatusFieldsCopied(liveGoal, row);
+
+        // NEITHER input changed: the live goal keeps its status (asserted above) and its rich fields.
+        Assert.Equal("LIVE description (the store holds no row for this goal)", liveGoal.Description);
+        Assert.Equal("live-repo", Assert.Single(liveGoal.RepositoryNames));
+        Assert.Equal("live", liveGoal.Metadata["source"]);
+        Assert.Single(liveGoal.IterationSummaries);
+        Assert.Equal("live-merge-sha", liveGoal.MergeCommitHash);
+
+        // NON-STATUS FIELDS come from the LIVE goal, because the store had no match: values AND the
+        // rich collections (summaries, metadata, repositories, usage) are the live ones.
+        Assert.Equal("LIVE description (the store holds no row for this goal)", row.Description);
+        Assert.Equal(GoalPriority.High, row.Priority);
+        Assert.Equal(GoalScope.Feature, row.Scope);
+        Assert.Same(liveGoal.RepositoryNames, row.RepositoryNames);
+        Assert.Equal("live-repo", Assert.Single(row.RepositoryNames));
+        Assert.Same(liveGoal.Metadata, row.Metadata);
+        Assert.Equal("live", row.Metadata["source"]);
+        Assert.Same(liveGoal.IterationSummaries, row.IterationSummaries);
+        var summary = Assert.Single(row.IterationSummaries);
+        Assert.Equal("live iteration one", Assert.Single(summary.Notes));
+        Assert.Same(liveGoal.Notes, row.Notes);
+        Assert.Equal("live note", Assert.Single(row.Notes));
+        Assert.Equal(2, row.Iterations);
+        Assert.Equal(321.5, row.TotalDurationSeconds);
+        Assert.Equal("live-merge-sha", row.MergeCommitHash);
+        Assert.Same(liveGoal.BrainUsage, row.BrainUsage);
+        AssertUsageFigures(HeartbeatUsage("model-live-brain", 4_200, 1_300), row.BrainUsage);
+        Assert.Equal("live-release", row.ReleaseId);
+        Assert.Equal(ReviewStatus.Approved, row.ReviewStatus);
+        Assert.Equal(["live-doc"], row.Documents);
+        Assert.Equal(["live-dependency"], row.DependsOn);
+        Assert.Equal("live-repo", row.TargetRepositoryNames);
+        Assert.Equal(7.5, row.PhaseDurations!["Coding"]);
+        Assert.Equal(MergeMissLiveCreatedAt, row.CreatedAt);
+
+        // ORDER: the store's rows in store order, then the pipeline-only goal — exactly the merge's
+        // insertion order. The store-only controls are published as-is: no pipeline derives their status.
+        Assert.Equal(
+            [MergeControlPendingId, MergeControlCancelledId, MergeMissGoalId],
+            snapshot.Goals.Select(g => g.Id));
+        var pendingRow = Assert.Single(snapshot.Goals, g => g.Id == MergeControlPendingId);
+        var cancelledRow = Assert.Single(snapshot.Goals, g => g.Id == MergeControlCancelledId);
+        Assert.Same(controlPending, pendingRow);
+        Assert.Same(controlCancelled, cancelledRow);
+        Assert.Equal(GoalStatus.Pending, pendingRow.Status);
+        Assert.Equal(GoalStatus.Cancelled, cancelledRow.Status);
+
+        // The DISPLAYED status drives the exact counts; the controls contribute only their own.
+        Assert.Equal(1, snapshot.PendingGoals);
+        Assert.Equal(0, snapshot.DraftGoals);
+        Assert.Equal(expectedDisplayStatus == GoalStatus.InProgress ? 1 : 0, snapshot.ActiveGoals);
+        Assert.Equal(expectedDisplayStatus == GoalStatus.Completed ? 1 : 0, snapshot.CompletedGoals);
+        Assert.Equal(expectedDisplayStatus == GoalStatus.Failed ? 1 : 0, snapshot.FailedGoals);
+
+        // The worker and pipeline projections are unchanged.
+        var worker = Assert.Single(snapshot.Workers);
+        Assert.Equal(MergeWorkerId, worker.Id);
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-merge", worker.CurrentTaskId);
+        var pipelineInfo = Assert.Single(snapshot.Pipelines);
+        Assert.Equal(MergeMissGoalId, pipelineInfo.GoalId);
+        Assert.Equal(phase.ToString(), pipelineInfo.Phase);
+        // The pipeline projection keeps reading the LIVE goal's own description (captured by the
+        // pipeline constructor), not the display row — the merge must not rewrite it either.
+        Assert.Equal(liveGoal.Description, pipelineInfo.Description);
+        Assert.Equal("LIVE description (the store holds no row for this goal)", pipeline.Description);
+    }
+
+    /// <summary>
+    /// STORE-HIT BRANCH: the store and a live pipeline are BOTH present for the same goal id, with
+    /// deliberately CONFLICTING non-status fields. The display row must carry the STORE row's fields
+    /// and the phase-derived status, while neither the store-returned goal nor the live pipeline goal
+    /// changes — the store row keeps the lifecycle status that
+    /// <see cref="DashboardStateService.GetGoalDetail"/> reads as its authoritative resume input.
+    /// </summary>
+    /// <remarks>
+    /// Both seeded statuses deliberately DISAGREE with the expected display status, and the stored and
+    /// live rich fields disagree with each other on every field the assertions read, so neither
+    /// precedence nor non-mutation can pass by coincidence.
+    /// </remarks>
+    [Theory]
+    [InlineData(GoalPhase.Planning, GoalStatus.InProgress, GoalStatus.Completed, GoalStatus.Failed)]
+    [InlineData(GoalPhase.Done, GoalStatus.Completed, GoalStatus.InProgress, GoalStatus.Pending)]
+    [InlineData(GoalPhase.Failed, GoalStatus.Failed, GoalStatus.Draft, GoalStatus.Completed)]
+    public async Task GetSnapshot_StoreHit_PreservesStoredFieldsWithoutMutatingEitherGoal(
+        GoalPhase phase, GoalStatus expectedDisplayStatus, GoalStatus storedStatus, GoalStatus liveStatus)
+    {
+        // Arrange
+        var ct = TestContext.Current.CancellationToken;
+        var storedGoal = new Goal
+        {
+            Id = MergeHitGoalId,
+            Description = "STORED description",
+            Status = storedStatus,
+            Priority = GoalPriority.High,
+            Scope = GoalScope.Feature,
+            RepositoryNames = ["stored-repo"],
+            Metadata = new Dictionary<string, string> { ["source"] = "store" },
+            Iterations = 3,
+            FailureReason = "stored failure reason",
+            Notes = ["stored note"],
+            IterationSummaries =
+            [
+                MergeIterationSummary(1, "stored iteration one"),
+                MergeIterationSummary(2, "stored iteration two"),
+            ],
+            BrainUsage = HeartbeatUsage("model-stored-brain", 111, 11),
+            ReviewUsage = HeartbeatUsage("model-stored-review", 222, 22),
+            TotalDurationSeconds = 1_234.5,
+            MergeCommitHash = "stored-merge-sha",
+            TargetRepositoryNames = "stored-repo",
+            DependsOn = ["stored-dependency"],
+            Documents = ["stored-doc"],
+            PhaseDurations = new Dictionary<string, double> { ["Testing"] = 99.5 },
+            ReleaseId = "stored-release",
+            BranchCleanedUp = false,
+            ReviewStatus = ReviewStatus.NeedsChanges,
+            CreatedAt = MergeHitStoredCreatedAt,
+            StartedAt = new DateTime(2024, 2, 3, 4, 5, 6, DateTimeKind.Utc),
+            CompletedAt = new DateTime(2024, 2, 4, 4, 5, 6, DateTimeKind.Utc),
+        };
+
+        var (store, controlPending, controlCancelled) = MergeStore(storedGoal);
+
+        var liveGoal = new Goal
+        {
+            Id = MergeHitGoalId,
+            Description = "LIVE description",
+            Status = liveStatus,
+            Priority = GoalPriority.Low,
+            Scope = GoalScope.Patch,
+            RepositoryNames = ["live-repo"],
+            Metadata = new Dictionary<string, string> { ["source"] = "live" },
+            Iterations = 1,
+            FailureReason = "live failure reason",
+            Notes = ["live note"],
+            IterationSummaries = [MergeIterationSummary(1, "live iteration one")],
+            BrainUsage = HeartbeatUsage("model-live-brain", 999, 99),
+            ReviewUsage = HeartbeatUsage("model-live-review", 888, 88),
+            TotalDurationSeconds = 42.0,
+            MergeCommitHash = "live-merge-sha",
+            TargetRepositoryNames = "live-repo",
+            DependsOn = ["live-dependency"],
+            Documents = ["live-doc"],
+            PhaseDurations = new Dictionary<string, double> { ["Coding"] = 3.25 },
+            ReleaseId = "live-release",
+            BranchCleanedUp = true,
+            ReviewStatus = ReviewStatus.Approved,
+            CreatedAt = MergeHitLiveCreatedAt,
+            StartedAt = new DateTime(2023, 3, 4, 5, 6, 7, DateTimeKind.Utc),
+            CompletedAt = new DateTime(2023, 3, 5, 5, 6, 7, DateTimeKind.Utc),
+        };
+
+        var merge = MergeService(store, liveGoal, phase);
+        using var service = merge.Service;
+        var pipelineManager = merge.PipelineManager;
+        var pipeline = merge.Pipeline;
+
+        // PREMISES — the hit returns the EXACT seeded instance and the pipeline holds its own goal.
+        Assert.Same(storedGoal, await store.GetGoalAsync(MergeHitGoalId, ct));
+        Assert.Same(liveGoal, pipeline.Goal);
+        Assert.Same(liveGoal, pipelineManager.GetByGoalId(MergeHitGoalId)!.Goal);
+        Assert.Equal(phase, pipeline.Phase);
+        // …the two sources really conflict, and both really disagree with the derived display status.
+        Assert.NotEqual(expectedDisplayStatus, storedStatus);
+        Assert.NotEqual(expectedDisplayStatus, liveStatus);
+        Assert.NotEqual(storedGoal.Description, liveGoal.Description);
+        Assert.NotEqual(storedGoal.IterationSummaries.Count, liveGoal.IterationSummaries.Count);
+        // …and the two same-ID goals carry DISTINCT, FIXED UTC creation timestamps, so the display
+        // row's timestamp parity identifies which source it came from rather than a shared clock tick.
+        Assert.Equal(MergeHitStoredCreatedAt, storedGoal.CreatedAt);
+        Assert.Equal(MergeHitLiveCreatedAt, liveGoal.CreatedAt);
+        Assert.NotEqual(storedGoal.CreatedAt, liveGoal.CreatedAt);
+
+        var snapshot = await service.GetSnapshot();
+
+        // THE SOURCE-MUTATION REGRESSION ASSERTIONS COME FIRST: they read the EXACT store-returned Goal
+        // and the EXACT live Goal instance, so restoring the old write-through merge fails HERE — on
+        // the stored lifecycle Status — rather than being masked by a later display assertion. Every
+        // assertion below is retained unchanged and still runs on the fixed implementation.
+        Assert.Equal(storedStatus, storedGoal.Status);
+        Assert.Equal(liveStatus, liveGoal.Status);
+        Assert.Equal(liveStatus, pipeline.Goal.Status);
+        Assert.Same(liveGoal, pipeline.Goal);
+
+        // ONE display row per ID, on a SEPARATE instance carrying the phase-derived status. A same-ID
+        // store row and live pipeline goal must NOT produce two rows: the ID inventory is asserted
+        // BEFORE Assert.Single(predicate), which would otherwise throw on the duplicate itself.
+        Assert.Equal(3, snapshot.Goals.Count);
+        Assert.Equal(3, snapshot.Goals.Select(g => g.Id).Distinct(StringComparer.Ordinal).Count());
+        Assert.Contains(snapshot.Goals, g => g.Id == MergeHitGoalId);
+        Assert.Contains(snapshot.Goals, g => g.Id == MergeControlPendingId);
+        Assert.Contains(snapshot.Goals, g => g.Id == MergeControlCancelledId);
+        var row = Assert.Single(snapshot.Goals, g => g.Id == MergeHitGoalId);
+        Assert.Equal(expectedDisplayStatus, row.Status);
+        Assert.NotSame(liveGoal, row);
+        Assert.NotSame(storedGoal, row);
+        AssertAllNonStatusFieldsCopied(storedGoal, row);
+        // The complete-field parity above must be read against the LIVE goal too: on a hit, the live
+        // goal's conflicting values must NOT be the row's values.
+        Assert.NotEqual(liveGoal.Description, row.Description);
+        Assert.NotSame(liveGoal.RepositoryNames, row.RepositoryNames);
+        Assert.NotSame(liveGoal.Metadata, row.Metadata);
+        Assert.NotSame(liveGoal.IterationSummaries, row.IterationSummaries);
+        Assert.NotSame(liveGoal.Notes, row.Notes);
+        Assert.NotSame(liveGoal.BrainUsage, row.BrainUsage);
+
+        // NEITHER input changed: the store row keeps its lifecycle status (asserted above) and every
+        // rich field…
+        Assert.Equal("STORED description", storedGoal.Description);
+        Assert.Equal(GoalPriority.High, storedGoal.Priority);
+        Assert.Equal("stored-repo", Assert.Single(storedGoal.RepositoryNames));
+        Assert.Equal("store", storedGoal.Metadata["source"]);
+        Assert.Equal(2, storedGoal.IterationSummaries.Count);
+        Assert.Equal("stored-merge-sha", storedGoal.MergeCommitHash);
+        // …and so does the live pipeline goal (its Status was asserted above).
+        Assert.Equal("LIVE description", liveGoal.Description);
+        Assert.Equal(GoalPriority.Low, liveGoal.Priority);
+        Assert.Equal("live-repo", Assert.Single(liveGoal.RepositoryNames));
+        Assert.Equal("live", liveGoal.Metadata["source"]);
+        Assert.Single(liveGoal.IterationSummaries);
+        Assert.Equal("live-merge-sha", liveGoal.MergeCommitHash);
+
+        // STORED ROW PRECEDENCE: every non-status field on the display row comes from the STORE row, not
+        // from the live goal that shares its id.
+        Assert.Equal("STORED description", row.Description);
+        Assert.Equal(GoalPriority.High, row.Priority);
+        Assert.Equal(GoalScope.Feature, row.Scope);
+        Assert.Same(storedGoal.RepositoryNames, row.RepositoryNames);
+        Assert.Equal("stored-repo", Assert.Single(row.RepositoryNames));
+        Assert.Same(storedGoal.Metadata, row.Metadata);
+        Assert.Equal("store", row.Metadata["source"]);
+        Assert.Same(storedGoal.IterationSummaries, row.IterationSummaries);
+        Assert.Equal(2, row.IterationSummaries.Count);
+        Assert.Equal(
+            ["stored iteration one", "stored iteration two"],
+            row.IterationSummaries.Select(s => Assert.Single(s.Notes)));
+        Assert.Same(storedGoal.Notes, row.Notes);
+        Assert.Equal("stored note", Assert.Single(row.Notes));
+        Assert.Equal(3, row.Iterations);
+        Assert.Equal("stored failure reason", row.FailureReason);
+        Assert.Equal(1_234.5, row.TotalDurationSeconds);
+        Assert.Equal("stored-merge-sha", row.MergeCommitHash);
+        Assert.Same(storedGoal.BrainUsage, row.BrainUsage);
+        AssertUsageFigures(HeartbeatUsage("model-stored-brain", 111, 11), row.BrainUsage);
+        Assert.Equal("stored-release", row.ReleaseId);
+        Assert.Equal(ReviewStatus.NeedsChanges, row.ReviewStatus);
+        Assert.Equal(["stored-doc"], row.Documents);
+        Assert.Equal(["stored-dependency"], row.DependsOn);
+        Assert.Equal("stored-repo", row.TargetRepositoryNames);
+        Assert.Equal(99.5, row.PhaseDurations!["Testing"]);
+        Assert.Equal(MergeHitStoredCreatedAt, row.CreatedAt);
+        Assert.NotEqual(MergeHitLiveCreatedAt, row.CreatedAt);
+
+        // ORDER: the store's rows in store order — the pipeline-backed goal first, then the controls.
+        Assert.Equal(
+            [MergeHitGoalId, MergeControlPendingId, MergeControlCancelledId],
+            snapshot.Goals.Select(g => g.Id));
+        var pendingRow = Assert.Single(snapshot.Goals, g => g.Id == MergeControlPendingId);
+        var cancelledRow = Assert.Single(snapshot.Goals, g => g.Id == MergeControlCancelledId);
+        Assert.Same(controlPending, pendingRow);
+        Assert.Same(controlCancelled, cancelledRow);
+        Assert.Equal(GoalStatus.Pending, pendingRow.Status);
+        Assert.Equal(GoalStatus.Cancelled, cancelledRow.Status);
+
+        // The DISPLAYED status drives the exact counts; the controls contribute only their own — the
+        // Cancelled control is counted by none of the five, and the live/stored statuses contribute
+        // nothing at all.
+        Assert.Equal(1, snapshot.PendingGoals);
+        Assert.Equal(0, snapshot.DraftGoals);
+        Assert.Equal(expectedDisplayStatus == GoalStatus.InProgress ? 1 : 0, snapshot.ActiveGoals);
+        Assert.Equal(expectedDisplayStatus == GoalStatus.Completed ? 1 : 0, snapshot.CompletedGoals);
+        Assert.Equal(expectedDisplayStatus == GoalStatus.Failed ? 1 : 0, snapshot.FailedGoals);
+
+        // The worker and pipeline projections are unchanged.
+        var worker = Assert.Single(snapshot.Workers);
+        Assert.Equal(MergeWorkerId, worker.Id);
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-merge", worker.CurrentTaskId);
+        var pipelineInfo = Assert.Single(snapshot.Pipelines);
+        Assert.Equal(MergeHitGoalId, pipelineInfo.GoalId);
+        Assert.Equal(phase.ToString(), pipelineInfo.Phase);
+        // The pipeline display keeps the LIVE goal's own description (captured by the constructor),
+        // NOT the stored row that wins the goal-row merge and NOT a rewritten live goal.
+        Assert.Equal(liveGoal.Description, pipelineInfo.Description);
+        Assert.Equal("LIVE description", pipeline.Description);
+    }
 }
 
 /// <summary>
