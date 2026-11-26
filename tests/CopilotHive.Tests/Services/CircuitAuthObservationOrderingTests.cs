@@ -291,6 +291,20 @@ public sealed class CircuitAuthObservationOrderingTests : IAsyncLifetime
         public Task<FacadeResult<KnowledgeDocumentProjection>> GetKnowledgeDocumentAsync(
             string documentId, ClaimsPrincipal? actingUser, CancellationToken ct) =>
             production.GetKnowledgeDocumentAsync(documentId, actingUser, ct);
+
+        // THE THREE DISPLAY PROJECTIONS are outside this ordering battery's three observed boundaries,
+        // so they delegate verbatim — nothing is recorded for them.
+        public Task<FacadeResult<DashboardDisplaySnapshot>> GetDashboardDisplayAsync(
+            ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            production.GetDashboardDisplayAsync(actingUser, ct);
+
+        public Task<FacadeResult<WorkerDisplayProjection>> GetWorkerDisplayAsync(
+            ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            production.GetWorkerDisplayAsync(actingUser, ct);
+
+        public Task<FacadeResult<IReadOnlyList<WorkerProgressDisplayEntry>>> GetWorkerProgressAsync(
+            string workerId, ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            production.GetWorkerProgressAsync(workerId, actingUser, ct);
     }
 
     /// <summary>The production clarification façade, recorded — the nav menu's OWN clarification boundary.</summary>
@@ -725,7 +739,8 @@ public sealed class CircuitAuthObservationOrderingTests : IAsyncLifetime
         var facadeRecorder = new CallRecorder();
         var operational = new RecordingOperational(
             new OperationalFacade(
-                dashboard, registry, _auth.Resolver(mode), _auth.Policy, NullLogger<OperationalFacade>.Instance),
+                dashboard, registry, _auth.Resolver(mode), _auth.Policy, NullLogger<OperationalFacade>.Instance,
+                new ProgressReportService(new GoalPipelineManager(), new ProgressLog())),
             facadeRecorder);
         services.AddSingleton<IOperationalFacade>(operational);
         var clarification = new RecordingClarification(

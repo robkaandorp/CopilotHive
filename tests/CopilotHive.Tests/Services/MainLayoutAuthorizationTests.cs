@@ -103,7 +103,8 @@ public sealed class MainLayoutAuthorizationTests : IAsyncLifetime
             sp.GetRequiredService<LlmSessionRegistry>(),
             _auth.Resolver(mode),
             _auth.Policy,
-            NullLogger<OperationalFacade>.Instance));
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog())));
         services.AddScoped(_ => new CircuitUserPrincipalAccessor(_auth.Resolver(mode), _auth.Policy));
         var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
         var scope = provider.CreateAsyncScope();

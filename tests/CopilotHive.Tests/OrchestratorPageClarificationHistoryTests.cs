@@ -164,11 +164,16 @@ public sealed class OrchestratorPageClarificationHistoryTests : IDisposable
         var notifier = new DashboardNotifier();
         var goalStore = new RecordingGoalStore();
 
+        // THE LIVE SOURCES the host registers as singletons, captured so the facade's progress
+        // aggregation reads the very same pipeline manager and progress log the dashboard does.
+        var pipelineManager = new GoalPipelineManager();
+        var progressLog = new ProgressLog();
+
         var dashboardState = new DashboardStateService(
             new WorkerPool(),
-            new GoalPipelineManager(),
+            pipelineManager,
             new DashboardLogSink(),
-            new ProgressLog(),
+            progressLog,
             notifier: notifier,
             brain: brain);
 
@@ -177,6 +182,9 @@ public sealed class OrchestratorPageClarificationHistoryTests : IDisposable
         services.AddSingleton(notifier);
         services.AddSingleton(dashboardState);
         services.AddSingleton(registry);
+        services.AddSingleton(pipelineManager);
+        services.AddSingleton(progressLog);
+        services.AddSingleton<ProgressReportService>();
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton<IGoalStore>(goalStore);
         services.AddSingleton<Microsoft.JSInterop.IJSRuntime>(new NullJsRuntime());
@@ -198,7 +206,8 @@ public sealed class OrchestratorPageClarificationHistoryTests : IDisposable
             sp.GetRequiredService<LlmSessionRegistry>(),
             sp.GetRequiredService<HivePrincipalResolver>(),
             sp.GetRequiredService<HivePolicy>(),
-            NullLogger<OperationalFacade>.Instance));
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(sp.GetRequiredService<GoalPipelineManager>(), sp.GetRequiredService<ProgressLog>())));
 
         // THE RECORDING CLARIFICATION FACADE — what the page is supposed to talk to, exclusively.
         services.AddSingleton<IClarificationFacade>(clarifications);

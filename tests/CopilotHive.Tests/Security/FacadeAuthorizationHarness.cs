@@ -75,15 +75,29 @@ internal sealed class FacadeAuthorizationHarness : IDisposable
     /// registry), so the test owns their state and can observe a real delegation — for example the
     /// Brain reset actually reaching the Brain behind the dashboard service.
     /// </para>
+    /// <para>
+    /// The progress-report aggregation is the SIXTH REQUIRED dependency, exactly as <c>Program.cs</c>
+    /// wires it (the host resolves it with <c>GetRequiredService</c>), so every constructed facade is
+    /// fully wired and the worker-progress read always delegates to a real aggregation.
+    /// </para>
     /// </summary>
     /// <param name="mode">The explicit authentication mode the resolver answers in.</param>
     /// <param name="dashboard">The trusted dashboard state service the facade delegates to.</param>
     /// <param name="registry">The trusted LLM session registry the facade projects from.</param>
+    /// <param name="progressReports">The trusted progress-report aggregation.</param>
     internal OperationalFacade OperationalFacade(
         HiveAuthMode mode,
         CopilotHive.Dashboard.DashboardStateService dashboard,
-        CopilotHive.Dashboard.LlmSessionRegistry registry) =>
-        new(dashboard, registry, Resolver(mode), Policy, NullLogger<OperationalFacade>.Instance);
+        CopilotHive.Dashboard.LlmSessionRegistry registry,
+        CopilotHive.Dashboard.ProgressReportService progressReports) =>
+        new(dashboard, registry, Resolver(mode), Policy, NullLogger<OperationalFacade>.Instance, progressReports);
+
+    /// <summary>
+    /// A progress aggregation over a FRESH pipeline manager and progress log — the shape a fixture wires
+    /// when it has no live pipeline sources of its own.
+    /// </summary>
+    internal static CopilotHive.Dashboard.ProgressReportService EmptyProgressReports() =>
+        new(new GoalPipelineManager(), new CopilotHive.Dashboard.ProgressLog());
 
     /// <summary>The production config facade over this directory's resolver for <paramref name="mode"/>.</summary>
     internal ConfigFacade ConfigFacade(

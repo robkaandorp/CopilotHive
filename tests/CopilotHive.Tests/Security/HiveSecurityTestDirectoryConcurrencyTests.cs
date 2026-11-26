@@ -476,7 +476,8 @@ public sealed class HiveSecurityTestDirectoryConcurrencyTests
                 new GoalPipelineManager(),
                 new DashboardLogSink(),
                 new ProgressLog()),
-            new LlmSessionRegistry());
+            new LlmSessionRegistry(),
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog()));
 
         // POSITIVE CONTROL: the Operator holds ExecutionOperator, so the reset is authorized through
         // the directory (a reset with no Brain configured is the service's own successful no-op).

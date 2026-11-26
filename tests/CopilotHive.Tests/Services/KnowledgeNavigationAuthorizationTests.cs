@@ -232,6 +232,20 @@ public sealed class KnowledgeNavigationAuthorizationTests : IDisposable
             if (gate is not null) await gate.ParkAsync();
             return result;
         }
+
+        // THE THREE DISPLAY PROJECTIONS are not exercised by this knowledge/navigation slice, so they
+        // delegate verbatim — no gate, no recording, no behaviour of their own.
+        public Task<FacadeResult<DashboardDisplaySnapshot>> GetDashboardDisplayAsync(
+            ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            production.GetDashboardDisplayAsync(actingUser, ct);
+
+        public Task<FacadeResult<WorkerDisplayProjection>> GetWorkerDisplayAsync(
+            ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            production.GetWorkerDisplayAsync(actingUser, ct);
+
+        public Task<FacadeResult<IReadOnlyList<WorkerProgressDisplayEntry>>> GetWorkerProgressAsync(
+            string workerId, ClaimsPrincipal? actingUser, CancellationToken ct) =>
+            production.GetWorkerProgressAsync(workerId, actingUser, ct);
     }
 
     /// <summary>ONE parked read: signals its arrival and awaits an explicit release.</summary>
@@ -328,7 +342,8 @@ public sealed class KnowledgeNavigationAuthorizationTests : IDisposable
             registry,
             _auth.Resolver(mode),
             _auth.Policy,
-            NullLogger<OperationalFacade>.Instance));
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog())));
         services.AddSingleton<IOperationalFacade>(gateable);
 
         services.AddSingleton<IClarificationFacade>(sp => new ClarificationFacade(

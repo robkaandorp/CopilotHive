@@ -70,6 +70,9 @@ public sealed class OperationalFacadeRegistrationTests
         var brain = await facade.GetBrainStatsAsync(null, Ct);
         var info = await facade.GetOrchestratorInfoAsync(null, Ct);
         var sessions = await facade.GetSharedLlmSessionsAsync(null, Ct);
+        var dashboardDisplay = await facade.GetDashboardDisplayAsync(null, Ct);
+        var workerDisplay = await facade.GetWorkerDisplayAsync(null, Ct);
+        var progress = await facade.GetWorkerProgressAsync("any-worker", null, Ct);
 
         if (mode.AuthEnabled)
         {
@@ -78,11 +81,19 @@ public sealed class OperationalFacadeRegistrationTests
                 ("brain stats", brain.Kind, brain.Error),
                 ("orchestrator info", info.Kind, info.Error),
                 ("shared sessions", sessions.Kind, sessions.Error),
+                ("dashboard display", dashboardDisplay.Kind, dashboardDisplay.Error),
+                ("worker display", workerDisplay.Kind, workerDisplay.Error),
+                ("worker progress", progress.Kind, progress.Error),
             })
             {
                 Assert.Equal(FacadeErrorKind.Forbidden, kind);
                 Assert.Equal(FacadeAuthorization.ForbiddenMessage, error);
             }
+
+            // A denial on the new projections carries NO value either.
+            Assert.Null(dashboardDisplay.Value);
+            Assert.Null(workerDisplay.Value);
+            Assert.Null(progress.Value);
 
             Assert.Equal(FacadeErrorKind.Forbidden, reset.Kind);
             Assert.Equal(FacadeAuthorization.ForbiddenMessage, reset.Error);
@@ -93,10 +104,43 @@ public sealed class OperationalFacadeRegistrationTests
             Assert.True(brain.Success, brain.Error);
             Assert.True(info.Success, info.Error);
             Assert.True(sessions.Success, sessions.Error);
+            Assert.True(dashboardDisplay.Success, dashboardDisplay.Error);
+            Assert.True(workerDisplay.Success, workerDisplay.Error);
+            Assert.True(progress.Success, progress.Error);
 
             // The projection is still sanitized in open mode: no Composer session is ever shared.
             Assert.DoesNotContain(sessions.Value!, s => s.SessionType == LlmSessionType.Composer);
+
+            // The dashboard display carries the two worker counts and NO worker row.
+            Assert.NotNull(dashboardDisplay.Value);
+            Assert.Equal(
+                workerDisplay.Value!.TotalWorkers, dashboardDisplay.Value!.TotalWorkers);
+
+            // The progress read is wired to the host's OWN registered aggregation: an unknown worker
+            // simply has no reports, which is a success with no rows rather than a missing dependency.
+            Assert.NotNull(progress.Value);
         }
+    }
+
+    /// <summary>
+    /// THE PROGRESS-RESOURCE IS THE HOST'S OWN REGISTERED AGGREGATION, injected at the factory and
+    /// nowhere else: the facade resolved from the host holds the very
+    /// <see cref="ProgressReportService"/> instance the host's container exposes as a singleton, so the
+    /// worker-progress read cannot drift into a second collection of its own.
+    /// </summary>
+    [Fact]
+    public void TheFacade_HoldsTheHostsOwnRegisteredProgressAggregation()
+    {
+        var facade = _factory.Services.GetRequiredService<IOperationalFacade>();
+        var hostService = _factory.Services.GetRequiredService<ProgressReportService>();
+        var sameService = _factory.Services.GetRequiredService<ProgressReportService>();
+
+        Assert.Same(hostService, sameService);
+
+        var field = typeof(OperationalFacade)
+            .GetField("_progressReports", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        Assert.Same(hostService, field.GetValue(facade));
     }
 
     /// <summary>

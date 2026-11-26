@@ -1005,12 +1005,16 @@ public sealed class Program
             // DashboardStateService and LlmSessionRegistry stay trusted internal services with their
             // public APIs unchanged — this facade only delegates, and its shared session projection
             // removes Composer sessions through the ONE filter the /api/sessions route also uses.
+            // The progress-report aggregation is the ALREADY-REGISTERED ProgressReportService (the
+            // same singleton the GoalDetail read uses), wired here and nowhere else, so the worker
+            // progress read cannot drift into a second collection of its own.
             builder.Services.AddSingleton<IOperationalFacade>(sp => new OperationalFacade(
                 sp.GetRequiredService<DashboardStateService>(),
                 sp.GetRequiredService<LlmSessionRegistry>(),
                 sp.GetRequiredService<HivePrincipalResolver>(),
                 sp.GetRequiredService<HivePolicy>(),
-                sp.GetRequiredService<ILogger<OperationalFacade>>()));
+                sp.GetRequiredService<ILogger<OperationalFacade>>(),
+                sp.GetRequiredService<ProgressReportService>()));
 
             builder.Services.AddScoped<PageHeaderState>();
             builder.Services.AddScoped<GoalsFilterState>();

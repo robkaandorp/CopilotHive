@@ -165,11 +165,16 @@ public sealed class OrchestratorPageAuthorizedBehaviorTests : IDisposable
         var brain = new RecordingBrain();
         var registry = new LlmSessionRegistry();
 
+        // THE LIVE SOURCES the host registers as singletons, captured so the facade's progress
+        // aggregation reads the very same pipeline manager and progress log the dashboard does.
+        var pipelineManager = new GoalPipelineManager();
+        var progressLog = new ProgressLog();
+
         var dashboardState = new DashboardStateService(
             new WorkerPool(),
-            new GoalPipelineManager(),
+            pipelineManager,
             new DashboardLogSink(),
-            new ProgressLog(),
+            progressLog,
             notifier: null,
             brain: brain);
 
@@ -177,6 +182,9 @@ public sealed class OrchestratorPageAuthorizedBehaviorTests : IDisposable
         services.AddLogging();
         services.AddSingleton(dashboardState);
         services.AddSingleton(registry);
+        services.AddSingleton(pipelineManager);
+        services.AddSingleton(progressLog);
+        services.AddSingleton<ProgressReportService>();
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton<IGoalStore>(new InMemoryGoalStore());
         services.AddSingleton<Microsoft.JSInterop.IJSRuntime>(new ConfirmingJsRuntime());
@@ -199,7 +207,8 @@ public sealed class OrchestratorPageAuthorizedBehaviorTests : IDisposable
             sp.GetRequiredService<LlmSessionRegistry>(),
             sp.GetRequiredService<HivePrincipalResolver>(),
             sp.GetRequiredService<HivePolicy>(),
-            NullLogger<OperationalFacade>.Instance));
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(sp.GetRequiredService<GoalPipelineManager>(), sp.GetRequiredService<ProgressLog>())));
 
         // THE AUTHORIZED CLARIFICATION FACADE — the production type over the production queue, the
         // seeded goal store and the production resolver/policy, exactly as Program.cs registers it.

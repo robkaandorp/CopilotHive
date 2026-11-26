@@ -4,6 +4,7 @@ using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
+using CopilotHive.Workers;
 
 using Microsoft.Extensions.AI;
 
@@ -158,19 +159,7 @@ public sealed class DashboardStateService : IDisposable
         return new DashboardSnapshot
         {
             Goals = goals,
-            Workers = workers.Select(w => new WorkerInfo
-            {
-                Id = w.Id,
-                Role = w.Role.ToString(),
-                IsBusy = w.IsBusy,
-                CurrentTaskId = w.CurrentTaskId,
-                LastHeartbeat = w.LastHeartbeat,
-                ConnectedAt = w.ConnectedAt,
-                CurrentModel = w.CurrentModel,
-                ContextUsagePercent = w.ContextUsagePercent,
-                IsAvailable = w.IsAvailable,
-                AwaitingWorkerReady = w.AwaitingWorkerReady,
-            }).ToList(),
+            Workers = workers.Select(ToWorkerInfo).ToList(),
             Pipelines = pipelines.Select(p => new PipelineInfo
             {
                 GoalId = p.GoalId,
@@ -198,6 +187,227 @@ public sealed class DashboardStateService : IDisposable
             AvailableWorkers = workers.Count(w => w.IsAvailable),
             AwaitingReadyWorkers = workers.Count(w => w.AwaitingWorkerReady),
         };
+    }
+
+    /// <summary>
+    /// THE ONE WORKER MAPPING into the snapshot's <see cref="WorkerInfo"/> row, used by
+    /// <see cref="GetSnapshot"/> for every captured worker.
+    /// </summary>
+    /// <param name="captured">One value of the pool-owned capture (never a live worker alias).</param>
+    /// <returns>The dashboard worker row, copied by value.</returns>
+    private static WorkerInfo ToWorkerInfo(WorkerStatusSnapshot captured) => new()
+    {
+        Id = captured.Id,
+        Role = captured.Role.ToString(),
+        IsBusy = captured.IsBusy,
+        CurrentTaskId = captured.CurrentTaskId,
+        LastHeartbeat = captured.LastHeartbeat,
+        ConnectedAt = captured.ConnectedAt,
+        CurrentModel = captured.CurrentModel,
+        ContextUsagePercent = captured.ContextUsagePercent,
+        IsAvailable = captured.IsAvailable,
+        AwaitingWorkerReady = captured.AwaitingWorkerReady,
+    };
+
+    // ── Workers surface projection ─────────────────────────────────────────────
+
+    /// <summary>
+    /// THE WORKER-ONLY DISPLAY CAPTURE behind <c>IOperationalFacade.GetWorkerDisplayAsync</c>: ONE
+    /// pool-owned capture of the worker status, from which BOTH the detached rows and all five counts
+    /// are derived.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT READS THE POOL AND THE LOCAL ROLE CONFIGURATION, AND NOTHING ELSE: no goal store read, no
+    /// pipeline read and no Composer statistics read happens here — not even indirectly through
+    /// <see cref="GetOrchestratorInfo"/>, whose Brain/Composer statistics half this projection
+    /// deliberately omits. The model/reasoning display values come from the SAME per-role configuration
+    /// source, copied out into local dictionaries rather than returned, so no live configuration object
+    /// escapes through the projection. This is deliberately narrower than <see cref="GetSnapshot"/>,
+    /// which merges goals and pipelines for the whole dashboard.
+    /// </para>
+    /// <para>
+    /// THE COUNTS CANNOT DISAGREE WITH THE ROWS: every one of them is computed from the same captured
+    /// list, so they describe one instant. The meanings are the existing ones —
+    /// <c>Idle</c> counts every non-busy worker (withheld workers included), <c>Available</c> only the
+    /// captured assignable verdict and <c>AwaitingReady</c> the readiness-wait subset.
+    /// </para>
+    /// <para>
+    /// THE REASONING RULE IS THE WORKERS PAGE'S, PRESERVED: the displayed model is the task-specific
+    /// model, else the role's configured model; the premium comparison runs FIRST (so identical
+    /// standard/premium models resolve to the premium effort) and the standard comparison second; an
+    /// unmatched model, an unassigned role or an unset effort all render the existing em dash.
+    /// </para>
+    /// </remarks>
+    /// <returns>The detached worker display projection for the captured instant.</returns>
+    public WorkerDisplayProjection GetWorkerDisplay()
+    {
+        // ONE capture for BOTH the rows and every count below.
+        var workers = _workerPool.CaptureWorkerStatus();
+
+        // The role display configuration, COPIED: the page's model/reasoning resolution reads these
+        // local copies, never the live config dictionaries.
+        var roleModels = RoleModelDisplayByRole();
+        var premiumModels = RolePremiumModelDisplayByRole();
+        var standardReasoning = RoleReasoningDisplayByRole();
+        var premiumReasoning = RolePremiumReasoningDisplayByRole();
+
+        var rows = new List<WorkerDisplayRow>(workers.Count);
+        foreach (var captured in workers)
+        {
+            // The role NAME the row shows ("Unspecified" for an unassigned worker) and the lowercase
+            // key the configuration is looked up by — exactly the page's own convention.
+            var roleName = captured.Role.ToString();
+            var roleKey = roleName.ToLowerInvariant();
+
+            var displayModel = captured.CurrentModel
+                ?? (roleName != nameof(WorkerRole.Unspecified) && roleModels.TryGetValue(roleKey, out var roleModel)
+                    ? roleModel
+                    : null);
+
+            var status = WorkerInfo.DescribeStatus(
+                captured.IsBusy, captured.IsAvailable, captured.AwaitingWorkerReady);
+
+            rows.Add(new WorkerDisplayRow(
+                captured.Id,
+                roleName,
+                captured.IsBusy,
+                captured.CurrentTaskId,
+                captured.LastHeartbeat,
+                captured.ConnectedAt,
+                captured.CurrentModel,
+                captured.ContextUsagePercent,
+                captured.IsAvailable,
+                captured.AwaitingWorkerReady,
+                displayModel,
+                ReasoningLabelFor(displayModel, roleKey, premiumModels, roleModels, premiumReasoning, standardReasoning),
+                status.Label,
+                status.CssClass));
+        }
+
+        return new WorkerDisplayProjection(
+            TotalWorkers: workers.Count,
+            BusyWorkers: workers.Count(w => w.IsBusy),
+            IdleWorkers: workers.Count(w => !w.IsBusy),
+            AvailableWorkers: workers.Count(w => w.IsAvailable),
+            AwaitingReadyWorkers: workers.Count(w => w.AwaitingWorkerReady),
+            Workers: rows);
+    }
+
+    /// <summary>
+    /// Resolves the reasoning-effort label for a worker row from the DISPLAYED model and the copied
+    /// role configuration: premium-before-standard matching, and the existing em dash for anything
+    /// else (no displayed model, an unmatched model, an unassigned role or an unset effort).
+    /// </summary>
+    /// <param name="displayedModel">The model the row displays, or <c>null</c>.</param>
+    /// <param name="roleKey">The lowercase role key the configuration is indexed by.</param>
+    /// <param name="premiumModels">Copied premium model per role key.</param>
+    /// <param name="standardModels">Copied standard model per role key.</param>
+    /// <param name="premiumReasoning">Copied premium reasoning effort per role key.</param>
+    /// <param name="standardReasoning">Copied standard reasoning effort per role key.</param>
+    /// <returns>The reasoning label the Workers page renders for this row.</returns>
+    private static string ReasoningLabelFor(
+        string? displayedModel,
+        string roleKey,
+        IReadOnlyDictionary<string, string?> premiumModels,
+        IReadOnlyDictionary<string, string> standardModels,
+        IReadOnlyDictionary<string, ReasoningEffort?> premiumReasoning,
+        IReadOnlyDictionary<string, ReasoningEffort?> standardReasoning)
+    {
+        if (string.IsNullOrEmpty(displayedModel))
+            return ReasoningEffortOptions.Label(null);
+
+        // PREMIUM FIRST: a role whose premium and standard models are identical resolves to the
+        // premium effort, exactly as the page's helper did.
+        if (string.Equals(displayedModel, premiumModels.GetValueOrDefault(roleKey), StringComparison.OrdinalIgnoreCase))
+            return ReasoningEffortOptions.Label(premiumReasoning.GetValueOrDefault(roleKey));
+
+        if (string.Equals(displayedModel, standardModels.GetValueOrDefault(roleKey), StringComparison.OrdinalIgnoreCase))
+            return ReasoningEffortOptions.Label(standardReasoning.GetValueOrDefault(roleKey));
+
+        return ReasoningEffortOptions.Label(null);
+    }
+
+    /// <summary>
+    /// Copies the per-role STANDARD models exactly as <see cref="GetOrchestratorInfo"/> renders them
+    /// — every known role, with the display-only "(not configured)" sentinel for an unset model.
+    /// </summary>
+    /// <remarks>
+    /// IT IS NOT <see cref="GetOrchestratorInfo"/>: that projection also reads the Brain's and the
+    /// Composer's live statistics, which are deliberately outside this worker-only surface. Only the
+    /// configuration-derived half is needed to render a worker row's model, so only that half is
+    /// computed — with the SAME per-role source (<see cref="HiveConfigFile.GetModelForRole(string)"/>)
+    /// and the SAME sentinel, so a worker row and the Orchestrator page's role table cannot disagree
+    /// about a role's configured model.
+    /// </remarks>
+    /// <returns>A detached role-key → display-model map.</returns>
+    private Dictionary<string, string> RoleModelDisplayByRole()
+    {
+        var roleModels = new Dictionary<string, string>(RolesReadForDisplay.Length);
+        foreach (var role in RolesReadForDisplay)
+        {
+            var model = _config?.Workers is null ? null : _config.GetModelForRole(role);
+            roleModels[role] = string.IsNullOrWhiteSpace(model) ? NotConfigured : model!;
+        }
+
+        return roleModels;
+    }
+
+    /// <summary>
+    /// The roles whose configured model the display projections render — the same five
+    /// <see cref="GetOrchestratorInfo"/> reports.
+    /// </summary>
+    private static readonly string[] RolesReadForDisplay = ["coder", "tester", "reviewer", "docwriter", "improver"];
+
+    /// <summary>Copies the per-role PREMIUM models out of the configuration (no live object escapes).</summary>
+    /// <returns>A detached role-key → premium-model map.</returns>
+    private Dictionary<string, string?> RolePremiumModelDisplayByRole()
+    {
+        var premiumModels = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        if (_config?.Workers is null)
+            return premiumModels;
+
+        foreach (var (roleName, workerCfg) in _config.Workers)
+        {
+            if (workerCfg is null) continue;
+            premiumModels[roleName] = workerCfg.PremiumModel;
+        }
+
+        return premiumModels;
+    }
+
+    /// <summary>Copies the per-role STANDARD reasoning efforts out of the configuration.</summary>
+    /// <returns>A detached role-key → reasoning-effort map.</returns>
+    private Dictionary<string, ReasoningEffort?> RoleReasoningDisplayByRole()
+    {
+        var reasoning = new Dictionary<string, ReasoningEffort?>(StringComparer.OrdinalIgnoreCase);
+        if (_config?.Workers is null)
+            return reasoning;
+
+        foreach (var (roleName, workerCfg) in _config.Workers)
+        {
+            if (workerCfg is null) continue;
+            reasoning[roleName] = ParseLenient(workerCfg.ReasoningEffort);
+        }
+
+        return reasoning;
+    }
+
+    /// <summary>Copies the per-role PREMIUM reasoning efforts out of the configuration.</summary>
+    /// <returns>A detached role-key → reasoning-effort map.</returns>
+    private Dictionary<string, ReasoningEffort?> RolePremiumReasoningDisplayByRole()
+    {
+        var reasoning = new Dictionary<string, ReasoningEffort?>(StringComparer.OrdinalIgnoreCase);
+        if (_config?.Workers is null)
+            return reasoning;
+
+        foreach (var (roleName, workerCfg) in _config.Workers)
+        {
+            if (workerCfg is null) continue;
+            reasoning[roleName] = ParseLenient(workerCfg.PremiumReasoningEffort);
+        }
+
+        return reasoning;
     }
 
     /// <summary>

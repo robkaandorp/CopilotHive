@@ -69,7 +69,8 @@ public sealed class OperationalFacadeKnowledgeReadTests : IDisposable
 
     private OperationalFacade FacadeFor(HiveAuthMode mode, DashboardStateService dashboard) =>
         new(dashboard, new LlmSessionRegistry(), _auth.Resolver(mode), _auth.Policy,
-            NullLogger<OperationalFacade>.Instance);
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog()));
 
     /// <summary>
     /// The REAL production graph with three documents, distinctive tags and one outgoing link from

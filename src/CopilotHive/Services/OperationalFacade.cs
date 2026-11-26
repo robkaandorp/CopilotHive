@@ -1,6 +1,7 @@
 using System.Security.Claims;
 
 using CopilotHive.Dashboard;
+using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Security;
@@ -43,7 +44,8 @@ namespace CopilotHive.Services;
 /// THE CAPABILITY SPLIT: resetting the master Brain session rewrites the orchestrator's live
 /// conversation for everybody, so it requires <see cref="HiveCapability.ExecutionOperator"/>
 /// (<see cref="UserRole.Operator"/> and above; a Viewer or a Member is refused). The read projections
-/// — including all three knowledge reads — describe shared data, so they require
+/// — including all three knowledge reads and the three DASHBOARD/WORKERS/WORKER-PROGRESS display
+/// projections — describe shared data, so they require
 /// <see cref="HiveCapability.SharedRead"/> (every role). A refusal produces
 /// <see cref="FacadeErrorKind.Forbidden"/> carrying the single sanitized
 /// <see cref="FacadeAuthorization.ForbiddenMessage"/> BEFORE any read or mutation runs.
@@ -178,6 +180,88 @@ public interface IOperationalFacade
     /// <see cref="HiveCapability.SharedRead"/>.
     /// </returns>
     Task<FacadeResult<int>> GetKnowledgeDocumentCountAsync(ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads the DASHBOARD DISPLAY PROJECTION — the <c>Home</c> page's cards and its two tables — as
+    /// one detached, bounded value.
+    /// </summary>
+    /// <remarks>
+    /// THE MERGED SNAPSHOT'S OWN WORK IS REUSED, NOT REIMPLEMENTED:
+    /// <see cref="DashboardStateService.GetSnapshot"/> still performs the side-effect-free merge of the
+    /// goal store, the pipelines and the one worker capture, so the phase-derived statuses, the store
+    /// precedence and the full-set counts are exactly what the page rendered before. This operation
+    /// only PROJECTS that answer: the five goal counts are carried through unchanged (they always
+    /// describe the WHOLE set), the worker half is reduced to the two counts the dashboard shows (no
+    /// worker row is returned) and the rows are bounded — see
+    /// <see cref="DashboardDisplaySnapshot.RecentGoals"/>, which is the newest
+    /// <see cref="DashboardDisplaySnapshot.RecentGoalLimit"/> Draft/Completed/Failed goals ordered by
+    /// creation time descending, and <see cref="DashboardDisplaySnapshot.Pipelines"/>, which keeps the
+    /// snapshot's existing order.
+    /// </remarks>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the detached display projection, or
+    /// <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently hold
+    /// <see cref="HiveCapability.SharedRead"/>. A failure of the underlying snapshot read propagates.
+    /// </returns>
+    Task<FacadeResult<DashboardDisplaySnapshot>> GetDashboardDisplayAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads the WORKERS DISPLAY PROJECTION — the <c>Workers</c> table and the
+    /// <c>WorkerDetail</c> header cards — as one detached value: every worker row plus all five counts,
+    /// all derived from ONE <c>WorkerPool.CaptureWorkerStatus</c> call.
+    /// </summary>
+    /// <remarks>
+    /// NO GOAL, PIPELINE OR COMPOSER DATA IS READ — not even indirectly: unlike
+    /// <see cref="GetOrchestratorInfoAsync"/> this operation does not touch the Brain's or the
+    /// Composer's live statistics, and it reads no goal store and no pipeline. The model and reasoning
+    /// values a worker row displays are computed inside the trusted service from COPIED role
+    /// configuration, so no live configuration object crosses the boundary.
+    /// </remarks>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the detached worker rows and counts (an empty row list when no worker
+    /// is connected), or <see cref="FacadeErrorKind.Forbidden"/> when the caller does not currently
+    /// hold <see cref="HiveCapability.SharedRead"/>.
+    /// </returns>
+    Task<FacadeResult<WorkerDisplayProjection>> GetWorkerDisplayAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct);
+
+    /// <summary>
+    /// Reads ONE worker's progress-report rows for the <c>WorkerDetail</c> table, through the existing
+    /// capped <see cref="ProgressReportService.GetProgressForWorker(string, int)"/> aggregation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE AGGREGATION IS REUSED VERBATIM: pipeline-collected reports plus the global log, with the
+    /// service's own deduplication, ordering and cap — the facade never re-collects, re-orders,
+    /// re-caps or back-fills. No worker status is captured and no Composer statistics are read.
+    /// </para>
+    /// <para>
+    /// THE DISCLOSURE OF <see cref="WorkerProgressDisplayEntry.Status"/> AND
+    /// <see cref="WorkerProgressDisplayEntry.Details"/> FOLLOWS THE INSTALLATION MODE. While
+    /// authentication is enabled, the already-capped rows are FILTERED (never extended) to the seven
+    /// <see cref="WorkerProgressDisplayEntry.ApprovedStatuses"/>, matched as a full value ordinally and
+    /// case-insensitively without trimming; each kept row carries the canonical spelling and a
+    /// <c>null</c> Details, and a row with any other status is OMITTED ENTIRELY rather than rewritten.
+    /// Only an EXPLICITLY open installation returns the raw status and details. BOTH modes authorize
+    /// first, and a <c>null</c> identity in authenticated mode is refused — it never selects the raw
+    /// branch.
+    /// </para>
+    /// </remarks>
+    /// <param name="workerId">The worker whose reports to read.</param>
+    /// <param name="actingUser">The per-request/per-circuit identity, or <c>null</c> when signed out.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates.</param>
+    /// <returns>
+    /// A success result carrying the projected rows (empty when the worker has reported nothing, or
+    /// when no row has an approved status), or <see cref="FacadeErrorKind.Forbidden"/> when the caller
+    /// does not currently hold <see cref="HiveCapability.SharedRead"/>.
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<WorkerProgressDisplayEntry>>> GetWorkerProgressAsync(
+        string workerId, ClaimsPrincipal? actingUser, CancellationToken ct);
 }
 
 /// <summary>
@@ -214,14 +298,16 @@ public static class SharedSessionProjection
 /// Default implementation of <see cref="IOperationalFacade"/> delegating to the unchanged
 /// <see cref="DashboardStateService"/> (including its <see cref="DashboardStateService.KnowledgeGraph"/>
 /// and <see cref="DashboardStateService.GetKnowledgeDocumentCount"/>, so the constructor takes no new
-/// dependency) and <see cref="LlmSessionRegistry"/>. The dashboard state service, the registry, the
-/// stateless principal resolver and the pure policy evaluator are all required dependencies, so
-/// there is no unauthenticated — and no dashboard-less — construction.
+/// dependency) and <see cref="LlmSessionRegistry"/>, plus the already-registered
+/// <see cref="ProgressReportService"/> behind the one worker-progress read. The dashboard state
+/// service, the registry, the stateless principal resolver and the pure policy evaluator are all
+/// required dependencies, so there is no unauthenticated — and no dashboard-less — construction.
 /// </summary>
 public sealed class OperationalFacade : IOperationalFacade
 {
     private readonly DashboardStateService _dashboard;
     private readonly LlmSessionRegistry _sessions;
+    private readonly ProgressReportService _progressReports;
     private readonly HivePrincipalResolver _resolver;
     private readonly HivePolicy _policy;
     private readonly ILogger<OperationalFacade> _log;
@@ -238,19 +324,27 @@ public sealed class OperationalFacade : IOperationalFacade
     /// </param>
     /// <param name="policy">The pure capability evaluator (required together with <paramref name="resolver"/>).</param>
     /// <param name="log">Logger used for secret-free denial and operation diagnostics.</param>
+    /// <param name="progressReports">
+    /// The trusted progress-report aggregation behind <see cref="GetWorkerProgressAsync"/> — REQUIRED,
+    /// exactly as the host registers it (the host already resolves it with
+    /// <c>GetRequiredService</c>), so there is no partially-wired construction and no silent
+    /// "no reports" fallback for an operation that was never given its data source.
+    /// </param>
     /// <exception cref="ArgumentNullException">A required dependency is null.</exception>
     public OperationalFacade(
         DashboardStateService dashboard,
         LlmSessionRegistry sessions,
         HivePrincipalResolver resolver,
         HivePolicy policy,
-        ILogger<OperationalFacade> log)
+        ILogger<OperationalFacade> log,
+        ProgressReportService progressReports)
     {
         _dashboard = dashboard ?? throw new ArgumentNullException(nameof(dashboard));
         _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _log = log ?? throw new ArgumentNullException(nameof(log));
+        _progressReports = progressReports ?? throw new ArgumentNullException(nameof(progressReports));
     }
 
     // ── Authorized mutation (ExecutionOperator) ─────────────────────────────
@@ -408,6 +502,127 @@ public sealed class OperationalFacade : IOperationalFacade
 
         // The service's own answer (0 when the graph is not configured) is preserved unchanged.
         return new(true, _dashboard.GetKnowledgeDocumentCount(), null, FacadeErrorKind.None);
+    }
+
+    // ── Authorized operational display projections (SharedRead) ──────────────
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<DashboardDisplaySnapshot>> GetDashboardDisplayAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST: the denied caller never reaches the snapshot's store, pipeline or pool read.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetDashboardDisplayAsync), ct))
+            return Forbidden<DashboardDisplaySnapshot>();
+
+        // THE SIDE-EFFECT-FREE MERGED SNAPSHOT, REUSED: its own merge (store precedence, phase-derived
+        // display statuses, ONE worker capture) is the trusted service's work and is not reimplemented
+        // here. Only the PROJECTION below is new; an unexpected failure of the read propagates exactly
+        // as it did when the page called the service directly.
+        var snapshot = await _dashboard.GetSnapshot();
+
+        // RECENT GOALS: the newest twenty Draft/Completed/Failed rows by creation time descending.
+        // CreatedAt is the SORT KEY only — it is deliberately absent from the projected row — and the
+        // cap is applied HERE so the projection is bounded, not merely the rendering.
+        var recentGoals = snapshot.Goals
+            .Where(goal => goal.Status is GoalStatus.Draft or GoalStatus.Completed or GoalStatus.Failed)
+            .OrderByDescending(goal => goal.CreatedAt)
+            .Take(DashboardDisplaySnapshot.RecentGoalLimit)
+            .Select(goal => new DashboardGoalDisplayEntry(goal.Id, goal.Status, goal.Iterations))
+            .ToList();
+
+        // PIPELINES: the snapshot's existing order, with the description reduced to its bounded
+        // preview — the full text and the omitted suffix never leave this operation.
+        var pipelines = snapshot.Pipelines
+            .Select(pipeline => new DashboardPipelineDisplayEntry(
+                pipeline.GoalId,
+                pipeline.Phase,
+                pipeline.Iteration,
+                pipeline.TotalTests,
+                pipeline.PassedTests,
+                pipeline.FailedTests,
+                pipeline.CoveragePercent,
+                pipeline.CreatedAt,
+                pipeline.GoalStartedAt,
+                pipeline.CompletedAt,
+                OperationalTextPreview.Of(pipeline.Description)))
+            .ToList();
+
+        return new(
+            true,
+            new DashboardDisplaySnapshot(
+                // THE FIVE FULL-SET COUNTS, carried through unchanged: they always describe the whole
+                // goal set, not the bounded recent set.
+                snapshot.DraftGoals,
+                snapshot.PendingGoals,
+                snapshot.ActiveGoals,
+                snapshot.CompletedGoals,
+                snapshot.FailedGoals,
+                // The dashboard shows ONLY these two worker numbers, and no worker row at all.
+                snapshot.BusyWorkers,
+                snapshot.TotalWorkers,
+                recentGoals,
+                pipelines),
+            null,
+            FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<WorkerDisplayProjection>> GetWorkerDisplayAsync(
+        ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST: no pool capture, no goal read and no configuration read before the answer.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetWorkerDisplayAsync), ct))
+            return Forbidden<WorkerDisplayProjection>();
+
+        // ONE worker-only capture, producing the rows AND every count. The service reads no goal, no
+        // pipeline and no Composer statistics for this projection.
+        return new(true, _dashboard.GetWorkerDisplay(), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<WorkerProgressDisplayEntry>>> GetWorkerProgressAsync(
+        string workerId, ClaimsPrincipal? actingUser, CancellationToken ct)
+    {
+        // AUTHORIZATION FIRST, IN BOTH MODES: even the open-mode raw branch below is only reached by a
+        // caller who currently holds SharedRead, and a null identity here has no bearing on that
+        // answer — the resolver decides.
+        if (!await IsAllowedAsync(actingUser, HiveCapability.SharedRead, nameof(GetWorkerProgressAsync), ct))
+            return Forbidden<IReadOnlyList<WorkerProgressDisplayEntry>>();
+
+        // THE EXISTING AGGREGATION, REUSED VERBATIM: pipeline-collected reports plus the global log,
+        // with its own deduplication, ordering and cap. No worker status is captured here and no
+        // Composer statistics are read.
+        var progress = _progressReports.GetProgressForWorker(workerId);
+
+        // THE RAW BRANCH IS SELECTED BY THE EXPLICIT MODE, NEVER BY THE CALLER'S IDENTITY: an
+        // authentication-enabled installation always takes the approved-status projection below, so a
+        // null identity (refused above anyway) cannot reach raw data.
+        if (!_resolver.Mode.AuthEnabled)
+        {
+            return new(
+                true,
+                progress
+                    .Select(entry => new WorkerProgressDisplayEntry(
+                        entry.Timestamp, entry.GoalId, entry.Status, entry.Details))
+                    .ToList(),
+                null,
+                FacadeErrorKind.None);
+        }
+
+        // AUTHENTICATED PROJECTION: FILTER the already-capped rows (never extend them, never back-fill
+        // after a filtered row), keeping only the seven approved statuses in their CANONICAL spelling
+        // and dropping the free-text details. A row with any other status is omitted entirely.
+        var projected = new List<WorkerProgressDisplayEntry>(progress.Count);
+        foreach (var entry in progress)
+        {
+            var canonicalStatus = WorkerProgressDisplayEntry.CanonicalStatus(entry.Status);
+            if (canonicalStatus is null)
+                continue;
+
+            projected.Add(new(entry.Timestamp, entry.GoalId, canonicalStatus, Details: null));
+        }
+
+        return new(true, projected, null, FacadeErrorKind.None);
     }
 
     // ── Authorization + shared results ──────────────────────────────────────

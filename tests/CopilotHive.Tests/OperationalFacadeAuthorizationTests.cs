@@ -68,7 +68,8 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
     /// </summary>
     private OperationalFacade FacadeFor(
         HiveAuthMode mode, DashboardStateService dashboard, LlmSessionRegistry registry) =>
-        new(dashboard, registry, _auth.Resolver(mode), _auth.Policy, NullLogger<OperationalFacade>.Instance);
+        new(dashboard, registry, _auth.Resolver(mode), _auth.Policy, NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog()));
 
     private async Task SeedAllRolesAsync()
     {
@@ -345,9 +346,11 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
     /// does any projection it returns. This pins the OMISSION decision so a later change cannot
     /// quietly add the surface back without changing the boundary's contract on purpose.
     /// <para>
-    /// The expected operation set is EXACT: the four original operations plus the three knowledge
+    /// The expected operation set is EXACT: the four original operations, the three knowledge
     /// <see cref="HiveCapability.SharedRead"/> reads added by the KNOWLEDGE/NAVIGATION AUTHORIZATION
-    /// slice. Anything beyond that set (a Composer-statistics projection above all) fails here.
+    /// slice, and the three DASHBOARD/WORKERS/WORKER-PROGRESS display projections added by the
+    /// OPERATIONAL READ PROJECTIONS slice — ten in all. Anything beyond that set (a Composer-statistics
+    /// projection above all) fails here.
     /// </para>
     /// </summary>
     [Fact]
@@ -358,7 +361,7 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
             .Select(m => m.Name)
             .ToHashSet(StringComparer.Ordinal);
 
-        // The boundary's operation set is EXACTLY the seven authorized operations: no more, no less.
+        // The boundary's operation set is EXACTLY the ten authorized operations: no more, no less.
         Assert.Equal(
             new HashSet<string>(StringComparer.Ordinal)
             {
@@ -371,6 +374,12 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
                 nameof(IOperationalFacade.GetKnowledgeDocumentsAsync),
                 nameof(IOperationalFacade.GetKnowledgeDocumentAsync),
                 nameof(IOperationalFacade.GetKnowledgeDocumentCountAsync),
+                // THE OPERATIONAL DISPLAY projections the Home / Workers / WorkerDetail surfaces read:
+                // the dashboard display snapshot, the worker display rows + counts, and one worker's
+                // approved progress rows.
+                nameof(IOperationalFacade.GetDashboardDisplayAsync),
+                nameof(IOperationalFacade.GetWorkerDisplayAsync),
+                nameof(IOperationalFacade.GetWorkerProgressAsync),
             },
             operations);
 
@@ -379,6 +388,107 @@ public sealed class OperationalFacadeAuthorizationTests : IDisposable
         // Task<FacadeResult<BrainStats>> shape as GetBrainStatsAsync, so the omission is enforced by
         // there being no such operation at all.)
         Assert.DoesNotContain(operations, name => name.Contains("Composer", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// THE EXACT SURFACE OF THE TEN OPERATIONS, PINNED ON BOTH TYPES: every operation's full signature
+    /// — return type and parameter types in order — is asserted on <see cref="IOperationalFacade"/>
+    /// AND on the public <see cref="OperationalFacade"/>, so the contract cannot drift on one side of
+    /// the boundary while the other keeps compiling. The three display projections are spelled out in
+    /// full because they are the values the pages bind to.
+    /// </summary>
+    [Fact]
+    public void TheExactTenOperationSignatures_ArePinnedOnBothTypes()
+    {
+        var expected = new[]
+        {
+            "Task`1[FacadeResult`1[BrainStats]] GetBrainStatsAsync(ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[DashboardDisplaySnapshot]] GetDashboardDisplayAsync(ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[KnowledgeDocumentProjection]] GetKnowledgeDocumentAsync(String, ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[Int32]] GetKnowledgeDocumentCountAsync(ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[KnowledgeDocumentListProjection]] GetKnowledgeDocumentsAsync(String, ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[OrchestratorInfo]] GetOrchestratorInfoAsync(ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[IReadOnlyList`1[LlmSessionInfo]]] GetSharedLlmSessionsAsync(ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[WorkerDisplayProjection]] GetWorkerDisplayAsync(ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult`1[IReadOnlyList`1[WorkerProgressDisplayEntry]]] GetWorkerProgressAsync(String, ClaimsPrincipal, CancellationToken)",
+            "Task`1[FacadeResult] ResetBrainSessionAsync(ClaimsPrincipal, CancellationToken)",
+        };
+        Array.Sort(expected, StringComparer.Ordinal);
+
+        foreach (var type in new[] { typeof(IOperationalFacade), typeof(OperationalFacade) })
+        {
+            var actual = type.GetMethods()
+                // The concrete type also inherits Object's members; the facade's own public surface is
+                // everything declared on it.
+                .Where(method => method.DeclaringType == type)
+                .Select(DescribeOperation)
+                .OrderBy(signature => signature, StringComparer.Ordinal)
+                .ToArray();
+
+            Assert.Equal(expected, actual);
+        }
+    }
+
+    /// <summary>Renders one operation as "ReturnType Name(ParameterTypes)".</summary>
+    private static string DescribeOperation(System.Reflection.MethodInfo method) =>
+        $"{DescribeType(method.ReturnType)} {method.Name}("
+        + string.Join(", ", method.GetParameters().Select(parameter => DescribeType(parameter.ParameterType)))
+        + ")";
+
+    /// <summary>
+    /// Renders a closed constructed type in its generic form, e.g.
+    /// <c>Task`1[FacadeResult`1[BrainStats]]</c>, so the pinned signature names the exact value types.
+    /// </summary>
+    private static string DescribeType(Type type) => type.IsGenericType
+        ? $"{type.GetGenericTypeDefinition().Name}[{string.Join(", ", type.GetGenericArguments().Select(DescribeType))}]"
+        : type.Name;
+
+    /// <summary>
+    /// THERE IS NO IDENTITY-FREE OVERLOAD: for every operation name on the interface — and on the
+    /// public implementation — there is EXACTLY ONE declared method, and none of them omits the
+    /// acting identity. A same-name convenience overload that dropped the
+    /// <see cref="ClaimsPrincipal"/> would silently reintroduce an unauthorized path, so it fails here
+    /// even though every other row would still pass.
+    /// </summary>
+    [Fact]
+    public void NoOperation_HasAnIdentityFreeOverload()
+    {
+        foreach (var type in new[] { typeof(IOperationalFacade), typeof(OperationalFacade) })
+        {
+            var declared = type.GetMethods()
+                .Where(method => method.DeclaringType == type)
+                .ToList();
+
+            // One declared method per name: a second overload of the same name is a contract change.
+            var duplicates = declared
+                .GroupBy(method => method.Name, StringComparer.Ordinal)
+                .Where(group => group.Count() != 1)
+                .Select(group => group.Key)
+                .ToArray();
+            Assert.Empty(duplicates);
+
+            // EVERY one of them takes the acting identity plus a cancellation token, and no operation
+            // exists in an identity-free form: the only non-identity parameter any operation takes is
+            // the argument it is reading (a search query, a document id or a worker id) together with
+            // the token, so a convenience overload that dropped the principal has nowhere to hide.
+            foreach (var method in declared)
+            {
+                var parameters = method.GetParameters().Select(parameter => parameter.ParameterType).ToList();
+
+                Assert.True(
+                    parameters.Contains(typeof(ClaimsPrincipal)),
+                    $"'{type.Name}.{method.Name}' must take the acting identity.");
+                Assert.True(
+                    parameters.Contains(typeof(CancellationToken)),
+                    $"'{type.Name}.{method.Name}' must take a cancellation token.");
+
+                // At most ONE non-identity, non-token argument — the operation's own subject.
+                Assert.True(
+                    parameters.Count(type0 => type0 != typeof(CancellationToken)) <= 2,
+                    $"'{type.Name}.{method.Name}' declares more arguments than the identity, one subject "
+                    + "and the token; an identity-free overload would look exactly like this.");
+            }
+        }
     }
 
     /// <summary>

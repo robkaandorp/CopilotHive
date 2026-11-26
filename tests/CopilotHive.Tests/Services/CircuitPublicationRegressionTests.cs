@@ -79,7 +79,8 @@ public sealed class CircuitPublicationRegressionTests : IAsyncLifetime
         services.AddScoped(_ => new CircuitUserPrincipalAccessor(resolver, _auth.Policy));
         services.AddSingleton<IOperationalFacade>(sp => new OperationalFacade(
             sp.GetRequiredService<DashboardStateService>(), sp.GetRequiredService<LlmSessionRegistry>(),
-            resolver, _auth.Policy, NullLogger<OperationalFacade>.Instance));
+            resolver, _auth.Policy, NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog())));
         var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
         var scope = provider.CreateAsyncScope();
         var renderer = new HtmlRenderer(scope.ServiceProvider, NullLoggerFactory.Instance);

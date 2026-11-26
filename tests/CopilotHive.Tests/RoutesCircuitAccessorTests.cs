@@ -143,14 +143,22 @@ public sealed class RoutesCircuitAccessorTests : IDisposable
             sp.GetRequiredService<HivePolicy>(),
             NullLogger<ClarificationFacade>.Instance));
 
+        // THE LIVE SOURCES the host registers as singletons, captured so the facade's progress
+        // aggregation reads the very same pipeline manager and progress log the dashboard does.
+        var pipelineManager = new GoalPipelineManager();
+        var progressLog = new ProgressLog();
+
         var dashboard = new DashboardStateService(
             new WorkerPool(),
-            new GoalPipelineManager(),
+            pipelineManager,
             new DashboardLogSink(),
-            new ProgressLog(),
+            progressLog,
             notifier: null,
             brain: null);
         services.AddSingleton(dashboard);
+        services.AddSingleton(pipelineManager);
+        services.AddSingleton(progressLog);
+        services.AddSingleton<ProgressReportService>();
 
         // THE AUTHORIZED OPERATIONAL BOUNDARY the nav menu now depends on (its knowledge-document
         // count read). Registered exactly as Program.cs wires it: the same production constructor
@@ -161,7 +169,8 @@ public sealed class RoutesCircuitAccessorTests : IDisposable
             sp.GetRequiredService<LlmSessionRegistry>(),
             sp.GetRequiredService<HivePrincipalResolver>(),
             sp.GetRequiredService<HivePolicy>(),
-            NullLogger<OperationalFacade>.Instance));
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(sp.GetRequiredService<GoalPipelineManager>(), sp.GetRequiredService<ProgressLog>())));
     }
 
     // ══════════════════════════════════════════════════════════════════

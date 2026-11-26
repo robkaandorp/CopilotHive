@@ -159,7 +159,9 @@ public sealed class OperationalFacadeDelegationTests : IDisposable
 
     private OperationalFacade FacadeFor(
         HiveAuthMode mode, DashboardStateService dashboard, LlmSessionRegistry registry) =>
-        _auth.OperationalFacade(mode, dashboard, registry);
+        _auth.OperationalFacade(
+            mode, dashboard, registry,
+            new ProgressReportService(new GoalPipelineManager(), new ProgressLog()));
 
     private async Task SeedAllRolesAsync()
     {

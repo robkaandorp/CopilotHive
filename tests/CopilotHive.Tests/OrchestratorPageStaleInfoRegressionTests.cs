@@ -195,11 +195,16 @@ public sealed class OrchestratorPageStaleInfoRegressionTests : IDisposable
             },
         };
 
+        // THE LIVE SOURCES the host registers as singletons, captured so the facade's progress
+        // aggregation reads the very same pipeline manager and progress log the dashboard does.
+        var pipelineManager = new GoalPipelineManager();
+        var progressLog = new ProgressLog();
+
         var dashboardState = new DashboardStateService(
             new WorkerPool(),
-            new GoalPipelineManager(),
+            pipelineManager,
             new DashboardLogSink(),
-            new ProgressLog(),
+            progressLog,
             notifier: notifier,
             brain: brain,
             config: config);
@@ -209,6 +214,9 @@ public sealed class OrchestratorPageStaleInfoRegressionTests : IDisposable
         services.AddSingleton(notifier);
         services.AddSingleton(dashboardState);
         services.AddSingleton(registry);
+        services.AddSingleton(pipelineManager);
+        services.AddSingleton(progressLog);
+        services.AddSingleton<ProgressReportService>();
         services.AddSingleton(new PageHeaderState());
         services.AddSingleton<IGoalStore>(new InMemoryGoalStore());
         services.AddSingleton<Microsoft.JSInterop.IJSRuntime>(new NullJsRuntime());
@@ -231,7 +239,8 @@ public sealed class OrchestratorPageStaleInfoRegressionTests : IDisposable
             sp.GetRequiredService<LlmSessionRegistry>(),
             sp.GetRequiredService<HivePrincipalResolver>(),
             sp.GetRequiredService<HivePolicy>(),
-            NullLogger<OperationalFacade>.Instance));
+            NullLogger<OperationalFacade>.Instance,
+            new ProgressReportService(sp.GetRequiredService<GoalPipelineManager>(), sp.GetRequiredService<ProgressLog>())));
 
         // THE AUTHORIZED CLARIFICATION FACADE — the production type over the production queue, the
         // seeded goal store and the production resolver/policy, exactly as Program.cs registers it.
